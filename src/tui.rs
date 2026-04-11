@@ -165,13 +165,26 @@ impl TuiState {
             ])
         }).collect();
 
+        // URL 列をコンテンツの最大長に合わせる (最小 20、最大 60)
+        let url_col_w = config.plugins.iter()
+            .map(|p| p.url.len())
+            .max()
+            .unwrap_or(20)
+            .clamp(20, 60) as u16;
+        // rev 列をコンテンツの最大長に合わせる (最小 3、最大 20)
+        let rev_col_w = config.plugins.iter()
+            .map(|p| p.rev.as_deref().unwrap_or("-").len())
+            .max()
+            .unwrap_or(3)
+            .clamp(3, 20) as u16;
+
         let table = Table::new(rows, [
-            Constraint::Length(3),
-            Constraint::Percentage(33),
-            Constraint::Length(7),
-            Constraint::Length(6),
-            Constraint::Percentage(12),
-            Constraint::Percentage(45),
+            Constraint::Length(3),           // アイコン
+            Constraint::Length(url_col_w),   // URL (動的)
+            Constraint::Length(6),           // Mode
+            Constraint::Length(6),           // Merge
+            Constraint::Length(rev_col_w),   // Rev (動的)
+            Constraint::Min(10),             // Detail (残り全部)
         ])
             .header(header)
             .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
