@@ -14,6 +14,11 @@ pub struct Options {
     pub config_root: Option<String>,
     pub concurrency: Option<usize>,
     pub loader_path: Option<String>,
+    /// rvpm のデータ置き場 root の上書き。
+    /// 未指定なら `~/.cache/rvpm`。ここで指定すると repos / merged / loader.lua
+    /// 全てがこの配下にまとまる。`loader_path` が別途指定されていればそちらが優先。
+    /// `~/...` 形式を受け付ける。
+    pub base_dir: Option<String>,
 }
 
 /// Keymap 仕様. TOML では文字列 (`"<leader>f"`) またはテーブル
@@ -277,6 +282,34 @@ on_cmd = ["Telescope", "Grep"]
 "#;
         let config = parse_config(toml).unwrap();
         assert_eq!(config.plugins[0].on_cmd, Some(vec!["Telescope".to_string(), "Grep".to_string()]));
+    }
+
+    #[test]
+    fn test_parse_config_accepts_base_dir_option() {
+        let toml = r#"
+[options]
+base_dir = "~/dotfiles/nvim/rvpm"
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(
+            config.options.base_dir.as_deref(),
+            Some("~/dotfiles/nvim/rvpm")
+        );
+    }
+
+    #[test]
+    fn test_parse_config_base_dir_defaults_to_none() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.options.base_dir, None);
     }
 
     #[test]

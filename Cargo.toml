@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 # CLI & UI
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 ratatui = "0.26"
 crossterm = { version = "0.27", features = ["events"] }
 indicatif = "0.17"
@@ -13,10 +13,10 @@ dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 anyhow = "1.0"
 
 # Async & Process
-tokio = { version = "1.36", features = ["full"] }
+tokio = { version = "1.51", features = ["full"] }
 
 # Template & Config
-tera = "1.19"
+tera = "1.20"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
@@ -24,8 +24,8 @@ toml_edit = "0.22"
 
 # File System & Path
 dirs = "5.0"
-junction = "1.1"
+junction = "1.4"
 walkdir = "2.5"
 
 [dev-dependencies]
-tempfile = "3.10"
+tempfile = "3.27"

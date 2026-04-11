@@ -58,6 +58,8 @@ enum Commands {
     },
     Status,
     List,
+    /// config.toml を $EDITOR で開く。編集後は sync を実行して変更を反映する。
+    Config,
 }
 
 #[tokio::main]
@@ -77,6 +79,7 @@ async fn main() -> Result<()> {
         Commands::Clean { force } => { run_clean(force).await?; },
         Commands::Status => { run_status().await?; },
         Commands::List => { run_list().await?; },
+        Commands::Config => { if run_config().await? { let _ = run_sync().await; } },
     }
 
     Ok(())
@@ -91,8 +94,7 @@ use ratatui::backend::CrosstermBackend;
 use crate::tui::{TuiState, PluginStatus};
 
 async fn run_sync() -> Result<()> {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    let config_path = home.join(".config/rvpm/config.toml");
+    let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
 
@@ -100,7 +102,7 @@ async fn run_sync() -> Result<()> {
     crate::config::sort_plugins(&mut config_data.plugins)?;
     let config = Arc::new(config_data);
     
-    let base_dir = home.join(".cache/rvpm");
+    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
     let merged_dir = base_dir.join("merged");
     
     if merged_dir.exists() {
@@ -154,11 +156,10 @@ async fn run_sync() -> Result<()> {
                 finished_tasks += 1;
                 if let Ok(Ok((plugin, dst_path))) = res {
                     if plugin.merge { let _ = merge_plugin(&dst_path, &merged_dir); }
-                    if let Some(config_root) = &config.options.config_root {
-                        let plugin_config_dir = Path::new(config_root).join(plugin.canonical_path());
-                        let scripts = build_plugin_scripts(&plugin, &dst_path, &plugin_config_dir);
-                        plugin_scripts.push(scripts);
-                    }
+                    let config_root = resolve_config_root(config.options.config_root.as_deref());
+                    let plugin_config_dir = config_root.join(plugin.canonical_path());
+                    let scripts = build_plugin_scripts(&plugin, &dst_path, &plugin_config_dir);
+                    plugin_scripts.push(scripts);
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
@@ -177,28 +178,26 @@ async fn run_sync() -> Result<()> {
 }
 
 async fn run_generate() -> Result<()> {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    let config_path = home.join(".config/rvpm/config.toml");
+    let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
     let mut config = parse_config(&toml_content)?;
     // depends に基づいた依存順に並べる (run_sync と同じ扱い)
     crate::config::sort_plugins(&mut config.plugins)?;
-    let base_dir = home.join(".cache/rvpm");
+    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
     let merged_dir = base_dir.join("merged");
     let loader_path = resolve_loader_path(config.options.loader_path.as_deref(), &base_dir);
 
     let mut plugin_scripts = Vec::new();
-    if let Some(config_root) = &config.options.config_root {
-        for plugin in &config.plugins {
-            let dst_path = if let Some(d) = &plugin.dst {
-                PathBuf::from(d)
-            } else {
-                base_dir.join("repos").join(plugin.canonical_path())
-            };
-            let plugin_config_dir = Path::new(config_root).join(plugin.canonical_path());
-            plugin_scripts.push(build_plugin_scripts(plugin, &dst_path, &plugin_config_dir));
-        }
+    let config_root = resolve_config_root(config.options.config_root.as_deref());
+    for plugin in &config.plugins {
+        let dst_path = if let Some(d) = &plugin.dst {
+            PathBuf::from(d)
+        } else {
+            base_dir.join("repos").join(plugin.canonical_path())
+        };
+        let plugin_config_dir = config_root.join(plugin.canonical_path());
+        plugin_scripts.push(build_plugin_scripts(plugin, &dst_path, &plugin_config_dir));
     }
 
     println!("Generating loader.lua...");
@@ -243,11 +242,10 @@ async fn fetch_plugin_statuses(config: &config::Config, base_dir: &Path) -> std:
 }
 
 async fn run_list() -> Result<()> {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    let config_path = home.join(".config/rvpm/config.toml");
+    let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)?;
     let mut config = parse_config(&toml_content)?;
-    let base_dir = home.join(".cache/rvpm");
+    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -410,11 +408,10 @@ async fn run_list() -> Result<()> {
 }
 
 async fn run_status() -> Result<()> {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    let config_path = home.join(".config/rvpm/config.toml");
+    let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
-    let base_dir = home.join(".cache/rvpm");
+    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
     let mut set = JoinSet::new();
     println!("Checking plugin status...");
     for plugin in config.plugins.into_iter() {
@@ -442,13 +439,12 @@ async fn run_status() -> Result<()> {
 }
 
 async fn run_update(query: Option<String>) -> Result<()> {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    let config_path = home.join(".config/rvpm/config.toml");
+    let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
     let config_data = parse_config(&toml_content)?;
     let config = Arc::new(config_data);
-    let base_dir = home.join(".cache/rvpm");
+    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
 
     let target_plugins: Vec<_> = config.plugins.iter()
         .filter(|p| {
@@ -529,8 +525,7 @@ async fn run_update(query: Option<String>) -> Result<()> {
 use toml_edit::{DocumentMut, table, value, Item};
 
 async fn run_add(repo: String, name: Option<String>) -> Result<()> {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    let config_path = home.join(".config/rvpm/config.toml");
+    let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)?;
     let mut doc = toml_content.parse::<DocumentMut>()?;
     if doc.get("plugins").is_none() { doc["plugins"] = toml_edit::ArrayOfTables::new().into(); }
@@ -548,9 +543,25 @@ async fn run_add(repo: String, name: Option<String>) -> Result<()> {
 
 use dialoguer::{FuzzySelect, Select};
 
+/// `rvpm config` — config.toml を $EDITOR で直接開く。
+/// ファイルが無ければ作らずにエラーを返す (init されていない場合のガード)。
+/// 常に `Ok(true)` を返すので呼び出し側で sync を走らせる前提。
+async fn run_config() -> Result<bool> {
+    let config_path = rvpm_config_path();
+    if !config_path.exists() {
+        anyhow::bail!(
+            "config file not found: {}\n\
+             Create it first or run `rvpm add <repo>` to bootstrap.",
+            config_path.display()
+        );
+    }
+    println!("Opening {}", config_path.display());
+    open_editor_at_line(&config_path, 1)?;
+    Ok(true)
+}
+
 async fn run_edit(query: Option<String>) -> Result<bool> {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    let config_path = home.join(".config/rvpm/config.toml");
+    let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
 
@@ -583,20 +594,17 @@ async fn run_edit(query: Option<String>) -> Result<bool> {
         None => return Ok(false),
     };
     
-    if let Some(config_root) = &config.options.config_root {
-        let plugin_config_dir = Path::new(config_root).join(plugin.canonical_path());
-        std::fs::create_dir_all(&plugin_config_dir)?;
-        let target_file = plugin_config_dir.join(file_name);
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
-        std::process::Command::new(editor).arg(target_file).status()?;
-        return Ok(true);
-    }
-    Ok(false)
+    let config_root = resolve_config_root(config.options.config_root.as_deref());
+    let plugin_config_dir = config_root.join(plugin.canonical_path());
+    std::fs::create_dir_all(&plugin_config_dir)?;
+    let target_file = plugin_config_dir.join(file_name);
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
+    std::process::Command::new(editor).arg(target_file).status()?;
+    Ok(true)
 }
 
 async fn run_set(query: Option<String>, lazy: Option<bool>, merge: Option<bool>, on_cmd: Option<String>, on_ft: Option<String>, rev: Option<String>) -> Result<bool> {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    let config_path = home.join(".config/rvpm/config.toml");
+    let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
 
@@ -742,11 +750,10 @@ async fn run_set(query: Option<String>, lazy: Option<bool>, merge: Option<bool>,
 }
 
 async fn run_clean(force: bool) -> Result<()> {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    let config_path = home.join(".config/rvpm/config.toml");
+    let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
-    let base_dir = home.join(".cache/rvpm");
+    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
     let repos_dir = base_dir.join("repos");
     let unused = find_unused_repos(&config, &repos_dir)?;
     if unused.is_empty() { println!("No unused plugins found."); return Ok(()); }
@@ -780,8 +787,7 @@ fn remove_plugin_from_toml(doc: &mut DocumentMut, url: &str) -> Result<()> {
 }
 
 async fn run_remove(query: Option<String>) -> Result<()> {
-    let home = dirs::home_dir().expect("Could not find home directory");
-    let config_path = home.join(".config/rvpm/config.toml");
+    let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
 
@@ -817,7 +823,7 @@ async fn run_remove(query: Option<String>) -> Result<()> {
     std::fs::write(&config_path, doc.to_string())?;
     println!("Removed '{}' from config.", selected_url);
 
-    let base_dir = home.join(".cache/rvpm");
+    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
     let plugin = config.plugins.iter().find(|p| p.url == selected_url).unwrap();
     let dst_path = if let Some(d) = &plugin.dst {
         PathBuf::from(d)
@@ -872,15 +878,9 @@ fn update_plugin_config(doc: &mut DocumentMut, url: &str, lazy: Option<bool>, me
 }
 
 fn resolve_loader_path(config_loader_path: Option<&str>, base_dir: &Path) -> PathBuf {
-    if let Some(raw) = config_loader_path {
-        if raw.starts_with('~') {
-            let home = dirs::home_dir().expect("Could not find home directory");
-            home.join(&raw[2..])
-        } else {
-            PathBuf::from(raw)
-        }
-    } else {
-        base_dir.join("loader.lua")
+    match config_loader_path {
+        Some(raw) => expand_tilde(raw),
+        None => base_dir.join("loader.lua"),
     }
 }
 
@@ -895,6 +895,70 @@ fn write_loader_to_path(merged_dir: &Path, scripts: &[crate::loader::PluginScrip
 
 fn resolve_concurrency(config_value: Option<usize>) -> usize {
     config_value.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS)
+}
+
+// ====================================================================
+// Paths: `.config` / `.cache` をクロスプラットフォームで固定する。
+//
+// Windows でも `dirs::config_dir()` (≒ `%APPDATA%`) ではなく明示的に
+// `~/.config` / `~/.cache` を使う。理由:
+//   - Neovim の config 慣習と一致 (`~/.config/nvim`)
+//   - dotfiles を WSL / Linux / Windows で同じパス構造で共有できる
+//   - 単一の mental model で済む
+//
+// ユーザー側で別のパスにしたければ TOML の options で上書きできる:
+//   - options.base_dir    → 全データの root (repos / merged / loader まとめて)
+//   - options.loader_path → loader.lua のみ細かく上書き (base_dir より優先)
+//   - options.config_root → per-plugin init/before/after.lua の置き場
+//
+// config.toml 自体の場所は固定 (~/.config/rvpm/config.toml)。これを読まないと
+// options が取れないので chicken-and-egg を避けるため動かさない。
+// ====================================================================
+
+/// `~/.config/rvpm/config.toml` (固定)
+fn rvpm_config_path() -> PathBuf {
+    let home = dirs::home_dir().expect("Could not find home directory");
+    home.join(".config").join("rvpm").join("config.toml")
+}
+
+/// `~` / `~/foo` / `~\foo` 形式を home dir に展開する。
+/// それ以外はそのまま PathBuf に変換。
+fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" {
+        return dirs::home_dir().expect("Could not find home directory");
+    }
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        return dirs::home_dir()
+            .expect("Could not find home directory")
+            .join(rest);
+    }
+    PathBuf::from(path)
+}
+
+/// rvpm のデータ置き場 root を決定する。
+/// `options.base_dir` が設定されていればそれを tilde 展開して返す。
+/// 未設定なら `~/.cache/rvpm` (デフォルト)。
+fn resolve_base_dir(config_base_dir: Option<&str>) -> PathBuf {
+    match config_base_dir {
+        Some(raw) => expand_tilde(raw),
+        None => {
+            let home = dirs::home_dir().expect("Could not find home directory");
+            home.join(".cache").join("rvpm")
+        }
+    }
+}
+
+/// per-plugin の init/before/after.lua を置く root を決定する。
+/// `options.config_root` が設定されていればそれを tilde 展開して返す。
+/// 未設定なら `~/.config/rvpm/plugins` (デフォルト)。
+fn resolve_config_root(config_root: Option<&str>) -> PathBuf {
+    match config_root {
+        Some(raw) => expand_tilde(raw),
+        None => {
+            let home = dirs::home_dir().expect("Could not find home directory");
+            home.join(".config").join("rvpm").join("plugins")
+        }
+    }
 }
 
 /// config.toml 上で指定プラグイン (url 一致) の `url = "..."` 行の行番号 (1-indexed) を返す。
@@ -1089,6 +1153,88 @@ mod tests {
             })
             .collect();
         assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_expand_tilde_bare_tilde_returns_home() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_tilde("~"), home);
+    }
+
+    #[test]
+    fn test_expand_tilde_with_forward_slash_subpath() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_tilde("~/foo/bar"), home.join("foo").join("bar"));
+    }
+
+    #[test]
+    fn test_expand_tilde_with_backslash_subpath() {
+        let home = dirs::home_dir().unwrap();
+        // Windows 入力形式にも対応
+        let got = expand_tilde("~\\foo\\bar");
+        // 実際のパス区切りは OS 依存だが、home 配下に foo と bar を含むかで判定
+        let s = got.to_string_lossy().replace('\\', "/");
+        let expected = home.join("foo").join("bar").to_string_lossy().replace('\\', "/");
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn test_expand_tilde_absolute_path_untouched() {
+        assert_eq!(expand_tilde("/absolute/path"), PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn test_expand_tilde_relative_path_untouched() {
+        assert_eq!(expand_tilde("relative/path"), PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn test_resolve_base_dir_uses_default_when_none() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(resolve_base_dir(None), home.join(".cache").join("rvpm"));
+    }
+
+    #[test]
+    fn test_resolve_base_dir_expands_tilde() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            resolve_base_dir(Some("~/dotfiles/rvpm")),
+            home.join("dotfiles").join("rvpm")
+        );
+    }
+
+    #[test]
+    fn test_resolve_base_dir_accepts_absolute_path() {
+        assert_eq!(
+            resolve_base_dir(Some("/opt/rvpm")),
+            PathBuf::from("/opt/rvpm")
+        );
+    }
+
+    #[test]
+    fn test_resolve_config_root_uses_default_when_none() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            resolve_config_root(None),
+            home.join(".config").join("rvpm").join("plugins")
+        );
+    }
+
+    #[test]
+    fn test_resolve_config_root_expands_tilde() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            resolve_config_root(Some("~/dotfiles/nvim/plugins")),
+            home.join("dotfiles").join("nvim").join("plugins")
+        );
+    }
+
+    #[test]
+    fn test_resolve_config_root_accepts_absolute_path() {
+        assert_eq!(
+            resolve_config_root(Some("/etc/rvpm/plugins")),
+            PathBuf::from("/etc/rvpm/plugins")
+        );
     }
 
     #[test]
