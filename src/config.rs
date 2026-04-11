@@ -92,9 +92,123 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     Ok(config)
 }
 
+pub fn sort_plugins(plugins: &mut Vec<Plugin>) -> Result<()> {
+    let mut sorted = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut visiting = std::collections::HashSet::new();
+
+    let plugin_map: std::collections::HashMap<String, &Plugin> = plugins
+        .iter()
+        .map(|p| (p.url.clone(), p))
+        .collect();
+
+    fn visit(
+        url: &str,
+        plugin_map: &std::collections::HashMap<String, &Plugin>,
+        visited: &mut std::collections::HashSet<String>,
+        visiting: &mut std::collections::HashSet<String>,
+        sorted: &mut Vec<Plugin>,
+    ) -> Result<()> {
+        if visited.contains(url) {
+            return Ok(());
+        }
+        if visiting.contains(url) {
+            eprintln!("Warning: Cyclic dependency detected: {}", url);
+            return Ok(());
+        }
+
+        visiting.insert(url.to_string());
+
+        if let Some(plugin) = plugin_map.get(url) {
+            if let Some(deps) = &plugin.depends {
+                for dep in deps {
+                    visit(dep, plugin_map, visited, visiting, sorted)?;
+                }
+            }
+            visited.insert(url.to_string());
+            visiting.remove(url);
+            sorted.push((*plugin).clone());
+        } else {
+            eprintln!("Warning: Dependency not found in config: {}", url);
+            visited.insert(url.to_string());
+            visiting.remove(url);
+        }
+        Ok(())
+    }
+
+    for plugin in plugins.iter() {
+        visit(&plugin.url, &plugin_map, &mut visited, &mut visiting, &mut sorted)?;
+    }
+
+    *plugins = sorted;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sort_plugins_dependencies() {
+        let mut plugins = vec![
+            Plugin {
+                url: "A".to_string(),
+                depends: Some(vec!["B".to_string()]),
+                ..Default::default()
+            },
+            Plugin {
+                url: "B".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        sort_plugins(&mut plugins).unwrap();
+
+        assert_eq!(plugins[0].url, "B");
+        assert_eq!(plugins[1].url, "A");
+    }
+
+    #[test]
+    fn test_sort_plugins_cycle_resilience() {
+        let mut plugins = vec![
+            Plugin {
+                url: "A".to_string(),
+                depends: Some(vec!["B".to_string()]),
+                ..Default::default()
+            },
+            Plugin {
+                url: "B".to_string(),
+                depends: Some(vec!["A".to_string()]),
+                ..Default::default()
+            },
+            Plugin {
+                url: "C".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let result = sort_plugins(&mut plugins);
+        assert!(result.is_ok());
+        assert!(plugins.iter().any(|p| p.url == "C"));
+    }
+
+    #[test]
+    fn test_sort_plugins_missing_dependency_resilience() {
+        let mut plugins = vec![
+            Plugin {
+                url: "A".to_string(),
+                depends: Some(vec!["NOT_FOUND".to_string()]),
+                ..Default::default()
+            },
+        ];
+
+        let result = sort_plugins(&mut plugins);
+        // エラーにならずに成功すべき
+        assert!(result.is_ok());
+        // A はリストに残るべき
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].url, "A");
+    }
 
     #[test]
     fn test_parse_config_with_tera() {

@@ -135,7 +135,9 @@ async fn run_sync() -> Result<()> {
     let toml_content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
 
-    let config = Arc::new(parse_config(&toml_content)?);
+    let mut config_data = parse_config(&toml_content)?;
+    crate::config::sort_plugins(&mut config_data.plugins)?;
+    let config = Arc::new(config_data);
     
     let base_dir = home.join(".cache/rvpm");
     let merged_dir = base_dir.join("merged");
@@ -168,37 +170,46 @@ async fn run_sync() -> Result<()> {
 
     let mut plugin_scripts = Vec::new();
     while let Some(res) = set.join_next().await {
-        let (plugin, dst_path) = res??;
-        println!("  Finished syncing {}...", plugin.url);
+        match res {
+            Ok(Ok((plugin, dst_path))) => {
+                println!("  Finished syncing {}...", plugin.url);
 
-        if plugin.merge {
-            println!("  Merging {}...", plugin.url);
-            merge_plugin(&dst_path, &merged_dir)?;
+                if plugin.merge {
+                    if let Err(e) = merge_plugin(&dst_path, &merged_dir) {
+                        eprintln!("Warning: Failed to merge plugin {}: {}", plugin.url, e);
+                    }
+                }
+
+                if let Some(config_root) = &config.options.config_root {
+                    let plugin_config_dir = Path::new(config_root).join(plugin.canonical_path());
+
+                    let scripts = PluginScripts {
+                        name: plugin.name.clone().unwrap_or_else(|| plugin.url.clone()),
+                        path: dst_path.to_string_lossy().to_string(),
+                        init: find_lua(&plugin_config_dir, "init.lua"),
+                        before: find_lua(&plugin_config_dir, "before.lua"),
+                        after: find_lua(&plugin_config_dir, "after.lua"),
+                        lazy: plugin.lazy,
+                        on_cmd: plugin.on_cmd.clone(),
+                        on_ft: plugin.on_ft.clone(),
+                        on_map: plugin.on_map.clone(),
+                        on_event: plugin.on_event.clone(),
+                        on_path: None,
+                        on_source: None,
+                        cond: None,
+                    };
+                    plugin_scripts.push(scripts);
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("Warning: Failed to sync a plugin: {}", e);
+            }
+            Err(e) => {
+                eprintln!("Warning: Task join error: {}", e);
+            }
         }
-
-        if let Some(config_root) = &config.options.config_root {
-            let plugin_config_dir = Path::new(config_root).join(plugin.canonical_path());
-
-            let scripts = PluginScripts {
-                name: plugin.name.clone().unwrap_or_else(|| plugin.url.clone()),
-                path: dst_path.to_string_lossy().to_string(),
-                init: find_lua(&plugin_config_dir, "init.lua"),
-                before: find_lua(&plugin_config_dir, "before.lua"),
-                after: find_lua(&plugin_config_dir, "after.lua"),
-                lazy: plugin.lazy,
-                on_cmd: plugin.on_cmd.clone(),
-                on_ft: plugin.on_ft.clone(),
-                on_map: plugin.on_map.clone(),
-                on_event: plugin.on_event.clone(),
-                on_path: None, // 未対応
-                on_source: None, // 未対応
-                cond: None, // 未対応
-            };
-
-            plugin_scripts.push(scripts);
-        }
-
     }
+
 
     println!("Generating loader.lua...");
     let lua = generate_loader(&merged_dir, &plugin_scripts);
@@ -253,7 +264,7 @@ async fn run_add(repo: String, name: Option<String>) -> Result<()> {
     std::fs::write(&config_path, doc.to_string())?;
     println!("Added plugin to config: {}", repo);
     
-    run_sync().await?;
+    let _ = run_sync().await;
     Ok(())
 }
 
@@ -303,7 +314,7 @@ async fn run_edit(query: Option<String>) -> Result<()> {
             .status()?;
     }
 
-    run_sync().await?;
+    let _ = run_sync().await;
     Ok(())
 }
 
@@ -405,7 +416,7 @@ async fn run_set(
     std::fs::write(&config_path, doc.to_string())?;
     println!("Updated config for: {}", selected_repo_url);
     
-    run_sync().await?;
+    let _ = run_sync().await;
     Ok(())
 }
 

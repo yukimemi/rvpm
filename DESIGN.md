@@ -54,3 +54,9 @@ depends = ["plenary"]
 - **Merged View**: `merge = true` なプラグインは `~/.cache/rvpm/merged/` にリンク（Windows は Junction）され、一括で RTP に追加。
 - **Static Loader**: Rust がファイル実在チェックを事前に行い、最小限の `dofile` のみを含む `loader.lua` を生成。
 - **Windows Support**: シンボリックリンクの代わりにジャンクションを使用して権限問題を回避。
+
+## 5. 設計原則
+- **Resilience (障害耐性)**: 
+    - 1つのプラグインの同期失敗や設定ミス（依存関係の欠如など）が、システム全体の実行や Neovim の起動を妨げてはならない。
+    - エラーは警告として報告し、可能な限り後続の処理（`generate` 等）を継続する。
+    - Neovim 起動時の安全性を最優先し、不完全な設定であっても最小限の起動を保証する。
