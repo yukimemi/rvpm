@@ -1,6 +1,6 @@
-use serde::Deserialize;
-use tera::{Tera, Context};
 use anyhow::Result;
+use serde::Deserialize;
+use tera::{Context, Tera};
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct Config {
@@ -71,7 +71,9 @@ pub struct Plugin {
 
 /// TOML 上で `on_cmd = "Foo"` (単一文字列) または `on_cmd = ["Foo", "Bar"]` (配列)
 /// のどちらの形式でも受け付け、内部的には `Vec<String>` に正規化する。
-fn deserialize_string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<String>>, D::Error>
+fn deserialize_string_or_vec<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -90,7 +92,9 @@ where
 }
 
 /// Vec<String> を文字列形式 ("n") または配列形式 (["n", "x"]) で受ける。
-fn deserialize_string_or_vec_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+fn deserialize_string_or_vec_vec<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -108,7 +112,9 @@ where
 }
 
 /// on_map の各要素を文字列 (`"<leader>f"`) またはテーブル (`{ lhs = "...", mode = ..., desc = "..." }`) で受け付ける。
-fn deserialize_map_specs<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<MapSpec>>, D::Error>
+fn deserialize_map_specs<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<MapSpec>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -207,10 +213,8 @@ pub fn sort_plugins(plugins: &mut Vec<Plugin>) -> Result<()> {
     let mut visited = std::collections::HashSet::new();
     let mut visiting = std::collections::HashSet::new();
 
-    let plugin_map: std::collections::HashMap<String, &Plugin> = plugins
-        .iter()
-        .map(|p| (p.url.clone(), p))
-        .collect();
+    let plugin_map: std::collections::HashMap<String, &Plugin> =
+        plugins.iter().map(|p| (p.url.clone(), p)).collect();
 
     fn visit(
         url: &str,
@@ -247,7 +251,13 @@ pub fn sort_plugins(plugins: &mut Vec<Plugin>) -> Result<()> {
     }
 
     for plugin in plugins.iter() {
-        visit(&plugin.url, &plugin_map, &mut visited, &mut visiting, &mut sorted)?;
+        visit(
+            &plugin.url,
+            &plugin_map,
+            &mut visited,
+            &mut visiting,
+            &mut sorted,
+        )?;
     }
 
     *plugins = sorted;
@@ -268,7 +278,10 @@ url = "owner/repo"
 on_cmd = "Telescope"
 "#;
         let config = parse_config(toml).unwrap();
-        assert_eq!(config.plugins[0].on_cmd, Some(vec!["Telescope".to_string()]));
+        assert_eq!(
+            config.plugins[0].on_cmd,
+            Some(vec!["Telescope".to_string()])
+        );
     }
 
     #[test]
@@ -281,7 +294,10 @@ url = "owner/repo"
 on_cmd = ["Telescope", "Grep"]
 "#;
         let config = parse_config(toml).unwrap();
-        assert_eq!(config.plugins[0].on_cmd, Some(vec!["Telescope".to_string(), "Grep".to_string()]));
+        assert_eq!(
+            config.plugins[0].on_cmd,
+            Some(vec!["Telescope".to_string(), "Grep".to_string()])
+        );
     }
 
     #[test]
@@ -325,7 +341,10 @@ on_map = ["<leader>f"]
         let maps = config.plugins[0].on_map.as_ref().unwrap();
         assert_eq!(maps.len(), 1);
         assert_eq!(maps[0].lhs, "<leader>f");
-        assert!(maps[0].mode.is_empty(), "simple form leaves mode empty (defaults to 'n' at generate)");
+        assert!(
+            maps[0].mode.is_empty(),
+            "simple form leaves mode empty (defaults to 'n' at generate)"
+        );
         assert_eq!(maps[0].desc, None);
     }
 
@@ -383,7 +402,10 @@ url = "owner/repo"
 on_event = "BufReadPre"
 "#;
         let config = parse_config(toml).unwrap();
-        assert_eq!(config.plugins[0].on_event, Some(vec!["BufReadPre".to_string()]));
+        assert_eq!(
+            config.plugins[0].on_event,
+            Some(vec!["BufReadPre".to_string()])
+        );
     }
 
     #[test]
@@ -432,13 +454,11 @@ on_event = "BufReadPre"
 
     #[test]
     fn test_sort_plugins_missing_dependency_resilience() {
-        let mut plugins = vec![
-            Plugin {
-                url: "A".to_string(),
-                depends: Some(vec!["NOT_FOUND".to_string()]),
-                ..Default::default()
-            },
-        ];
+        let mut plugins = vec![Plugin {
+            url: "A".to_string(),
+            depends: Some(vec!["NOT_FOUND".to_string()]),
+            ..Default::default()
+        }];
 
         let result = sort_plugins(&mut plugins);
         // エラーにならずに成功すべき
@@ -468,7 +488,9 @@ dst = "{{ vars.base }}/plenary"
 
     #[test]
     fn test_parse_config_with_env_and_os() {
-        unsafe { std::env::set_var("RVPM_TEST_ENV", "hello"); }
+        unsafe {
+            std::env::set_var("RVPM_TEST_ENV", "hello");
+        }
         let toml_content = r#"
 [options]
 
@@ -510,13 +532,22 @@ merge = false
 
     #[test]
     fn test_plugin_canonical_path() {
-        let p1 = Plugin { url: "https://github.com/owner/repo".to_string(), ..Default::default() };
+        let p1 = Plugin {
+            url: "https://github.com/owner/repo".to_string(),
+            ..Default::default()
+        };
         assert_eq!(p1.canonical_path(), "github.com/owner/repo");
 
-        let p2 = Plugin { url: "owner/repo".to_string(), ..Default::default() };
+        let p2 = Plugin {
+            url: "owner/repo".to_string(),
+            ..Default::default()
+        };
         assert_eq!(p2.canonical_path(), "github.com/owner/repo");
 
-        let p3 = Plugin { url: "git@github.com:owner/repo.git".to_string(), ..Default::default() };
+        let p3 = Plugin {
+            url: "git@github.com:owner/repo.git".to_string(),
+            ..Default::default()
+        };
         assert_eq!(p3.canonical_path(), "github.com/owner/repo");
     }
 }

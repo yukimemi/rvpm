@@ -1,5 +1,5 @@
-use std::path::Path;
 use anyhow::Result;
+use std::path::Path;
 
 pub fn junction_or_symlink(src: &Path, dst: &Path) -> Result<()> {
     if dst.exists() {
@@ -28,13 +28,15 @@ pub fn junction_or_symlink(src: &Path, dst: &Path) -> Result<()> {
 
 /// 指定したプラグインの中身（lua, plugin, after 等）を merged ディレクトリにマージ
 pub fn merge_plugin(src: &Path, dst_root: &Path) -> Result<()> {
-    let targets = ["lua", "plugin", "after", "autoload", "doc", "colors", "queries", "syntax"];
-    
+    let targets = [
+        "lua", "plugin", "after", "autoload", "doc", "colors", "queries", "syntax",
+    ];
+
     for target in targets {
         let target_src = src.join(target);
         if target_src.exists() {
             let target_dst = dst_root.join(target);
-            
+
             // ターゲット（例: merged/lua）がまだ存在しない場合は作成
             if !target_dst.exists() {
                 std::fs::create_dir_all(&target_dst)?;
@@ -58,19 +60,19 @@ pub fn merge_plugin(src: &Path, dst_root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_merge_plugins() {
         let root = tempdir().unwrap();
         let merged = root.path().join("merged");
-        
+
         // Plugin A
         let plugin_a = root.path().join("plugin_a");
         fs::create_dir_all(plugin_a.join("lua/plugin_a")).unwrap();
         fs::write(plugin_a.join("lua/plugin_a/init.lua"), "print('a')").unwrap();
-        
+
         // Plugin B
         let plugin_b = root.path().join("plugin_b");
         fs::create_dir_all(plugin_b.join("plugin")).unwrap();

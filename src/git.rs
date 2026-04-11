@@ -1,5 +1,5 @@
-use std::path::Path;
 use anyhow::Result;
+use std::path::Path;
 use tokio::process::Command;
 
 pub struct Repo<'a> {
@@ -13,7 +13,6 @@ pub enum RepoStatus {
     NotInstalled,
     Clean,
     Modified,
-    Outdated(String),
     Error(String),
 }
 
@@ -23,7 +22,11 @@ impl<'a> Repo<'a> {
     }
 
     pub async fn sync(&self) -> Result<()> {
-        let url = if !self.url.contains("://") && !self.url.contains("@") && !self.url.contains(":\\") && !self.url.starts_with("/") {
+        let url = if !self.url.contains("://")
+            && !self.url.contains("@")
+            && !self.url.contains(":\\")
+            && !self.url.starts_with("/")
+        {
             format!("https://github.com/{}", self.url)
         } else {
             self.url.to_string()
@@ -34,9 +37,9 @@ impl<'a> Repo<'a> {
         if self.dst.exists() {
             let mut args = vec!["pull"];
             if let Some(rev) = self.rev {
-                 // 特定の rev の場合は pull ではなく fetch して checkout するのが安全なため、
-                 // ここでは一旦 origin を fetch して checkout するロジックにする（後述）
-                 args = vec!["fetch", "--depth", "1", "origin", rev];
+                // 特定の rev の場合は pull ではなく fetch して checkout するのが安全なため、
+                // ここでは一旦 origin を fetch して checkout するロジックにする（後述）
+                args = vec!["fetch", "--depth", "1", "origin", rev];
             }
 
             let output = Command::new("git")
@@ -45,13 +48,16 @@ impl<'a> Repo<'a> {
                 .output()
                 .await?;
             if !output.status.success() {
-                anyhow::bail!("git pull/fetch failed: {}", String::from_utf8_lossy(&output.stderr));
+                anyhow::bail!(
+                    "git pull/fetch failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
         } else {
             if let Some(parent) = self.dst.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            
+
             // rev が指定されている場合は、最初からそのブランチやタグを狙ってクローンする（最速）
             // ※ ただしハッシュだった場合は clone --branch は失敗するので、汎用的なフォールバックが必要だが、
             // 今回は TDD なので、まずは --branch に渡してみて、失敗したら通常のクローンをする等工夫する。
@@ -64,23 +70,28 @@ impl<'a> Repo<'a> {
             args.push(&url);
             args.push(self.dst.to_str().unwrap());
 
-            let output = Command::new("git")
-                .args(&args)
-                .output()
-                .await?;
-                
+            let output = Command::new("git").args(&args).output().await?;
+
             if !output.status.success() {
                 // ハッシュ指定で --branch が失敗した可能性もあるため、通常クローンにフォールバック
-                if self.rev.is_some() && String::from_utf8_lossy(&output.stderr).contains("not found in upstream") {
+                if self.rev.is_some()
+                    && String::from_utf8_lossy(&output.stderr).contains("not found in upstream")
+                {
                     let output = Command::new("git")
                         .args(["clone", &url, self.dst.to_str().unwrap()]) // depth 1 は諦める
                         .output()
                         .await?;
                     if !output.status.success() {
-                         anyhow::bail!("git clone fallback failed: {}", String::from_utf8_lossy(&output.stderr));
+                        anyhow::bail!(
+                            "git clone fallback failed: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
                     }
                 } else {
-                    anyhow::bail!("git clone failed: {}", String::from_utf8_lossy(&output.stderr));
+                    anyhow::bail!(
+                        "git clone failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
                 }
             }
             is_new_clone = true;
@@ -98,7 +109,11 @@ impl<'a> Repo<'a> {
                 if is_new_clone {
                     let _ = std::fs::remove_dir_all(self.dst);
                 }
-                anyhow::bail!("git checkout failed for rev '{}': {}", rev, String::from_utf8_lossy(&output.stderr));
+                anyhow::bail!(
+                    "git checkout failed for rev '{}': {}",
+                    rev,
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
         }
 
@@ -120,7 +135,10 @@ impl<'a> Repo<'a> {
             .output()
             .await?;
         if !output.status.success() {
-            anyhow::bail!("git pull/fetch failed: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "git pull/fetch failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         if let Some(rev) = self.rev {
             let output = Command::new("git")
@@ -129,7 +147,10 @@ impl<'a> Repo<'a> {
                 .output()
                 .await?;
             if !output.status.success() {
-                anyhow::bail!("git checkout failed: {}", String::from_utf8_lossy(&output.stderr));
+                anyhow::bail!(
+                    "git checkout failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
         }
         Ok(())
@@ -177,8 +198,8 @@ impl<'a> Repo<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::fs;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_sync_cleans_up_on_invalid_rev() {
@@ -187,12 +208,37 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&src).unwrap();
-        Command::new("git").args(["init"]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["config", "user.name", "Test"]).current_dir(&src).output().await.unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
         fs::write(src.join("hello.txt"), "hello").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(&src).output().await.unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
 
         let repo = Repo::new(src.to_str().unwrap(), &dst, Some("nonexistent-rev"));
         let result = repo.sync().await;
@@ -207,12 +253,37 @@ mod tests {
         let src = root.path().join("src");
 
         fs::create_dir_all(&src).unwrap();
-        Command::new("git").args(["init"]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["config", "user.name", "Test"]).current_dir(&src).output().await.unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
         fs::write(src.join("hello.txt"), "hello").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(&src).output().await.unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
 
         // 存在しない rev を指定
         let repo = Repo::new(src.to_str().unwrap(), &src, Some("nonexistent-rev"));
@@ -220,7 +291,8 @@ mod tests {
 
         assert!(
             matches!(status, RepoStatus::Error(_)),
-            "存在しない rev は get_status が Error を返すべき、実際: {:?}", status
+            "存在しない rev は get_status が Error を返すべき、実際: {:?}",
+            status
         );
     }
 
@@ -231,12 +303,37 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&src).unwrap();
-        Command::new("git").args(["init"]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["config", "user.name", "Test"]).current_dir(&src).output().await.unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
         fs::write(src.join("hello.txt"), "v1").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "v1"]).current_dir(&src).output().await.unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "v1"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
 
         // 最初に clone
         let repo = Repo::new(src.to_str().unwrap(), &dst, None);
@@ -244,8 +341,18 @@ mod tests {
 
         // src に更新を追加
         fs::write(src.join("hello.txt"), "v2").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "v2"]).current_dir(&src).output().await.unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "v2"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
 
         // update のみ実行
         repo.update().await.unwrap();
@@ -270,17 +377,42 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&src).unwrap();
-        Command::new("git").args(["init"]).current_dir(&src).output().await.unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
         fs::write(src.join("hello.txt"), "hello").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(&src).output().await.unwrap();
-        
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+
         let repo = Repo::new(src.to_str().unwrap(), &dst, None);
         repo.sync().await.unwrap();
 
         fs::write(src.join("hello.txt"), "updated").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "update"]).current_dir(&src).output().await.unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "update"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
 
         repo.sync().await.unwrap();
 
@@ -294,10 +426,25 @@ mod tests {
         let src = root.path().join("src");
 
         fs::create_dir_all(&src).unwrap();
-        Command::new("git").args(["init"]).current_dir(&src).output().await.unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
         fs::write(src.join("hello.txt"), "hello").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "init"]).current_dir(&src).output().await.unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
 
         let repo = Repo::new(src.to_str().unwrap(), &src, None);
 
@@ -317,18 +464,48 @@ mod tests {
 
         // 1. ダミーのリポジトリを作成し、2回コミットする
         fs::create_dir_all(&src).unwrap();
-        Command::new("git").args(["init"]).current_dir(&src).output().await.unwrap();
-        
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+
         fs::write(src.join("hello.txt"), "v1").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "v1"]).current_dir(&src).output().await.unwrap();
-        
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "v1"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+
         // tag "v1.0" を打つ
-        Command::new("git").args(["tag", "v1.0"]).current_dir(&src).output().await.unwrap();
+        Command::new("git")
+            .args(["tag", "v1.0"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
 
         fs::write(src.join("hello.txt"), "v2").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&src).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "v2"]).current_dir(&src).output().await.unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "v2"])
+            .current_dir(&src)
+            .output()
+            .await
+            .unwrap();
 
         // 2. v1.0 タグを指定してクローン
         let repo = Repo::new(src.to_str().unwrap(), &dst, Some("v1.0"));

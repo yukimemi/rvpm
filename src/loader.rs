@@ -1,5 +1,5 @@
-use std::path::Path;
 use crate::config::MapSpec;
+use std::path::Path;
 
 #[derive(Clone)]
 pub struct PluginScripts {
@@ -217,9 +217,21 @@ end
 
         let mut body = String::new();
         // ファイルリストをローカルテーブルとして宣言
-        body.push_str(&format!("local {} = {}\n", pf_var, lua_str_list(&s.plugin_files)));
-        body.push_str(&format!("local {} = {}\n", fd_var, lua_str_list(&s.ftdetect_files)));
-        body.push_str(&format!("local {} = {}\n", ap_var, lua_str_list(&s.after_plugin_files)));
+        body.push_str(&format!(
+            "local {} = {}\n",
+            pf_var,
+            lua_str_list(&s.plugin_files)
+        ));
+        body.push_str(&format!(
+            "local {} = {}\n",
+            fd_var,
+            lua_str_list(&s.ftdetect_files)
+        ));
+        body.push_str(&format!(
+            "local {} = {}\n",
+            ap_var,
+            lua_str_list(&s.after_plugin_files)
+        ));
 
         let load_call = format!(
             "load_lazy(\"{}\", \"{}\", {}, {}, {}, {}, {})",
@@ -349,7 +361,10 @@ end
 
         // ---- on_source: プラグインロード完了 User イベントを受けて連鎖 ----
         if let Some(sources) = &s.on_source {
-            let patterns: Vec<String> = sources.iter().map(|src| format!("rvpm_loaded_{}", src)).collect();
+            let patterns: Vec<String> = sources
+                .iter()
+                .map(|src| format!("rvpm_loaded_{}", src))
+                .collect();
             body.push_str(&format!(
                 "vim.api.nvim_create_autocmd(\"User\", {{ pattern = {{ \"{}\" }}, once = true, callback = function()\n\
                  \x20 {load}\n\
@@ -390,9 +405,14 @@ mod tests {
         s.before = Some("/cfg/a/before.lua".to_string());
         let lua = generate_loader(Path::new("/merged"), &[s]);
         let init_pos = lua.find("/cfg/a/init.lua").expect("init missing");
-        let rtp_pos = lua.find("vim.opt.rtp:append(\"/merged\")").expect("merged rtp missing");
+        let rtp_pos = lua
+            .find("vim.opt.rtp:append(\"/merged\")")
+            .expect("merged rtp missing");
         let before_pos = lua.find("/cfg/a/before.lua").expect("before missing");
-        assert!(init_pos < rtp_pos, "init must come BEFORE merged rtp append");
+        assert!(
+            init_pos < rtp_pos,
+            "init must come BEFORE merged rtp append"
+        );
         assert!(rtp_pos < before_pos, "before must come AFTER rtp append");
     }
 
@@ -404,7 +424,10 @@ mod tests {
         b.merge = true;
         let lua = generate_loader(Path::new("/merged"), &[a, b]);
         let count = lua.matches("vim.opt.rtp:append(\"/merged\")").count();
-        assert_eq!(count, 1, "merged rtp should be appended exactly once for multiple merge=true plugins");
+        assert_eq!(
+            count, 1,
+            "merged rtp should be appended exactly once for multiple merge=true plugins"
+        );
     }
 
     #[test]
@@ -438,10 +461,18 @@ mod tests {
         a.plugin_files = vec!["/path/a/plugin/a.vim".to_string()];
         let lua = generate_loader(Path::new("/merged"), &[a]);
         let before_pos = lua.find("/cfg/a/before.lua").unwrap();
-        let source_pos = lua.find("vim.cmd(\"source /path/a/plugin/a.vim\")").expect("plugin file source missing");
+        let source_pos = lua
+            .find("vim.cmd(\"source /path/a/plugin/a.vim\")")
+            .expect("plugin file source missing");
         let after_pos = lua.find("/cfg/a/after.lua").unwrap();
-        assert!(before_pos < source_pos, "before.lua must come before plugin/ source");
-        assert!(source_pos < after_pos, "after.lua must come after plugin/ source");
+        assert!(
+            before_pos < source_pos,
+            "before.lua must come before plugin/ source"
+        );
+        assert!(
+            source_pos < after_pos,
+            "after.lua must come after plugin/ source"
+        );
     }
 
     #[test]
@@ -457,10 +488,14 @@ mod tests {
             .expect("ftdetect source missing");
         // source の手前に "augroup filetypedetect" (source より前の範囲で rfind)
         let prior = &lua[..ftdetect_source_pos];
-        let augroup_begin_pos = prior.rfind("augroup filetypedetect").expect("augroup begin missing before ftdetect source");
+        let augroup_begin_pos = prior
+            .rfind("augroup filetypedetect")
+            .expect("augroup begin missing before ftdetect source");
         // source の後ろに "augroup END"
         let after = &lua[ftdetect_source_pos..];
-        let augroup_end_rel = after.find("augroup END").expect("augroup END missing after ftdetect source");
+        let augroup_end_rel = after
+            .find("augroup END")
+            .expect("augroup END missing after ftdetect source");
         // source と begin/end の間に他の augroup END/begin がないことも軽く確認
         assert!(augroup_begin_pos < ftdetect_source_pos);
         assert!(augroup_end_rel > 0);
@@ -493,7 +528,10 @@ mod tests {
         // (load_lazy の中のローカルテーブル内には出ていい)
         let direct_source_count = lua
             .lines()
-            .filter(|l| l.trim_start().starts_with("vim.cmd(\"source /path/a/plugin/a.vim\")"))
+            .filter(|l| {
+                l.trim_start()
+                    .starts_with("vim.cmd(\"source /path/a/plugin/a.vim\")")
+            })
             .count();
         assert_eq!(
             direct_source_count, 0,
@@ -511,20 +549,40 @@ mod tests {
         a.after_plugin_files = vec!["/path/a/after/plugin/a.vim".to_string()];
         let lua = generate_loader(Path::new("/merged"), &[a]);
         // ファイルリストがどこかに登場すること (ローカルテーブルとしてでも load_lazy 引数内でも OK)
-        assert!(lua.contains("/path/a/plugin/a.vim"), "plugin file must be referenced");
-        assert!(lua.contains("/path/a/ftdetect/a.vim"), "ftdetect file must be referenced");
-        assert!(lua.contains("/path/a/after/plugin/a.vim"), "after/plugin file must be referenced");
+        assert!(
+            lua.contains("/path/a/plugin/a.vim"),
+            "plugin file must be referenced"
+        );
+        assert!(
+            lua.contains("/path/a/ftdetect/a.vim"),
+            "ftdetect file must be referenced"
+        );
+        assert!(
+            lua.contains("/path/a/after/plugin/a.vim"),
+            "after/plugin file must be referenced"
+        );
     }
 
     #[test]
     fn test_load_lazy_helper_sources_ftdetect_in_augroup() {
         let lua = generate_loader(Path::new("/merged"), &[]);
         // load_lazy 関数定義の中に ftdetect の処理が augroup 付きで入っているか
-        let load_lazy_start = lua.find("local function load_lazy").expect("load_lazy definition missing");
-        let end_marker = lua[load_lazy_start..].find("\nend\n").expect("load_lazy end missing") + load_lazy_start;
+        let load_lazy_start = lua
+            .find("local function load_lazy")
+            .expect("load_lazy definition missing");
+        let end_marker = lua[load_lazy_start..]
+            .find("\nend\n")
+            .expect("load_lazy end missing")
+            + load_lazy_start;
         let body = &lua[load_lazy_start..end_marker];
-        assert!(body.contains("augroup filetypedetect"), "load_lazy must wrap ftdetect in filetypedetect augroup");
-        assert!(body.contains("augroup END"), "load_lazy must close the augroup");
+        assert!(
+            body.contains("augroup filetypedetect"),
+            "load_lazy must wrap ftdetect in filetypedetect augroup"
+        );
+        assert!(
+            body.contains("augroup END"),
+            "load_lazy must close the augroup"
+        );
     }
 
     // ========================================================
@@ -545,8 +603,14 @@ mod tests {
         // user command 定義に bang/range/complete オプションが入っている
         assert!(lua.contains("bang = true"), "on_cmd must enable bang");
         assert!(lua.contains("range = true"), "on_cmd must enable range");
-        assert!(lua.contains("complete ="), "on_cmd must provide complete callback");
-        assert!(lua.contains("nargs = \"*\""), "on_cmd still supports any args");
+        assert!(
+            lua.contains("complete ="),
+            "on_cmd must provide complete callback"
+        );
+        assert!(
+            lua.contains("nargs = \"*\""),
+            "on_cmd still supports any args"
+        );
     }
 
     #[test]
@@ -733,33 +797,58 @@ mod tests {
     #[ignore]
     fn dump_full_sample_loader() {
         // `cargo test dump_full_sample_loader -- --ignored --nocapture` で出力確認用
-        let mut plenary = PluginScripts::for_test("plenary", "/cache/rvpm/repos/github.com/nvim-lua/plenary.nvim");
+        let mut plenary = PluginScripts::for_test(
+            "plenary",
+            "/cache/rvpm/repos/github.com/nvim-lua/plenary.nvim",
+        );
         plenary.merge = true;
         plenary.init = Some("/config/init.lua".to_string());
         plenary.plugin_files = vec![
             "/cache/rvpm/repos/github.com/nvim-lua/plenary.nvim/plugin/plenary.vim".to_string(),
         ];
 
-        let mut telescope = PluginScripts::for_test("telescope", "/cache/rvpm/repos/github.com/nvim-telescope/telescope.nvim");
+        let mut telescope = PluginScripts::for_test(
+            "telescope",
+            "/cache/rvpm/repos/github.com/nvim-telescope/telescope.nvim",
+        );
         telescope.merge = true;
         telescope.lazy = true;
         telescope.before = Some("/config/tel/before.lua".to_string());
         telescope.after = Some("/config/tel/after.lua".to_string());
         telescope.on_cmd = Some(vec!["Telescope".to_string()]);
         telescope.on_source = Some(vec!["plenary".to_string()]);
-        telescope.on_event = Some(vec!["BufReadPre".to_string(), "User LazyVimStarted".to_string()]);
+        telescope.on_event = Some(vec![
+            "BufReadPre".to_string(),
+            "User LazyVimStarted".to_string(),
+        ]);
         telescope.on_map = Some(vec![
-            MapSpec { lhs: "<leader>ff".to_string(), mode: vec!["n".to_string()], desc: Some("Find files".to_string()) },
-            MapSpec { lhs: "<leader>fg".to_string(), mode: vec!["n".to_string(), "x".to_string()], desc: None },
-            MapSpec { lhs: "<leader>fb".to_string(), mode: Vec::new(), desc: None },
+            MapSpec {
+                lhs: "<leader>ff".to_string(),
+                mode: vec!["n".to_string()],
+                desc: Some("Find files".to_string()),
+            },
+            MapSpec {
+                lhs: "<leader>fg".to_string(),
+                mode: vec!["n".to_string(), "x".to_string()],
+                desc: None,
+            },
+            MapSpec {
+                lhs: "<leader>fb".to_string(),
+                mode: Vec::new(),
+                desc: None,
+            },
         ]);
         telescope.plugin_files = vec![
-            "/cache/rvpm/repos/github.com/nvim-telescope/telescope.nvim/plugin/telescope.lua".to_string(),
+            "/cache/rvpm/repos/github.com/nvim-telescope/telescope.nvim/plugin/telescope.lua"
+                .to_string(),
         ];
         telescope.ftdetect_files = vec![];
         telescope.after_plugin_files = vec![];
 
-        let mut treesitter = PluginScripts::for_test("nvim-treesitter", "/cache/rvpm/repos/github.com/nvim-treesitter/nvim-treesitter");
+        let mut treesitter = PluginScripts::for_test(
+            "nvim-treesitter",
+            "/cache/rvpm/repos/github.com/nvim-treesitter/nvim-treesitter",
+        );
         treesitter.merge = false; // non-merge eager
         treesitter.before = Some("/config/ts/before.lua".to_string());
         treesitter.after = Some("/config/ts/after.lua".to_string());
@@ -767,7 +856,8 @@ mod tests {
             "/cache/rvpm/repos/github.com/nvim-treesitter/nvim-treesitter/plugin/nvim-treesitter.lua".to_string(),
         ];
         treesitter.ftdetect_files = vec![
-            "/cache/rvpm/repos/github.com/nvim-treesitter/nvim-treesitter/ftdetect/blade.vim".to_string(),
+            "/cache/rvpm/repos/github.com/nvim-treesitter/nvim-treesitter/ftdetect/blade.vim"
+                .to_string(),
         ];
         treesitter.after_plugin_files = vec![
             "/cache/rvpm/repos/github.com/nvim-treesitter/nvim-treesitter/after/plugin/query_predicates.lua".to_string(),
@@ -775,7 +865,10 @@ mod tests {
 
         let scripts = vec![plenary, telescope, treesitter];
         let lua = generate_loader(Path::new("/cache/rvpm/merged"), &scripts);
-        println!("\n======== GENERATED LOADER ========\n{}\n==================================\n", lua);
+        println!(
+            "\n======== GENERATED LOADER ========\n{}\n==================================\n",
+            lua
+        );
     }
 
     // ========================================================
@@ -790,7 +883,9 @@ mod tests {
         s.on_cmd = Some(vec!["Plenary".to_string()]);
         let lua = generate_loader(merged_dir, &[s]);
         assert!(
-            lua.contains("vim.api.nvim_exec_autocmds(\"User\", { pattern = \"rvpm_loaded_\" .. name })"),
+            lua.contains(
+                "vim.api.nvim_exec_autocmds(\"User\", { pattern = \"rvpm_loaded_\" .. name })"
+            ),
             "load_lazy must fire User autocmd after loading"
         );
     }
@@ -822,4 +917,3 @@ mod tests {
         assert!(lua.contains("pattern = { \"rvpm_loaded_plenary.nvim\" }"));
     }
 }
-

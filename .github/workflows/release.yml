@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: rvpm
+            archive_name: rvpm-x86_64-unknown-linux-gnu.tar.gz
+            archive_cmd: tar
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: rvpm
+            archive_name: rvpm-x86_64-apple-darwin.tar.gz
+            archive_cmd: tar
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: rvpm
+            archive_name: rvpm-aarch64-apple-darwin.tar.gz
+            archive_cmd: tar
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: rvpm.exe
+            archive_name: rvpm-x86_64-pc-windows-msvc.zip
+            archive_cmd: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (tar)
+        if: matrix.archive_cmd == 'tar'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} dist/
+          cp README.md LICENSE dist/
+          tar -C dist -czf ${{ matrix.archive_name }} ${{ matrix.artifact_name }} README.md LICENSE
+
+      - name: Package (zip)
+        if: matrix.archive_cmd == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" "dist/"
+          Copy-Item "README.md" "dist/"
+          Copy-Item "LICENSE" "dist/"
+          Compress-Archive -Path "dist/*" -DestinationPath "${{ matrix.archive_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive_name }}
+          path: ${{ matrix.archive_name }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifact directory
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
