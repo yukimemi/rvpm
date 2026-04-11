@@ -4,8 +4,10 @@ mod link;
 mod loader;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tokio::task::JoinSet;
 use crate::config::{parse_config, Plugin};
 use crate::git::Repo;
 use crate::link::merge_plugin;
@@ -56,7 +58,7 @@ async fn run_sync() -> Result<()> {
     let toml_content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
 
-    let config = parse_config(&toml_content)?;
+    let config = Arc::new(parse_config(&toml_content)?);
     
     let base_dir = home.join(".cache/rvpm");
     let merged_dir = base_dir.join("merged");
@@ -69,41 +71,49 @@ async fn run_sync() -> Result<()> {
     println!("Using config: {}", config_path.display());
     println!("Syncing plugins...");
 
+    let mut set = JoinSet::new();
+
+    for plugin in config.plugins.iter() {
+        let plugin = plugin.clone();
+        let base_dir = base_dir.clone();
+        
+        set.spawn(async move {
+            let dst_path = if let Some(d) = &plugin.dst {
+                PathBuf::from(d)
+            } else {
+                base_dir.join("repos").join(plugin.canonical_path())
+            };
+
+            let repo = Repo::new(&plugin.url, &dst_path);
+            repo.sync().await.map(|_| (plugin, dst_path))
+        });
+    }
+
     let mut plugin_scripts = Vec::new();
-
-    for plugin in &config.plugins {
-        let dst_path = if let Some(d) = &plugin.dst {
-            PathBuf::from(d)
-        } else {
-            base_dir.join("repos").join(plugin.canonical_path())
-        };
-
-        let repo = Repo::new(&plugin.url, &dst_path);
-        println!("  Updating {}...", plugin.url);
-        repo.sync().await?;
+    while let Some(res) = set.join_next().await {
+        let (plugin, dst_path) = res??;
+        println!("  Finished syncing {}...", plugin.url);
 
         if plugin.merge {
             println!("  Merging {}...", plugin.url);
             merge_plugin(&dst_path, &merged_dir)?;
         }
-// 規約ファイルの探索
-if let Some(config_root) = &config.options.config_root {
-    let plugin_config_dir = Path::new(config_root).join(plugin.canonical_path());
 
-    let scripts = PluginScripts {
-        name: plugin.name.clone().unwrap_or_else(|| plugin.url.clone()),
-        path: dst_path.to_string_lossy().to_string(),
-        init: find_lua(&plugin_config_dir, "init.lua"),
-        before: find_lua(&plugin_config_dir, "before.lua"),
-        after: find_lua(&plugin_config_dir, "after.lua"),
-        lazy: plugin.lazy,
-        on_cmd: plugin.on_cmd.clone(),
-        on_ft: plugin.on_ft.clone(),
-    };
-
-    plugin_scripts.push(scripts);
-}
-
+        if let Some(config_root) = &config.options.config_root {
+            let plugin_config_dir = Path::new(config_root).join(plugin.canonical_path());
+            
+            let scripts = PluginScripts {
+                name: plugin.name.clone().unwrap_or_else(|| plugin.url.clone()),
+                path: dst_path.to_string_lossy().to_string(),
+                init: find_lua(&plugin_config_dir, "init.lua"),
+                before: find_lua(&plugin_config_dir, "before.lua"),
+                after: find_lua(&plugin_config_dir, "after.lua"),
+                lazy: plugin.lazy,
+                on_cmd: plugin.on_cmd.clone(),
+                on_ft: plugin.on_ft.clone(),
+            };
+            plugin_scripts.push(scripts);
+        }
     }
 
     println!("Generating loader.lua...");
@@ -152,7 +162,6 @@ async fn run_add(repo: String, name: Option<String>) -> Result<()> {
         new_plugin["name"] = value(n);
     }
     
-    // table() は Item を返すので、Table に変換してから push
     if let Item::Table(t) = new_plugin {
         plugins.push(t);
     }
@@ -172,7 +181,6 @@ async fn run_edit(query: Option<String>) -> Result<()> {
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
 
-    // 1. プラグインの選択
     let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
     
     let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
@@ -188,7 +196,6 @@ async fn run_edit(query: Option<String>) -> Result<()> {
 
     let plugin = config.plugins.iter().find(|p| &p.url == selected_url).unwrap();
 
-    // 2. 編集するファイルの選択
     let files = vec!["init.lua", "before.lua", "after.lua"];
     let file_selection = Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
         .with_prompt("Select file to edit")
@@ -201,7 +208,6 @@ async fn run_edit(query: Option<String>) -> Result<()> {
         None => return Ok(()),
     };
     
-    // 3. ファイルを開く
     if let Some(config_root) = &config.options.config_root {
         let plugin_config_dir = Path::new(config_root).join(plugin.canonical_path());
         std::fs::create_dir_all(&plugin_config_dir)?;

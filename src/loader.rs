@@ -2,6 +2,7 @@ use std::path::Path;
 use anyhow::Result;
 use crate::config::Plugin;
 
+#[derive(Clone)]
 pub struct PluginScripts {
     pub name: String,
     pub path: String, // プラグインの実体パス

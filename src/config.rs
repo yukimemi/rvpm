@@ -9,14 +9,14 @@ pub struct Config {
     pub plugins: Vec<Plugin>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone)]
 pub struct Options {
     pub config_root: Option<String>,
     pub concurrency: Option<usize>,
     pub loader_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone)]
 pub struct Plugin {
     pub name: Option<String>,
     pub url: String,
