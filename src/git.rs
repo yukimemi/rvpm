@@ -13,7 +13,7 @@ impl<'a> Repo<'a> {
     }
 
     pub async fn sync(&self) -> Result<()> {
-        let url = if !self.url.contains("://") && !self.url.contains("@") {
+        let url = if !self.url.contains("://") && !self.url.contains("@") && !self.url.contains(":\\") && !self.url.starts_with("/") {
             format!("https://github.com/{}", self.url)
         } else {
             self.url.to_string()
