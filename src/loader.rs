@@ -1,4 +1,5 @@
 use std::path::Path;
+use crate::config::MapSpec;
 
 #[derive(Clone)]
 pub struct PluginScripts {
@@ -18,7 +19,7 @@ pub struct PluginScripts {
     pub lazy: bool,
     pub on_cmd: Option<Vec<String>>,
     pub on_ft: Option<Vec<String>>,
-    pub on_map: Option<Vec<String>>,
+    pub on_map: Option<Vec<MapSpec>>,
     pub on_event: Option<Vec<String>>,
     pub on_path: Option<Vec<String>>,
     pub on_source: Option<Vec<String>>,
@@ -225,56 +226,136 @@ end
             s.name, path, pf_var, fd_var, ap_var, before, after
         );
 
+        // ---- on_cmd: lazy.nvim 方式 ----
+        // bang/range/count/mods/args を event から復元して vim.cmd(table) で dispatch
+        // complete callback は plugin をロードしてから vim.fn.getcompletion に委譲
         if let Some(cmds) = &s.on_cmd {
             for cmd in cmds {
                 body.push_str(&format!(
-                    "vim.api.nvim_create_user_command(\"{cmd}\", function(opts)\n  vim.api.nvim_del_user_command(\"{cmd}\")\n  {load}\n  vim.cmd(\"{cmd} \" .. opts.args)\nend, {{ nargs = \"*\" }})\n",
+                    "vim.api.nvim_create_user_command(\"{cmd}\", function(event)\n\
+                     \x20 pcall(vim.api.nvim_del_user_command, \"{cmd}\")\n\
+                     \x20 {load}\n\
+                     \x20 local cmd = {{ cmd = \"{cmd}\", bang = event.bang or nil, mods = event.smods, args = event.fargs }}\n\
+                     \x20 if event.range == 1 then\n\
+                     \x20   cmd.range = {{ event.line1 }}\n\
+                     \x20 elseif event.range == 2 then\n\
+                     \x20   cmd.range = {{ event.line1, event.line2 }}\n\
+                     \x20 end\n\
+                     \x20 if event.count >= 0 and event.range == 0 then\n\
+                     \x20   cmd.count = event.count\n\
+                     \x20 end\n\
+                     \x20 vim.cmd(cmd)\n\
+                     end, {{\n\
+                     \x20 bang = true,\n\
+                     \x20 range = true,\n\
+                     \x20 nargs = \"*\",\n\
+                     \x20 complete = function(_, line)\n\
+                     \x20   pcall(vim.api.nvim_del_user_command, \"{cmd}\")\n\
+                     \x20   {load}\n\
+                     \x20   return vim.fn.getcompletion(line, \"cmdline\")\n\
+                     \x20 end,\n\
+                     }})\n",
                     cmd = cmd,
                     load = load_call,
                 ));
             }
         }
 
+        // ---- on_ft: FileType を再トリガーして ftplugin/ を発火 ----
         if let Some(fts) = &s.on_ft {
             body.push_str(&format!(
-                "vim.api.nvim_create_autocmd(\"FileType\", {{ pattern = {{ \"{}\" }}, once = true, callback = function()\n  {}\nend }})\n",
+                "vim.api.nvim_create_autocmd(\"FileType\", {{ pattern = {{ \"{}\" }}, once = true, callback = function(ev)\n\
+                 \x20 {load}\n\
+                 \x20 vim.api.nvim_exec_autocmds(\"FileType\", {{ buffer = ev.buf, modeline = false }})\n\
+                 end }})\n",
                 fts.join("\", \""),
-                load_call,
+                load = load_call,
             ));
         }
 
+        // ---- on_map: lhs + mode (+ desc) 対応、<Ignore> prefix で安全に replay ----
         if let Some(maps) = &s.on_map {
             for m in maps {
+                let modes = m.modes_or_default();
+                let modes_lua = lua_str_list(&modes);
+                let lhs = &m.lhs;
+                let opts_table = match &m.desc {
+                    Some(d) => format!(", {{ desc = \"{}\" }}", d.replace('"', "\\\"")),
+                    None => String::new(),
+                };
                 body.push_str(&format!(
-                    "vim.keymap.set(\"n\", \"{m}\", function()\n  vim.keymap.del(\"n\", \"{m}\")\n  {load}\n  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(\"{m}\", true, true, true), \"m\", true)\nend)\n",
-                    m = m,
+                    "vim.keymap.set({modes}, \"{lhs}\", function()\n\
+                     \x20 vim.keymap.del({modes}, \"{lhs}\")\n\
+                     \x20 {load}\n\
+                     \x20 local feed = vim.api.nvim_replace_termcodes(\"<Ignore>{lhs}\", true, true, true)\n\
+                     \x20 vim.api.nvim_feedkeys(feed, \"m\", false)\n\
+                     end{opts})\n",
+                    modes = modes_lua,
+                    lhs = lhs,
+                    load = load_call,
+                    opts = opts_table,
+                ));
+            }
+        }
+
+        // ---- on_event: ロード後に event を再発火 (buffer + data 保持) ----
+        // "User Xxx" 形式は User autocmd + pattern="Xxx" として切り出し、
+        // それ以外のイベントはまとめて 1 つの autocmd にする
+        if let Some(events) = &s.on_event {
+            let mut regular: Vec<String> = Vec::new();
+            let mut user_patterns: Vec<String> = Vec::new();
+            for e in events {
+                if let Some(pat) = e.strip_prefix("User ") {
+                    user_patterns.push(pat.trim().to_string());
+                } else {
+                    regular.push(e.clone());
+                }
+            }
+
+            if !regular.is_empty() {
+                body.push_str(&format!(
+                    "vim.api.nvim_create_autocmd({{ \"{}\" }}, {{ once = true, callback = function(ev)\n\
+                     \x20 {load}\n\
+                     \x20 vim.api.nvim_exec_autocmds(ev.event, {{ buffer = ev.buf, data = ev.data, modeline = false }})\n\
+                     end }})\n",
+                    regular.join("\", \""),
+                    load = load_call,
+                ));
+            }
+
+            for pat in &user_patterns {
+                body.push_str(&format!(
+                    "vim.api.nvim_create_autocmd(\"User\", {{ pattern = \"{pat}\", once = true, callback = function(ev)\n\
+                     \x20 {load}\n\
+                     \x20 vim.api.nvim_exec_autocmds(\"User\", {{ pattern = \"{pat}\", data = ev.data, modeline = false }})\n\
+                     end }})\n",
+                    pat = pat,
                     load = load_call,
                 ));
             }
         }
 
-        if let Some(events) = &s.on_event {
-            body.push_str(&format!(
-                "vim.api.nvim_create_autocmd({{ \"{}\" }}, {{ once = true, callback = function()\n  {}\nend }})\n",
-                events.join("\", \""),
-                load_call,
-            ));
-        }
-
+        // ---- on_path: BufRead/BufNewFile 再発火で buffer 状態を復元 ----
         if let Some(paths) = &s.on_path {
             body.push_str(&format!(
-                "vim.api.nvim_create_autocmd({{ \"BufRead\", \"BufNewFile\" }}, {{ pattern = {{ \"{}\" }}, once = true, callback = function()\n  {}\nend }})\n",
+                "vim.api.nvim_create_autocmd({{ \"BufRead\", \"BufNewFile\" }}, {{ pattern = {{ \"{}\" }}, once = true, callback = function(ev)\n\
+                 \x20 {load}\n\
+                 \x20 vim.api.nvim_exec_autocmds(ev.event, {{ buffer = ev.buf, data = ev.data, modeline = false }})\n\
+                 end }})\n",
                 paths.join("\", \""),
-                load_call,
+                load = load_call,
             ));
         }
 
+        // ---- on_source: プラグインロード完了 User イベントを受けて連鎖 ----
         if let Some(sources) = &s.on_source {
             let patterns: Vec<String> = sources.iter().map(|src| format!("rvpm_loaded_{}", src)).collect();
             body.push_str(&format!(
-                "vim.api.nvim_create_autocmd(\"User\", {{ pattern = {{ \"{}\" }}, once = true, callback = function()\n  {}\nend }})\n",
+                "vim.api.nvim_create_autocmd(\"User\", {{ pattern = {{ \"{}\" }}, once = true, callback = function()\n\
+                 \x20 {load}\n\
+                 end }})\n",
                 patterns.join("\", \""),
-                load_call,
+                load = load_call,
             ));
         }
 
@@ -446,6 +527,208 @@ mod tests {
         assert!(body.contains("augroup END"), "load_lazy must close the augroup");
     }
 
+    // ========================================================
+    // Lazy trigger 改善テスト (lazy.nvim 参考)
+    // ========================================================
+
+    fn make_lazy_plugin(name: &str) -> PluginScripts {
+        let mut s = PluginScripts::for_test(name, &format!("/path/{}", name));
+        s.lazy = true;
+        s
+    }
+
+    #[test]
+    fn test_on_cmd_handler_has_bang_range_complete_options() {
+        let mut s = make_lazy_plugin("tel");
+        s.on_cmd = Some(vec!["Telescope".to_string()]);
+        let lua = generate_loader(Path::new("/merged"), &[s]);
+        // user command 定義に bang/range/complete オプションが入っている
+        assert!(lua.contains("bang = true"), "on_cmd must enable bang");
+        assert!(lua.contains("range = true"), "on_cmd must enable range");
+        assert!(lua.contains("complete ="), "on_cmd must provide complete callback");
+        assert!(lua.contains("nargs = \"*\""), "on_cmd still supports any args");
+    }
+
+    #[test]
+    fn test_on_cmd_handler_reconstructs_command_from_event() {
+        let mut s = make_lazy_plugin("tel");
+        s.on_cmd = Some(vec!["Telescope".to_string()]);
+        let lua = generate_loader(Path::new("/merged"), &[s]);
+        // callback は event から bang/mods/args を取り出して vim.cmd(table) で dispatch
+        assert!(lua.contains("event.bang"), "should read event.bang");
+        assert!(lua.contains("event.smods"), "should read event.smods");
+        assert!(lua.contains("event.fargs"), "should read event.fargs");
+        assert!(lua.contains("event.range"), "should read event.range");
+        assert!(lua.contains("event.count"), "should read event.count");
+        // vim.cmd に table を渡している (文字列連結ではない)
+        assert!(
+            lua.contains("vim.cmd(cmd)") || lua.contains("vim.cmd(_rvpm_cmd"),
+            "should dispatch via vim.cmd(table), not string concatenation"
+        );
+    }
+
+    #[test]
+    fn test_on_cmd_handler_complete_loads_plugin_and_delegates() {
+        let mut s = make_lazy_plugin("tel");
+        s.on_cmd = Some(vec!["Telescope".to_string()]);
+        let lua = generate_loader(Path::new("/merged"), &[s]);
+        // complete callback 内で load_lazy が呼ばれ、getcompletion でデリゲート
+        assert!(
+            lua.contains("vim.fn.getcompletion"),
+            "complete callback should delegate to vim.fn.getcompletion"
+        );
+    }
+
+    #[test]
+    fn test_on_ft_handler_retriggers_filetype_event_after_load() {
+        let mut s = make_lazy_plugin("nvim-rust");
+        s.on_ft = Some(vec!["rust".to_string()]);
+        let lua = generate_loader(Path::new("/merged"), &[s]);
+        // ロード後に FileType を exec_autocmds で再発火
+        assert!(
+            lua.contains("nvim_exec_autocmds(\"FileType\""),
+            "on_ft callback must re-trigger FileType after load so ftplugin/ fires"
+        );
+        assert!(
+            lua.contains("buffer = ev.buf"),
+            "re-trigger must use the original buffer"
+        );
+    }
+
+    #[test]
+    fn test_on_event_handler_refires_event_with_buffer_and_data() {
+        let mut s = make_lazy_plugin("lsp");
+        s.on_event = Some(vec!["BufReadPre".to_string()]);
+        let lua = generate_loader(Path::new("/merged"), &[s]);
+        // ロード後に ev.event を buffer と data 付きで再発火
+        assert!(
+            lua.contains("nvim_exec_autocmds(ev.event"),
+            "on_event callback must re-fire the triggering event"
+        );
+        assert!(lua.contains("buffer = ev.buf"));
+        assert!(lua.contains("data = ev.data"));
+    }
+
+    #[test]
+    fn test_on_event_user_prefix_creates_user_autocmd_with_pattern() {
+        let mut s = make_lazy_plugin("lazyvim-extras");
+        s.on_event = Some(vec!["User LazyVimStarted".to_string()]);
+        let lua = generate_loader(Path::new("/merged"), &[s]);
+        // User autocmd が pattern 指定で登録されている
+        assert!(
+            lua.contains("nvim_create_autocmd(\"User\""),
+            "User event must create a User autocmd"
+        );
+        assert!(
+            lua.contains("pattern = \"LazyVimStarted\"")
+                || lua.contains("pattern = { \"LazyVimStarted\" }"),
+            "User event must specify the pattern"
+        );
+    }
+
+    #[test]
+    fn test_on_event_mixes_regular_and_user_events() {
+        let mut s = make_lazy_plugin("mixed");
+        s.on_event = Some(vec![
+            "BufReadPre".to_string(),
+            "User LazyVimStarted".to_string(),
+        ]);
+        let lua = generate_loader(Path::new("/merged"), &[s]);
+        // 通常イベントの autocmd (BufReadPre)
+        assert!(
+            lua.contains("BufReadPre"),
+            "regular event BufReadPre must still be registered"
+        );
+        // User autocmd も登録されている
+        assert!(
+            lua.contains("nvim_create_autocmd(\"User\""),
+            "User event must also be registered"
+        );
+        assert!(
+            lua.contains("LazyVimStarted"),
+            "User pattern must be present"
+        );
+    }
+
+    #[test]
+    fn test_on_path_handler_refires_event_after_load() {
+        let mut s = make_lazy_plugin("rust-tools");
+        s.on_path = Some(vec!["*.rs".to_string()]);
+        let lua = generate_loader(Path::new("/merged"), &[s]);
+        // BufRead/BufNewFile の再発火
+        assert!(
+            lua.contains("nvim_exec_autocmds(ev.event"),
+            "on_path callback must re-fire the BufRead/BufNewFile event"
+        );
+        assert!(lua.contains("buffer = ev.buf"));
+    }
+
+    #[test]
+    fn test_on_map_handler_uses_ignore_prefix_feedkeys() {
+        let mut s = make_lazy_plugin("keyed");
+        s.on_map = Some(vec![MapSpec {
+            lhs: "<leader>f".to_string(),
+            mode: Vec::new(),
+            desc: None,
+        }]);
+        let lua = generate_loader(Path::new("/merged"), &[s]);
+        // <Ignore> prefix で recursion 保護
+        assert!(
+            lua.contains("<Ignore>"),
+            "on_map replay must use <Ignore> prefix (lazy.nvim pattern)"
+        );
+    }
+
+    #[test]
+    fn test_on_map_simple_form_defaults_to_normal_mode() {
+        let mut s = make_lazy_plugin("p");
+        s.on_map = Some(vec![MapSpec {
+            lhs: "<leader>f".to_string(),
+            mode: Vec::new(),
+            desc: None,
+        }]);
+        let lua = generate_loader(Path::new("/merged"), &[s]);
+        // mode 空 → {"n"} にフォールバック
+        assert!(
+            lua.contains("vim.keymap.set({ \"n\" }"),
+            "empty mode should default to normal mode"
+        );
+    }
+
+    #[test]
+    fn test_on_map_table_form_respects_multiple_modes() {
+        let mut s = make_lazy_plugin("p");
+        s.on_map = Some(vec![MapSpec {
+            lhs: "<leader>v".to_string(),
+            mode: vec!["n".to_string(), "x".to_string()],
+            desc: None,
+        }]);
+        let lua = generate_loader(Path::new("/merged"), &[s]);
+        assert!(
+            lua.contains("vim.keymap.set({ \"n\", \"x\" }"),
+            "multiple modes should be emitted as a Lua list"
+        );
+    }
+
+    #[test]
+    fn test_on_map_table_form_emits_desc_opts() {
+        let mut s = make_lazy_plugin("p");
+        s.on_map = Some(vec![MapSpec {
+            lhs: "<leader>g".to_string(),
+            mode: vec!["n".to_string()],
+            desc: Some("Grep files".to_string()),
+        }]);
+        let lua = generate_loader(Path::new("/merged"), &[s]);
+        assert!(
+            lua.contains("desc = \"Grep files\""),
+            "desc should be emitted in keymap opts"
+        );
+    }
+
+    // ========================================================
+    // Sample dump (目視用 ignored test)
+    // ========================================================
+
     #[test]
     #[ignore]
     fn dump_full_sample_loader() {
@@ -464,6 +747,12 @@ mod tests {
         telescope.after = Some("/config/tel/after.lua".to_string());
         telescope.on_cmd = Some(vec!["Telescope".to_string()]);
         telescope.on_source = Some(vec!["plenary".to_string()]);
+        telescope.on_event = Some(vec!["BufReadPre".to_string(), "User LazyVimStarted".to_string()]);
+        telescope.on_map = Some(vec![
+            MapSpec { lhs: "<leader>ff".to_string(), mode: vec!["n".to_string()], desc: Some("Find files".to_string()) },
+            MapSpec { lhs: "<leader>fg".to_string(), mode: vec!["n".to_string(), "x".to_string()], desc: None },
+            MapSpec { lhs: "<leader>fb".to_string(), mode: Vec::new(), desc: None },
+        ]);
         telescope.plugin_files = vec![
             "/cache/rvpm/repos/github.com/nvim-telescope/telescope.nvim/plugin/telescope.lua".to_string(),
         ];
@@ -513,7 +802,11 @@ mod tests {
         s.lazy = true;
         s.on_cmd = Some(vec!["Cmd".to_string()]);
         s.on_ft = Some(vec!["rust".to_string()]);
-        s.on_map = Some(vec!["<leader>f".to_string()]);
+        s.on_map = Some(vec![MapSpec {
+            lhs: "<leader>f".to_string(),
+            mode: Vec::new(),
+            desc: None,
+        }]);
         s.on_event = Some(vec!["BufRead".to_string()]);
         s.on_path = Some(vec!["*.rs".to_string(), "Cargo.toml".to_string()]);
         s.on_source = Some(vec!["plenary.nvim".to_string()]);
@@ -523,7 +816,7 @@ mod tests {
         assert!(lua.contains("if vim.fn.has('win32') == 1 then"));
         assert!(lua.contains("nvim_create_user_command(\"Cmd\""));
         assert!(lua.contains("pattern = { \"rust\" }"));
-        assert!(lua.contains("vim.keymap.set(\"n\", \"<leader>f\""));
+        assert!(lua.contains("vim.keymap.set({ \"n\" }, \"<leader>f\""));
         assert!(lua.contains("nvim_create_autocmd({ \"BufRead\" }"));
         assert!(lua.contains("pattern = { \"*.rs\", \"Cargo.toml\" }"));
         assert!(lua.contains("pattern = { \"rvpm_loaded_plenary.nvim\" }"));

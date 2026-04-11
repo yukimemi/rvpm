@@ -623,23 +623,35 @@ async fn run_set(query: Option<String>, lazy: Option<bool>, merge: Option<bool>,
         let current_plugin = config.plugins.iter().find(|p| p.url == selected_repo_url).cloned();
         let list_field_value = |field: &str| -> String {
             let Some(p) = current_plugin.as_ref() else { return String::new(); };
-            let list = match field {
-                "on_cmd" => p.on_cmd.as_ref(),
-                "on_ft" => p.on_ft.as_ref(),
-                "on_map" => p.on_map.as_ref(),
-                "on_event" => p.on_event.as_ref(),
-                "on_path" => p.on_path.as_ref(),
-                "on_source" => p.on_source.as_ref(),
+            // on_map は MapSpec の lhs だけを列挙する (mode/desc は手書き編集に委ねる)
+            let items: Option<Vec<String>> = match field {
+                "on_cmd" => p.on_cmd.clone(),
+                "on_ft" => p.on_ft.clone(),
+                "on_map" => p.on_map.as_ref().map(|v| v.iter().map(|m| m.lhs.clone()).collect()),
+                "on_event" => p.on_event.clone(),
+                "on_path" => p.on_path.clone(),
+                "on_source" => p.on_source.clone(),
                 _ => None,
             };
-            list.map(|v| v.join(", ")).unwrap_or_default()
+            items.map(|v| v.join(", ")).unwrap_or_default()
         };
 
-        let options = vec!["lazy", "merge", "on_cmd", "on_ft", "on_map", "on_event", "on_path", "on_source", "rev"];
+        const EDITOR_SENTINEL: &str = "[ Open config.toml in $EDITOR ]";
+        let options = vec![
+            "lazy", "merge", "on_cmd", "on_ft", "on_map", "on_event", "on_path", "on_source", "rev",
+            EDITOR_SENTINEL,
+        ];
         let selection = Select::with_theme(&dialoguer::theme::ColorfulTheme::default()).with_prompt("Select option to set").items(&options).interact_opt()?;
         match selection {
             Some(index) => {
                 match options[index] {
+                    s if s == EDITOR_SENTINEL => {
+                        // 対応 editor なら plugin の url 行にジャンプ
+                        let line = find_plugin_line_in_toml(&toml_content, &selected_repo_url);
+                        open_editor_at_line(&config_path, line)?;
+                        // ユーザーが何を編集したか分からないので常に変更ありと見なす
+                        return Ok(true);
+                    }
                     "lazy" | "merge" => {
                         let current = current_plugin.as_ref().map(|p| {
                             if options[index] == "lazy" { p.lazy } else { p.merge }
@@ -655,7 +667,40 @@ async fn run_set(query: Option<String>, lazy: Option<bool>, merge: Option<bool>,
                             modified = true;
                         } else { return Ok(false); }
                     }
-                    field @ ("on_cmd" | "on_ft" | "on_map" | "on_event" | "on_path" | "on_source") => {
+                    "on_map" => {
+                        // on_map は table 形式 (mode/desc) もあるので edit mode を先に聞く
+                        let modes = &["Edit lhs list only (CLI, mode/desc lost)", "Open config.toml in $EDITOR"];
+                        let mode_sel = Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                            .with_prompt("on_map edit mode")
+                            .items(modes)
+                            .default(0)
+                            .interact_opt()?;
+                        match mode_sel {
+                            Some(0) => {
+                                // CLI: lhs のみ編集 (既存の簡易フロー)
+                                let existing = list_field_value("on_map");
+                                let val = read_input_with_esc(
+                                    "Enter on_map lhs values (comma separated, Esc to cancel)",
+                                    &existing,
+                                )?;
+                                match val {
+                                    Some(v) if !v.is_empty() => {
+                                        let items: Vec<String> = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                                        set_plugin_list_field(&mut doc, &selected_repo_url, "on_map", items)?;
+                                        modified = true;
+                                    }
+                                    _ => return Ok(false),
+                                }
+                            }
+                            Some(1) => {
+                                let line = find_plugin_line_in_toml(&toml_content, &selected_repo_url);
+                                open_editor_at_line(&config_path, line)?;
+                                return Ok(true);
+                            }
+                            _ => return Ok(false),
+                        }
+                    }
+                    field @ ("on_cmd" | "on_ft" | "on_event" | "on_path" | "on_source") => {
                         let existing = list_field_value(field);
                         let val = read_input_with_esc(
                             &format!("Enter {} (comma separated, Esc to cancel)", field),
@@ -850,6 +895,51 @@ fn write_loader_to_path(merged_dir: &Path, scripts: &[crate::loader::PluginScrip
 
 fn resolve_concurrency(config_value: Option<usize>) -> usize {
     config_value.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS)
+}
+
+/// config.toml 上で指定プラグイン (url 一致) の `url = "..."` 行の行番号 (1-indexed) を返す。
+/// 見つからなければ 1 を返す (ファイル先頭)。
+/// whitespace の入り方に寛容: `url="..."`, `url = "..."`, `url  =   "..."` など全部拾う。
+fn find_plugin_line_in_toml(toml_content: &str, url: &str) -> usize {
+    let needle = format!("\"{}\"", url);
+    for (i, line) in toml_content.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("url") {
+            continue;
+        }
+        // "url" の後は空白 or "=" しか来ないはず (他のフィールド名は "url..." で始まらない)
+        let rest = trimmed["url".len()..].trim_start();
+        if !rest.starts_with('=') {
+            continue;
+        }
+        if line.contains(&needle) {
+            return i + 1;
+        }
+    }
+    1
+}
+
+/// `$EDITOR` が `+<line>` 形式の行ジャンプをサポートするか簡易判定。
+/// nvim/vim/vi/nano/emacs ファミリーは真。VS Code / helix 等は偽。
+fn editor_supports_line_jump(editor_cmd: &str) -> bool {
+    let base = std::path::Path::new(editor_cmd)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    matches!(base.as_str(), "nvim" | "vim" | "vi" | "nano" | "emacs")
+}
+
+/// `$EDITOR` (未設定なら "nvim") でファイルを開く。対応している editor なら指定行にジャンプ。
+fn open_editor_at_line(path: &Path, line: usize) -> Result<()> {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
+    let mut cmd = std::process::Command::new(&editor);
+    if editor_supports_line_jump(&editor) {
+        cmd.arg(format!("+{}", line));
+    }
+    cmd.arg(path);
+    cmd.status()?;
+    Ok(())
 }
 
 /// ESC キーで None を返し、Enter キーで入力文字列を Some で返すテキスト入力。
@@ -1056,6 +1146,47 @@ mod tests {
         let result = doc.to_string();
         assert!(!result.contains("owner/a"));
         assert!(result.contains("owner/b"));
+    }
+
+    #[test]
+    fn test_find_plugin_line_in_toml_basic() {
+        let toml = "[options]\n\n[[plugins]]\nurl = \"owner/a\"\nlazy = true\n\n[[plugins]]\nurl = \"owner/b\"\n";
+        //            1         2  3             4             5           6  7             8
+        assert_eq!(find_plugin_line_in_toml(toml, "owner/a"), 4);
+        assert_eq!(find_plugin_line_in_toml(toml, "owner/b"), 8);
+    }
+
+    #[test]
+    fn test_find_plugin_line_in_toml_handles_whitespace_variants() {
+        let toml = "[[plugins]]\nurl=\"owner/a\"\n\n[[plugins]]\nurl  =   \"owner/b\"\n";
+        assert_eq!(find_plugin_line_in_toml(toml, "owner/a"), 2);
+        assert_eq!(find_plugin_line_in_toml(toml, "owner/b"), 5);
+    }
+
+    #[test]
+    fn test_find_plugin_line_in_toml_missing_falls_back_to_one() {
+        let toml = "[[plugins]]\nurl = \"owner/a\"\n";
+        assert_eq!(find_plugin_line_in_toml(toml, "owner/nonexistent"), 1);
+    }
+
+    #[test]
+    fn test_find_plugin_line_in_toml_ignores_substring_matches() {
+        // "owner/ab" should not be matched when searching for "owner/a"
+        let toml = "[[plugins]]\nurl = \"owner/ab\"\n\n[[plugins]]\nurl = \"owner/a\"\n";
+        assert_eq!(find_plugin_line_in_toml(toml, "owner/a"), 5);
+    }
+
+    #[test]
+    fn test_editor_supports_line_jump() {
+        assert!(editor_supports_line_jump("nvim"));
+        assert!(editor_supports_line_jump("vim"));
+        assert!(editor_supports_line_jump("vi"));
+        assert!(editor_supports_line_jump("nano"));
+        assert!(editor_supports_line_jump("emacs"));
+        assert!(editor_supports_line_jump("/usr/local/bin/nvim"));
+        assert!(editor_supports_line_jump("C:\\Program Files\\Neovim\\bin\\nvim.exe"));
+        assert!(!editor_supports_line_jump("code"));
+        assert!(!editor_supports_line_jump("hx"));
     }
 
     #[test]

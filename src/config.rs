@@ -16,6 +16,27 @@ pub struct Options {
     pub loader_path: Option<String>,
 }
 
+/// Keymap 仕様. TOML では文字列 (`"<leader>f"`) またはテーブル
+/// (`{ lhs = "<leader>f", mode = ["n", "x"], desc = "..." }`) で記述可能。
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
+pub struct MapSpec {
+    pub lhs: String,
+    /// 空の場合は normal mode (`"n"`) として扱う。
+    pub mode: Vec<String>,
+    pub desc: Option<String>,
+}
+
+impl MapSpec {
+    /// 空 mode を `["n"]` に正規化した Vec を返す。
+    pub fn modes_or_default(&self) -> Vec<String> {
+        if self.mode.is_empty() {
+            vec!["n".to_string()]
+        } else {
+            self.mode.clone()
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone)]
 pub struct Plugin {
     pub name: Option<String>,
@@ -29,8 +50,8 @@ pub struct Plugin {
     pub on_cmd: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub on_ft: Option<Vec<String>>,
-    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
-    pub on_map: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_map_specs")]
+    pub on_map: Option<Vec<MapSpec>>,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub on_event: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
@@ -60,6 +81,63 @@ where
     Ok(opt.map(|v| match v {
         StringOrVec::String(s) => vec![s],
         StringOrVec::Vec(v) => v,
+    }))
+}
+
+/// Vec<String> を文字列形式 ("n") または配列形式 (["n", "x"]) で受ける。
+fn deserialize_string_or_vec_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SV {
+        S(String),
+        V(Vec<String>),
+    }
+    let sv: SV = Deserialize::deserialize(deserializer)?;
+    Ok(match sv {
+        SV::S(s) => vec![s],
+        SV::V(v) => v,
+    })
+}
+
+/// on_map の各要素を文字列 (`"<leader>f"`) またはテーブル (`{ lhs = "...", mode = ..., desc = "..." }`) で受け付ける。
+fn deserialize_map_specs<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<MapSpec>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct MapSpecFull {
+        lhs: String,
+        #[serde(default, deserialize_with = "deserialize_string_or_vec_vec")]
+        mode: Vec<String>,
+        desc: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum MapSpecRaw {
+        Simple(String),
+        Full(MapSpecFull),
+    }
+
+    let opt = Option::<Vec<MapSpecRaw>>::deserialize(deserializer)?;
+    Ok(opt.map(|v| {
+        v.into_iter()
+            .map(|raw| match raw {
+                MapSpecRaw::Simple(lhs) => MapSpec {
+                    lhs,
+                    mode: Vec::new(),
+                    desc: None,
+                },
+                MapSpecRaw::Full(full) => MapSpec {
+                    lhs: full.lhs,
+                    mode: full.mode,
+                    desc: full.desc,
+                },
+            })
+            .collect()
     }))
 }
 
@@ -199,6 +277,67 @@ on_cmd = ["Telescope", "Grep"]
 "#;
         let config = parse_config(toml).unwrap();
         assert_eq!(config.plugins[0].on_cmd, Some(vec!["Telescope".to_string(), "Grep".to_string()]));
+    }
+
+    #[test]
+    fn test_parse_config_accepts_on_map_simple_string() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+on_map = ["<leader>f"]
+"#;
+        let config = parse_config(toml).unwrap();
+        let maps = config.plugins[0].on_map.as_ref().unwrap();
+        assert_eq!(maps.len(), 1);
+        assert_eq!(maps[0].lhs, "<leader>f");
+        assert!(maps[0].mode.is_empty(), "simple form leaves mode empty (defaults to 'n' at generate)");
+        assert_eq!(maps[0].desc, None);
+    }
+
+    #[test]
+    fn test_parse_config_accepts_on_map_table_form() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+on_map = [
+  { lhs = "<leader>v", mode = ["n", "x"], desc = "visual thing" },
+]
+"#;
+        let config = parse_config(toml).unwrap();
+        let maps = config.plugins[0].on_map.as_ref().unwrap();
+        assert_eq!(maps.len(), 1);
+        assert_eq!(maps[0].lhs, "<leader>v");
+        assert_eq!(maps[0].mode, vec!["n".to_string(), "x".to_string()]);
+        assert_eq!(maps[0].desc.as_deref(), Some("visual thing"));
+    }
+
+    #[test]
+    fn test_parse_config_accepts_on_map_mixed_forms() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+on_map = [
+  "<leader>a",
+  { lhs = "<leader>b", mode = "x" },
+  { lhs = "<leader>c", mode = ["n", "v"], desc = "C" },
+]
+"#;
+        let config = parse_config(toml).unwrap();
+        let maps = config.plugins[0].on_map.as_ref().unwrap();
+        assert_eq!(maps.len(), 3);
+        assert_eq!(maps[0].lhs, "<leader>a");
+        assert!(maps[0].mode.is_empty());
+        assert_eq!(maps[1].lhs, "<leader>b");
+        assert_eq!(maps[1].mode, vec!["x".to_string()]);
+        assert_eq!(maps[2].lhs, "<leader>c");
+        assert_eq!(maps[2].mode, vec!["n".to_string(), "v".to_string()]);
+        assert_eq!(maps[2].desc.as_deref(), Some("C"));
     }
 
     #[test]
