@@ -75,10 +75,10 @@ impl TuiState {
         let items: Vec<ListItem> = self.plugins.iter().map(|url| {
             let status = self.status_map.get(url).cloned().unwrap_or(PluginStatus::Waiting);
             let (icon, color, msg) = match &status {
-                PluginStatus::Waiting => ("󰒲", Color::DarkGray, "Waiting...".to_string()),
-                PluginStatus::Syncing(m) => ("↻", Color::Cyan, m.clone()),
-                PluginStatus::Finished => ("", Color::Green, "Finished".to_string()),
-                PluginStatus::Failed(e) => ("✖", Color::Red, e.clone()),
+                PluginStatus::Waiting    => ("\u{f0292}", Color::DarkGray, "Waiting...".to_string()),
+                PluginStatus::Syncing(m) => ("\u{21bb}", Color::Cyan, m.clone()),
+                PluginStatus::Finished   => ("\u{f00c}", Color::Green, "Finished".to_string()),
+                PluginStatus::Failed(e)  => ("\u{2716}", Color::Red, e.clone()),
             };
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {} ", icon), Style::default().fg(color)),
@@ -102,42 +102,81 @@ impl TuiState {
             .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3)])
             .split(f.size());
 
+        // インストール済み / 未インストール / エラー のカウント
+        let installed = self.status_map.values().filter(|s| matches!(s, PluginStatus::Finished)).count();
+        let missing   = self.status_map.values().filter(|s| matches!(s, PluginStatus::Failed(m) if m == "Missing")).count();
+        let errors    = self.status_map.values().filter(|s| matches!(s, PluginStatus::Failed(m) if m != "Missing")).count();
+        let modified  = self.status_map.values().filter(|s| matches!(s, PluginStatus::Syncing(_))).count();
+
         let title = Paragraph::new(Line::from(vec![
             Span::styled(" P L U G I N   L I S T ", Style::default().fg(Color::Black).bg(Color::Magenta).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  Total: {}", config.plugins.len()), Style::default().fg(Color::Magenta)),
+            Span::styled(format!("  Total:{} ", config.plugins.len()), Style::default().fg(Color::White)),
+            Span::styled(format!(" \u{f00c}:{} ", installed), Style::default().fg(Color::Green)),
+            Span::styled(format!(" \u{f05e}:{} ", missing),   Style::default().fg(Color::Red)),
+            Span::styled(format!(" \u{f071}:{} ", modified),  Style::default().fg(Color::Yellow)),
+            Span::styled(format!(" \u{2716}:{} ", errors),    Style::default().fg(Color::Red)),
         ])).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
         f.render_widget(title, chunks[0]);
 
-        let header = Row::new(vec!["Plugin URL", "Status", "Merged", "Rev", "Triggers"].into_iter().map(|h| Cell::from(h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))).style(Style::default().bg(Color::Black)).height(1).bottom_margin(1);
-        
-        let rows = config.plugins.iter().map(|p| {
-            let status = if p.lazy { ("󰒲 Lazy", Color::Yellow) } else { ("󰚰 Eager", Color::Green) };
-            let merged = if p.merge { ("", Color::Cyan) } else { ("✖", Color::DarkGray) };
-            let rev = p.rev.as_deref().unwrap_or("-");
-            
-            let mut trg = Vec::new();
-            if let Some(c) = &p.on_cmd { trg.push(format!("Cmd:{}", c.len())); }
-            if let Some(f) = &p.on_ft { trg.push(format!("Ft:{}", f.len())); }
-            if p.cond.is_some() { trg.push("Cond".to_string()); }
+        let header = Row::new(["", "Plugin URL", "Mode", "Merge", "Rev", "Detail"].iter()
+            .map(|h| Cell::from(*h).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))))
+            .style(Style::default().bg(Color::Black)).height(1).bottom_margin(1);
+
+        let rows: Vec<Row> = config.plugins.iter().map(|p| {
+            // インストール状態アイコン
+            let install_status = self.status_map.get(&p.url).cloned().unwrap_or(PluginStatus::Waiting);
+            let (inst_icon, inst_color) = match &install_status {
+                PluginStatus::Finished                                => ("\u{f00c}", Color::Green),   //
+                PluginStatus::Failed(m) if m == "Missing"             => ("\u{f05e}", Color::Red),     //
+                PluginStatus::Failed(_)                               => ("\u{2716}", Color::Red),     // ✖
+                PluginStatus::Syncing(m) if m.contains("Modified")    => ("\u{f071}", Color::Yellow),  //
+                PluginStatus::Syncing(_)                              => ("\u{21bb}", Color::Cyan),    // ↻
+                PluginStatus::Waiting                                 => ("?",        Color::DarkGray),
+            };
+
+            // 詳細列: エラー/変更時はその内容、正常時はトリガー情報
+            let (detail_text, detail_color) = match &install_status {
+                PluginStatus::Finished => {
+                    let mut trg = Vec::new();
+                    if let Some(c) = &p.on_cmd    { trg.push(format!("cmd:{}", c.len())); }
+                    if let Some(f) = &p.on_ft     { trg.push(format!("ft:{}", f.len())); }
+                    if let Some(m) = &p.on_map    { trg.push(format!("map:{}", m.len())); }
+                    if let Some(e) = &p.on_event  { trg.push(format!("ev:{}", e.len())); }
+                    if let Some(s) = &p.on_source { trg.push(format!("src:{}", s.len())); }
+                    if p.cond.is_some() { trg.push("cond".to_string()); }
+                    (trg.join(" "), Color::DarkGray)
+                }
+                PluginStatus::Failed(msg)  => (msg.clone(), Color::Red),
+                PluginStatus::Syncing(msg) => (msg.clone(), Color::Yellow),
+                PluginStatus::Waiting      => ("Checking...".to_string(), Color::DarkGray),
+            };
+
+            let mode   = if p.lazy  { ("Lazy",  Color::Yellow) } else { ("Eager", Color::Green) };
+            let merged = if p.merge { ("\u{f00c}", Color::Cyan) } else { ("\u{2716}", Color::DarkGray) };
+            let rev    = p.rev.as_deref().unwrap_or("-");
 
             Row::new(vec![
+                Cell::from(inst_icon).style(Style::default().fg(inst_color)),
                 Cell::from(p.url.clone()).style(Style::default().fg(Color::White)),
-                Cell::from(status.0).style(Style::default().fg(status.1)),
+                Cell::from(mode.0).style(Style::default().fg(mode.1)),
                 Cell::from(merged.0).style(Style::default().fg(merged.1)),
                 Cell::from(rev).style(Style::default().fg(Color::Magenta)),
-                Cell::from(trg.join(", ")).style(Style::default().fg(Color::DarkGray))
+                Cell::from(detail_text).style(Style::default().fg(detail_color)),
             ])
-        });
+        }).collect();
 
         let table = Table::new(rows, [
-            Constraint::Percentage(35),
-            Constraint::Percentage(10),
-            Constraint::Percentage(10),
-            Constraint::Percentage(15),
-            Constraint::Percentage(30)
+            Constraint::Length(3),
+            Constraint::Percentage(33),
+            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Percentage(12),
+            Constraint::Percentage(45),
         ])
-            .header(header).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
-            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)).highlight_symbol(">> ");
+            .header(header)
+            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
+            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+            .highlight_symbol(">> ");
         f.render_stateful_widget(table, chunks[1], &mut self.table_state);
 
         let footer = Paragraph::new(Line::from(vec![
@@ -153,6 +192,7 @@ impl TuiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test_tui_state_update() {
         let mut state = TuiState::new(vec!["repo1".to_string(), "repo2".to_string()]);
@@ -166,5 +206,22 @@ mod tests {
         let mut state = TuiState::new(vec!["test".to_string()]);
         state.update_status("test", PluginStatus::Failed("Error".to_string()));
         assert!(matches!(state.status_map["test"], PluginStatus::Failed(_)));
+    }
+
+    #[test]
+    fn test_install_status_icons() {
+        // インストール状態ごとのステータスマッピングを確認
+        let mut state = TuiState::new(vec![
+            "a".to_string(), "b".to_string(), "c".to_string(), "d".to_string(),
+        ]);
+        state.update_status("a", PluginStatus::Finished);
+        state.update_status("b", PluginStatus::Failed("Missing".to_string()));
+        state.update_status("c", PluginStatus::Syncing("Modified".to_string()));
+        state.update_status("d", PluginStatus::Failed("git error".to_string()));
+
+        assert!(matches!(state.status_map["a"], PluginStatus::Finished));
+        assert!(matches!(&state.status_map["b"], PluginStatus::Failed(m) if m == "Missing"));
+        assert!(matches!(&state.status_map["c"], PluginStatus::Syncing(m) if m.contains("Modified")));
+        assert!(matches!(&state.status_map["d"], PluginStatus::Failed(m) if m != "Missing"));
     }
 }

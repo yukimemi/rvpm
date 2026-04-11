@@ -238,7 +238,7 @@ async fn run_list() -> Result<()> {
     let config_path = home.join(".config/rvpm/config.toml");
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
-    
+
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -248,18 +248,51 @@ async fn run_list() -> Result<()> {
     let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
     let mut tui_state = TuiState::new(urls);
 
-    // インストール状態の初期チェック
+    // インストール状態を並列で git status チェック
     let base_dir = home.join(".cache/rvpm");
-    for plugin in &config.plugins {
-        let dst_path = if let Some(d) = &plugin.dst {
-            PathBuf::from(d)
-        } else {
-            base_dir.join("repos").join(plugin.canonical_path())
-        };
-        if dst_path.exists() {
-            tui_state.update_status(&plugin.url, PluginStatus::Finished);
-        } else {
-            tui_state.update_status(&plugin.url, PluginStatus::Failed("Missing".to_string()));
+    let (tx, mut rx) = mpsc::channel::<(String, PluginStatus)>(100);
+    let mut set = JoinSet::new();
+
+    for plugin in config.plugins.iter() {
+        let plugin = plugin.clone();
+        let base_dir = base_dir.clone();
+        let tx = tx.clone();
+        set.spawn(async move {
+            let dst_path = if let Some(d) = &plugin.dst {
+                PathBuf::from(d)
+            } else {
+                base_dir.join("repos").join(plugin.canonical_path())
+            };
+            let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
+            let git_status = repo.get_status().await;
+            let plugin_status = match git_status {
+                crate::git::RepoStatus::Clean => PluginStatus::Finished,
+                crate::git::RepoStatus::NotInstalled => PluginStatus::Failed("Missing".to_string()),
+                crate::git::RepoStatus::Modified => PluginStatus::Syncing("Modified".to_string()),
+                crate::git::RepoStatus::Outdated(msg) => PluginStatus::Syncing(format!("Outdated: {}", msg)),
+                crate::git::RepoStatus::Error(e) => PluginStatus::Failed(e),
+            };
+            let _ = tx.send((plugin.url.clone(), plugin_status)).await;
+        });
+    }
+
+    let total = config.plugins.len();
+    let mut done = 0;
+    while done < total {
+        terminal.draw(|f| tui_state.draw(f))?;
+        tokio::select! {
+            Some((url, status)) = rx.recv() => {
+                tui_state.update_status(&url, status);
+            }
+            Some(_) = set.join_next() => { done += 1; }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+    }
+    // チャンネルに残ったメッセージを消化
+    loop {
+        match rx.try_recv() {
+            Ok((url, status)) => tui_state.update_status(&url, status),
+            Err(_) => break,
         }
     }
 
