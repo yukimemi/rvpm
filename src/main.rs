@@ -23,50 +23,33 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Sync plugins based on config.toml (Clone/Pull/Merge/Generate)
     Sync,
-    /// Add a new plugin to config.toml
     Add {
-        /// Repository URL (e.g., owner/repo or full URL)
         repo: String,
-        /// Optional name for the plugin
         #[arg(long)]
         name: Option<String>,
     },
-    /// Edit plugin configuration files (init/before/after.lua)
     Edit {
-        /// Query to filter plugins
         query: Option<String>,
     },
-    /// Set plugin options (lazy, merge, on_cmd, etc.)
     Set {
-        /// Query to filter plugins
         query: Option<String>,
-        /// Enable or disable lazy loading
         #[arg(long)]
         lazy: Option<bool>,
-        /// Enable or disable merging
         #[arg(long)]
         merge: Option<bool>,
-        /// Commands for lazy loading (as JSON array string)
         #[arg(long)]
         on_cmd: Option<String>,
-        /// FileTypes for lazy loading (as JSON array string)
         #[arg(long)]
         on_ft: Option<String>,
-        /// Revision to checkout (branch, tag, or commit hash)
         #[arg(long)]
         rev: Option<String>,
     },
-    /// Remove unused plugin directories from repos/
     Clean {
-        /// Skip confirmation prompt
         #[arg(short, long)]
         force: bool,
     },
-    /// Show the git status of all managed plugins
     Status,
-    /// List all managed plugins
     List,
 }
 
@@ -75,15 +58,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Sync => run_sync().await?,
-        Commands::Add { repo, name } => run_add(repo, name).await?,
-        Commands::Edit { query } => run_edit(query).await?,
+        Commands::Sync => { run_sync().await?; },
+        Commands::Add { repo, name } => { run_add(repo, name).await?; },
+        Commands::Edit { query } => { if run_edit(query).await? { let _ = run_sync().await; } },
         Commands::Set { query, lazy, merge, on_cmd, on_ft, rev } => {
-            run_set(query, lazy, merge, on_cmd, on_ft, rev).await?
+            if run_set(query, lazy, merge, on_cmd, on_ft, rev).await? { let _ = run_sync().await; }
         },
-        Commands::Clean { force } => run_clean(force).await?,
-        Commands::Status => run_status().await?,
-        Commands::List => run_list().await?,
+        Commands::Clean { force } => { run_clean(force).await?; },
+        Commands::Status => { run_status().await?; },
+        Commands::List => { run_list().await?; },
     }
 
     Ok(())
@@ -131,31 +114,16 @@ async fn run_sync() -> Result<()> {
         let mut plugin = plugin.clone();
         let base_dir = base_dir.clone();
         let tx = tx.clone();
-        
-        if plugin.cond.is_some() {
-            plugin.merge = false;
-        }
+        if plugin.cond.is_some() { plugin.merge = false; }
 
         set.spawn(async move {
-            let dst_path = if let Some(d) = &plugin.dst {
-                PathBuf::from(d)
-            } else {
-                base_dir.join("repos").join(plugin.canonical_path())
-            };
-
+            let dst_path = if let Some(d) = &plugin.dst { PathBuf::from(d) } else { base_dir.join("repos").join(plugin.canonical_path()) };
             let _ = tx.send((plugin.url.clone(), PluginStatus::Syncing("Syncing...".to_string()))).await;
             let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
             let res = repo.sync().await;
-            
             match res {
-                Ok(_) => {
-                    let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
-                    Ok((plugin, dst_path))
-                }
-                Err(e) => {
-                    let _ = tx.send((plugin.url.clone(), PluginStatus::Failed(e.to_string()))).await;
-                    Err(e)
-                }
+                Ok(_) => { let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await; Ok((plugin, dst_path)) }
+                Err(e) => { let _ = tx.send((plugin.url.clone(), PluginStatus::Failed(e.to_string()))).await; Err(e) }
             }
         });
     }
@@ -166,57 +134,45 @@ async fn run_sync() -> Result<()> {
 
     while finished_tasks < total_tasks {
         terminal.draw(|f| tui_state.draw(f))?;
-
         tokio::select! {
-            Some((url, status)) = rx.recv() => {
-                tui_state.update_status(&url, status);
-            }
+            Some((url, status)) = rx.recv() => { tui_state.update_status(&url, status); }
             Some(res) = set.join_next() => {
                 finished_tasks += 1;
-                match res {
-                    Ok(Ok((plugin, dst_path))) => {
-                        if plugin.merge {
-                            let _ = merge_plugin(&dst_path, &merged_dir);
-                        }
-                        if let Some(config_root) = &config.options.config_root {
-                            let plugin_config_dir = Path::new(config_root).join(plugin.canonical_path());
-                            let scripts = PluginScripts {
-                                name: plugin.name.clone().unwrap_or_else(|| plugin.url.clone()),
-                                path: dst_path.to_string_lossy().to_string(),
-                                init: find_lua(&plugin_config_dir, "init.lua"),
-                                before: find_lua(&plugin_config_dir, "before.lua"),
-                                after: find_lua(&plugin_config_dir, "after.lua"),
-                                lazy: plugin.lazy,
-                                on_cmd: plugin.on_cmd.clone(),
-                                on_ft: plugin.on_ft.clone(),
-                                on_map: plugin.on_map.clone(),
-                                on_event: plugin.on_event.clone(),
-                                on_path: None,
-                                on_source: None,
-                                cond: plugin.cond.clone(),
-                            };
-                            plugin_scripts.push(scripts);
-                        }
+                if let Ok(Ok((plugin, dst_path))) = res {
+                    if plugin.merge { let _ = merge_plugin(&dst_path, &merged_dir); }
+                    if let Some(config_root) = &config.options.config_root {
+                        let plugin_config_dir = Path::new(config_root).join(plugin.canonical_path());
+                        let scripts = PluginScripts {
+                            name: plugin.name.clone().unwrap_or_else(|| plugin.url.clone()),
+                            path: dst_path.to_string_lossy().to_string(),
+                            init: find_lua(&plugin_config_dir, "init.lua"),
+                            before: find_lua(&plugin_config_dir, "before.lua"),
+                            after: find_lua(&plugin_config_dir, "after.lua"),
+                            lazy: plugin.lazy,
+                            on_cmd: plugin.on_cmd.clone(),
+                            on_ft: plugin.on_ft.clone(),
+                            on_map: plugin.on_map.clone(),
+                            on_event: plugin.on_event.clone(),
+                            on_path: plugin.on_path.clone(),
+                            on_source: plugin.on_source.clone(),
+                            cond: plugin.cond.clone(),
+                        };
+                        plugin_scripts.push(scripts);
                     }
-                    _ => {}
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
         }
     }
-
     terminal.draw(|f| tui_state.draw(f))?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-
     println!("Generating loader.lua...");
     let lua = generate_loader(&merged_dir, &plugin_scripts);
     let loader_path = base_dir.join("loader.lua");
     std::fs::write(loader_path, lua)?;
-
     println!("Done!");
     Ok(())
 }
@@ -227,7 +183,72 @@ async fn run_list() -> Result<()> {
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
     
-    println!("{}", format_plugin_list(&config));
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = ratatui::Terminal::new(backend)?;
+
+    let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
+    let mut tui_state = TuiState::new(urls);
+
+    // インストール状態の初期チェック
+    let base_dir = home.join(".cache/rvpm");
+    for plugin in &config.plugins {
+        let dst_path = if let Some(d) = &plugin.dst {
+            PathBuf::from(d)
+        } else {
+            base_dir.join("repos").join(plugin.canonical_path())
+        };
+        if dst_path.exists() {
+            tui_state.update_status(&plugin.url, PluginStatus::Finished);
+        } else {
+            tui_state.update_status(&plugin.url, PluginStatus::Failed("Missing".to_string()));
+        }
+    }
+
+    loop {
+        terminal.draw(|f| tui_state.draw_list(f, &config))?;
+
+        if crossterm::event::poll(std::time::Duration::from_millis(100))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                if key.kind != crossterm::event::KeyEventKind::Press { continue; }
+
+                match key.code {
+                    crossterm::event::KeyCode::Char('q') => break,
+                    crossterm::event::KeyCode::Char('j') | crossterm::event::KeyCode::Down => tui_state.next(),
+                    crossterm::event::KeyCode::Char('k') | crossterm::event::KeyCode::Up => tui_state.previous(),
+                    crossterm::event::KeyCode::Char('e') => {
+                        if let Some(url) = tui_state.selected_url() {
+                            disable_raw_mode()?;
+                            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                            terminal.show_cursor()?;
+                            if run_edit(Some(url)).await? { let _ = run_sync().await; }
+                            enable_raw_mode()?;
+                            execute!(std::io::stdout(), EnterAlternateScreen)?;
+                            terminal.clear()?;
+                        }
+                    }
+                    crossterm::event::KeyCode::Char('s') => {
+                        if let Some(url) = tui_state.selected_url() {
+                            disable_raw_mode()?;
+                            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                            terminal.show_cursor()?;
+                            if run_set(Some(url), None, None, None, None, None).await? { let _ = run_sync().await; }
+                            enable_raw_mode()?;
+                            execute!(std::io::stdout(), EnterAlternateScreen)?;
+                            terminal.clear()?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
     Ok(())
 }
 
@@ -236,32 +257,21 @@ async fn run_status() -> Result<()> {
     let config_path = home.join(".config/rvpm/config.toml");
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
-
     let base_dir = home.join(".cache/rvpm");
     let mut set = JoinSet::new();
-
     println!("Checking plugin status...");
-
     for plugin in config.plugins.into_iter() {
         let base_dir = base_dir.clone();
         set.spawn(async move {
-            let dst_path = if let Some(d) = &plugin.dst {
-                PathBuf::from(d)
-            } else {
-                base_dir.join("repos").join(plugin.canonical_path())
-            };
+            let dst_path = if let Some(d) = &plugin.dst { PathBuf::from(d) } else { base_dir.join("repos").join(plugin.canonical_path()) };
             let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
             let status = repo.get_status().await;
             (plugin.url.clone(), status)
         });
     }
-
     let mut results = Vec::new();
-    while let Some(res) = set.join_next().await {
-        results.push(res?);
-    }
+    while let Some(res) = set.join_next().await { results.push(res?); }
     results.sort_by(|a, b| a.0.cmp(&b.0));
-
     for (url, status) in results {
         match status {
             crate::git::RepoStatus::Clean => println!("  [Clean]     {}", url),
@@ -281,16 +291,9 @@ async fn run_add(repo: String, name: Option<String>) -> Result<()> {
     let config_path = home.join(".config/rvpm/config.toml");
     let toml_content = std::fs::read_to_string(&config_path)?;
     let mut doc = toml_content.parse::<DocumentMut>()?;
-    if doc.get("plugins").is_none() {
-        doc["plugins"] = toml_edit::ArrayOfTables::new().into();
-    }
+    if doc.get("plugins").is_none() { doc["plugins"] = toml_edit::ArrayOfTables::new().into(); }
     let plugins = doc["plugins"].as_array_of_tables_mut().context("plugins is not an array of tables")?;
-    for p in plugins.iter() {
-        if p.get("url").and_then(|v| v.as_str()) == Some(&repo) {
-            println!("Plugin already exists: {}", repo);
-            return Ok(());
-        }
-    }
+    for p in plugins.iter() { if p.get("url").and_then(|v| v.as_str()) == Some(&repo) { println!("Plugin already exists: {}", repo); return Ok(()); } }
     let mut new_plugin = table();
     new_plugin["url"] = value(&repo);
     if let Some(n) = name { new_plugin["name"] = value(n); }
@@ -303,84 +306,117 @@ async fn run_add(repo: String, name: Option<String>) -> Result<()> {
 
 use dialoguer::{FuzzySelect, Select};
 
-async fn run_edit(query: Option<String>) -> Result<()> {
+async fn run_edit(query: Option<String>) -> Result<bool> {
     let home = dirs::home_dir().expect("Could not find home directory");
     let config_path = home.join(".config/rvpm/config.toml");
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
-    let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
-    let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
-        .with_prompt("Select plugin to edit")
-        .with_initial_text(query.unwrap_or_default())
-        .items(&urls)
-        .interact_opt()?;
-    let selected_url = match selection {
-        Some(index) => &urls[index],
-        None => return Ok(()),
+
+    let plugin = if let Some(q) = query {
+        config.plugins.iter().find(|p| p.url == q || p.url.contains(&q))
+            .context("Plugin not found")?
+    } else {
+        let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
+        let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt("Select plugin to edit")
+            .items(&urls)
+            .interact_opt()?;
+        match selection {
+            Some(index) => config.plugins.iter().find(|p| p.url == urls[index]).unwrap(),
+            None => return Ok(false),
+        }
     };
-    let plugin = config.plugins.iter().find(|p| &p.url == selected_url).unwrap();
+
+    println!("\n>> Editing configuration for: {}", plugin.url);
+
     let files = vec!["init.lua", "before.lua", "after.lua"];
     let file_selection = Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
         .with_prompt("Select file to edit")
         .default(0)
         .items(&files)
         .interact_opt()?;
+
     let file_name = match file_selection {
         Some(index) => files[index],
-        None => return Ok(()),
+        None => return Ok(false),
     };
+    
     if let Some(config_root) = &config.options.config_root {
         let plugin_config_dir = Path::new(config_root).join(plugin.canonical_path());
         std::fs::create_dir_all(&plugin_config_dir)?;
         let target_file = plugin_config_dir.join(file_name);
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
         std::process::Command::new(editor).arg(target_file).status()?;
+        return Ok(true);
     }
-    let _ = run_sync().await;
-    Ok(())
+    Ok(false)
 }
 
-async fn run_set(query: Option<String>, lazy: Option<bool>, merge: Option<bool>, on_cmd: Option<String>, on_ft: Option<String>, rev: Option<String>) -> Result<()> {
+async fn run_set(query: Option<String>, lazy: Option<bool>, merge: Option<bool>, on_cmd: Option<String>, on_ft: Option<String>, rev: Option<String>) -> Result<bool> {
     let home = dirs::home_dir().expect("Could not find home directory");
     let config_path = home.join(".config/rvpm/config.toml");
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
+
     let selected_repo_url = if let Some(q) = query.as_ref() {
-        let matches: Vec<_> = config.plugins.iter().filter(|p| p.url.contains(q)).collect();
-        if matches.len() == 1 { matches[0].url.clone() } else { select_plugin_interactively(&config.plugins, Some(q))? }
-    } else { select_plugin_interactively(&config.plugins, None)? };
+        config.plugins.iter().find(|p| &p.url == q || p.url.contains(q))
+            .map(|p| p.url.clone())
+            .context("Plugin not found")?
+    } else {
+        let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
+        let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default()).with_prompt("Select plugin to set").items(&urls).interact_opt()?;
+        match selection { Some(index) => urls[index].clone(), None => return Ok(false) }
+    };
+
+    println!("\n>> Setting options for: {}", selected_repo_url);
     let mut doc = toml_content.parse::<DocumentMut>()?;
+    let mut modified = false;
+
     if lazy.is_some() || merge.is_some() || on_cmd.is_some() || on_ft.is_some() || rev.is_some() {
-        let parse_list = |s: Option<String>| -> Option<Vec<String>> {
-            s.map(|v| if v.trim().starts_with('[') { serde_json::from_str(&v).unwrap_or_else(|_| vec![v]) } else { v.split(',').map(|s| s.trim().to_string()).collect() })
-        };
+        let parse_list = |s: Option<String>| -> Option<Vec<String>> { s.map(|v| if v.trim().starts_with('[') { serde_json::from_str(&v).unwrap_or_else(|_| vec![v]) } else { v.split(',').map(|s| s.trim().to_string()).collect() }) };
         update_plugin_config(&mut doc, &selected_repo_url, lazy, merge, parse_list(on_cmd), parse_list(on_ft), rev)?;
+        modified = true;
     } else {
         let options = vec!["lazy", "merge", "on_cmd", "on_ft", "rev"];
         let selection = Select::with_theme(&dialoguer::theme::ColorfulTheme::default()).with_prompt("Select option to set").items(&options).interact_opt()?;
-        if let Some(index) = selection {
-            match options[index] {
-                "lazy" | "merge" => {
-                    let val = Select::with_theme(&dialoguer::theme::ColorfulTheme::default()).with_prompt(format!("Set {} to", options[index])).items(&["true", "false"]).interact()?;
-                    update_plugin_config(&mut doc, &selected_repo_url, if options[index] == "lazy" { Some(val == 0) } else { None }, if options[index] == "merge" { Some(val == 0) } else { None }, None, None, None)?;
+        match selection {
+            Some(index) => {
+                match options[index] {
+                    "lazy" | "merge" => {
+                        let val = Select::with_theme(&dialoguer::theme::ColorfulTheme::default()).with_prompt(format!("Set {} to", options[index])).items(&["true", "false"]).interact_opt()?;
+                        if let Some(v) = val {
+                            update_plugin_config(&mut doc, &selected_repo_url, if options[index] == "lazy" { Some(v == 0) } else { None }, if options[index] == "merge" { Some(v == 0) } else { None }, None, None, None)?;
+                            modified = true;
+                        } else { return Ok(false); }
+                    }
+                    "on_cmd" | "on_ft" => {
+                        let input_res: Result<String, _> = dialoguer::Input::<String>::new().with_prompt(format!("Enter {} (comma separated)", options[index])).allow_empty(true).interact_text();
+                        match input_res { Ok(val) if !val.is_empty() => {
+                            let cmds: Vec<String> = val.split(',').map(|s| s.trim().to_string()).collect();
+                            update_plugin_config(&mut doc, &selected_repo_url, None, None, if options[index] == "on_cmd" { Some(cmds.clone()) } else { None }, if options[index] == "on_ft" { Some(cmds) } else { None }, None)?;
+                            modified = true;
+                        } _ => return Ok(false) }
+                    }
+                    "rev" => {
+                        let input_res: Result<String, _> = dialoguer::Input::<String>::new().with_prompt(format!("Enter {}", options[index])).allow_empty(true).interact_text();
+                        match input_res { Ok(val) if !val.is_empty() => {
+                            update_plugin_config(&mut doc, &selected_repo_url, None, None, None, None, Some(val))?;
+                            modified = true;
+                        } _ => return Ok(false) }
+                    }
+                    _ => {}
                 }
-                "on_cmd" | "on_ft" => {
-                    let val: String = dialoguer::Input::new().with_prompt(format!("Enter {} (comma separated)", options[index])).interact_text()?;
-                    let cmds: Vec<String> = val.split(',').map(|s| s.trim().to_string()).collect();
-                    update_plugin_config(&mut doc, &selected_repo_url, None, None, if options[index] == "on_cmd" { Some(cmds.clone()) } else { None }, if options[index] == "on_ft" { Some(cmds) } else { None }, None)?;
-                }
-                "rev" => {
-                    let val: String = dialoguer::Input::new().with_prompt(format!("Enter {}", options[index])).interact_text()?;
-                    update_plugin_config(&mut doc, &selected_repo_url, None, None, None, None, Some(val))?;
-                }
-                _ => {}
             }
+            None => return Ok(false),
         }
     }
-    std::fs::write(&config_path, doc.to_string())?;
-    println!("Updated config for: {}", selected_repo_url);
-    let _ = run_sync().await;
-    Ok(())
+
+    if modified {
+        std::fs::write(&config_path, doc.to_string())?;
+        println!("Updated config for: {}", selected_repo_url);
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 async fn run_clean(force: bool) -> Result<()> {
@@ -441,12 +477,13 @@ fn find_lua(dir: &Path, name: &str) -> Option<String> {
 
 fn format_plugin_list(config: &config::Config) -> String {
     let mut out = String::new();
-    out.push_str(&format!("{:<40} | {:<10} | {:<10}\n", "URL", "Status", "Merge"));
-    out.push_str(&format!("{:-<40}-+-{:-<10}-+-{:-<10}\n", "", "", ""));
+    out.push_str(&format!("{:<40} | {:<10} | {:<10} | {:<10}\n", "URL", "Status", "Merge", "Rev"));
+    out.push_str(&format!("{:-<40}-+-{:-<10}-+-{:-<10}-+-{:-<10}\n", "", "", "", ""));
     for plugin in &config.plugins {
         let status = if plugin.lazy { "Lazy" } else { "Eager" };
         let merge = if plugin.merge { "Yes" } else { "No" };
-        out.push_str(&format!("{:<40} | {:<10} | {:<10}\n", plugin.url, status, merge));
+        let rev = plugin.rev.as_deref().unwrap_or("-");
+        out.push_str(&format!("{:<40} | {:<10} | {:<10} | {:<10}\n", plugin.url, status, merge, rev));
     }
     out
 }
@@ -464,12 +501,13 @@ mod tests {
             vars: None,
             options: Options::default(),
             plugins: vec![
-                Plugin { url: "owner/repo1".to_string(), lazy: true, merge: false, ..Default::default() },
-                Plugin { url: "owner/repo2".to_string(), lazy: false, merge: true, ..Default::default() },
+                Plugin { url: "owner/repo1".to_string(), lazy: true, merge: false, rev: Some("v1.0".to_string()), ..Default::default() },
+                Plugin { url: "owner/repo2".to_string(), lazy: false, merge: true, rev: None, ..Default::default() },
             ],
         };
         let output = format_plugin_list(&config);
         assert!(output.contains("owner/repo1"));
+        assert!(output.contains("v1.0"));
         assert!(output.contains("Lazy"));
         assert!(output.contains("Eager"));
     }

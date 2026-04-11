@@ -29,6 +29,8 @@ pub struct Plugin {
     pub on_ft: Option<Vec<String>>,
     pub on_map: Option<Vec<String>>,
     pub on_event: Option<Vec<String>>,
+    pub on_path: Option<Vec<String>>,
+    pub on_source: Option<Vec<String>>,
     pub depends: Option<Vec<String>>,
     pub build: Option<String>,
     pub rev: Option<String>,
@@ -253,6 +255,8 @@ dst = "{{ env.RVPM_TEST_ENV }}_{{ is_windows }}"
 url = "nvim-telescope/telescope.nvim"
 lazy = true
 on_cmd = ["Telescope"]
+on_path = ["*.rs"]
+on_source = ["plenary.nvim"]
 depends = ["plenary"]
 merge = false
 "#;
@@ -261,6 +265,8 @@ merge = false
         assert_eq!(p.url, "nvim-telescope/telescope.nvim");
         assert!(p.lazy);
         assert_eq!(p.on_cmd, Some(vec!["Telescope".to_string()]));
+        assert_eq!(p.on_path, Some(vec!["*.rs".to_string()]));
+        assert_eq!(p.on_source, Some(vec!["plenary.nvim".to_string()]));
         assert_eq!(p.depends, Some(vec!["plenary".to_string()]));
         assert!(!p.merge);
     }

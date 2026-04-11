@@ -44,9 +44,9 @@ on_cmd = ["Telescope"]
 on_ft = ["rust", "toml"]
 on_map = ["<leader>f"]
 on_event = ["BufReadPre"]
-on_path = ["*"]       # (予約)
-on_source = ["plugin"]# (予約)
-cond = "return true"  # (予約)
+on_path = ["*"]
+on_source = ["plugin"]
+cond = "return true"
 depends = ["plenary"]
 # Git 参照の指定
 # rev = "v0.1.0" # ブランチ、タグ、コミットハッシュのいずれかを指定
@@ -69,3 +69,7 @@ depends = ["plenary"]
     - 1つのプラグインの同期失敗や設定ミス（依存関係の欠如など）が、システム全体の実行や Neovim の起動を妨げてはならない。
     - エラーは警告として報告し、可能な限り後続の処理（`generate` 等）を継続する。
     - Neovim 起動時の安全性を最優先し、不完全な設定であっても最小限の起動を保証する。
+
+## 6. 実装方式
+
+必ず TDD で実装を進める
