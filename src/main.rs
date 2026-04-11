@@ -60,6 +60,12 @@ enum Commands {
     List,
     /// config.toml を $EDITOR で開く。編集後は sync を実行して変更を反映する。
     Config,
+    /// Neovim init.lua に loader.lua の dofile を組み込むスニペットを案内/追記する。
+    /// `--write` で自動追記 (init.lua がなければ新規作成)。
+    Init {
+        #[arg(long)]
+        write: bool,
+    },
 }
 
 #[tokio::main]
@@ -80,6 +86,7 @@ async fn main() -> Result<()> {
         Commands::Status => { run_status().await?; },
         Commands::List => { run_list().await?; },
         Commands::Config => { if run_config().await? { let _ = run_sync().await; } },
+        Commands::Init { write } => { run_init(write).await?; },
     }
 
     Ok(())
@@ -174,6 +181,7 @@ async fn run_sync() -> Result<()> {
     let loader_path = resolve_loader_path(config.options.loader_path.as_deref(), &base_dir);
     write_loader_to_path(&merged_dir, &plugin_scripts, &loader_path)?;
     println!("Done! -> {}", loader_path.display());
+    print_init_lua_hint_if_missing(&config);
     Ok(())
 }
 
@@ -203,6 +211,7 @@ async fn run_generate() -> Result<()> {
     println!("Generating loader.lua...");
     write_loader_to_path(&merged_dir, &plugin_scripts, &loader_path)?;
     println!("Done! -> {}", loader_path.display());
+    print_init_lua_hint_if_missing(&config);
     Ok(())
 }
 
@@ -558,6 +567,53 @@ async fn run_config() -> Result<bool> {
     println!("Opening {}", config_path.display());
     open_editor_at_line(&config_path, 1)?;
     Ok(true)
+}
+
+/// `rvpm init` — Neovim init.lua に loader.lua を繋ぐ dofile 行を案内 or 自動追記する。
+async fn run_init(write: bool) -> Result<()> {
+    // config が存在すれば読み込んで loader_path / base_dir を反映した snippet を出す
+    // 存在しなければ default (~/.cache/rvpm/loader.lua) の snippet を出す (add 前でも init は使えるように)
+    let config_path = rvpm_config_path();
+    let config = if config_path.exists() {
+        let toml_content = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+        parse_config(&toml_content)?
+    } else {
+        config::Config {
+            vars: None,
+            options: config::Options::default(),
+            plugins: vec![],
+        }
+    };
+
+    let snippet = loader_init_snippet(&config);
+    let init_lua_path = nvim_init_lua_path();
+
+    if write {
+        match write_init_lua_snippet(&init_lua_path, &snippet)? {
+            WriteInitResult::Created => {
+                println!("\u{2714} Created {} with rvpm loader.", init_lua_path.display());
+                println!("  Snippet: {}", snippet);
+            }
+            WriteInitResult::Appended => {
+                println!("\u{2714} Appended rvpm loader to {}.", init_lua_path.display());
+                println!("  Snippet: {}", snippet);
+            }
+            WriteInitResult::AlreadyConfigured => {
+                println!(
+                    "\u{2714} {} already references rvpm loader. No changes.",
+                    init_lua_path.display()
+                );
+            }
+        }
+    } else {
+        println!("-- Add this to your Neovim init.lua:");
+        println!("{}", snippet);
+        println!();
+        println!("Target: {}", init_lua_path.display());
+        println!("Or run `rvpm init --write` to append it automatically.");
+    }
+    Ok(())
 }
 
 async fn run_edit(query: Option<String>) -> Result<bool> {
@@ -961,6 +1017,106 @@ fn resolve_config_root(config_root: Option<&str>) -> PathBuf {
     }
 }
 
+// ====================================================================
+// rvpm init: Neovim init.lua に loader をつなぐためのヘルパー
+// ====================================================================
+
+/// `$NVIM_APPNAME` を考慮して init.lua のパスを返す (pure function、テスト容易性のため env は外から注入)。
+fn nvim_init_lua_path_for_appname(appname: Option<&str>) -> PathBuf {
+    let appname = appname.unwrap_or("nvim");
+    let home = dirs::home_dir().expect("Could not find home directory");
+    home.join(".config").join(appname).join("init.lua")
+}
+
+/// 実行時の `$NVIM_APPNAME` 環境変数を見て init.lua のパスを返す。
+fn nvim_init_lua_path() -> PathBuf {
+    let appname = std::env::var("NVIM_APPNAME").ok();
+    nvim_init_lua_path_for_appname(appname.as_deref())
+}
+
+/// loader.lua を参照する `dofile(...)` 行を config から生成する。
+/// 優先順位: `options.loader_path` > `options.base_dir`/loader.lua > `~/.cache/rvpm/loader.lua`
+/// tilde 形式を保持することで dotfiles のマシン間共有を妨げない。
+fn loader_init_snippet(config: &config::Config) -> String {
+    let raw_path = if let Some(loader) = &config.options.loader_path {
+        loader.clone()
+    } else if let Some(base) = &config.options.base_dir {
+        format!("{}/loader.lua", base.trim_end_matches('/'))
+    } else {
+        "~/.cache/rvpm/loader.lua".to_string()
+    };
+    format!("dofile(vim.fn.expand(\"{}\"))", raw_path)
+}
+
+/// init.lua が rvpm の loader を参照しているかを緩く検出する。
+/// 同じ行内に `rvpm` と `loader.lua` が両方出ていれば真。
+fn init_lua_references_rvpm_loader(init_lua_path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(init_lua_path) else {
+        return false;
+    };
+    content
+        .lines()
+        .any(|line| line.contains("rvpm") && line.contains("loader.lua"))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WriteInitResult {
+    /// init.lua が存在しなかったので新規作成した
+    Created,
+    /// 既存 init.lua に末尾追記した
+    Appended,
+    /// 既に loader を参照していて変更不要だった
+    AlreadyConfigured,
+}
+
+/// init.lua に loader snippet を書き込む (冪等)。
+fn write_init_lua_snippet(init_lua_path: &Path, snippet: &str) -> Result<WriteInitResult> {
+    if init_lua_path.exists() {
+        if init_lua_references_rvpm_loader(init_lua_path) {
+            return Ok(WriteInitResult::AlreadyConfigured);
+        }
+        let mut content = std::fs::read_to_string(init_lua_path)?;
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str("\n-- rvpm loader (auto-added by `rvpm init --write`)\n");
+        content.push_str(snippet);
+        content.push('\n');
+        std::fs::write(init_lua_path, content)?;
+        Ok(WriteInitResult::Appended)
+    } else {
+        if let Some(parent) = init_lua_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = format!(
+            "-- Neovim config (auto-created by `rvpm init --write`)\n\n-- rvpm loader\n{}\n",
+            snippet
+        );
+        std::fs::write(init_lua_path, content)?;
+        Ok(WriteInitResult::Created)
+    }
+}
+
+/// `rvpm sync` / `rvpm generate` / `rvpm add` 等の末尾で呼ぶ hint 表示。
+/// init.lua が loader を参照していない (or 未作成) なら案内を出す。
+fn print_init_lua_hint_if_missing(config: &config::Config) {
+    let init_lua_path = nvim_init_lua_path();
+    if !init_lua_path.exists() {
+        println!();
+        println!("\u{26a0} Neovim init.lua not found at {}", init_lua_path.display());
+        println!("  Run `rvpm init --write` to create one with the rvpm loader.");
+        return;
+    }
+    if !init_lua_references_rvpm_loader(&init_lua_path) {
+        let snippet = loader_init_snippet(config);
+        println!();
+        println!("\u{26a0} {} doesn't reference rvpm loader yet.", init_lua_path.display());
+        println!("  Add this line:");
+        println!("    {}", snippet);
+        println!("  Or run `rvpm init --write` to do it automatically.");
+    }
+}
+
 /// config.toml 上で指定プラグイン (url 一致) の `url = "..."` 行の行番号 (1-indexed) を返す。
 /// 見つからなければ 1 を返す (ファイル先頭)。
 /// whitespace の入り方に寛容: `url="..."`, `url = "..."`, `url  =   "..."` など全部拾う。
@@ -1235,6 +1391,165 @@ mod tests {
             resolve_config_root(Some("/etc/rvpm/plugins")),
             PathBuf::from("/etc/rvpm/plugins")
         );
+    }
+
+    // -----------------------------------------------------------------
+    // rvpm init ヘルパーのテスト
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_nvim_init_lua_path_for_appname_defaults_to_nvim() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            nvim_init_lua_path_for_appname(None),
+            home.join(".config").join("nvim").join("init.lua")
+        );
+    }
+
+    #[test]
+    fn test_nvim_init_lua_path_for_appname_respects_nvim_appname() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            nvim_init_lua_path_for_appname(Some("mynvim")),
+            home.join(".config").join("mynvim").join("init.lua")
+        );
+    }
+
+    #[test]
+    fn test_loader_init_snippet_uses_default_when_no_options() {
+        let cfg = config::Config {
+            vars: None,
+            options: config::Options::default(),
+            plugins: vec![],
+        };
+        assert_eq!(
+            loader_init_snippet(&cfg),
+            "dofile(vim.fn.expand(\"~/.cache/rvpm/loader.lua\"))"
+        );
+    }
+
+    #[test]
+    fn test_loader_init_snippet_uses_loader_path_when_set() {
+        let mut opts = config::Options::default();
+        opts.loader_path = Some("~/foo/loader.lua".to_string());
+        let cfg = config::Config {
+            vars: None,
+            options: opts,
+            plugins: vec![],
+        };
+        assert_eq!(
+            loader_init_snippet(&cfg),
+            "dofile(vim.fn.expand(\"~/foo/loader.lua\"))"
+        );
+    }
+
+    #[test]
+    fn test_loader_init_snippet_uses_base_dir_when_set() {
+        let mut opts = config::Options::default();
+        opts.base_dir = Some("~/dotfiles/rvpm".to_string());
+        let cfg = config::Config {
+            vars: None,
+            options: opts,
+            plugins: vec![],
+        };
+        assert_eq!(
+            loader_init_snippet(&cfg),
+            "dofile(vim.fn.expand(\"~/dotfiles/rvpm/loader.lua\"))"
+        );
+    }
+
+    #[test]
+    fn test_loader_init_snippet_loader_path_wins_over_base_dir() {
+        let mut opts = config::Options::default();
+        opts.base_dir = Some("~/cache".to_string());
+        opts.loader_path = Some("~/custom/loader.lua".to_string());
+        let cfg = config::Config {
+            vars: None,
+            options: opts,
+            plugins: vec![],
+        };
+        assert_eq!(
+            loader_init_snippet(&cfg),
+            "dofile(vim.fn.expand(\"~/custom/loader.lua\"))"
+        );
+    }
+
+    #[test]
+    fn test_init_lua_references_rvpm_loader_detects_line() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("init.lua");
+        std::fs::write(&path, "-- some\ndofile(vim.fn.expand(\"~/.cache/rvpm/loader.lua\"))\n").unwrap();
+        assert!(init_lua_references_rvpm_loader(&path));
+    }
+
+    #[test]
+    fn test_init_lua_references_rvpm_loader_false_when_absent() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("init.lua");
+        std::fs::write(&path, "-- empty\nvim.g.mapleader = ' '\n").unwrap();
+        assert!(!init_lua_references_rvpm_loader(&path));
+    }
+
+    #[test]
+    fn test_init_lua_references_rvpm_loader_false_when_file_missing() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("missing.lua");
+        assert!(!init_lua_references_rvpm_loader(&path));
+    }
+
+    #[test]
+    fn test_init_lua_references_rvpm_loader_requires_both_keywords() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("init.lua");
+        // "loader.lua" だけでは rvpm の loader 参照と判定しない
+        std::fs::write(&path, "dofile(\"~/other/loader.lua\")\n").unwrap();
+        assert!(!init_lua_references_rvpm_loader(&path));
+    }
+
+    #[test]
+    fn test_write_init_lua_snippet_creates_when_missing() {
+        let root = tempdir().unwrap();
+        let init_path = root.path().join("nvim").join("init.lua");
+        let snippet = "dofile(vim.fn.expand(\"~/.cache/rvpm/loader.lua\"))";
+        let result = write_init_lua_snippet(&init_path, snippet).unwrap();
+        assert!(matches!(result, WriteInitResult::Created));
+        assert!(init_path.exists());
+        let content = std::fs::read_to_string(&init_path).unwrap();
+        assert!(content.contains(snippet));
+        assert!(content.contains("rvpm"));
+    }
+
+    #[test]
+    fn test_write_init_lua_snippet_appends_when_exists_without_loader() {
+        let root = tempdir().unwrap();
+        let init_path = root.path().join("init.lua");
+        std::fs::write(&init_path, "-- existing\nvim.g.mapleader = ' '\n").unwrap();
+        let snippet = "dofile(vim.fn.expand(\"~/.cache/rvpm/loader.lua\"))";
+        let result = write_init_lua_snippet(&init_path, snippet).unwrap();
+        assert!(matches!(result, WriteInitResult::Appended));
+        let content = std::fs::read_to_string(&init_path).unwrap();
+        assert!(content.contains("mapleader"));
+        assert!(content.contains(snippet));
+    }
+
+    #[test]
+    fn test_write_init_lua_snippet_noop_when_already_configured() {
+        let root = tempdir().unwrap();
+        let init_path = root.path().join("init.lua");
+        std::fs::write(
+            &init_path,
+            "dofile(vim.fn.expand(\"~/.cache/rvpm/loader.lua\"))\n",
+        )
+        .unwrap();
+        let result = write_init_lua_snippet(
+            &init_path,
+            "dofile(vim.fn.expand(\"~/.cache/rvpm/loader.lua\"))",
+        )
+        .unwrap();
+        assert!(matches!(result, WriteInitResult::AlreadyConfigured));
+        let content = std::fs::read_to_string(&init_path).unwrap();
+        // 行数が増えていないこと
+        assert_eq!(content.lines().count(), 1);
     }
 
     #[test]

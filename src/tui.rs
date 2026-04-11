@@ -64,7 +64,7 @@ impl TuiState {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3)])
-            .split(f.size());
+            .split(f.area());
 
         let title = Paragraph::new(Line::from(vec![
             Span::styled(" R V P M ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -100,7 +100,7 @@ impl TuiState {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3)])
-            .split(f.size());
+            .split(f.area());
 
         // インストール済み / 未インストール / エラー のカウント
         let installed = self.status_map.values().filter(|s| matches!(s, PluginStatus::Finished)).count();
@@ -188,7 +188,7 @@ impl TuiState {
         ])
             .header(header)
             .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED).add_modifier(Modifier::BOLD))
+            .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED).add_modifier(Modifier::BOLD))
             .highlight_symbol(">> ");
         f.render_stateful_widget(table, chunks[1], &mut self.table_state);
 

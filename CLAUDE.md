@@ -241,6 +241,7 @@ let _permit = sem.acquire_owned().await.unwrap();
 | `edit [query]` | `run_edit()` | per-plugin init/before/after.lua をエディタで編集 |
 | `set [query]` | `run_set()` | lazy/merge/on_* などを対話式に変更。`[ Open config.toml in $EDITOR ]` sentinel で TOML 直接編集に逃げられる。`on_map` 選択時は CLI / EDITOR の sub-menu |
 | `config` | `run_config()` | `config.toml` を `$EDITOR` で直接開く (終了後に sync 実行) |
+| `init [--write]` | `run_init()` | Neovim `init.lua` に loader.lua を繋ぐ `dofile(...)` スニペットを案内。`--write` で自動追記 (init.lua がなければ新規作成)。`$NVIM_APPNAME` を尊重 |
 | `clean` | `run_clean()` | 未使用リポジトリディレクトリを削除 |
 | `status` | `run_status()` | 各プラグインの git 状態を表示 |
 | `list` | `run_list()` | TUI でプラグイン一覧表示。`[S] sync / [u/U] update / [g] generate / [d] remove / [e] edit / [s] set` のアクションキー対応 |
@@ -256,3 +257,7 @@ let _permit = sem.acquire_owned().await.unwrap();
 | `~/.cache/rvpm/loader.lua` | 生成された Neovim 用ローダー |
 
 `options.base_dir` を指定すると `~/.cache/rvpm/` 全体 (repos/merged/loader) が移動する。`options.loader_path` は loader.lua だけを個別に移動する。`options.config_root` は per-plugin 設定ディレクトリの置き場を個別に移動する。
+
+### 初回導入サポート
+
+`rvpm sync` / `rvpm generate` は末尾で `print_init_lua_hint_if_missing()` を呼び、`$NVIM_APPNAME` を考慮した Neovim `init.lua` が loader.lua を参照していない (or 未作成) 場合に案内を表示する。ユーザーは `rvpm init --write` を実行すると init.lua がなければ新規作成、あれば末尾追記 (冪等) してくれる。コメント付きで「これは rvpm が書き加えた」と分かる形で挿入される。
