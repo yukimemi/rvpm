@@ -31,9 +31,8 @@ pub struct Plugin {
     pub on_event: Option<Vec<String>>,
     pub depends: Option<Vec<String>>,
     pub build: Option<String>,
-    pub branch: Option<String>,
-    pub tag: Option<String>,
     pub rev: Option<String>,
+    pub cond: Option<String>,
 }
 
 fn default_merge() -> bool {

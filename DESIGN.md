@@ -39,8 +39,17 @@ lazy = false
 name = "telescope"
 url = "nvim-telescope/telescope.nvim"
 lazy = true
+# 豊富な遅延読み込みトリガー
 on_cmd = ["Telescope"]
+on_ft = ["rust", "toml"]
+on_map = ["<leader>f"]
+on_event = ["BufReadPre"]
+on_path = ["*"]       # (予約)
+on_source = ["plugin"]# (予約)
+cond = "return true"  # (予約)
 depends = ["plenary"]
+# Git 参照の指定
+# rev = "v0.1.0" # ブランチ、タグ、コミットハッシュのいずれかを指定
 ```
 
 ## 3. ディレクトリ規約

@@ -53,13 +53,7 @@ enum Commands {
         /// FileTypes for lazy loading (as JSON array string)
         #[arg(long)]
         on_ft: Option<String>,
-        /// Branch to checkout
-        #[arg(long)]
-        branch: Option<String>,
-        /// Tag to checkout
-        #[arg(long)]
-        tag: Option<String>,
-        /// Revision to checkout
+        /// Revision to checkout (branch, tag, or commit hash)
         #[arg(long)]
         rev: Option<String>,
     },
@@ -69,6 +63,8 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
     },
+    /// Show the git status of all managed plugins
+    Status,
 }
 
 #[tokio::main]
@@ -79,10 +75,69 @@ async fn main() -> Result<()> {
         Commands::Sync => run_sync().await?,
         Commands::Add { repo, name } => run_add(repo, name).await?,
         Commands::Edit { query } => run_edit(query).await?,
-        Commands::Set { query, lazy, merge, on_cmd, on_ft, branch, tag, rev } => {
-            run_set(query, lazy, merge, on_cmd, on_ft, branch, tag, rev).await?
+        Commands::Set { query, lazy, merge, on_cmd, on_ft, rev } => {
+            run_set(query, lazy, merge, on_cmd, on_ft, rev).await?
         },
         Commands::Clean { force } => run_clean(force).await?,
+        Commands::Status => run_status().await?,
+    }
+
+    Ok(())
+}
+
+async fn run_status() -> Result<()> {
+    let home = dirs::home_dir().expect("Could not find home directory");
+    let config_path = home.join(".config/rvpm/config.toml");
+    let toml_content = std::fs::read_to_string(&config_path)?;
+    let config = parse_config(&toml_content)?;
+
+    let base_dir = home.join(".cache/rvpm");
+    let mut set = JoinSet::new();
+
+    println!("Checking plugin status...");
+
+    for plugin in config.plugins.into_iter() {
+        let base_dir = base_dir.clone();
+        
+        set.spawn(async move {
+            let dst_path = if let Some(d) = &plugin.dst {
+                PathBuf::from(d)
+            } else {
+                base_dir.join("repos").join(plugin.canonical_path())
+            };
+
+            let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
+            let status = repo.get_status().await;
+            (plugin.url.clone(), status)
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(res) = set.join_next().await {
+        results.push(res?);
+    }
+
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (url, status) in results {
+        match status {
+            crate::git::RepoStatus::Clean => {
+                // Clean は通常表示
+                println!("  [Clean]     {}", url);
+            }
+            crate::git::RepoStatus::NotInstalled => {
+                println!("  [Missing]   {}", url);
+            }
+            crate::git::RepoStatus::Modified => {
+                println!("  [Modified]  {}", url);
+            }
+            crate::git::RepoStatus::Outdated(msg) => {
+                println!("  [Outdated]  {} ({})", url, msg);
+            }
+            crate::git::RepoStatus::Error(e) => {
+                println!("  [Error]     {} ({})", url, e);
+            }
+        }
     }
 
     Ok(())
@@ -153,9 +208,14 @@ async fn run_sync() -> Result<()> {
     let mut set = JoinSet::new();
 
     for plugin in config.plugins.iter() {
-        let plugin = plugin.clone();
+        let mut plugin = plugin.clone();
         let base_dir = base_dir.clone();
         
+        // cond がある場合は強制的に merge = false にする
+        if plugin.cond.is_some() {
+            plugin.merge = false;
+        }
+
         set.spawn(async move {
             let dst_path = if let Some(d) = &plugin.dst {
                 PathBuf::from(d)
@@ -163,7 +223,7 @@ async fn run_sync() -> Result<()> {
                 base_dir.join("repos").join(plugin.canonical_path())
             };
 
-            let repo = Repo::new(&plugin.url, &dst_path);
+            let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
             repo.sync().await.map(|_| (plugin, dst_path))
         });
     }
@@ -196,7 +256,7 @@ async fn run_sync() -> Result<()> {
                         on_event: plugin.on_event.clone(),
                         on_path: None,
                         on_source: None,
-                        cond: None,
+                        cond: plugin.cond.clone(),
                     };
                     plugin_scripts.push(scripts);
                 }
@@ -324,8 +384,6 @@ async fn run_set(
     merge: Option<bool>, 
     on_cmd: Option<String>,
     on_ft: Option<String>,
-    branch: Option<String>,
-    tag: Option<String>,
     rev: Option<String>,
 ) -> Result<()> {
     let home = dirs::home_dir().expect("Could not find home directory");
@@ -351,7 +409,7 @@ async fn run_set(
     let plugin_table = plugins.iter_mut().find(|p| p.get("url").and_then(|v| v.as_str()) == Some(&selected_repo_url))
         .context("Could not find plugin in toml_edit document")?;
 
-    if lazy.is_some() || merge.is_some() || on_cmd.is_some() || on_ft.is_some() || branch.is_some() || tag.is_some() || rev.is_some() {
+    if lazy.is_some() || merge.is_some() || on_cmd.is_some() || on_ft.is_some() || rev.is_some() {
         let parse_list = |s: Option<String>| -> Option<Vec<String>> {
             s.map(|v| {
                 if v.trim().starts_with('[') {
@@ -369,10 +427,11 @@ async fn run_set(
             merge,
             parse_list(on_cmd),
             parse_list(on_ft),
+            rev,
         )?;
     } else {
         // インタラクティブ設定モード
-        let options = vec!["lazy", "merge", "on_cmd", "on_ft"];
+        let options = vec!["lazy", "merge", "on_cmd", "on_ft", "rev"];
         let selection = Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
             .with_prompt("Select option to set")
             .items(&options)
@@ -392,6 +451,7 @@ async fn run_set(
                         if options[index] == "merge" { Some(val == 0) } else { None },
                         None,
                         None,
+                        None,
                     )?;
                 }
                 "on_cmd" | "on_ft" => {
@@ -406,6 +466,21 @@ async fn run_set(
                         None,
                         if options[index] == "on_cmd" { Some(cmds.clone()) } else { None },
                         if options[index] == "on_ft" { Some(cmds) } else { None },
+                        None,
+                    )?;
+                }
+                "rev" => {
+                    let val: String = dialoguer::Input::new()
+                        .with_prompt(format!("Enter {}", options[index]))
+                        .interact_text()?;
+                    update_plugin_config(
+                        &mut doc,
+                        &selected_repo_url,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(val),
                     )?;
                 }
                 _ => {}
@@ -465,6 +540,7 @@ fn update_plugin_config(
     merge: Option<bool>,
     on_cmd: Option<Vec<String>>,
     on_ft: Option<Vec<String>>,
+    rev: Option<String>,
 ) -> Result<()> {
     let plugins = doc["plugins"].as_array_of_tables_mut().context("plugins is not an array of tables")?;
 
@@ -486,6 +562,10 @@ fn update_plugin_config(
         plugin_table["on_ft"] = value(array);
     }
 
+    if let Some(r) = rev {
+        plugin_table["rev"] = value(r);
+    }
+
     Ok(())
 }
 
@@ -505,11 +585,12 @@ lazy = false
 "#;
         let mut doc = toml.parse::<DocumentMut>().unwrap();
         
-        update_plugin_config(&mut doc, "test/plugin", Some(true), Some(true), None, None).unwrap();
+        update_plugin_config(&mut doc, "test/plugin", Some(true), Some(true), None, None, Some("v1.0".to_string())).unwrap();
         
         let result = doc.to_string();
         assert!(result.contains("lazy = true"));
         assert!(result.contains("merge = true"));
+        assert!(result.contains("rev = \"v1.0\""));
     }
 
     #[test]
