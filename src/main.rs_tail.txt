@@ -1,0 +1,81 @@
+fn format_plugin_list(config: &config::Config) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("{:<40} | {:<10} | {:<10}\n", "URL", "Status", "Merge"));
+    out.push_str(&format!("{:-<40}-+-{:-<10}-+-{:-<10}\n", "", "", ""));
+
+    for plugin in &config.plugins {
+        let status = if plugin.lazy { "Lazy" } else { "Eager" };
+        let merge = if plugin.merge { "Yes" } else { "No" };
+        out.push_str(&format!("{:<40} | {:<10} | {:<10}\n", plugin.url, status, merge));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, Plugin, Options};
+    use tempfile::tempdir;
+    use toml_edit::DocumentMut;
+
+    #[test]
+    fn test_format_plugin_list() {
+        let config = Config {
+            vars: None,
+            options: Options::default(),
+            plugins: vec![
+                Plugin {
+                    url: "owner/repo1".to_string(),
+                    lazy: true,
+                    merge: false,
+                    ..Default::default()
+                },
+                Plugin {
+                    url: "owner/repo2".to_string(),
+                    lazy: false,
+                    merge: true,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let output = format_plugin_list(&config);
+        assert!(output.contains("owner/repo1"));
+        assert!(output.contains("Lazy"));
+        assert!(output.contains("Eager"));
+    }
+
+    #[test]
+    fn test_update_plugin_config() {
+        let toml = r#"
+[[plugins]]
+url = "test/plugin"
+lazy = false
+"#;
+        let mut doc = toml.parse::<DocumentMut>().unwrap();
+        update_plugin_config(&mut doc, "test/plugin", Some(true), Some(true), None, None, Some("v1.0".to_string())).unwrap();
+        let result = doc.to_string();
+        assert!(result.contains("lazy = true"));
+        assert!(result.contains("merge = true"));
+        assert!(result.contains("rev = \"v1.0\""));
+    }
+
+    #[test]
+    fn test_find_unused_repos() {
+        let root = tempdir().unwrap();
+        let repos_dir = root.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let used_dir = repos_dir.join("github.com/used/plugin");
+        let unused_dir = repos_dir.join("github.com/unused/plugin");
+        std::fs::create_dir_all(used_dir.join(".git")).unwrap();
+        std::fs::create_dir_all(unused_dir.join(".git")).unwrap();
+        let config = Config {
+            vars: None,
+            options: Options::default(),
+            plugins: vec![Plugin { url: "used/plugin".to_string(), ..Default::default() }],
+        };
+        let unused = find_unused_repos(&config, &repos_dir).unwrap();
+        assert_eq!(unused.len(), 1);
+        assert!(unused[0].to_string_lossy().contains("unused"));
+    }
+}
