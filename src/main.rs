@@ -51,7 +51,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Clone/pull plugins and regenerate loader.lua
-    Sync,
+    ///
+    /// With --prune, also delete any plugin directories under the repos
+    /// cache that are no longer referenced by config.toml.
+    Sync {
+        /// Delete unused plugin directories after syncing
+        #[arg(long)]
+        prune: bool,
+    },
 
     /// Regenerate loader.lua only (no git)
     ///
@@ -138,21 +145,17 @@ enum Commands {
         query: Option<String>,
     },
 
-    /// Delete unused plugin directories
-    Clean {
-        /// Skip the interactive confirmation
-        #[arg(short, long)]
-        force: bool,
-    },
-
-    /// Show git status for every plugin
-    Status,
-
-    /// Plugin list TUI with interactive actions
+    /// Show plugin list (TUI by default, plain text with --no-tui)
     ///
-    /// Keys: [q] quit  [j/k] move  [e] edit  [s] set  [S] sync all
-    /// [u] update selected  [U] update all  [g] regenerate  [d] remove
-    List,
+    /// TUI keys: [q] quit  [j/k] move  [e] edit  [s] set  [S] sync all
+    /// [u] update selected  [U] update all  [g] regenerate  [d] remove{n}
+    /// With --no-tui: prints a sorted plain-text status line per plugin
+    /// (pipe-friendly for scripting).
+    List {
+        /// Print plain text instead of launching the TUI
+        #[arg(long)]
+        no_tui: bool,
+    },
 
     /// Open config.toml in $EDITOR
     ///
@@ -180,19 +183,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Sync => { run_sync().await?; },
+        Commands::Sync { prune } => { run_sync(prune).await?; },
         Commands::Generate => { run_generate().await?; },
         Commands::Add { repo, name } => { run_add(repo, name).await?; },
-        Commands::Edit { query } => { if run_edit(query).await? { let _ = run_sync().await; } },
+        Commands::Edit { query } => { if run_edit(query).await? { let _ = run_sync(false).await; } },
         Commands::Set { query, lazy, merge, on_cmd, on_ft, on_map, on_event, on_path, on_source, rev } => {
-            if run_set(query, lazy, merge, on_cmd, on_ft, on_map, on_event, on_path, on_source, rev).await? { let _ = run_sync().await; }
+            if run_set(query, lazy, merge, on_cmd, on_ft, on_map, on_event, on_path, on_source, rev).await? { let _ = run_sync(false).await; }
         },
         Commands::Update { query } => { run_update(query).await?; },
         Commands::Remove { query } => { run_remove(query).await?; },
-        Commands::Clean { force } => { run_clean(force).await?; },
-        Commands::Status => { run_status().await?; },
-        Commands::List => { run_list().await?; },
-        Commands::Config => { if run_config().await? { let _ = run_sync().await; } },
+        Commands::List { no_tui } => { run_list(no_tui).await?; },
+        Commands::Config => { if run_config().await? { let _ = run_sync(false).await; } },
         Commands::Init { write } => { run_init(write).await?; },
     }
 
@@ -207,7 +208,7 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use crate::tui::{TuiState, PluginStatus};
 
-async fn run_sync() -> Result<()> {
+async fn run_sync(prune: bool) -> Result<()> {
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
@@ -288,6 +289,32 @@ async fn run_sync() -> Result<()> {
     let loader_path = resolve_loader_path(config.options.loader_path.as_deref(), &base_dir);
     write_loader_to_path(&merged_dir, &plugin_scripts, &loader_path)?;
     println!("Done! -> {}", loader_path.display());
+
+    // 未使用 plugin ディレクトリの処理: --prune なら削除、それ以外なら警告表示
+    let repos_dir = base_dir.join("repos");
+    if repos_dir.exists() {
+        let unused = find_unused_repos(&config, &repos_dir).unwrap_or_default();
+        if !unused.is_empty() {
+            if prune {
+                println!();
+                println!("Pruning {} unused plugin {}:", unused.len(), if unused.len() == 1 { "directory" } else { "directories" });
+                for path in &unused {
+                    println!("  - {}", path.display());
+                    if let Err(e) = std::fs::remove_dir_all(path) {
+                        eprintln!("    \u{26a0} failed: {}", e);
+                    }
+                }
+            } else {
+                println!();
+                println!("\u{26a0} Found {} unused plugin {}:", unused.len(), if unused.len() == 1 { "directory" } else { "directories" });
+                for path in &unused {
+                    println!("    {}", path.display());
+                }
+                println!("  Run `rvpm sync --prune` to delete them.");
+            }
+        }
+    }
+
     print_init_lua_hint_if_missing(&config);
     Ok(())
 }
@@ -357,11 +384,32 @@ async fn fetch_plugin_statuses(config: &config::Config, base_dir: &Path) -> std:
     result
 }
 
-async fn run_list() -> Result<()> {
+async fn run_list(no_tui: bool) -> Result<()> {
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)?;
     let mut config = parse_config(&toml_content)?;
     let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
+
+    if no_tui {
+        // 非対話モード: plain text 出力 (旧 status コマンド相当)
+        println!("Checking plugin status...");
+        let statuses = fetch_plugin_statuses(&config, &base_dir).await;
+        let mut rows: Vec<(String, PluginStatus)> = statuses.into_iter().collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        for (url, status) in rows {
+            match status {
+                PluginStatus::Finished => println!("  [Clean]     {}", url),
+                PluginStatus::Failed(msg) if msg == "Missing" => println!("  [Missing]   {}", url),
+                PluginStatus::Syncing(msg) if msg.contains("Modified") => {
+                    println!("  [Modified]  {}", url)
+                }
+                PluginStatus::Syncing(msg) => println!("  [Outdated]  {} ({})", url, msg),
+                PluginStatus::Failed(msg) => println!("  [Error]     {} ({})", url, msg),
+                PluginStatus::Waiting => println!("  [Waiting]   {}", url),
+            }
+        }
+        return Ok(());
+    }
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -451,7 +499,7 @@ async fn run_list() -> Result<()> {
                             disable_raw_mode()?;
                             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                             terminal.show_cursor()?;
-                            if run_edit(Some(url)).await? { let _ = run_sync().await; }
+                            if run_edit(Some(url)).await? { let _ = run_sync(false).await; }
                             let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
                             config = c; tui_state = s;
                         }
@@ -461,7 +509,7 @@ async fn run_list() -> Result<()> {
                             disable_raw_mode()?;
                             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                             terminal.show_cursor()?;
-                            if run_set(Some(url), None, None, None, None, None, None, None, None, None).await? { let _ = run_sync().await; }
+                            if run_set(Some(url), None, None, None, None, None, None, None, None, None).await? { let _ = run_sync(false).await; }
                             let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
                             config = c; tui_state = s;
                         }
@@ -470,7 +518,7 @@ async fn run_list() -> Result<()> {
                         disable_raw_mode()?;
                         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                         terminal.show_cursor()?;
-                        let _ = run_sync().await;
+                        let _ = run_sync(false).await;
                         let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
                         config = c; tui_state = s;
                     }
@@ -520,37 +568,6 @@ async fn run_list() -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-    Ok(())
-}
-
-async fn run_status() -> Result<()> {
-    let config_path = rvpm_config_path();
-    let toml_content = std::fs::read_to_string(&config_path)?;
-    let config = parse_config(&toml_content)?;
-    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
-    let mut set = JoinSet::new();
-    println!("Checking plugin status...");
-    for plugin in config.plugins.into_iter() {
-        let base_dir = base_dir.clone();
-        set.spawn(async move {
-            let dst_path = if let Some(d) = &plugin.dst { PathBuf::from(d) } else { base_dir.join("repos").join(plugin.canonical_path()) };
-            let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
-            let status = repo.get_status().await;
-            (plugin.url.clone(), status)
-        });
-    }
-    let mut results = Vec::new();
-    while let Some(res) = set.join_next().await { results.push(res?); }
-    results.sort_by(|a, b| a.0.cmp(&b.0));
-    for (url, status) in results {
-        match status {
-            crate::git::RepoStatus::Clean => println!("  [Clean]     {}", url),
-            crate::git::RepoStatus::NotInstalled => println!("  [Missing]   {}", url),
-            crate::git::RepoStatus::Modified => println!("  [Modified]  {}", url),
-            crate::git::RepoStatus::Outdated(msg) => println!("  [Outdated]  {} ({})", url, msg),
-            crate::git::RepoStatus::Error(e) => println!("  [Error]     {} ({})", url, e),
-        }
-    }
     Ok(())
 }
 
@@ -653,7 +670,7 @@ async fn run_add(repo: String, name: Option<String>) -> Result<()> {
     if let Item::Table(t) = new_plugin { plugins.push(t); }
     std::fs::write(&config_path, doc.to_string())?;
     println!("Added plugin to config: {}", repo);
-    let _ = run_sync().await;
+    let _ = run_sync(false).await;
     Ok(())
 }
 
@@ -958,21 +975,6 @@ async fn run_set(
         return Ok(true);
     }
     Ok(false)
-}
-
-async fn run_clean(force: bool) -> Result<()> {
-    let config_path = rvpm_config_path();
-    let toml_content = std::fs::read_to_string(&config_path)?;
-    let config = parse_config(&toml_content)?;
-    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
-    let repos_dir = base_dir.join("repos");
-    let unused = find_unused_repos(&config, &repos_dir)?;
-    if unused.is_empty() { println!("No unused plugins found."); return Ok(()); }
-    println!("Found unused plugin directories:");
-    for path in &unused { println!("  {}", path.display()); }
-    let confirm = if force { true } else { dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default()).with_prompt("Do you want to delete these directories?").default(false).interact()? };
-    if confirm { for path in unused { println!("Deleting {}...", path.display()); let _ = std::fs::remove_dir_all(path); } println!("Cleanup complete."); }
-    Ok(())
 }
 
 

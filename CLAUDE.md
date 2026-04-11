@@ -233,18 +233,20 @@ let _permit = sem.acquire_owned().await.unwrap();
 
 | コマンド | 関数 | 説明 |
 |---------|------|------|
-| `sync` | `run_sync()` | clone/pull + merged + loader.lua 生成 |
+| `sync [--prune]` | `run_sync()` | clone/pull + merged + loader.lua 生成。`--prune` で未使用プラグインディレクトリも削除。無指定でも未使用があれば末尾で警告表示 |
 | `generate` | `run_generate()` | loader.lua のみ再生成 |
 | `add <repo>` | `run_add()` | TOML 追加 + sync |
 | `update [query]` | `run_update()` | 既存プラグインの pull (clone しない) |
 | `remove [query]` | `run_remove()` | TOML + ディレクトリ削除 + generate |
 | `edit [query]` | `run_edit()` | per-plugin init/before/after.lua をエディタで編集 |
-| `set [query]` | `run_set()` | lazy/merge/on_* などを対話式に変更。`[ Open config.toml in $EDITOR ]` sentinel で TOML 直接編集に逃げられる。`on_map` 選択時は CLI / EDITOR の sub-menu |
+| `set [query] [flags]` | `run_set()` | lazy/merge/on_* などを対話式 or 引数で変更。`on_cmd` 等は comma-separated / JSON array 両対応、`--on-map` は JSON object/array で table 形式もサポート。`[ Open config.toml in $EDITOR ]` sentinel で TOML 直接編集に逃げられる |
 | `config` | `run_config()` | `config.toml` を `$EDITOR` で直接開く (終了後に sync 実行) |
 | `init [--write]` | `run_init()` | Neovim `init.lua` に loader.lua を繋ぐ `dofile(...)` スニペットを案内。`--write` で自動追記 (init.lua がなければ新規作成)。`$NVIM_APPNAME` を尊重 |
-| `clean` | `run_clean()` | 未使用リポジトリディレクトリを削除 |
-| `status` | `run_status()` | 各プラグインの git 状態を表示 |
-| `list` | `run_list()` | TUI でプラグイン一覧表示。`[S] sync / [u/U] update / [g] generate / [d] remove / [e] edit / [s] set` のアクションキー対応 |
+| `list [--no-tui]` | `run_list()` | プラグイン一覧表示。デフォルトは TUI で `[S] sync / [u/U] update / [g] generate / [d] remove / [e] edit / [s] set` のアクションキー対応。`--no-tui` で pipe-friendly な plain text 出力 (旧 `status` 相当) |
+
+**廃止コマンド:**
+- `status` → `list --no-tui` に統合 (plain text 出力で機能同等)
+- `clean` → `sync --prune` に統合。未使用 dir がある状態で `sync` を走らせると末尾に警告が出るので発見しやすい
 
 ### ディレクトリレイアウト (デフォルト)
 
