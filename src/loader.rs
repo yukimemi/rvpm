@@ -1,6 +1,4 @@
 use std::path::Path;
-use anyhow::Result;
-use crate::config::Plugin;
 
 #[derive(Clone)]
 pub struct PluginScripts {
@@ -34,6 +32,7 @@ local function load_lazy(name, path, before, after)
     vim.cmd("source " .. file)
   end
   if after then dofile(after) end
+  vim.api.nvim_exec_autocmds("User", { pattern = "rvpm_loaded_" .. name })
 end
 "#);
     lua.push_str("\n");
@@ -142,6 +141,31 @@ end
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_load_lazy_fires_user_event() {
+        let merged_dir = Path::new("/merged");
+        let scripts = vec![PluginScripts {
+            name: "plenary".to_string(),
+            path: "/path/plenary".to_string(),
+            init: None,
+            before: None,
+            after: None,
+            lazy: true,
+            on_cmd: Some(vec!["Plenary".to_string()]),
+            on_ft: None,
+            on_map: None,
+            on_event: None,
+            on_path: None,
+            on_source: None,
+            cond: None,
+        }];
+        let lua = generate_loader(merged_dir, &scripts);
+        assert!(
+            lua.contains("vim.api.nvim_exec_autocmds(\"User\", { pattern = \"rvpm_loaded_\" .. name })"),
+            "load_lazy must fire User autocmd after loading"
+        );
+    }
 
     #[test]
     fn test_generate_loader_with_cond() {

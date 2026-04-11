@@ -24,6 +24,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Sync,
+    Generate,
     Add {
         repo: String,
         #[arg(long)]
@@ -45,6 +46,12 @@ enum Commands {
         #[arg(long)]
         rev: Option<String>,
     },
+    Update {
+        query: Option<String>,
+    },
+    Remove {
+        query: Option<String>,
+    },
     Clean {
         #[arg(short, long)]
         force: bool,
@@ -59,11 +66,14 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Sync => { run_sync().await?; },
+        Commands::Generate => { run_generate().await?; },
         Commands::Add { repo, name } => { run_add(repo, name).await?; },
         Commands::Edit { query } => { if run_edit(query).await? { let _ = run_sync().await; } },
         Commands::Set { query, lazy, merge, on_cmd, on_ft, rev } => {
             if run_set(query, lazy, merge, on_cmd, on_ft, rev).await? { let _ = run_sync().await; }
         },
+        Commands::Update { query } => { run_update(query).await?; },
+        Commands::Remove { query } => { run_remove(query).await?; },
         Commands::Clean { force } => { run_clean(force).await?; },
         Commands::Status => { run_status().await?; },
         Commands::List => { run_list().await?; },
@@ -108,15 +118,19 @@ async fn run_sync() -> Result<()> {
     let mut tui_state = TuiState::new(urls);
     let (tx, mut rx) = mpsc::channel::<(String, PluginStatus)>(100);
 
+    let concurrency = resolve_concurrency(config.options.concurrency);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut set = JoinSet::new();
 
     for plugin in config.plugins.iter() {
         let mut plugin = plugin.clone();
         let base_dir = base_dir.clone();
         let tx = tx.clone();
+        let sem = semaphore.clone();
         if plugin.cond.is_some() { plugin.merge = false; }
 
         set.spawn(async move {
+            let _permit = sem.acquire_owned().await.unwrap();
             let dst_path = if let Some(d) = &plugin.dst { PathBuf::from(d) } else { base_dir.join("repos").join(plugin.canonical_path()) };
             let _ = tx.send((plugin.url.clone(), PluginStatus::Syncing("Syncing...".to_string()))).await;
             let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
@@ -170,10 +184,52 @@ async fn run_sync() -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     println!("Generating loader.lua...");
-    let lua = generate_loader(&merged_dir, &plugin_scripts);
-    let loader_path = base_dir.join("loader.lua");
-    std::fs::write(loader_path, lua)?;
-    println!("Done!");
+    let loader_path = resolve_loader_path(config.options.loader_path.as_deref(), &base_dir);
+    write_loader_to_path(&merged_dir, &plugin_scripts, &loader_path)?;
+    println!("Done! -> {}", loader_path.display());
+    Ok(())
+}
+
+async fn run_generate() -> Result<()> {
+    let home = dirs::home_dir().expect("Could not find home directory");
+    let config_path = home.join(".config/rvpm/config.toml");
+    let toml_content = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+    let config = parse_config(&toml_content)?;
+    let base_dir = home.join(".cache/rvpm");
+    let merged_dir = base_dir.join("merged");
+    let loader_path = resolve_loader_path(config.options.loader_path.as_deref(), &base_dir);
+
+    let mut plugin_scripts = Vec::new();
+    if let Some(config_root) = &config.options.config_root {
+        for plugin in &config.plugins {
+            let dst_path = if let Some(d) = &plugin.dst {
+                PathBuf::from(d)
+            } else {
+                base_dir.join("repos").join(plugin.canonical_path())
+            };
+            let plugin_config_dir = Path::new(config_root).join(plugin.canonical_path());
+            plugin_scripts.push(PluginScripts {
+                name: plugin.name.clone().unwrap_or_else(|| plugin.url.clone()),
+                path: dst_path.to_string_lossy().to_string(),
+                init: find_lua(&plugin_config_dir, "init.lua"),
+                before: find_lua(&plugin_config_dir, "before.lua"),
+                after: find_lua(&plugin_config_dir, "after.lua"),
+                lazy: plugin.lazy,
+                on_cmd: plugin.on_cmd.clone(),
+                on_ft: plugin.on_ft.clone(),
+                on_map: plugin.on_map.clone(),
+                on_event: plugin.on_event.clone(),
+                on_path: plugin.on_path.clone(),
+                on_source: plugin.on_source.clone(),
+                cond: plugin.cond.clone(),
+            });
+        }
+    }
+
+    println!("Generating loader.lua...");
+    write_loader_to_path(&merged_dir, &plugin_scripts, &loader_path)?;
+    println!("Done! -> {}", loader_path.display());
     Ok(())
 }
 
@@ -281,6 +337,91 @@ async fn run_status() -> Result<()> {
             crate::git::RepoStatus::Error(e) => println!("  [Error]     {} ({})", url, e),
         }
     }
+    Ok(())
+}
+
+async fn run_update(query: Option<String>) -> Result<()> {
+    let home = dirs::home_dir().expect("Could not find home directory");
+    let config_path = home.join(".config/rvpm/config.toml");
+    let toml_content = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+    let config_data = parse_config(&toml_content)?;
+    let config = Arc::new(config_data);
+    let base_dir = home.join(".cache/rvpm");
+
+    let target_plugins: Vec<_> = config.plugins.iter()
+        .filter(|p| {
+            if let Some(q) = &query {
+                p.url.contains(q.as_str())
+                    || p.name.as_deref().map(|n| n.contains(q.as_str())).unwrap_or(false)
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
+
+    if target_plugins.is_empty() {
+        println!("No plugins matched the query.");
+        return Ok(());
+    }
+
+    let concurrency = resolve_concurrency(config.options.concurrency);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+
+    let urls: Vec<String> = target_plugins.iter().map(|p| p.url.clone()).collect();
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = ratatui::Terminal::new(backend)?;
+    let mut tui_state = TuiState::new(urls);
+    let (tx, mut rx) = mpsc::channel::<(String, PluginStatus)>(100);
+
+    let mut set = JoinSet::new();
+
+    for plugin in target_plugins.iter() {
+        let plugin = plugin.clone();
+        let base_dir = base_dir.clone();
+        let tx = tx.clone();
+        let sem = semaphore.clone();
+
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.unwrap();
+            let dst_path = if let Some(d) = &plugin.dst {
+                PathBuf::from(d)
+            } else {
+                base_dir.join("repos").join(plugin.canonical_path())
+            };
+            let _ = tx.send((plugin.url.clone(), PluginStatus::Syncing("Updating...".to_string()))).await;
+            let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
+            let res = repo.update().await;
+            match res {
+                Ok(_) => { let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await; Ok(()) }
+                Err(e) => { let _ = tx.send((plugin.url.clone(), PluginStatus::Failed(e.to_string()))).await; Err(e) }
+            }
+        });
+    }
+
+    let total_tasks = target_plugins.len();
+    let mut finished_tasks = 0;
+
+    while finished_tasks < total_tasks {
+        terminal.draw(|f| tui_state.draw(f))?;
+        tokio::select! {
+            Some((url, status)) = rx.recv() => { tui_state.update_status(&url, status); }
+            Some(_) = set.join_next() => { finished_tasks += 1; }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+    }
+    terminal.draw(|f| tui_state.draw(f))?;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    println!("Update complete. Regenerating loader.lua...");
+    run_generate().await?;
     Ok(())
 }
 
@@ -459,6 +600,72 @@ fn find_unused_repos(config: &config::Config, repos_dir: &Path) -> Result<Vec<Pa
     Ok(unused)
 }
 
+fn remove_plugin_from_toml(doc: &mut DocumentMut, url: &str) -> Result<()> {
+    let plugins = doc["plugins"].as_array_of_tables_mut()
+        .context("plugins is not an array of tables")?;
+    let idx = plugins.iter().position(|p| {
+        p.get("url").and_then(|v| v.as_str()) == Some(url)
+    }).context("Plugin not found in config")?;
+    plugins.remove(idx);
+    Ok(())
+}
+
+async fn run_remove(query: Option<String>) -> Result<()> {
+    let home = dirs::home_dir().expect("Could not find home directory");
+    let config_path = home.join(".config/rvpm/config.toml");
+    let toml_content = std::fs::read_to_string(&config_path)?;
+    let config = parse_config(&toml_content)?;
+
+    let selected_url = if let Some(q) = query.as_ref() {
+        config.plugins.iter()
+            .find(|p| p.url == *q || p.url.contains(q.as_str()))
+            .map(|p| p.url.clone())
+            .context("Plugin not found")?
+    } else {
+        let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
+        let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt("Select plugin to remove")
+            .items(&urls)
+            .interact_opt()?;
+        match selection {
+            Some(idx) => urls[idx].clone(),
+            None => return Ok(()),
+        }
+    };
+
+    let confirm = dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt(format!("Remove plugin '{}'?", selected_url))
+        .default(false)
+        .interact()?;
+
+    if !confirm {
+        println!("Cancelled.");
+        return Ok(());
+    }
+
+    let mut doc = toml_content.parse::<DocumentMut>()?;
+    remove_plugin_from_toml(&mut doc, &selected_url)?;
+    std::fs::write(&config_path, doc.to_string())?;
+    println!("Removed '{}' from config.", selected_url);
+
+    let base_dir = home.join(".cache/rvpm");
+    let plugin = config.plugins.iter().find(|p| p.url == selected_url).unwrap();
+    let dst_path = if let Some(d) = &plugin.dst {
+        PathBuf::from(d)
+    } else {
+        base_dir.join("repos").join(plugin.canonical_path())
+    };
+
+    if dst_path.exists() {
+        std::fs::remove_dir_all(&dst_path)?;
+        println!("Deleted directory: {}", dst_path.display());
+    }
+
+    println!("Regenerating loader.lua...");
+    run_generate().await?;
+    Ok(())
+}
+
 fn update_plugin_config(doc: &mut DocumentMut, url: &str, lazy: Option<bool>, merge: Option<bool>, on_cmd: Option<Vec<String>>, on_ft: Option<Vec<String>>, rev: Option<String>) -> Result<()> {
     let plugins = doc["plugins"].as_array_of_tables_mut().context("plugins is not an array of tables")?;
     let plugin_table = plugins.iter_mut().find(|p| p.get("url").and_then(|v| v.as_str()) == Some(url)).context("Could not find plugin in toml_edit document")?;
@@ -468,6 +675,32 @@ fn update_plugin_config(doc: &mut DocumentMut, url: &str, lazy: Option<bool>, me
     if let Some(fts) = on_ft { let mut array = toml_edit::Array::new(); for ft in fts { array.push(ft); } plugin_table["on_ft"] = value(array); }
     if let Some(r) = rev { plugin_table["rev"] = value(r); }
     Ok(())
+}
+
+fn resolve_loader_path(config_loader_path: Option<&str>, base_dir: &Path) -> PathBuf {
+    if let Some(raw) = config_loader_path {
+        if raw.starts_with('~') {
+            let home = dirs::home_dir().expect("Could not find home directory");
+            home.join(&raw[2..])
+        } else {
+            PathBuf::from(raw)
+        }
+    } else {
+        base_dir.join("loader.lua")
+    }
+}
+
+fn write_loader_to_path(merged_dir: &Path, scripts: &[crate::loader::PluginScripts], loader_path: &Path) -> Result<()> {
+    if let Some(parent) = loader_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lua = generate_loader(merged_dir, scripts);
+    std::fs::write(loader_path, lua)?;
+    Ok(())
+}
+
+fn resolve_concurrency(config_value: Option<usize>) -> usize {
+    config_value.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS)
 }
 
 fn find_lua(dir: &Path, name: &str) -> Option<String> {
@@ -492,8 +725,105 @@ fn format_plugin_list(config: &config::Config) -> String {
 mod tests {
     use super::*;
     use crate::config::{Config, Plugin, Options};
+    use crate::loader::PluginScripts;
     use tempfile::tempdir;
     use toml_edit::DocumentMut;
+
+    #[test]
+    fn test_update_filters_by_query() {
+        let plugins = vec![
+            Plugin { url: "owner/telescope.nvim".to_string(), ..Default::default() },
+            Plugin { url: "owner/plenary.nvim".to_string(), ..Default::default() },
+            Plugin { url: "owner/nvim-cmp".to_string(), ..Default::default() },
+        ];
+        let query = Some("telescope".to_string());
+        let filtered: Vec<_> = plugins.iter()
+            .filter(|p| {
+                if let Some(q) = &query { p.url.contains(q.as_str()) } else { true }
+            })
+            .collect();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].url, "owner/telescope.nvim");
+    }
+
+    #[test]
+    fn test_update_no_query_matches_all() {
+        let plugins = vec![
+            Plugin { url: "owner/telescope.nvim".to_string(), ..Default::default() },
+            Plugin { url: "owner/plenary.nvim".to_string(), ..Default::default() },
+        ];
+        let query: Option<String> = None;
+        let filtered: Vec<_> = plugins.iter()
+            .filter(|p| {
+                if let Some(q) = &query { p.url.contains(q.as_str()) } else { true }
+            })
+            .collect();
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_loader_path_uses_default_when_none() {
+        let base = PathBuf::from("/cache/rvpm");
+        let result = resolve_loader_path(None, &base);
+        assert_eq!(result, PathBuf::from("/cache/rvpm/loader.lua"));
+    }
+
+    #[test]
+    fn test_resolve_loader_path_expands_tilde() {
+        let base = PathBuf::from("/cache/rvpm");
+        let result = resolve_loader_path(Some("~/.cache/nvim/loader.lua"), &base);
+        assert!(result.to_str().unwrap().ends_with(".cache/nvim/loader.lua"));
+        assert!(!result.to_str().unwrap().contains('~'));
+    }
+
+    #[test]
+    fn test_resolve_loader_path_uses_absolute_path() {
+        let base = PathBuf::from("/cache/rvpm");
+        let result = resolve_loader_path(Some("/custom/path/loader.lua"), &base);
+        assert_eq!(result, PathBuf::from("/custom/path/loader.lua"));
+    }
+
+    #[test]
+    fn test_write_loader_to_path_creates_file() {
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        std::fs::create_dir_all(&merged).unwrap();
+        let loader_path = root.path().join("custom").join("loader.lua");
+        let scripts: Vec<PluginScripts> = vec![];
+        write_loader_to_path(&merged, &scripts, &loader_path).unwrap();
+        assert!(loader_path.exists());
+        let content = std::fs::read_to_string(&loader_path).unwrap();
+        assert!(content.contains("-- rvpm generated loader.lua"));
+    }
+
+    #[test]
+    fn test_resolve_concurrency_defaults_to_max_permits() {
+        let result = resolve_concurrency(None);
+        assert_eq!(result, tokio::sync::Semaphore::MAX_PERMITS);
+    }
+
+    #[test]
+    fn test_resolve_concurrency_uses_config_value() {
+        let result = resolve_concurrency(Some(5));
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn test_remove_from_toml() {
+        let toml = "[[plugins]]\nurl = \"owner/a\"\n\n[[plugins]]\nurl = \"owner/b\"\n";
+        let mut doc = toml.parse::<DocumentMut>().unwrap();
+        remove_plugin_from_toml(&mut doc, "owner/a").unwrap();
+        let result = doc.to_string();
+        assert!(!result.contains("owner/a"));
+        assert!(result.contains("owner/b"));
+    }
+
+    #[test]
+    fn test_remove_from_toml_not_found_returns_error() {
+        let toml = "[[plugins]]\nurl = \"owner/a\"\n";
+        let mut doc = toml.parse::<DocumentMut>().unwrap();
+        assert!(remove_plugin_from_toml(&mut doc, "owner/nonexistent").is_err());
+    }
 
     #[test]
     fn test_format_plugin_list() {

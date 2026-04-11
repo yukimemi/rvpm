@@ -101,6 +101,36 @@ impl<'a> Repo<'a> {
         Ok(())
     }
 
+    pub async fn update(&self) -> Result<()> {
+        if !self.dst.exists() {
+            anyhow::bail!("Plugin not installed: {}", self.dst.display());
+        }
+        let args: Vec<&str> = if let Some(rev) = self.rev {
+            vec!["fetch", "--depth", "1", "origin", rev]
+        } else {
+            vec!["pull"]
+        };
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(self.dst)
+            .output()
+            .await?;
+        if !output.status.success() {
+            anyhow::bail!("git pull/fetch failed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        if let Some(rev) = self.rev {
+            let output = Command::new("git")
+                .args(["checkout", rev])
+                .current_dir(self.dst)
+                .output()
+                .await?;
+            if !output.status.success() {
+                anyhow::bail!("git checkout failed: {}", String::from_utf8_lossy(&output.stderr));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn get_status(&self) -> RepoStatus {
         if !self.dst.exists() {
             return RepoStatus::NotInstalled;
@@ -131,6 +161,45 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use std::fs;
+
+    #[tokio::test]
+    async fn test_git_update_method_pulls_latest() {
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        Command::new("git").args(["init"]).current_dir(&src).output().await.unwrap();
+        Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(&src).output().await.unwrap();
+        Command::new("git").args(["config", "user.name", "Test"]).current_dir(&src).output().await.unwrap();
+        fs::write(src.join("hello.txt"), "v1").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&src).output().await.unwrap();
+        Command::new("git").args(["commit", "-m", "v1"]).current_dir(&src).output().await.unwrap();
+
+        // 最初に clone
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        repo.sync().await.unwrap();
+
+        // src に更新を追加
+        fs::write(src.join("hello.txt"), "v2").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&src).output().await.unwrap();
+        Command::new("git").args(["commit", "-m", "v2"]).current_dir(&src).output().await.unwrap();
+
+        // update のみ実行
+        repo.update().await.unwrap();
+        let content = fs::read_to_string(dst.join("hello.txt")).unwrap();
+        assert_eq!(content, "v2");
+    }
+
+    #[tokio::test]
+    async fn test_git_update_method_fails_when_not_installed() {
+        let root = tempdir().unwrap();
+        let dst = root.path().join("nonexistent");
+        let repo = Repo::new("dummy/repo", &dst, None);
+        let result = repo.update().await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not installed"));
+    }
 
     #[tokio::test]
     async fn test_git_update() {
