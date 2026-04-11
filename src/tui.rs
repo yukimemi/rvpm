@@ -188,7 +188,7 @@ impl TuiState {
         ])
             .header(header)
             .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)))
-            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED).add_modifier(Modifier::BOLD))
             .highlight_symbol(">> ");
         f.render_stateful_widget(table, chunks[1], &mut self.table_state);
 
@@ -197,6 +197,10 @@ impl TuiState {
             Span::styled(" [j/k] Move ", Style::default().fg(Color::Black).bg(Color::DarkGray)),
             Span::styled(" [e] Edit ", Style::default().fg(Color::Black).bg(Color::Magenta)),
             Span::styled(" [s] Set ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+            Span::styled(" [S] Sync ", Style::default().fg(Color::Black).bg(Color::Green)),
+            Span::styled(" [u/U] Update ", Style::default().fg(Color::Black).bg(Color::Yellow)),
+            Span::styled(" [g] Generate ", Style::default().fg(Color::Black).bg(Color::Blue)),
+            Span::styled(" [d] Delete ", Style::default().fg(Color::Black).bg(Color::Red)),
         ])).block(Block::default().borders(Borders::ALL));
         f.render_widget(footer, chunks[2]);
     }

@@ -25,16 +25,42 @@ pub struct Plugin {
     pub lazy: bool,
     #[serde(default = "default_merge")]
     pub merge: bool,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub on_cmd: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub on_ft: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub on_map: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub on_event: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub on_path: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub on_source: Option<Vec<String>>,
     pub depends: Option<Vec<String>>,
     pub build: Option<String>,
     pub rev: Option<String>,
     pub cond: Option<String>,
+}
+
+/// TOML 上で `on_cmd = "Foo"` (単一文字列) または `on_cmd = ["Foo", "Bar"]` (配列)
+/// のどちらの形式でも受け付け、内部的には `Vec<String>` に正規化する。
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        String(String),
+        Vec(Vec<String>),
+    }
+
+    let opt = Option::<StringOrVec>::deserialize(deserializer)?;
+    Ok(opt.map(|v| match v {
+        StringOrVec::String(s) => vec![s],
+        StringOrVec::Vec(v) => v,
+    }))
 }
 
 fn default_merge() -> bool {
@@ -148,6 +174,45 @@ pub fn sort_plugins(plugins: &mut Vec<Plugin>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_config_accepts_on_cmd_as_string() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+on_cmd = "Telescope"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins[0].on_cmd, Some(vec!["Telescope".to_string()]));
+    }
+
+    #[test]
+    fn test_parse_config_accepts_on_cmd_as_array() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+on_cmd = ["Telescope", "Grep"]
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins[0].on_cmd, Some(vec!["Telescope".to_string(), "Grep".to_string()]));
+    }
+
+    #[test]
+    fn test_parse_config_accepts_on_event_as_string() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+on_event = "BufReadPre"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins[0].on_event, Some(vec!["BufReadPre".to_string()]));
+    }
 
     #[test]
     fn test_sort_plugins_dependencies() {
