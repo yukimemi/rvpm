@@ -94,7 +94,11 @@ impl<'a> Repo<'a> {
                 .output()
                 .await?;
             if !output.status.success() {
-                anyhow::bail!("git checkout failed: {}", String::from_utf8_lossy(&output.stderr));
+                // 新規クローン時に checkout が失敗した場合は不完全なディレクトリを削除する
+                if is_new_clone {
+                    let _ = std::fs::remove_dir_all(self.dst);
+                }
+                anyhow::bail!("git checkout failed for rev '{}': {}", rev, String::from_utf8_lossy(&output.stderr));
             }
         }
 
@@ -141,7 +145,7 @@ impl<'a> Repo<'a> {
             .current_dir(self.dst)
             .output()
             .await;
-            
+
         match status_output {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -150,6 +154,20 @@ impl<'a> Repo<'a> {
                 }
             }
             _ => return RepoStatus::Error("Failed to run git status".to_string()),
+        }
+
+        // rev が指定されている場合、そのref がローカルに存在するか確認する
+        // 存在しない場合は sync 失敗後にディレクトリだけ残った可能性がある
+        if let Some(rev) = self.rev {
+            let verify = Command::new("git")
+                .args(["rev-parse", "--verify", rev])
+                .current_dir(self.dst)
+                .output()
+                .await;
+            match verify {
+                Ok(output) if output.status.success() => {}
+                _ => return RepoStatus::Error(format!("rev '{}' not found in local repo", rev)),
+            }
         }
 
         RepoStatus::Clean
@@ -161,6 +179,50 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use std::fs;
+
+    #[tokio::test]
+    async fn test_sync_cleans_up_on_invalid_rev() {
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        Command::new("git").args(["init"]).current_dir(&src).output().await.unwrap();
+        Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(&src).output().await.unwrap();
+        Command::new("git").args(["config", "user.name", "Test"]).current_dir(&src).output().await.unwrap();
+        fs::write(src.join("hello.txt"), "hello").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&src).output().await.unwrap();
+        Command::new("git").args(["commit", "-m", "init"]).current_dir(&src).output().await.unwrap();
+
+        let repo = Repo::new(src.to_str().unwrap(), &dst, Some("nonexistent-rev"));
+        let result = repo.sync().await;
+
+        assert!(result.is_err(), "存在しない rev は sync エラーになるべき");
+        assert!(!dst.exists(), "失敗後にディレクトリが残ってはいけない");
+    }
+
+    #[tokio::test]
+    async fn test_get_status_errors_on_invalid_rev() {
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+
+        fs::create_dir_all(&src).unwrap();
+        Command::new("git").args(["init"]).current_dir(&src).output().await.unwrap();
+        Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(&src).output().await.unwrap();
+        Command::new("git").args(["config", "user.name", "Test"]).current_dir(&src).output().await.unwrap();
+        fs::write(src.join("hello.txt"), "hello").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&src).output().await.unwrap();
+        Command::new("git").args(["commit", "-m", "init"]).current_dir(&src).output().await.unwrap();
+
+        // 存在しない rev を指定
+        let repo = Repo::new(src.to_str().unwrap(), &src, Some("nonexistent-rev"));
+        let status = repo.get_status().await;
+
+        assert!(
+            matches!(status, RepoStatus::Error(_)),
+            "存在しない rev は get_status が Error を返すべき、実際: {:?}", status
+        );
+    }
 
     #[tokio::test]
     async fn test_git_update_method_pulls_latest() {
