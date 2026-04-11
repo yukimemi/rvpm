@@ -14,8 +14,35 @@ use crate::git::Repo;
 use crate::link::merge_plugin;
 use crate::loader::generate_loader;
 
+// Clap 4 styling: section headers / usage / literals / placeholders を色分けする。
+// `const` で渡せるようにビルダ経由で作成 (clap 4.5+ は Styles::styled() が const)。
+const CLI_STYLES: clap::builder::styling::Styles = {
+    use clap::builder::styling::{AnsiColor, Effects, Styles};
+    Styles::styled()
+        .header(AnsiColor::BrightCyan.on_default().effects(Effects::BOLD))
+        .usage(AnsiColor::BrightGreen.on_default().effects(Effects::BOLD))
+        .literal(AnsiColor::BrightBlue.on_default().effects(Effects::BOLD))
+        .placeholder(AnsiColor::Magenta.on_default())
+        .error(AnsiColor::BrightRed.on_default().effects(Effects::BOLD))
+        .valid(AnsiColor::BrightGreen.on_default())
+        .invalid(AnsiColor::BrightYellow.on_default())
+};
+
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about = "Fast Neovim plugin manager with pre-compiled loader and merge optimization",
+    long_about = "\
+rvpm clones plugins in parallel, links merge=true plugins into a single\n\
+runtime-path entry, and pre-compiles a loader.lua that sources everything\n\
+without runtime glob cost. Inspired by lazy.nvim but adds merge and\n\
+ahead-of-time file-list compilation on top.\n\
+\n\
+Run `rvpm init --write` once after your first `rvpm sync` to wire the\n\
+generated loader.lua into your Neovim init.lua.",
+    styles = CLI_STYLES,
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -23,46 +50,126 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Clone/pull plugins and regenerate loader.lua
     Sync,
+
+    /// Regenerate loader.lua only (no git)
+    ///
+    /// Useful after editing per-plugin init/before/after.lua or tweaking
+    /// TOML triggers — skips the clone/pull phase entirely.
     Generate,
+
+    /// Add a plugin and sync
     Add {
+        /// Plugin repo: owner/repo, URL, or local path
         repo: String,
+
+        /// Friendly name (optional)
         #[arg(long)]
         name: Option<String>,
     },
+
+    /// Edit per-plugin init/before/after.lua in $EDITOR
     Edit {
+        /// Fuzzy match plugin url (omit to pick interactively)
         query: Option<String>,
     },
+
+    /// Tweak a plugin's options interactively
+    ///
+    /// Walks through lazy / merge / on_* / rev with fuzzy-select and
+    /// ESC-cancellable prompts. Pick `[ Open config.toml in $EDITOR ]`
+    /// to drop into raw TOML editing when you need table-form on_map
+    /// or complex `cond` expressions.
     Set {
+        /// Fuzzy match plugin url (omit to pick interactively)
         query: Option<String>,
+
+        /// Set lazy flag non-interactively
         #[arg(long)]
         lazy: Option<bool>,
+
+        /// Set merge flag non-interactively
         #[arg(long)]
         merge: Option<bool>,
+
+        /// Set on_cmd. Comma-separated (`"Foo,Bar"`) or JSON array
+        /// (`'["Foo","Bar"]'`).
         #[arg(long)]
         on_cmd: Option<String>,
+
+        /// Set on_ft. Comma-separated or JSON array.
         #[arg(long)]
         on_ft: Option<String>,
+
+        /// Set on_map. Comma-separated lhs list, JSON array of
+        /// strings, or JSON array/object with full `{ lhs, mode, desc }`
+        /// form. Example: --on-map '{"lhs":"<space>d","mode":["n","x"]}'
+        #[arg(long)]
+        on_map: Option<String>,
+
+        /// Set on_event. Comma-separated or JSON array. Supports the
+        /// `"User Xxx"` shorthand for User events with patterns.
+        #[arg(long)]
+        on_event: Option<String>,
+
+        /// Set on_path glob list. Comma-separated or JSON array.
+        #[arg(long)]
+        on_path: Option<String>,
+
+        /// Set on_source (plugin names). Comma-separated or JSON array.
+        #[arg(long)]
+        on_source: Option<String>,
+
+        /// Set rev (branch/tag/commit) non-interactively
         #[arg(long)]
         rev: Option<String>,
     },
+
+    /// Update (git pull) installed plugins
     Update {
+        /// Fuzzy match plugin url (omit to update all)
         query: Option<String>,
     },
+
+    /// Remove a plugin and delete its directory
     Remove {
+        /// Fuzzy match plugin url (omit to pick interactively)
         query: Option<String>,
     },
+
+    /// Delete unused plugin directories
     Clean {
+        /// Skip the interactive confirmation
         #[arg(short, long)]
         force: bool,
     },
+
+    /// Show git status for every plugin
     Status,
+
+    /// Plugin list TUI with interactive actions
+    ///
+    /// Keys: [q] quit  [j/k] move  [e] edit  [s] set  [S] sync all
+    /// [u] update selected  [U] update all  [g] regenerate  [d] remove
     List,
-    /// config.toml を $EDITOR で開く。編集後は sync を実行して変更を反映する。
+
+    /// Open config.toml in $EDITOR
+    ///
+    /// Runs `sync` automatically after the editor exits.
     Config,
-    /// Neovim init.lua に loader.lua の dofile を組み込むスニペットを案内/追記する。
-    /// `--write` で自動追記 (init.lua がなければ新規作成)。
+
+    /// Print or write the init.lua loader snippet
+    ///
+    /// Without --write: prints the exact `dofile(vim.fn.expand("..."))`
+    /// line for your current config. Copy it into your Neovim init.lua.
+    ///
+    /// With --write: appends the snippet to `$NVIM_APPNAME`'s init.lua
+    /// (defaults to `~/.config/nvim/init.lua`). If init.lua does not
+    /// exist it is created with a header comment. Idempotent — a no-op
+    /// if the loader is already referenced.
     Init {
+        /// Append to init.lua (creates the file if missing)
         #[arg(long)]
         write: bool,
     },
@@ -77,8 +184,8 @@ async fn main() -> Result<()> {
         Commands::Generate => { run_generate().await?; },
         Commands::Add { repo, name } => { run_add(repo, name).await?; },
         Commands::Edit { query } => { if run_edit(query).await? { let _ = run_sync().await; } },
-        Commands::Set { query, lazy, merge, on_cmd, on_ft, rev } => {
-            if run_set(query, lazy, merge, on_cmd, on_ft, rev).await? { let _ = run_sync().await; }
+        Commands::Set { query, lazy, merge, on_cmd, on_ft, on_map, on_event, on_path, on_source, rev } => {
+            if run_set(query, lazy, merge, on_cmd, on_ft, on_map, on_event, on_path, on_source, rev).await? { let _ = run_sync().await; }
         },
         Commands::Update { query } => { run_update(query).await?; },
         Commands::Remove { query } => { run_remove(query).await?; },
@@ -354,7 +461,7 @@ async fn run_list() -> Result<()> {
                             disable_raw_mode()?;
                             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                             terminal.show_cursor()?;
-                            if run_set(Some(url), None, None, None, None, None).await? { let _ = run_sync().await; }
+                            if run_set(Some(url), None, None, None, None, None, None, None, None, None).await? { let _ = run_sync().await; }
                             let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
                             config = c; tui_state = s;
                         }
@@ -659,7 +766,19 @@ async fn run_edit(query: Option<String>) -> Result<bool> {
     Ok(true)
 }
 
-async fn run_set(query: Option<String>, lazy: Option<bool>, merge: Option<bool>, on_cmd: Option<String>, on_ft: Option<String>, rev: Option<String>) -> Result<bool> {
+#[allow(clippy::too_many_arguments)]
+async fn run_set(
+    query: Option<String>,
+    lazy: Option<bool>,
+    merge: Option<bool>,
+    on_cmd: Option<String>,
+    on_ft: Option<String>,
+    on_map: Option<String>,
+    on_event: Option<String>,
+    on_path: Option<String>,
+    on_source: Option<String>,
+    rev: Option<String>,
+) -> Result<bool> {
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
@@ -678,9 +797,45 @@ async fn run_set(query: Option<String>, lazy: Option<bool>, merge: Option<bool>,
     let mut doc = toml_content.parse::<DocumentMut>()?;
     let mut modified = false;
 
-    if lazy.is_some() || merge.is_some() || on_cmd.is_some() || on_ft.is_some() || rev.is_some() {
-        let parse_list = |s: Option<String>| -> Option<Vec<String>> { s.map(|v| if v.trim().starts_with('[') { serde_json::from_str(&v).unwrap_or_else(|_| vec![v]) } else { v.split(',').map(|s| s.trim().to_string()).collect() }) };
-        update_plugin_config(&mut doc, &selected_repo_url, lazy, merge, parse_list(on_cmd), parse_list(on_ft), rev)?;
+    let any_flag_set = lazy.is_some()
+        || merge.is_some()
+        || on_cmd.is_some()
+        || on_ft.is_some()
+        || on_map.is_some()
+        || on_event.is_some()
+        || on_path.is_some()
+        || on_source.is_some()
+        || rev.is_some();
+
+    if any_flag_set {
+        // Option<String> → Result<Option<Vec<String>>> へ (malformed JSON はエラー)
+        let maybe_parse = |raw: Option<String>| -> Result<Option<Vec<String>>> {
+            raw.map(|s| parse_cli_string_list(&s)).transpose()
+        };
+
+        update_plugin_config(
+            &mut doc,
+            &selected_repo_url,
+            lazy,
+            merge,
+            maybe_parse(on_cmd)?,
+            maybe_parse(on_ft)?,
+            rev,
+        )?;
+        // on_map は table 形式 (mode/desc) をサポートするため専用パーサを通す
+        if let Some(raw) = on_map {
+            let specs = parse_on_map_cli(&raw)?;
+            set_plugin_map_field(&mut doc, &selected_repo_url, specs)?;
+        }
+        if let Some(items) = maybe_parse(on_event)? {
+            set_plugin_list_field(&mut doc, &selected_repo_url, "on_event", items)?;
+        }
+        if let Some(items) = maybe_parse(on_path)? {
+            set_plugin_list_field(&mut doc, &selected_repo_url, "on_path", items)?;
+        }
+        if let Some(items) = maybe_parse(on_source)? {
+            set_plugin_list_field(&mut doc, &selected_repo_url, "on_source", items)?;
+        }
         modified = true;
     } else {
         // 現在のプラグインを探して既存値をプレフィルに使う
@@ -909,6 +1064,147 @@ fn set_plugin_list_field(doc: &mut DocumentMut, url: &str, field: &str, values: 
         for v in values { array.push(v); }
         plugin_table[field] = value(array);
     }
+    Ok(())
+}
+
+/// `--on-cmd` / `--on-ft` / `--on-event` / `--on-path` / `--on-source` の
+/// 入力文字列を `Vec<String>` に正規化する。
+///
+/// 受け付ける形式:
+/// - `"Foo"`                 → `["Foo"]`
+/// - `"Foo,Bar,Baz"`         → `["Foo", "Bar", "Baz"]` (空要素は無視)
+/// - `'["Foo", "Bar"]'`      → `["Foo", "Bar"]` (JSON 配列)
+///
+/// JSON っぽく `[` で始まっていて parse に失敗すると明示エラー。
+fn parse_cli_string_list(input: &str) -> Result<Vec<String>> {
+    let trimmed = input.trim();
+    if trimmed.starts_with('[') {
+        return serde_json::from_str::<Vec<String>>(trimmed)
+            .with_context(|| format!("invalid JSON string array: {}", trimmed));
+    }
+    Ok(trimmed
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// `--on-map` CLI flag の入力を `Vec<MapSpec>` に変換する。
+///
+/// 受け付ける形式 (すべて同じ flag で混在可能):
+/// - `"<leader>f"`                       (単純な文字列)
+/// - `"<leader>f, <leader>g"`            (カンマ区切り)
+/// - `'["<leader>f", "<leader>g"]'`      (JSON 文字列配列)
+/// - `'{ "lhs": "<space>d", "mode": ["n", "x"], "desc": "..." }'`  (JSON object 単体)
+/// - `'[{ ... }, "<leader>f", { ... }]'`  (JSON mixed array)
+fn parse_on_map_cli(input: &str) -> Result<Vec<crate::config::MapSpec>> {
+    let trimmed = input.trim();
+    let first = trimmed.chars().next().unwrap_or(' ');
+
+    // JSON 解析を試みる (配列 or オブジェクト先頭)
+    if first == '[' || first == '{' {
+        let value: serde_json::Value = serde_json::from_str(trimmed)
+            .with_context(|| format!("invalid JSON for --on-map: {}", trimmed))?;
+        return match value {
+            serde_json::Value::Array(items) => items
+                .into_iter()
+                .map(map_spec_from_json_value)
+                .collect::<Result<Vec<_>>>(),
+            serde_json::Value::Object(_) => Ok(vec![map_spec_from_json_value(value)?]),
+            _ => anyhow::bail!("--on-map JSON must be an object or array"),
+        };
+    }
+
+    // 単純: カンマ区切り (空要素は無視) → 全部 lhs のみの MapSpec
+    Ok(trimmed
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|lhs| crate::config::MapSpec {
+            lhs,
+            mode: Vec::new(),
+            desc: None,
+        })
+        .collect())
+}
+
+fn map_spec_from_json_value(value: serde_json::Value) -> Result<crate::config::MapSpec> {
+    use crate::config::MapSpec;
+    match value {
+        serde_json::Value::String(lhs) => Ok(MapSpec {
+            lhs,
+            mode: Vec::new(),
+            desc: None,
+        }),
+        serde_json::Value::Object(map) => {
+            let lhs = map
+                .get("lhs")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .context("map spec missing required `lhs` field")?;
+            let mode = match map.get("mode") {
+                Some(serde_json::Value::String(s)) => vec![s.clone()],
+                Some(serde_json::Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+                Some(_) => anyhow::bail!("`mode` must be a string or array of strings"),
+                None => Vec::new(),
+            };
+            let desc = map
+                .get("desc")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            Ok(MapSpec { lhs, mode, desc })
+        }
+        _ => anyhow::bail!("map spec must be a string or object"),
+    }
+}
+
+/// `Vec<MapSpec>` を TOML の `on_map` フィールドに書き込む。
+/// - 1 要素かつ simple (mode/desc なし) → plain string
+/// - それ以外 → 配列 (要素ごとに simple なら string、詳細なら inline table)
+fn set_plugin_map_field(
+    doc: &mut DocumentMut,
+    url: &str,
+    specs: Vec<crate::config::MapSpec>,
+) -> Result<()> {
+    let plugins = doc["plugins"]
+        .as_array_of_tables_mut()
+        .context("plugins is not an array of tables")?;
+    let plugin_table = plugins
+        .iter_mut()
+        .find(|p| p.get("url").and_then(|v| v.as_str()) == Some(url))
+        .context("Could not find plugin in toml_edit document")?;
+
+    let is_simple = |s: &crate::config::MapSpec| s.mode.is_empty() && s.desc.is_none();
+
+    if specs.len() == 1 && is_simple(&specs[0]) {
+        plugin_table["on_map"] = value(specs.into_iter().next().unwrap().lhs);
+        return Ok(());
+    }
+
+    let mut array = toml_edit::Array::new();
+    for spec in specs {
+        if is_simple(&spec) {
+            array.push(spec.lhs);
+        } else {
+            let mut inline = toml_edit::InlineTable::new();
+            inline.insert("lhs", spec.lhs.into());
+            if !spec.mode.is_empty() {
+                let mut mode_arr = toml_edit::Array::new();
+                for m in spec.mode {
+                    mode_arr.push(m);
+                }
+                inline.insert("mode", toml_edit::Value::Array(mode_arr));
+            }
+            if let Some(desc) = spec.desc {
+                inline.insert("desc", desc.into());
+            }
+            array.push(toml_edit::Value::InlineTable(inline));
+        }
+    }
+    plugin_table["on_map"] = value(array);
     Ok(())
 }
 
@@ -1274,7 +1570,7 @@ fn build_plugin_scripts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, Plugin, Options};
+    use crate::config::{Config, MapSpec, Plugin, Options};
     use crate::loader::PluginScripts;
     use tempfile::tempdir;
     use toml_edit::DocumentMut;
@@ -1667,6 +1963,188 @@ mod tests {
             "1要素は文字列として書かれるべき: {}", result);
         assert!(!result.contains("on_cmd = ["),
             "1要素は配列にしないべき: {}", result);
+    }
+
+    // -----------------------------------------------------------------
+    // --on-* CLI パーサ (Vec<String> 用) のテスト
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_parse_cli_string_list_single_value() {
+        let items = parse_cli_string_list("BufReadPre").unwrap();
+        assert_eq!(items, vec!["BufReadPre".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_cli_string_list_comma_separated() {
+        let items = parse_cli_string_list("BufReadPre, BufNewFile ,InsertEnter").unwrap();
+        assert_eq!(
+            items,
+            vec![
+                "BufReadPre".to_string(),
+                "BufNewFile".to_string(),
+                "InsertEnter".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_cli_string_list_json_array() {
+        let items = parse_cli_string_list(r#"["BufReadPre", "BufNewFile"]"#).unwrap();
+        assert_eq!(items, vec!["BufReadPre".to_string(), "BufNewFile".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_cli_string_list_json_array_with_user_event() {
+        let items = parse_cli_string_list(r#"["BufReadPre", "User LazyVimStarted"]"#).unwrap();
+        assert_eq!(items[1], "User LazyVimStarted");
+    }
+
+    #[test]
+    fn test_parse_cli_string_list_malformed_json_errors() {
+        // "[" で始まっていると JSON として扱うので、壊れた JSON はエラー
+        let err = parse_cli_string_list(r#"[BufReadPre, BufNewFile]"#).unwrap_err();
+        assert!(err.to_string().contains("JSON"));
+    }
+
+    #[test]
+    fn test_parse_cli_string_list_trims_and_ignores_empty() {
+        let items = parse_cli_string_list("  a  ,  ,b,").unwrap();
+        assert_eq!(items, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    // -----------------------------------------------------------------
+    // --on-map CLI パーサ / writer のテスト
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_parse_on_map_cli_simple_single_string() {
+        let specs = parse_on_map_cli("<leader>f").unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].lhs, "<leader>f");
+        assert!(specs[0].mode.is_empty());
+        assert_eq!(specs[0].desc, None);
+    }
+
+    #[test]
+    fn test_parse_on_map_cli_comma_separated() {
+        let specs = parse_on_map_cli("<leader>f, <leader>g ,<leader>h").unwrap();
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].lhs, "<leader>f");
+        assert_eq!(specs[1].lhs, "<leader>g");
+        assert_eq!(specs[2].lhs, "<leader>h");
+    }
+
+    #[test]
+    fn test_parse_on_map_cli_json_array_of_strings() {
+        let specs = parse_on_map_cli(r#"["<leader>f", "<leader>g"]"#).unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].lhs, "<leader>f");
+        assert_eq!(specs[1].lhs, "<leader>g");
+    }
+
+    #[test]
+    fn test_parse_on_map_cli_json_single_object() {
+        let specs = parse_on_map_cli(
+            r#"{ "lhs": "<space>d", "mode": ["n", "x"], "desc": "Delete" }"#,
+        )
+        .unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].lhs, "<space>d");
+        assert_eq!(specs[0].mode, vec!["n".to_string(), "x".to_string()]);
+        assert_eq!(specs[0].desc.as_deref(), Some("Delete"));
+    }
+
+    #[test]
+    fn test_parse_on_map_cli_json_object_mode_as_string() {
+        let specs = parse_on_map_cli(r#"{ "lhs": "<leader>v", "mode": "v" }"#).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].lhs, "<leader>v");
+        assert_eq!(specs[0].mode, vec!["v".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_on_map_cli_json_array_mixed() {
+        let specs = parse_on_map_cli(
+            r#"[
+                "<leader>a",
+                { "lhs": "<leader>b", "mode": "x" },
+                { "lhs": "<leader>c", "mode": ["n", "v"], "desc": "C" }
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].lhs, "<leader>a");
+        assert!(specs[0].mode.is_empty());
+        assert_eq!(specs[1].lhs, "<leader>b");
+        assert_eq!(specs[1].mode, vec!["x".to_string()]);
+        assert_eq!(specs[2].lhs, "<leader>c");
+        assert_eq!(specs[2].mode, vec!["n".to_string(), "v".to_string()]);
+        assert_eq!(specs[2].desc.as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn test_parse_on_map_cli_json_object_missing_lhs_errors() {
+        let err = parse_on_map_cli(r#"{ "mode": ["n"] }"#).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("lhs"));
+    }
+
+    #[test]
+    fn test_set_plugin_map_field_single_simple_writes_string() {
+        let toml = "[[plugins]]\nurl = \"owner/a\"\n";
+        let mut doc = toml.parse::<DocumentMut>().unwrap();
+        let specs = vec![MapSpec {
+            lhs: "<leader>f".to_string(),
+            mode: Vec::new(),
+            desc: None,
+        }];
+        set_plugin_map_field(&mut doc, "owner/a", specs).unwrap();
+        let result = doc.to_string();
+        assert!(
+            result.contains("on_map = \"<leader>f\""),
+            "simple single spec should write as plain string: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_set_plugin_map_field_with_mode_writes_inline_table() {
+        let toml = "[[plugins]]\nurl = \"owner/a\"\n";
+        let mut doc = toml.parse::<DocumentMut>().unwrap();
+        let specs = vec![MapSpec {
+            lhs: "<space>d".to_string(),
+            mode: vec!["n".to_string(), "x".to_string()],
+            desc: Some("Delete".to_string()),
+        }];
+        set_plugin_map_field(&mut doc, "owner/a", specs).unwrap();
+        let result = doc.to_string();
+        assert!(result.contains("lhs = \"<space>d\""), "should include lhs field: {}", result);
+        assert!(result.contains("mode = [\"n\", \"x\"]") || result.contains("mode = [ \"n\", \"x\" ]"), "should include mode array: {}", result);
+        assert!(result.contains("desc = \"Delete\""), "should include desc: {}", result);
+    }
+
+    #[test]
+    fn test_set_plugin_map_field_mixed_writes_array_of_mixed() {
+        let toml = "[[plugins]]\nurl = \"owner/a\"\n";
+        let mut doc = toml.parse::<DocumentMut>().unwrap();
+        let specs = vec![
+            MapSpec {
+                lhs: "<leader>a".to_string(),
+                mode: Vec::new(),
+                desc: None,
+            },
+            MapSpec {
+                lhs: "<leader>b".to_string(),
+                mode: vec!["n".to_string(), "x".to_string()],
+                desc: Some("B".to_string()),
+            },
+        ];
+        set_plugin_map_field(&mut doc, "owner/a", specs).unwrap();
+        let result = doc.to_string();
+        // 配列 literal 内に単純文字列とインラインテーブルが混在
+        assert!(result.contains("\"<leader>a\""), "simple item as string: {}", result);
+        assert!(result.contains("lhs = \"<leader>b\""), "full item as inline table: {}", result);
+        assert!(result.contains("desc = \"B\""));
     }
 
     #[test]
