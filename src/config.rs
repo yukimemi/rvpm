@@ -6,6 +6,7 @@ use tera::{Context, Tera};
 pub struct Config {
     pub vars: Option<serde_json::Value>,
     pub options: Options,
+    #[serde(default)]
     pub plugins: Vec<Plugin>,
 }
 
