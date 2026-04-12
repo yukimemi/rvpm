@@ -1369,6 +1369,7 @@ async fn run_set(
 
         const EDITOR_SENTINEL: &str = "[ Open config.toml in $EDITOR ]";
         let options = vec![
+            EDITOR_SENTINEL,
             "lazy",
             "merge",
             "on_cmd",
@@ -1378,7 +1379,6 @@ async fn run_set(
             "on_path",
             "on_source",
             "rev",
-            EDITOR_SENTINEL,
         ];
         let selection = Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
             .with_prompt("Select option to set")
