@@ -109,12 +109,12 @@ rvpm list
 ```toml
 [vars]
 # Your own variables, referenced via Tera templates {{ vars.xxx }}
-config_base = "~/.config/nvim/rc/after"
+nvim_rc = "~/.config/nvim/rc"
 
 [options]
 # Per-plugin init/before/after.lua directory
 # Default: ~/.config/rvpm/plugins
-config_root = "{{ vars.config_base }}/plugins"
+config_root = "{{ vars.nvim_rc }}/plugins"
 # Parallel git operations limit (default: unlimited)
 concurrency = 10
 # Optional: move all rvpm data (repos + merged + loader.lua) under a custom root

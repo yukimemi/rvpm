@@ -43,12 +43,12 @@ cargo test dump_full_sample_loader -- --ignored --nocapture
 [vars]
 # ユーザー定義の変数。TOML 内 Tera テンプレートから {{ vars.xxx }} で参照できる。
 repo_base   = "~/.cache/nvim/rvpm"
-config_base = "~/.config/nvim/rc/after"
+nvim_rc = "~/.config/nvim/rc"
 
 [options]
 # per-plugin の init/before/after.lua を置くディレクトリの root
 # 未指定なら ~/.config/rvpm/plugins (config.toml と隣合わせ)
-config_root = "{{ vars.config_base }}/plugins"
+config_root = "{{ vars.nvim_rc }}/plugins"
 # 並列数上限 (未指定なら無制限)
 concurrency = 10
 # rvpm のデータ置き場 root を上書き (未指定なら ~/.cache/rvpm)
@@ -89,7 +89,7 @@ cond = "vim.fn.has('win32') == 1"
 
 ## per-plugin 設定ファイル (config_root)
 
-`options.config_root` 配下に `<host>/<owner>/<repo>/` の階層でプラグインごとの Lua 設定ファイルを配置できる。例: `~/.config/nvim/rc/after/plugins/github.com/nvim-telescope/telescope.nvim/`。
+`options.config_root` 配下に `<host>/<owner>/<repo>/` の階層でプラグインごとの Lua 設定ファイルを配置できる。例: `~/.config/nvim/rc/plugins/github.com/nvim-telescope/telescope.nvim/`。
 
 | ファイル | 実行タイミング | 典型用途 |
 |---|---|---|
