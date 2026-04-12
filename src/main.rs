@@ -1776,10 +1776,7 @@ fn find_plugin_line_in_toml(toml_content: &str, url: &str) -> usize {
 /// nvim/vim/vi/nano/emacs ファミリーは真。VS Code / helix 等は偽。
 fn editor_supports_line_jump(editor_cmd: &str) -> bool {
     // Unix の Path は `\` をパス区切りと認識しないため、手動で両方で split する
-    let file_name = editor_cmd
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(editor_cmd);
+    let file_name = editor_cmd.rsplit(['/', '\\']).next().unwrap_or(editor_cmd);
     let base = file_name
         .rsplit_once('.')
         .map(|(stem, _)| stem)
