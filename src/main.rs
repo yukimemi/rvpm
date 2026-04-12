@@ -845,20 +845,12 @@ async fn run_config() -> Result<bool> {
 
 /// `rvpm init` — Neovim init.lua に loader.lua を繋ぐ dofile 行を案内 or 自動追記する。
 async fn run_init(write: bool) -> Result<()> {
-    // config が存在すれば読み込んで loader_path / base_dir を反映した snippet を出す
-    // 存在しなければ default (~/.cache/rvpm/loader.lua) の snippet を出す (add 前でも init は使えるように)
+    // config.toml がなければテンプレートで自動作成 (add / config と同じ)
     let config_path = rvpm_config_path();
-    let config = if config_path.exists() {
-        let toml_content = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
-        parse_config(&toml_content)?
-    } else {
-        config::Config {
-            vars: None,
-            options: config::Options::default(),
-            plugins: vec![],
-        }
-    };
+    ensure_config_exists(&config_path)?;
+    let toml_content = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+    let config = parse_config(&toml_content)?;
 
     let snippet = loader_init_snippet(&config);
     let init_lua_path = nvim_init_lua_path();
