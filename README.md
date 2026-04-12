@@ -7,30 +7,21 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 rvpm clones plugins in parallel, links `merge = true` plugins into a single
-runtime-path entry, and ahead-of-time compiles a `loader.lua` that sources
-everything without any runtime `vim.fn.glob` cost.
-
-Inspired by [lazy.nvim](https://github.com/folke/lazy.nvim) — rvpm adopts the
-same "take full control of plugin loading" approach (`vim.go.loadplugins =
-false`), but adds **merge optimization** and **generate-time file-list
-compilation** on top.
+runtime-path entry, and ahead-of-time compiles a static `loader.lua` that
+sources everything without any runtime glob cost.
 
 ## Why rvpm?
 
-| | lazy.nvim | rvpm |
-|---|---|---|
-| Plugin loading control | ✓ (own dispatch) | ✓ (own dispatch) |
-| `init` / `config` hooks | ✓ | ✓ (`init.lua` / `before.lua` / `after.lua`) |
-| Per-plugin runtimepath | ✓ | ✓ (when `merge = false`) |
-| **Merged runtimepath** (single rtp entry for many plugins) | ✗ | ✓ |
-| **Runtime glob elimination** (plugin file paths baked at generate time) | ✗ | ✓ |
-| Written in | Lua | Rust |
-| Installation workflow | Lua in `init.lua` | CLI tool, static `loader.lua` |
-| Parallel git operations | Lua coroutines | Tokio `JoinSet` + `Semaphore` |
-| Config format | Lua tables | TOML + Tera templates |
-
-The upshot: rvpm does more work at `rvpm sync` / `rvpm generate` time so that
-Neovim startup reads exactly the files it needs and nothing else.
+- **CLI-first** — manage plugins from your terminal, not from inside Neovim
+- **TOML config** — declarative plugin specs with Tera template support
+- **Pre-compiled loader** — `rvpm generate` walks plugin directories at CLI
+  time and bakes the file list into `loader.lua`; Neovim just sources a
+  fixed list of `dofile()` / `source` calls
+- **Merge optimization** — `merge = true` plugins share a single rtp entry
+- **Full lazy-loading** — `on_cmd`, `on_ft`, `on_map`, `on_event`, `on_path`,
+  `on_source`, auto-detected `ColorSchemePre`, and `depends`-aware loading
+- **Resilient** — cyclic dependencies, missing plugins, and config errors
+  produce warnings, not crashes
 
 ## Features
 
@@ -225,8 +216,7 @@ time. No extra config field is required.
 
 When Neovim processes `:colorscheme <name>`, it fires `ColorSchemePre` before
 switching the scheme. rvpm intercepts this event, loads the matching lazy
-plugin, and then lets the colorscheme apply normally. This mirrors what
-lazy.nvim does at runtime — rvpm bakes the decision in at generate time instead.
+plugin, and then lets the colorscheme apply normally.
 
 Eager plugins are unaffected: their `colors/` directory is already on the
 runtimepath and Neovim finds it without any handler.
@@ -425,8 +415,8 @@ cost; Neovim startup just sources a fixed list of files.
 
 When `merge = true`, the plugin directory is linked (junction on Windows,
 symlink elsewhere) into `{base_dir}/merged/`. All `merge = true` plugins share
-a single `vim.opt.rtp:append(merged_dir)` call — lazy.nvim doesn't do this, so
-if you have ~100 eager plugins, rvpm keeps your `&runtimepath` lean.
+a single `vim.opt.rtp:append(merged_dir)` call, keeping `&runtimepath` lean
+even with many eager plugins.
 
 ### Dependency ordering
 
@@ -492,13 +482,9 @@ covered by either unit or integration tests before implementation.
 
 ## Acknowledgments
 
-- **[lazy.nvim](https://github.com/folke/lazy.nvim)** by `@folke` — the
-  approach of taking over plugin loading entirely (`vim.go.loadplugins =
-  false`), the `ftdetect` augroup wrapping trick, the `<Ignore>`-prefixed
-  feedkeys replay, and the per-handler designs (`cmd.lua`, `keys.lua`,
-  `event.lua`, `ft.lua`) were all studied and adapted for rvpm. rvpm is an
-  independent Rust re-implementation inspired by these ideas.
-- **[dvpm](https://github.com/yukimemi/dvpm)** — a Deno-based predecessor.
+- **[lazy.nvim](https://github.com/folke/lazy.nvim)** — design inspiration
+  for the plugin loading model and lazy trigger patterns.
+- **[dvpm](https://github.com/yukimemi/dvpm)** — predecessor project (Deno-based).
 
 ## License
 
