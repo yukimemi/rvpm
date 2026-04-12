@@ -76,15 +76,17 @@ enum Commands {
         name: Option<String>,
     },
 
-    /// Edit per-plugin init/before/after.lua in $EDITOR
+    /// Edit per-plugin or global hook files in $EDITOR
     ///
-    /// Without --init / --before / --after, prompts which file to edit.
-    /// With a flag, opens that file directly (skips the file selector).
+    /// Without flags, prompts which plugin and file to edit.
+    /// With --init / --before / --after, opens that file directly.
+    /// With --global, edits global before.lua / after.lua hooks
+    /// (~/.config/rvpm/) instead of per-plugin files.
     Edit {
         /// Fuzzy match plugin url (omit to pick interactively)
         query: Option<String>,
 
-        /// Open init.lua directly
+        /// Open init.lua directly (per-plugin only)
         #[arg(long)]
         init: bool,
 
@@ -95,6 +97,10 @@ enum Commands {
         /// Open after.lua directly
         #[arg(long)]
         after: bool,
+
+        /// Edit global hooks instead of per-plugin files
+        #[arg(long)]
+        global: bool,
     },
 
     /// Tweak a plugin's options interactively
@@ -212,8 +218,9 @@ async fn main() -> Result<()> {
             init,
             before,
             after,
+            global,
         } => {
-            if run_edit(query, init, before, after).await? {
+            if run_edit(query, init, before, after, global).await? {
                 let _ = run_sync(false).await;
             }
         }
@@ -385,7 +392,12 @@ async fn run_sync(prune: bool) -> Result<()> {
     terminal.show_cursor()?;
     println!("Generating loader.lua...");
     let loader_path = resolve_loader_path(config.options.loader_path.as_deref(), &base_dir);
-    write_loader_to_path(&merged_dir, &plugin_scripts, &loader_path)?;
+    write_loader_to_path(
+        &merged_dir,
+        &plugin_scripts,
+        &loader_path,
+        &build_loader_options(),
+    )?;
     println!("Done! -> {}", loader_path.display());
 
     // 未使用 plugin ディレクトリの処理: --prune なら削除、それ以外なら警告表示
@@ -457,7 +469,12 @@ async fn run_generate() -> Result<()> {
     }
 
     println!("Generating loader.lua...");
-    write_loader_to_path(&merged_dir, &plugin_scripts, &loader_path)?;
+    write_loader_to_path(
+        &merged_dir,
+        &plugin_scripts,
+        &loader_path,
+        &build_loader_options(),
+    )?;
     println!("Done! -> {}", loader_path.display());
     print_init_lua_hint_if_missing(&config);
     Ok(())
@@ -621,7 +638,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         disable_raw_mode()?;
                         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                         terminal.show_cursor()?;
-                        if run_edit(Some(url), false, false, false).await? {
+                        if run_edit(Some(url), false, false, false, false).await? {
                             let _ = run_sync(false).await;
                         }
                         let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
@@ -913,11 +930,46 @@ async fn run_edit(
     flag_init: bool,
     flag_before: bool,
     flag_after: bool,
+    flag_global: bool,
 ) -> Result<bool> {
+    // --global: グローバル hooks (~/.config/rvpm/before.lua / after.lua)
+    if flag_global {
+        let config_dir = rvpm_config_path()
+            .parent()
+            .expect("config path has parent")
+            .to_path_buf();
+        std::fs::create_dir_all(&config_dir)?;
+
+        let file_name = if flag_before {
+            "before.lua"
+        } else if flag_after {
+            "after.lua"
+        } else {
+            let files = vec!["before.lua", "after.lua"];
+            let sel = Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                .with_prompt("Select global hook to edit")
+                .default(0)
+                .items(&files)
+                .interact_opt()?;
+            match sel {
+                Some(index) => files[index],
+                None => return Ok(false),
+            }
+        };
+
+        let target = config_dir.join(file_name);
+        println!("\n>> Editing global hook: {}", target.display());
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
+        std::process::Command::new(editor).arg(&target).status()?;
+        return Ok(true);
+    }
+
+    // per-plugin edit
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
 
+    // 対話モード: plugin 選択肢に [ Global hooks ] sentinel を追加
     let plugin = if let Some(q) = query {
         config
             .plugins
@@ -925,16 +977,22 @@ async fn run_edit(
             .find(|p| p.url == q || p.url.contains(&q))
             .context("Plugin not found")?
     } else {
-        let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
+        const GLOBAL_SENTINEL: &str = "[ Global hooks ]";
+        let mut items: Vec<String> = vec![GLOBAL_SENTINEL.to_string()];
+        items.extend(config.plugins.iter().map(|p| p.url.clone()));
         let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
             .with_prompt("Select plugin to edit")
-            .items(&urls)
+            .items(&items)
             .interact_opt()?;
         match selection {
+            Some(0) => {
+                // Global hooks → 再帰的に --global を呼ぶ
+                return Box::pin(run_edit(None, false, false, false, true)).await;
+            }
             Some(index) => config
                 .plugins
                 .iter()
-                .find(|p| p.url == urls[index])
+                .find(|p| p.url == items[index])
                 .unwrap(),
             None => return Ok(false),
         }
@@ -1570,15 +1628,28 @@ fn resolve_loader_path(config_loader_path: Option<&str>, base_dir: &Path) -> Pat
     }
 }
 
+/// config.toml の隣にある before.lua / after.lua を検出して LoaderOptions を構築する。
+fn build_loader_options() -> crate::loader::LoaderOptions {
+    let config_dir = rvpm_config_path()
+        .parent()
+        .expect("config path has parent")
+        .to_path_buf();
+    crate::loader::LoaderOptions {
+        global_before: find_lua(&config_dir, "before.lua"),
+        global_after: find_lua(&config_dir, "after.lua"),
+    }
+}
+
 fn write_loader_to_path(
     merged_dir: &Path,
     scripts: &[crate::loader::PluginScripts],
     loader_path: &Path,
+    loader_opts: &crate::loader::LoaderOptions,
 ) -> Result<()> {
     if let Some(parent) = loader_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let lua = generate_loader(merged_dir, scripts);
+    let lua = generate_loader(merged_dir, scripts, loader_opts);
     std::fs::write(loader_path, lua)?;
     Ok(())
 }
@@ -2287,7 +2358,13 @@ mod tests {
         std::fs::create_dir_all(&merged).unwrap();
         let loader_path = root.path().join("custom").join("loader.lua");
         let scripts: Vec<PluginScripts> = vec![];
-        write_loader_to_path(&merged, &scripts, &loader_path).unwrap();
+        write_loader_to_path(
+            &merged,
+            &scripts,
+            &loader_path,
+            &crate::loader::LoaderOptions::default(),
+        )
+        .unwrap();
         assert!(loader_path.exists());
         let content = std::fs::read_to_string(&loader_path).unwrap();
         assert!(content.contains("-- rvpm generated loader.lua"));

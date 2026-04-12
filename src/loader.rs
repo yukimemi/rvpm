@@ -81,7 +81,20 @@ fn push_with_cond(lua: &mut String, cond: &Option<String>, body: &str) {
     }
 }
 
-pub fn generate_loader(merged_dir: &Path, scripts: &[PluginScripts]) -> String {
+/// generate_loader に渡すグローバルオプション。
+#[derive(Default)]
+pub struct LoaderOptions {
+    /// `~/.config/rvpm/before.lua` が存在すれば Some (Phase 0.7)
+    pub global_before: Option<String>,
+    /// `~/.config/rvpm/after.lua` が存在すれば Some (Phase 4.5)
+    pub global_after: Option<String>,
+}
+
+pub fn generate_loader(
+    merged_dir: &Path,
+    scripts: &[PluginScripts],
+    opts: &LoaderOptions,
+) -> String {
     let mut lua = String::new();
     lua.push_str("-- rvpm generated loader.lua\n\n");
 
@@ -112,6 +125,14 @@ pub fn generate_loader(merged_dir: &Path, scripts: &[PluginScripts]) -> String {
 end
 
 "#);
+
+    // ======================================================
+    // Phase 0.7: グローバル before.lua (全プラグインの前)
+    // leader / vim options / 基本設定を書く場所
+    // ======================================================
+    if let Some(before) = &opts.global_before {
+        lua.push_str(&format!("dofile(\"{}\")\n\n", before.replace('\\', "/")));
+    }
 
     // ======================================================
     // Phase 1: 全プラグインの init.lua (依存順)
@@ -377,6 +398,14 @@ end
         push_with_cond(&mut lua, &s.cond, &body);
     }
 
+    // ======================================================
+    // Phase 4.5: グローバル after.lua (全プラグインの後)
+    // colorscheme / 最終 UI 調整を書く場所
+    // ======================================================
+    if let Some(after) = &opts.global_after {
+        lua.push_str(&format!("\ndofile(\"{}\")\n", after.replace('\\', "/")));
+    }
+
     lua
 }
 
@@ -388,9 +417,68 @@ mod tests {
     // 新モデル: lazy.nvim 方式 + merge optimization + 事前コンパイル
     // ========================================================
 
+    // ========================================================
+    // グローバル hooks テスト
+    // ========================================================
+
+    #[test]
+    fn test_loader_global_before_runs_before_all_plugins() {
+        let mut s = PluginScripts::for_test("a", "/path/a");
+        s.init = Some("/cfg/a/init.lua".to_string());
+        let opts = LoaderOptions {
+            global_before: Some("/rvpm/before.lua".to_string()),
+            global_after: None,
+        };
+        let lua = generate_loader(Path::new("/merged"), &[s], &opts);
+        let before_pos = lua.find("/rvpm/before.lua").expect("global before missing");
+        let init_pos = lua.find("/cfg/a/init.lua").expect("plugin init missing");
+        assert!(
+            before_pos < init_pos,
+            "global before must run BEFORE any plugin init"
+        );
+    }
+
+    #[test]
+    fn test_loader_global_after_runs_after_all_lazy_triggers() {
+        let mut s = PluginScripts::for_test("a", "/path/a");
+        s.lazy = true;
+        s.on_cmd = Some(vec!["Foo".to_string()]);
+        let opts = LoaderOptions {
+            global_before: None,
+            global_after: Some("/rvpm/after.lua".to_string()),
+        };
+        let lua = generate_loader(Path::new("/merged"), &[s], &opts);
+        let trigger_pos = lua
+            .find("nvim_create_user_command")
+            .expect("trigger missing");
+        let after_pos = lua.find("/rvpm/after.lua").expect("global after missing");
+        assert!(
+            trigger_pos < after_pos,
+            "global after must run AFTER lazy trigger registrations"
+        );
+    }
+
+    #[test]
+    fn test_loader_no_global_hooks_when_none() {
+        let opts = LoaderOptions {
+            global_before: None,
+            global_after: None,
+        };
+        let lua = generate_loader(Path::new("/merged"), &[], &opts);
+        // global hooks のセクションコメントがあっても dofile は出ない
+        assert!(
+            !lua.contains("dofile") || lua.contains("load_lazy"),
+            "no dofile for global hooks when None"
+        );
+    }
+
+    // ========================================================
+    // 新モデルテスト
+    // ========================================================
+
     #[test]
     fn test_loader_disables_neovim_plugin_loading() {
-        let lua = generate_loader(Path::new("/merged"), &[]);
+        let lua = gen_loader(Path::new("/merged"), &[]);
         assert!(
             lua.contains("vim.go.loadplugins = false"),
             "loader must disable Neovim's default plugin loading"
@@ -403,7 +491,7 @@ mod tests {
         s.merge = true;
         s.init = Some("/cfg/a/init.lua".to_string());
         s.before = Some("/cfg/a/before.lua".to_string());
-        let lua = generate_loader(Path::new("/merged"), &[s]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
         let init_pos = lua.find("/cfg/a/init.lua").expect("init missing");
         let rtp_pos = lua
             .find("vim.opt.rtp:append(\"/merged\")")
@@ -422,7 +510,7 @@ mod tests {
         a.merge = true;
         let mut b = PluginScripts::for_test("b", "/path/b");
         b.merge = true;
-        let lua = generate_loader(Path::new("/merged"), &[a, b]);
+        let lua = gen_loader(Path::new("/merged"), &[a, b]);
         let count = lua.matches("vim.opt.rtp:append(\"/merged\")").count();
         assert_eq!(
             count, 1,
@@ -434,7 +522,7 @@ mod tests {
     fn test_loader_no_merged_rtp_when_all_non_merge() {
         let mut a = PluginScripts::for_test("a", "/path/a");
         a.merge = false;
-        let lua = generate_loader(Path::new("/merged"), &[a]);
+        let lua = gen_loader(Path::new("/merged"), &[a]);
         assert!(
             !lua.contains("vim.opt.rtp:append(\"/merged\")"),
             "should NOT append merged rtp when no merge=true plugin exists"
@@ -445,7 +533,7 @@ mod tests {
     fn test_loader_non_merge_eager_appends_own_rtp() {
         let mut a = PluginScripts::for_test("solo", "/path/solo");
         a.merge = false;
-        let lua = generate_loader(Path::new("/merged"), &[a]);
+        let lua = gen_loader(Path::new("/merged"), &[a]);
         assert!(
             lua.contains("vim.opt.rtp:append(\"/path/solo\")"),
             "non-merge eager plugin must append its own path to rtp"
@@ -459,7 +547,7 @@ mod tests {
         a.before = Some("/cfg/a/before.lua".to_string());
         a.after = Some("/cfg/a/after.lua".to_string());
         a.plugin_files = vec!["/path/a/plugin/a.vim".to_string()];
-        let lua = generate_loader(Path::new("/merged"), &[a]);
+        let lua = gen_loader(Path::new("/merged"), &[a]);
         let before_pos = lua.find("/cfg/a/before.lua").unwrap();
         let source_pos = lua
             .find("vim.cmd(\"source /path/a/plugin/a.vim\")")
@@ -480,7 +568,7 @@ mod tests {
         let mut a = PluginScripts::for_test("a", "/path/a");
         a.merge = true;
         a.ftdetect_files = vec!["/path/a/ftdetect/a.vim".to_string()];
-        let lua = generate_loader(Path::new("/merged"), &[a]);
+        let lua = gen_loader(Path::new("/merged"), &[a]);
         // eager phase 内の ftdetect source を探し、その直前/直後に augroup begin/end があるか確認
         // (load_lazy helper 内の augroup とは別に、Phase 3 の augroup が必要)
         let ftdetect_source_pos = lua
@@ -506,7 +594,7 @@ mod tests {
         let mut a = PluginScripts::for_test("a", "/path/a");
         a.merge = true;
         a.after_plugin_files = vec!["/path/a/after/plugin/a.vim".to_string()];
-        let lua = generate_loader(Path::new("/merged"), &[a]);
+        let lua = gen_loader(Path::new("/merged"), &[a]);
         assert!(
             lua.contains("vim.cmd(\"source /path/a/after/plugin/a.vim\")"),
             "after/plugin files must be sourced"
@@ -520,7 +608,7 @@ mod tests {
         a.merge = false;
         a.on_cmd = Some(vec!["Foo".to_string()]);
         a.plugin_files = vec!["/path/a/plugin/a.vim".to_string()];
-        let lua = generate_loader(Path::new("/merged"), &[a]);
+        let lua = gen_loader(Path::new("/merged"), &[a]);
         // lazy plugin の plugin_files は eager の位置で直接 source されない
         // (load_lazy 経由で動的に呼ばれる)
         // eager の source とは区別して、 trigger 経由でのみ呼ばれる
@@ -547,7 +635,7 @@ mod tests {
         a.plugin_files = vec!["/path/a/plugin/a.vim".to_string()];
         a.ftdetect_files = vec!["/path/a/ftdetect/a.vim".to_string()];
         a.after_plugin_files = vec!["/path/a/after/plugin/a.vim".to_string()];
-        let lua = generate_loader(Path::new("/merged"), &[a]);
+        let lua = gen_loader(Path::new("/merged"), &[a]);
         // ファイルリストがどこかに登場すること (ローカルテーブルとしてでも load_lazy 引数内でも OK)
         assert!(
             lua.contains("/path/a/plugin/a.vim"),
@@ -565,7 +653,7 @@ mod tests {
 
     #[test]
     fn test_load_lazy_helper_sources_ftdetect_in_augroup() {
-        let lua = generate_loader(Path::new("/merged"), &[]);
+        let lua = gen_loader(Path::new("/merged"), &[]);
         // load_lazy 関数定義の中に ftdetect の処理が augroup 付きで入っているか
         let load_lazy_start = lua
             .find("local function load_lazy")
@@ -589,6 +677,11 @@ mod tests {
     // Lazy trigger 改善テスト (lazy.nvim 参考)
     // ========================================================
 
+    /// テスト用: デフォルト opts で generate_loader を呼ぶ
+    fn gen_loader(merged: &Path, scripts: &[PluginScripts]) -> String {
+        generate_loader(merged, scripts, &LoaderOptions::default())
+    }
+
     fn make_lazy_plugin(name: &str) -> PluginScripts {
         let mut s = PluginScripts::for_test(name, &format!("/path/{}", name));
         s.lazy = true;
@@ -599,7 +692,7 @@ mod tests {
     fn test_on_cmd_handler_has_bang_range_complete_options() {
         let mut s = make_lazy_plugin("tel");
         s.on_cmd = Some(vec!["Telescope".to_string()]);
-        let lua = generate_loader(Path::new("/merged"), &[s]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
         // user command 定義に bang/range/complete オプションが入っている
         assert!(lua.contains("bang = true"), "on_cmd must enable bang");
         assert!(lua.contains("range = true"), "on_cmd must enable range");
@@ -617,7 +710,7 @@ mod tests {
     fn test_on_cmd_handler_reconstructs_command_from_event() {
         let mut s = make_lazy_plugin("tel");
         s.on_cmd = Some(vec!["Telescope".to_string()]);
-        let lua = generate_loader(Path::new("/merged"), &[s]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
         // callback は event から bang/mods/args を取り出して vim.cmd(table) で dispatch
         assert!(lua.contains("event.bang"), "should read event.bang");
         assert!(lua.contains("event.smods"), "should read event.smods");
@@ -635,7 +728,7 @@ mod tests {
     fn test_on_cmd_handler_complete_loads_plugin_and_delegates() {
         let mut s = make_lazy_plugin("tel");
         s.on_cmd = Some(vec!["Telescope".to_string()]);
-        let lua = generate_loader(Path::new("/merged"), &[s]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
         // complete callback 内で load_lazy が呼ばれ、getcompletion でデリゲート
         assert!(
             lua.contains("vim.fn.getcompletion"),
@@ -647,7 +740,7 @@ mod tests {
     fn test_on_ft_handler_retriggers_filetype_event_after_load() {
         let mut s = make_lazy_plugin("nvim-rust");
         s.on_ft = Some(vec!["rust".to_string()]);
-        let lua = generate_loader(Path::new("/merged"), &[s]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
         // ロード後に FileType を exec_autocmds で再発火
         assert!(
             lua.contains("nvim_exec_autocmds(\"FileType\""),
@@ -663,7 +756,7 @@ mod tests {
     fn test_on_event_handler_refires_event_with_buffer_and_data() {
         let mut s = make_lazy_plugin("lsp");
         s.on_event = Some(vec!["BufReadPre".to_string()]);
-        let lua = generate_loader(Path::new("/merged"), &[s]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
         // ロード後に ev.event を buffer と data 付きで再発火
         assert!(
             lua.contains("nvim_exec_autocmds(ev.event"),
@@ -677,7 +770,7 @@ mod tests {
     fn test_on_event_user_prefix_creates_user_autocmd_with_pattern() {
         let mut s = make_lazy_plugin("lazyvim-extras");
         s.on_event = Some(vec!["User LazyVimStarted".to_string()]);
-        let lua = generate_loader(Path::new("/merged"), &[s]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
         // User autocmd が pattern 指定で登録されている
         assert!(
             lua.contains("nvim_create_autocmd(\"User\""),
@@ -697,7 +790,7 @@ mod tests {
             "BufReadPre".to_string(),
             "User LazyVimStarted".to_string(),
         ]);
-        let lua = generate_loader(Path::new("/merged"), &[s]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
         // 通常イベントの autocmd (BufReadPre)
         assert!(
             lua.contains("BufReadPre"),
@@ -718,7 +811,7 @@ mod tests {
     fn test_on_path_handler_refires_event_after_load() {
         let mut s = make_lazy_plugin("rust-tools");
         s.on_path = Some(vec!["*.rs".to_string()]);
-        let lua = generate_loader(Path::new("/merged"), &[s]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
         // BufRead/BufNewFile の再発火
         assert!(
             lua.contains("nvim_exec_autocmds(ev.event"),
@@ -735,7 +828,7 @@ mod tests {
             mode: Vec::new(),
             desc: None,
         }]);
-        let lua = generate_loader(Path::new("/merged"), &[s]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
         // <Ignore> prefix で recursion 保護
         assert!(
             lua.contains("<Ignore>"),
@@ -751,7 +844,7 @@ mod tests {
             mode: Vec::new(),
             desc: None,
         }]);
-        let lua = generate_loader(Path::new("/merged"), &[s]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
         // mode 空 → {"n"} にフォールバック
         assert!(
             lua.contains("vim.keymap.set({ \"n\" }"),
@@ -767,7 +860,7 @@ mod tests {
             mode: vec!["n".to_string(), "x".to_string()],
             desc: None,
         }]);
-        let lua = generate_loader(Path::new("/merged"), &[s]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
         assert!(
             lua.contains("vim.keymap.set({ \"n\", \"x\" }"),
             "multiple modes should be emitted as a Lua list"
@@ -782,7 +875,7 @@ mod tests {
             mode: vec!["n".to_string()],
             desc: Some("Grep files".to_string()),
         }]);
-        let lua = generate_loader(Path::new("/merged"), &[s]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
         assert!(
             lua.contains("desc = \"Grep files\""),
             "desc should be emitted in keymap opts"
@@ -864,7 +957,7 @@ mod tests {
         ];
 
         let scripts = vec![plenary, telescope, treesitter];
-        let lua = generate_loader(Path::new("/cache/rvpm/merged"), &scripts);
+        let lua = gen_loader(Path::new("/cache/rvpm/merged"), &scripts);
         println!(
             "\n======== GENERATED LOADER ========\n{}\n==================================\n",
             lua
@@ -881,7 +974,7 @@ mod tests {
         let mut s = PluginScripts::for_test("plenary", "/path/plenary");
         s.lazy = true;
         s.on_cmd = Some(vec!["Plenary".to_string()]);
-        let lua = generate_loader(merged_dir, &[s]);
+        let lua = gen_loader(merged_dir, &[s]);
         assert!(
             lua.contains(
                 "vim.api.nvim_exec_autocmds(\"User\", { pattern = \"rvpm_loaded_\" .. name })"
@@ -906,7 +999,7 @@ mod tests {
         s.on_path = Some(vec!["*.rs".to_string(), "Cargo.toml".to_string()]);
         s.on_source = Some(vec!["plenary.nvim".to_string()]);
         s.cond = Some("vim.fn.has('win32') == 1".to_string());
-        let lua = generate_loader(merged_dir, &[s]);
+        let lua = gen_loader(merged_dir, &[s]);
 
         assert!(lua.contains("if vim.fn.has('win32') == 1 then"));
         assert!(lua.contains("nvim_create_user_command(\"Cmd\""));
