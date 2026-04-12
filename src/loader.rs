@@ -721,6 +721,73 @@ mod tests {
     }
 
     #[test]
+    fn test_circular_depends_does_not_infinite_loop() {
+        // A(lazy, depends=["B"]) + B(lazy, depends=["A"]) — 相互依存
+        let mut a = PluginScripts::for_test("a", "/path/a");
+        a.lazy = true;
+        a.depends = Some(vec!["b".to_string()]);
+        a.on_cmd = Some(vec!["FooA".to_string()]);
+
+        let mut b = PluginScripts::for_test("b", "/path/b");
+        b.lazy = true;
+        b.depends = Some(vec!["a".to_string()]);
+        b.on_cmd = Some(vec!["FooB".to_string()]);
+
+        // パニック・無限ループしなければ OK
+        let lua = gen_loader(Path::new("/merged"), &[a, b]);
+        // 両方 lazy のまま (eager がないので昇格しない)
+        assert!(lua.contains("nvim_create_user_command(\"FooA\""), "a trigger exists");
+        assert!(lua.contains("nvim_create_user_command(\"FooB\""), "b trigger exists");
+    }
+
+    #[test]
+    fn test_circular_depends_with_eager_involved() {
+        // A(eager, depends=["B"]) + B(lazy, depends=["A"]) — A が eager で B に依存、B が A に逆依存
+        // → B は A に依存されるので eager に昇格
+        // → 昇格後の B が A に depends しているが A も eager → 無限昇格ループにならない
+        let mut a = PluginScripts::for_test("a", "/path/a");
+        a.lazy = false;
+        a.depends = Some(vec!["b".to_string()]);
+        a.plugin_files = vec!["/path/a/plugin/a.lua".to_string()];
+
+        let mut b = PluginScripts::for_test("b", "/path/b");
+        b.lazy = true;
+        b.depends = Some(vec!["a".to_string()]);
+        b.plugin_files = vec!["/path/b/plugin/b.lua".to_string()];
+
+        let lua = gen_loader(Path::new("/merged"), &[a, b]);
+        // B は eager に昇格されて source
+        assert!(lua.contains("source /path/b/plugin/b.lua"), "b should be promoted");
+        assert!(lua.contains("source /path/a/plugin/a.lua"), "a should be sourced");
+    }
+
+    #[test]
+    fn test_three_way_circular_depends() {
+        // A→B→C→A の循環 (全 lazy)
+        let mut a = PluginScripts::for_test("a", "/path/a");
+        a.lazy = true;
+        a.depends = Some(vec!["c".to_string()]);
+        a.on_cmd = Some(vec!["FooA".to_string()]);
+
+        let mut b = PluginScripts::for_test("b", "/path/b");
+        b.lazy = true;
+        b.depends = Some(vec!["a".to_string()]);
+        b.on_cmd = Some(vec!["FooB".to_string()]);
+
+        let mut c = PluginScripts::for_test("c", "/path/c");
+        c.lazy = true;
+        c.depends = Some(vec!["b".to_string()]);
+        c.on_cmd = Some(vec!["FooC".to_string()]);
+
+        // 無限ループしない
+        let lua = gen_loader(Path::new("/merged"), &[a, b, c]);
+        // 全部 lazy のまま
+        assert!(lua.contains("nvim_create_user_command(\"FooA\""));
+        assert!(lua.contains("nvim_create_user_command(\"FooB\""));
+        assert!(lua.contains("nvim_create_user_command(\"FooC\""));
+    }
+
+    #[test]
     fn test_self_referential_depends_does_not_crash() {
         // A(lazy, depends=["A"]) — 自己参照
         let mut a = PluginScripts::for_test("a", "/path/a");
