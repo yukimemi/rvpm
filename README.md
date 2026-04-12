@@ -132,31 +132,26 @@ concurrency = 10
 [[plugins]]
 name  = "snacks"
 url   = "folke/snacks.nvim"
-merge = true     # Default for eager plugins
-lazy  = false
+# No on_* triggers → eager (loaded at startup)
 
 [[plugins]]
 name    = "telescope"
 url     = "nvim-telescope/telescope.nvim"
-lazy    = true
 depends = ["snacks.nvim"]
-# Trigger on command — plugin loads when the user runs :Telescope
+# on_cmd is set → lazy is auto-inferred as true
 on_cmd  = ["Telescope"]
-# Or as a User autocmd chained off another plugin
 on_source = ["snacks.nvim"]
 
 [[plugins]]
 url     = "neovim/nvim-lspconfig"
-lazy    = true
-# Multiple triggers are OR-ed: any one firing loads the plugin
+# on_ft / on_event → auto lazy
 on_ft   = ["rust", "toml", "lua"]
 on_event = ["BufReadPre", "User LazyVimStarted"]
 
 [[plugins]]
 name = "which-key"
 url  = "folke/which-key.nvim"
-lazy = true
-# on_map accepts simple strings or full `{ lhs, mode, desc }` tables
+# on_map → auto lazy
 on_map = [
   "<leader>?",
   { lhs = "<leader>v", mode = ["n", "x"], desc = "Visual leader" },
@@ -179,7 +174,7 @@ on_map = [
 | `url` | `string` | **(required)** | Plugin repository. `owner/repo` (GitHub shorthand), full URL, or local path |
 | `name` | `string` | repo name from `url` (e.g. `telescope.nvim`) | Friendly name used in `rvpm_loaded_<name>` User autocmd, `on_source` chain, and log messages. Auto-derived by taking the last path component of the URL and stripping `.git` |
 | `dst` | `string` | `{base_dir}/repos/<host>/<owner>/<repo>` | Custom clone destination (overrides the default path layout) |
-| `lazy` | `bool` | `false` | If `true`, the plugin is not loaded at startup. Normally used with at least one trigger (`on_cmd`, `on_ft`, etc.), but a lazy plugin can also be loaded implicitly when it appears in another plugin's `depends` list (see below) |
+| `lazy` | `bool` | auto | **Auto-inferred**: if any `on_*` trigger is set, defaults to `true`; otherwise `false`. Write `lazy = false` explicitly to force eager loading even with triggers |
 | `merge` | `bool` | `true` | If `true`, the plugin directory is linked into `{base_dir}/merged/` and shares a single runtimepath entry |
 | `rev` | `string` | HEAD | Branch, tag, or commit hash to check out after clone/pull |
 | `depends` | `string[]` | none | Plugins that must be loaded before this one. Accepts `display_name` (e.g. `"snacks.nvim"`) or `url` (e.g. `"folke/snacks.nvim"`). **Eager plugin depending on a lazy plugin:** the lazy dep is auto-promoted to eager (a warning is printed to stderr). **Lazy plugin depending on a lazy plugin:** the dep(s) are loaded first inside the trigger callback via a `load_lazy` chain guarded against double-loading |
@@ -246,15 +241,17 @@ cost.
 ```toml
 [[plugins]]
 url  = "folke/tokyonight.nvim"
-lazy = true
-# No on_cmd / on_event needed — rvpm detects colors/*.lua at generate time
-# and registers a ColorSchemePre autocmd automatically.
+lazy = true  # explicit — no on_* triggers to auto-infer from
 
 [[plugins]]
 url  = "catppuccin/nvim"
 name = "catppuccin"
-lazy = true
+lazy = true  # explicit — ColorSchemePre is auto-registered, not an on_* field
 ```
+
+> Note: colorscheme plugins don't have `on_*` triggers, so `lazy = true` must be
+> written explicitly. rvpm handles the rest (scanning `colors/` and registering
+> `ColorSchemePre`).
 
 With this config, running `:colorscheme tokyonight` or `:colorscheme catppuccin`
 in Neovim will load the respective plugin just in time, with zero startup

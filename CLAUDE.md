@@ -60,18 +60,16 @@ loader_path = "~/.cache/nvim/rvpm/loader.lua"
 [[plugins]]
 name  = "snacks"
 url   = "folke/snacks.nvim"
-merge = true    # Eager のデフォルト (merged/ にリンク)
-lazy  = false
+# on_* なし → eager (起動時にロード)
 
 [[plugins]]
 name = "telescope"
 url  = "nvim-telescope/telescope.nvim"
-lazy = true
 depends = ["snacks.nvim"]
 # rev: ブランチ / タグ / コミットハッシュ
 # rev = "v0.1.0"
 
-# 遅延読み込みトリガー (全部省略可能、いずれか 1 つでも書けばその key で起動)
+# 遅延読み込みトリガー (いずれか 1 つでも書けば lazy は自動で true に推論される)
 on_cmd    = ["Telescope"]                    # string | string[]
 on_ft     = ["rust", "toml"]                 # string | string[]
 on_event  = ["BufReadPre", "User LazyDone"]  # "User Xxx" は User イベント + pattern に展開される
