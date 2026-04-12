@@ -171,7 +171,7 @@ on_map = [
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `url` | `string` | **(required)** | Plugin repository. `owner/repo` (GitHub shorthand), full URL, or local path |
-| `name` | `string` | same as `url` | Friendly name used in `rvpm_loaded_<name>` User autocmd and log messages |
+| `name` | `string` | repo name from `url` (e.g. `telescope.nvim`) | Friendly name used in `rvpm_loaded_<name>` User autocmd, `on_source` chain, and log messages. Auto-derived by taking the last path component of the URL and stripping `.git` |
 | `dst` | `string` | `{base_dir}/repos/<host>/<owner>/<repo>` | Custom clone destination (overrides the default path layout) |
 | `lazy` | `bool` | `false` | If `true`, the plugin is not loaded at startup — requires at least one trigger (`on_cmd`, `on_ft`, etc.) |
 | `merge` | `bool` | `true` | If `true`, the plugin directory is linked into `{base_dir}/merged/` and shares a single runtimepath entry |

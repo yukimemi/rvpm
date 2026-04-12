@@ -176,6 +176,29 @@ impl Plugin {
             }
         }
     }
+
+    /// URL からリポジトリ名を抽出してデフォルトの name として返す。
+    /// `.git` suffix は除去。パスの最後のコンポーネントを使う。
+    ///
+    /// - `owner/repo`                       → `repo`
+    /// - `https://github.com/owner/repo`    → `repo`
+    /// - `https://github.com/owner/repo.git`→ `repo`
+    /// - `git@github.com:owner/repo.git`    → `repo`
+    pub fn default_name(&self) -> String {
+        let url = self.url.trim_end_matches(".git");
+        // SSH の `:` を `/` に正規化してからスラッシュで split
+        let normalized = url.replace(':', "/");
+        normalized
+            .rsplit('/')
+            .next()
+            .unwrap_or(url)
+            .to_string()
+    }
+
+    /// `name` が明示されていればそれを、なければ `default_name()` を返す。
+    pub fn display_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.default_name())
+    }
 }
 
 pub fn parse_config(toml_str: &str) -> Result<Config> {
@@ -549,5 +572,47 @@ merge = false
             ..Default::default()
         };
         assert_eq!(p3.canonical_path(), "github.com/owner/repo");
+    }
+
+    #[test]
+    fn test_plugin_default_name() {
+        // owner/repo shorthand
+        let p1 = Plugin {
+            url: "nvim-lua/plenary.nvim".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(p1.default_name(), "plenary.nvim");
+
+        // Full HTTPS URL
+        let p2 = Plugin {
+            url: "https://github.com/yukimemi/chronicle.vim".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(p2.default_name(), "chronicle.vim");
+
+        // Full URL with .git suffix
+        let p3 = Plugin {
+            url: "https://github.com/owner/repo.git".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(p3.default_name(), "repo");
+
+        // SSH URL
+        let p4 = Plugin {
+            url: "git@github.com:owner/telescope.nvim.git".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(p4.default_name(), "telescope.nvim");
+
+        // Explicit name overrides
+        let p5 = Plugin {
+            url: "https://github.com/owner/long-ugly-name".to_string(),
+            name: Some("short".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(p5.display_name(), "short");
+
+        // No explicit name → default_name
+        assert_eq!(p1.display_name(), "plenary.nvim");
     }
 }

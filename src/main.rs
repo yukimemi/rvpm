@@ -1898,7 +1898,7 @@ fn build_plugin_scripts(
     plugin_config_dir: &Path,
 ) -> crate::loader::PluginScripts {
     crate::loader::PluginScripts {
-        name: plugin.name.clone().unwrap_or_else(|| plugin.url.clone()),
+        name: plugin.display_name(),
         path: plugin_path.to_string_lossy().replace('\\', "/"),
         merge: plugin.merge,
         init: find_lua(plugin_config_dir, "init.lua"),
