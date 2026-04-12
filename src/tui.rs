@@ -297,23 +297,14 @@ impl TuiState {
             ])
             .split(f.area());
 
-        // インストール済み / 未インストール / エラー のカウント
-        let installed = self
+        let eager_count = config.plugins.iter().filter(|p| !p.lazy).count();
+        let lazy_count = config.plugins.iter().filter(|p| p.lazy).count();
+        let error_count = self
             .status_map
             .values()
-            .filter(|s| matches!(s, PluginStatus::Finished))
+            .filter(|s| matches!(s, PluginStatus::Failed(_)))
             .count();
-        let missing = self
-            .status_map
-            .values()
-            .filter(|s| matches!(s, PluginStatus::Failed(m) if m == "Missing"))
-            .count();
-        let errors = self
-            .status_map
-            .values()
-            .filter(|s| matches!(s, PluginStatus::Failed(m) if m != "Missing"))
-            .count();
-        let modified = self
+        let modified_count = self
             .status_map
             .values()
             .filter(|s| matches!(s, PluginStatus::Syncing(_)))
@@ -328,25 +319,27 @@ impl TuiState {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("  Total:{} ", config.plugins.len()),
+                format!("  {}:", config.plugins.len()),
                 Style::default().fg(Color::White),
             ),
+            Span::styled("total ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!(" \u{f00c}:{} ", installed),
+                format!("{}:", eager_count),
                 Style::default().fg(Color::Green),
             ),
+            Span::styled("eager ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!(" \u{f05e}:{} ", missing),
-                Style::default().fg(Color::Red),
-            ),
-            Span::styled(
-                format!(" \u{f071}:{} ", modified),
+                format!("{}:", lazy_count),
                 Style::default().fg(Color::Yellow),
             ),
+            Span::styled("lazy ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}:", error_count), Style::default().fg(Color::Red)),
+            Span::styled("err ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!(" \u{2716}:{} ", errors),
-                Style::default().fg(Color::Red),
+                format!("{}:", modified_count),
+                Style::default().fg(Color::Yellow),
             ),
+            Span::styled("mod", Style::default().fg(Color::DarkGray)),
         ]))
         .block(
             Block::default()
@@ -426,9 +419,9 @@ impl TuiState {
                     ("Eager", Color::Green)
                 };
                 let merged = if p.merge {
-                    ("\u{f00c}", Color::Cyan)
+                    ("\u{2713}", Color::Cyan) // ✓
                 } else {
-                    ("\u{2716}", Color::DarkGray)
+                    ("-", Color::DarkGray)
                 };
                 let rev = p.rev.as_deref().unwrap_or("-");
 
