@@ -92,7 +92,7 @@ rvpm init --write
 # Respects $NVIM_APPNAME for custom Neovim configs.
 
 # 2. Add plugins
-rvpm add nvim-lua/plenary.nvim
+rvpm add folke/snacks.nvim
 rvpm add nvim-telescope/telescope.nvim
 
 # 3. Open config.toml to tweak settings (lazy, triggers, etc.)
@@ -123,8 +123,8 @@ concurrency = 10
 # loader_path = "~/.cache/nvim/rvpm/loader.lua"
 
 [[plugins]]
-name  = "plenary"
-url   = "nvim-lua/plenary.nvim"
+name  = "snacks"
+url   = "folke/snacks.nvim"
 merge = true     # Default for eager plugins
 lazy  = false
 
@@ -132,15 +132,14 @@ lazy  = false
 name    = "telescope"
 url     = "nvim-telescope/telescope.nvim"
 lazy    = true
-depends = ["plenary.nvim"]
+depends = ["snacks.nvim"]
 # Trigger on command — plugin loads when the user runs :Telescope
 on_cmd  = ["Telescope"]
 # Or as a User autocmd chained off another plugin
-on_source = ["plenary.nvim"]
+on_source = ["snacks.nvim"]
 
 [[plugins]]
-name    = "nvim-treesitter"
-url     = "nvim-treesitter/nvim-treesitter"
+url     = "neovim/nvim-lspconfig"
 lazy    = true
 # Multiple triggers are OR-ed: any one firing loads the plugin
 on_ft   = ["rust", "toml", "lua"]
@@ -176,7 +175,7 @@ on_map = [
 | `lazy` | `bool` | `false` | If `true`, the plugin is not loaded at startup — requires at least one trigger (`on_cmd`, `on_ft`, etc.) |
 | `merge` | `bool` | `true` | If `true`, the plugin directory is linked into `{base_dir}/merged/` and shares a single runtimepath entry |
 | `rev` | `string` | HEAD | Branch, tag, or commit hash to check out after clone/pull |
-| `depends` | `string[]` | none | Plugins that must be loaded first. Accepts `display_name` (e.g. `"plenary.nvim"`) or `url` (e.g. `"nvim-lua/plenary.nvim"`) |
+| `depends` | `string[]` | none | Plugins that must be loaded first. Accepts `display_name` (e.g. `"snacks.nvim"`) or `url` (e.g. `"folke/snacks.nvim"`) |
 | `cond` | `string` | none | Lua expression. When set, the plugin's loader code is wrapped in `if <cond> then ... end` |
 | `build` | `string` | none | Shell command to run after clone (not yet implemented) |
 
@@ -190,7 +189,7 @@ All trigger fields are optional. When multiple triggers are specified on the sam
 | `on_ft` | `string \| string[]` | `"rust"` or `["rust", "toml"]` | Load on `FileType` event, then re-trigger so `ftplugin/` fires |
 | `on_event` | `string \| string[]` | `"BufReadPre"` or `["BufReadPre", "User LazyDone"]` | Load on Neovim event. `"User Xxx"` shorthand creates a User autocmd with `pattern = "Xxx"` |
 | `on_path` | `string \| string[]` | `"*.rs"` or `["*.rs", "Cargo.toml"]` | Load on `BufRead` / `BufNewFile` matching the glob pattern |
-| `on_source` | `string \| string[]` | `"plenary.nvim"` or `["plenary.nvim", "nui.nvim"]` | Load when the named plugin fires its `rvpm_loaded_<name>` User autocmd. Value must match the target plugin's `display_name` |
+| `on_source` | `string \| string[]` | `"snacks.nvim"` or `["snacks.nvim", "nui.nvim"]` | Load when the named plugin fires its `rvpm_loaded_<name>` User autocmd. Value must match the target plugin's `display_name` |
 | `on_map` | `string \| MapSpec \| array` | see below | Load on keypress. Accepts simple `"<leader>f"` or table form |
 
 #### `on_map` formats
@@ -270,7 +269,7 @@ rvpm generate
 # ── Add / remove ─────────────────────────────────────────
 
 # Add a plugin (creates entry in config.toml and syncs immediately)
-rvpm add nvim-lua/plenary.nvim
+rvpm add folke/snacks.nvim
 rvpm add nvim-telescope/telescope.nvim --name telescope
 
 # Remove interactively (fuzzy-select prompt)
@@ -286,8 +285,8 @@ rvpm edit
 
 # Jump straight to a specific file (skips both selectors)
 rvpm edit telescope --after
-rvpm edit plenary --init
-rvpm edit treesitter --before
+rvpm edit snacks --init
+rvpm edit lspconfig --before
 
 # ── Set plugin options ───────────────────────────────────
 
