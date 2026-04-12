@@ -1624,11 +1624,8 @@ fn ensure_config_exists(config_path: &Path) -> Result<bool> {
         std::fs::create_dir_all(parent)?;
     }
     let template = "\
+# rvpm config — https://github.com/yukimemi/rvpm#configuration
 [options]
-# config_root = \"~/.config/rvpm/plugins\"  # per-plugin init/before/after.lua
-# concurrency = 8                          # parallel git operations (default: 8)
-# base_dir = \"~/.cache/rvpm\"              # repos / merged / loader.lua root
-# loader_path = \"~/.cache/rvpm/loader.lua\"
 ";
     std::fs::write(config_path, template)?;
     println!("Created {}", config_path.display());
