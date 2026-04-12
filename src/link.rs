@@ -26,32 +26,39 @@ pub fn junction_or_symlink(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 指定したプラグインの中身（lua, plugin, after 等）を merged ディレクトリにマージ
+/// 指定したプラグインの全ディレクトリ・ファイルを merged ディレクトリにマージ。
+/// `.git` 等の隠しディレクトリは除外し、それ以外の全エントリをリンクする。
+/// ディレクトリの場合はサブエントリ単位でリンク (衝突時は上書き)。
+/// ファイルの場合はコピー。
 pub fn merge_plugin(src: &Path, dst_root: &Path) -> Result<()> {
-    let targets = [
-        "lua", "plugin", "after", "autoload", "doc", "colors", "queries", "syntax",
-    ];
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
 
-    for target in targets {
-        let target_src = src.join(target);
-        if target_src.exists() {
-            let target_dst = dst_root.join(target);
+        // 隠しファイル・ディレクトリ (.git, .github, etc) は除外
+        if name_str.starts_with('.') {
+            continue;
+        }
 
-            // ターゲット（例: merged/lua）がまだ存在しない場合は作成
+        let entry_src = entry.path();
+
+        if entry_src.is_dir() {
+            // ディレクトリ: merged/<dir>/ を作成して中身をリンク
+            let target_dst = dst_root.join(&name);
             if !target_dst.exists() {
                 std::fs::create_dir_all(&target_dst)?;
             }
-
-            // 中身を再帰的にリンク... ではなく、まずは単純にサブディレクトリ単位でリンク。
-            // 同じプラグインが同じディレクトリ（例: plugin/a.vim）を持つ場合は上書き。
-            // ここでは簡易的に、各プラグインのサブディレクトリ（例: lua/plugin_a）を
-            // ターゲット（merged/lua/plugin_a）としてリンクする。
-            for entry in std::fs::read_dir(&target_src)? {
-                let entry = entry?;
-                let entry_src = entry.path();
-                let entry_dst = target_dst.join(entry.file_name());
-                junction_or_symlink(&entry_src, &entry_dst)?;
+            for sub in std::fs::read_dir(&entry_src)? {
+                let sub = sub?;
+                let sub_src = sub.path();
+                let sub_dst = target_dst.join(sub.file_name());
+                junction_or_symlink(&sub_src, &sub_dst)?;
             }
+        } else {
+            // ファイル: そのままコピー
+            let file_dst = dst_root.join(&name);
+            std::fs::copy(&entry_src, &file_dst)?;
         }
     }
     Ok(())
