@@ -235,6 +235,9 @@ impl TuiState {
         );
         f.render_widget(title, chunks[0]);
 
+        // URL の最大幅に合わせてパディング (+2 でゆとり)
+        let max_url_len = self.plugins.iter().map(|u| u.len()).max().unwrap_or(20) + 2;
+
         let items: Vec<ListItem> = self
             .plugins
             .iter()
@@ -254,7 +257,10 @@ impl TuiState {
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!(" {} ", icon), Style::default().fg(color)),
-                    Span::styled(format!("{:<40}", url), Style::default().fg(Color::White)),
+                    Span::styled(
+                        format!("{:<width$}", url, width = max_url_len),
+                        Style::default().fg(Color::White),
+                    ),
                     Span::styled(msg, Style::default().fg(Color::DarkGray)),
                 ]))
             })
