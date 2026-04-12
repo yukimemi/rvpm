@@ -460,7 +460,11 @@ async fn run_sync(prune: bool) -> Result<()> {
             Some(res) = set.join_next() => {
                 finished_tasks += 1;
                 if let Ok(Ok((plugin, dst_path))) = res {
-                    if plugin.merge { let _ = merge_plugin(&dst_path, &merged_dir); }
+                    // lazy プラグインは merge しない (trigger 前に merged/ 経由で
+                    // lua モジュールが rtp に漏れて lazy の意味がなくなるため)
+                    if plugin.merge && !plugin.lazy {
+                        let _ = merge_plugin(&dst_path, &merged_dir);
+                    }
                     let config_root = resolve_config_root(config.options.config_root.as_deref());
                     let plugin_config_dir = config_root.join(plugin.canonical_path());
                     let scripts = build_plugin_scripts(&plugin, &dst_path, &plugin_config_dir);
