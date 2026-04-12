@@ -982,6 +982,7 @@ async fn run_edit(
         items.extend(config.plugins.iter().map(|p| p.url.clone()));
         let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
             .with_prompt("Select plugin to edit")
+            .default(0)
             .items(&items)
             .interact_opt()?;
         match selection {
@@ -1059,6 +1060,7 @@ async fn run_set(
         let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
         let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
             .with_prompt("Select plugin to set")
+            .default(0)
             .items(&urls)
             .interact_opt()?;
         match selection {
@@ -1153,6 +1155,7 @@ async fn run_set(
         ];
         let selection = Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
             .with_prompt("Select option to set")
+            .default(0)
             .items(&options)
             .interact_opt()?;
         match selection {
@@ -1363,6 +1366,7 @@ async fn run_remove(query: Option<String>) -> Result<()> {
         let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
         let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
             .with_prompt("Select plugin to remove")
+            .default(0)
             .items(&urls)
             .interact_opt()?;
         match selection {
