@@ -115,7 +115,7 @@ nvim_rc = "~/.config/nvim/rc"
 # Per-plugin init/before/after.lua directory
 # Default: ~/.config/rvpm/plugins
 config_root = "{{ vars.nvim_rc }}/plugins"
-# Parallel git operations limit (default: unlimited)
+# Parallel git operations limit (default: 8)
 concurrency = 10
 # Optional: move all rvpm data (repos + merged + loader.lua) under a custom root
 # base_dir = "~/dotfiles/nvim/rvpm"
@@ -162,7 +162,7 @@ on_map = [
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `config_root` | `string` | `~/.config/rvpm/plugins` | Root directory for per-plugin `init.lua` / `before.lua` / `after.lua`. Supports `~` and `{{ vars.xxx }}` templates |
-| `concurrency` | `integer` | unlimited | Max number of parallel git operations during `sync` / `update` |
+| `concurrency` | `integer` | `8` | Max number of parallel git operations during `sync` / `update`. Kept moderate to avoid GitHub rate limits |
 | `base_dir` | `string` | `~/.cache/rvpm` | Root for all rvpm data (repos, merged, loader.lua). Setting this moves everything together |
 | `loader_path` | `string` | `{base_dir}/loader.lua` | Override only the loader.lua output path. Takes precedence over `base_dir` for the loader file |
 

@@ -49,7 +49,7 @@ nvim_rc = "~/.config/nvim/rc"
 # per-plugin の init/before/after.lua を置くディレクトリの root
 # 未指定なら ~/.config/rvpm/plugins (config.toml と隣合わせ)
 config_root = "{{ vars.nvim_rc }}/plugins"
-# 並列数上限 (未指定なら無制限)
+# 並列数上限 (デフォルト 8、GitHub rate limit 回避のため控えめ)
 concurrency = 10
 # rvpm のデータ置き場 root を上書き (未指定なら ~/.cache/rvpm)
 # repos / merged / loader.lua 全部ここ配下にまとまる

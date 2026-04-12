@@ -1563,8 +1563,11 @@ fn write_loader_to_path(
     Ok(())
 }
 
+/// デフォルト並列数。GitHub の rate limit を避けるため控えめに。
+const DEFAULT_CONCURRENCY: usize = 8;
+
 fn resolve_concurrency(config_value: Option<usize>) -> usize {
-    config_value.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS)
+    config_value.unwrap_or(DEFAULT_CONCURRENCY)
 }
 
 // ====================================================================
@@ -1603,7 +1606,7 @@ fn ensure_config_exists(config_path: &Path) -> Result<bool> {
     let template = "\
 [options]
 # config_root = \"~/.config/rvpm/plugins\"  # per-plugin init/before/after.lua
-# concurrency = 10                         # parallel git operations
+# concurrency = 8                          # parallel git operations (default: 8)
 # base_dir = \"~/.cache/rvpm\"              # repos / merged / loader.lua root
 # loader_path = \"~/.cache/rvpm/loader.lua\"
 ";
@@ -2274,9 +2277,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_concurrency_defaults_to_max_permits() {
+    fn test_resolve_concurrency_defaults_to_8() {
         let result = resolve_concurrency(None);
-        assert_eq!(result, tokio::sync::Semaphore::MAX_PERMITS);
+        assert_eq!(result, DEFAULT_CONCURRENCY);
+        assert_eq!(result, 8);
     }
 
     #[test]
