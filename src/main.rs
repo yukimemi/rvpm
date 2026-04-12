@@ -385,22 +385,29 @@ async fn run_sync(prune: bool) -> Result<()> {
                                 PluginStatus::Syncing(format!("Building: {}", build_cmd)),
                             ))
                             .await;
-                        // 自身 + depends の path を rtp に追加
+                        // 自身 + depends の path を rtp に追加 (再帰的に辿る)
                         let mut rtp_dirs = vec![dst_path.clone()];
-                        if let Some(deps) = &plugin.depends {
-                            for dep in deps {
-                                // dep は display_name or URL → canonical_path で解決
-                                if let Some(dep_plugin) = config_for_build
-                                    .plugins
-                                    .iter()
-                                    .find(|p| p.display_name() == *dep || p.url == *dep)
-                                {
-                                    let dep_path = if let Some(d) = &dep_plugin.dst {
-                                        PathBuf::from(d)
-                                    } else {
-                                        base_dir.join("repos").join(dep_plugin.canonical_path())
-                                    };
-                                    rtp_dirs.push(dep_path);
+                        let mut visited = std::collections::HashSet::new();
+                        let mut stack: Vec<String> =
+                            plugin.depends.iter().flatten().cloned().collect();
+                        while let Some(dep) = stack.pop() {
+                            if !visited.insert(dep.clone()) {
+                                continue; // 循環防止
+                            }
+                            if let Some(dep_plugin) = config_for_build
+                                .plugins
+                                .iter()
+                                .find(|p| p.display_name() == dep || p.url == dep)
+                            {
+                                let dep_path = if let Some(d) = &dep_plugin.dst {
+                                    PathBuf::from(d)
+                                } else {
+                                    base_dir.join("repos").join(dep_plugin.canonical_path())
+                                };
+                                rtp_dirs.push(dep_path);
+                                // dep の depends も辿る
+                                if let Some(deeper) = &dep_plugin.depends {
+                                    stack.extend(deeper.clone());
                                 }
                             }
                         }
