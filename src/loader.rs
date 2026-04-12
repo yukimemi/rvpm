@@ -98,22 +98,66 @@ pub fn generate_loader(
     opts: &LoaderOptions,
 ) -> String {
     // ======================================================
-    // Pre-pass: eager プラグインが depends する lazy プラグインを eager に自動昇格
-    // (lazy.nvim の dependencies と同じセマンティクス)
+    // Pre-pass: lazy → eager 自動昇格 (反復)
+    //
+    // 以下のケースで lazy を eager に昇格する:
+    //   1. eager が lazy に depends → lazy を eager に
+    //   2. lazy が on_source で eager を参照 → その lazy は Phase 3 後の
+    //      User autocmd を受けないと永遠にロードされないので eager に昇格
+    //
+    // チェーン対応: A(eager) ← B(lazy, on_source=["A"]) ← C(lazy, on_source=["B"])
+    // → B 昇格 → C も昇格。ループで収束するまで繰り返す。
     // ======================================================
     let mut scripts = scripts.to_vec();
-    let eager_names: std::collections::HashSet<String> = scripts
-        .iter()
-        .filter(|s| !s.lazy)
-        .flat_map(|s| s.depends.iter().flatten().cloned())
-        .collect();
-    for s in scripts.iter_mut() {
-        if s.lazy && eager_names.contains(&s.name) {
+    loop {
+        let eager_names: std::collections::HashSet<String> = scripts
+            .iter()
+            .filter(|s| !s.lazy)
+            .map(|s| s.name.clone())
+            .collect();
+
+        // eager が depends する lazy の名前を収集
+        let depended_by_eager: std::collections::HashSet<String> = scripts
+            .iter()
+            .filter(|s| !s.lazy)
+            .flat_map(|s| s.depends.iter().flatten().cloned())
+            .collect();
+
+        // 昇格対象を先に集める (借用の衝突回避)
+        let to_promote: Vec<(String, &'static str)> = scripts
+            .iter()
+            .filter(|s| s.lazy)
+            .filter_map(|s| {
+                if depended_by_eager.contains(&s.name) {
+                    Some((s.name.clone(), "depended on by an eager plugin"))
+                } else if s
+                    .on_source
+                    .as_ref()
+                    .map(|sources| sources.iter().any(|src| eager_names.contains(src)))
+                    .unwrap_or(false)
+                {
+                    Some((
+                        s.name.clone(),
+                        "on_source references an eager plugin (event fires before listener is registered)",
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if to_promote.is_empty() {
+            break;
+        }
+
+        for (name, reason) in &to_promote {
             eprintln!(
-                "Note: '{}' is lazy but depended on by an eager plugin — promoting to eager.",
-                s.name
+                "Note: '{}' is lazy but {} — promoting to eager.",
+                name, reason
             );
-            s.lazy = false;
+            if let Some(s) = scripts.iter_mut().find(|s| s.name == *name) {
+                s.lazy = false;
+            }
         }
     }
 
@@ -537,6 +581,63 @@ mod tests {
             !lua.contains("nvim_create_user_command(\"Snacks\""),
             "promoted plugin should not register lazy triggers"
         );
+    }
+
+    #[test]
+    fn test_on_source_referencing_eager_promotes_to_eager() {
+        // Lazy A の on_source が Eager B を参照 → A は eager に昇格
+        // (Phase 3 で B の rvpm_loaded 発火時に Phase 4 のリスナーが未登録の問題を回避)
+        let mut b = PluginScripts::for_test("snacks.nvim", "/path/snacks");
+        b.lazy = false;
+        b.plugin_files = vec!["/path/snacks/plugin/snacks.lua".to_string()];
+
+        let mut a = PluginScripts::for_test("telescope.nvim", "/path/telescope");
+        a.lazy = true;
+        a.on_source = Some(vec!["snacks.nvim".to_string()]);
+        a.plugin_files = vec!["/path/telescope/plugin/telescope.lua".to_string()];
+
+        let lua = gen_loader(Path::new("/merged"), &[b, a]);
+        // A が Phase 3 (eager) で source されている
+        assert!(
+            lua.contains("source /path/telescope/plugin/telescope.lua"),
+            "on_source→eager plugin should be promoted and sourced eagerly"
+        );
+        // A の on_source trigger は登録されていない
+        assert!(
+            !lua.contains("rvpm_loaded_snacks.nvim\", once = true"),
+            "promoted plugin should not register on_source trigger"
+        );
+    }
+
+    #[test]
+    fn test_on_source_chain_promotion() {
+        // A(eager) ← B(lazy, on_source=["A"]) ← C(lazy, on_source=["B"])
+        // → B 昇格 → C も昇格
+        let mut a = PluginScripts::for_test("a", "/path/a");
+        a.lazy = false;
+        a.plugin_files = vec!["/path/a/plugin/a.lua".to_string()];
+
+        let mut b = PluginScripts::for_test("b", "/path/b");
+        b.lazy = true;
+        b.on_source = Some(vec!["a".to_string()]);
+        b.plugin_files = vec!["/path/b/plugin/b.lua".to_string()];
+
+        let mut c = PluginScripts::for_test("c", "/path/c");
+        c.lazy = true;
+        c.on_source = Some(vec!["b".to_string()]);
+        c.plugin_files = vec!["/path/c/plugin/c.lua".to_string()];
+
+        let lua = gen_loader(Path::new("/merged"), &[a, b, c]);
+        // 全部 eager で source されている
+        assert!(lua.contains("source /path/a/plugin/a.lua"));
+        assert!(lua.contains("source /path/b/plugin/b.lua"));
+        assert!(lua.contains("source /path/c/plugin/c.lua"));
+        // source 順序: a → b → c
+        let pos_a = lua.find("source /path/a/plugin/a.lua").unwrap();
+        let pos_b = lua.find("source /path/b/plugin/b.lua").unwrap();
+        let pos_c = lua.find("source /path/c/plugin/c.lua").unwrap();
+        assert!(pos_a < pos_b, "a must load before b");
+        assert!(pos_b < pos_c, "b must load before c");
     }
 
     #[test]
