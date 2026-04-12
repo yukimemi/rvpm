@@ -379,10 +379,10 @@ impl TuiState {
         )
         .row_highlight_style(
             Style::default()
-                .add_modifier(Modifier::REVERSED)
+                .bg(Color::Indexed(237)) // #3a3a3a — 落ち着いたダークグレー
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol(">> ");
+        .highlight_symbol("\u{25b8} "); // ▸
         f.render_stateful_widget(table, chunks[1], &mut self.table_state);
 
         let footer = Paragraph::new(Line::from(vec![
