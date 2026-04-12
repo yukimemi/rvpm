@@ -36,6 +36,9 @@ Neovim startup reads exactly the files it needs and nothing else.
 
 - **Fast startup** — Phase 0–4 loader model with `vim.go.loadplugins = false`
   and pre-globbed `plugin/` / `ftdetect/` / `after/plugin/` file lists
+- **Global hooks** — `~/.config/rvpm/before.lua` (Phase 0.7, before all plugin
+  `init.lua`) and `~/.config/rvpm/after.lua` (Phase 4.5, after all lazy trigger
+  registrations); auto-detected at generate time, no config required
 - **Merge optimization** — `merge = true` plugins share a single
   `vim.opt.rtp:append(...)` entry via junction/symlink
 - **Full lazy triggers** — `on_cmd` / `on_ft` / `on_map` / `on_event` /
@@ -215,6 +218,20 @@ on_map = [
 | `mode` | `string \| string[]` | `"n"` | Vim mode(s) for the keymap (`"n"`, `"x"`, `"i"`, etc.) |
 | `desc` | `string` | none | Description shown in `:map` / which-key **before** the plugin is loaded |
 
+### Global hooks
+
+Place Lua files directly under `~/.config/rvpm/` and rvpm picks them up
+automatically at generate time — no configuration entry needed:
+
+| File | Phase | When it runs |
+|---|---|---|
+| `~/.config/rvpm/before.lua` | 0.7 | After `load_lazy` helper is defined, before any per-plugin `init.lua` |
+| `~/.config/rvpm/after.lua` | 4.5 | After all lazy trigger registrations |
+
+These are useful for any setup that must happen before plugins are initialised
+(e.g. setting `vim.g.*` globals) or for post-load orchestration that doesn't
+belong to any single plugin.
+
 ### Per-plugin hooks
 
 Drop Lua files under `{config_root}/<host>/<owner>/<repo>/` and rvpm will
@@ -244,7 +261,7 @@ vim.keymap.set("n", "<leader>ff", "<cmd>Telescope find_files<cr>")
 | `rvpm add <repo>` | Add a plugin and sync |
 | `rvpm update [query]` | `git pull` installed plugins |
 | `rvpm remove [query]` | Remove a plugin from `config.toml` and delete its directory |
-| `rvpm edit [query] [--init\|--before\|--after]` | Edit per-plugin Lua config in `$EDITOR`. Flag skips the file picker |
+| `rvpm edit [query] [--init\|--before\|--after] [--global]` | Edit per-plugin Lua config in `$EDITOR`. Flag skips the file picker. `--global` (or selecting `[ Global hooks ]` in the interactive picker) edits `~/.config/rvpm/before.lua` / `after.lua` |
 | `rvpm set [query] [flags]` | Interactively or non-interactively tweak plugin options (lazy, merge, on\_\*, rev) |
 | `rvpm config` | Open `config.toml` in `$EDITOR` |
 | `rvpm init [--write]` | Print (or write) the `dofile(...)` snippet to wire `loader.lua` into `init.lua` |
@@ -287,6 +304,15 @@ rvpm edit
 rvpm edit telescope --after
 rvpm edit snacks --init
 rvpm edit lspconfig --before
+
+# ── Edit global hooks ────────────────────────────────────
+
+# Open the interactive picker and select [ Global hooks ]
+rvpm edit
+
+# Jump straight to the global before/after hooks
+rvpm edit --global --before    # ~/.config/rvpm/before.lua (Phase 0.7)
+rvpm edit --global --after     # ~/.config/rvpm/after.lua  (Phase 4.5)
 
 # ── Set plugin options ───────────────────────────────────
 
@@ -332,19 +358,21 @@ rvpm list --no-tui | grep Missing
 ### Phase 0–4 loader model
 
 ```
-Phase 0:  vim.go.loadplugins = false         -- disable Neovim's auto-source
+Phase 0:   vim.go.loadplugins = false         -- disable Neovim's auto-source
 Phase 0.5: load_lazy helper                   -- runtime loader for lazy plugins
-Phase 1:  all init.lua (dependency order)    -- pre-rtp phase
-Phase 2:  rtp:append(merged_dir)              -- once, if any merge=true plugins
-Phase 3:  eager plugins in dependency order:
-            if not merge: rtp:append(plugin_path)
-            before.lua
-            source plugin/**/*.{vim,lua}     -- pre-globbed at generate time
-            source ftdetect/** in augroup filetypedetect
-            source after/plugin/**
-            after.lua
-            User autocmd "rvpm_loaded_<name>"
-Phase 4:  lazy trigger registrations (on_cmd / on_ft / on_map / etc)
+Phase 0.7: global before.lua                  -- ~/.config/rvpm/before.lua (if present)
+Phase 1:   all init.lua (dependency order)   -- pre-rtp phase
+Phase 2:   rtp:append(merged_dir)             -- once, if any merge=true plugins
+Phase 3:   eager plugins in dependency order:
+             if not merge: rtp:append(plugin_path)
+             before.lua
+             source plugin/**/*.{vim,lua}    -- pre-globbed at generate time
+             source ftdetect/** in augroup filetypedetect
+             source after/plugin/**
+             after.lua
+             User autocmd "rvpm_loaded_<name>"
+Phase 4:   lazy trigger registrations (on_cmd / on_ft / on_map / etc)
+Phase 4.5: global after.lua                  -- ~/.config/rvpm/after.lua (if present)
 ```
 
 Because the file lists are baked in at `rvpm generate` time, the loader does
@@ -371,6 +399,8 @@ dependencies.
 | Path | Purpose |
 |---|---|
 | `~/.config/rvpm/config.toml` | Main configuration (fixed location) |
+| `~/.config/rvpm/before.lua` | Global before hook — runs at Phase 0.7, before all plugin `init.lua` |
+| `~/.config/rvpm/after.lua` | Global after hook — runs at Phase 4.5, after all lazy trigger registrations |
 | `~/.config/rvpm/plugins/<host>/<owner>/<repo>/` | Per-plugin `init/before/after.lua` (`options.config_root` to override) |
 | `~/.cache/rvpm/repos/<host>/<owner>/<repo>/` | Plugin clones |
 | `~/.cache/rvpm/merged/` | Linked root for `merge = true` plugins |

@@ -87,6 +87,17 @@ on_map = [
 cond = "vim.fn.has('win32') == 1"
 ```
 
+## グローバル hooks
+
+`~/.config/rvpm/` 直下に置くだけで自動適用される。設定ファイルへの記述不要 (Convention over Configuration)。
+
+| ファイル | Phase | 実行タイミング |
+|---|---|---|
+| `~/.config/rvpm/before.lua` | 0.7 | `load_lazy` helper 定義後、全プラグインの `init.lua` より前 |
+| `~/.config/rvpm/after.lua` | 4.5 | 全 lazy trigger 登録後 |
+
+`generate_loader()` は `LoaderOptions` 構造体 (`global_before: Option<PathBuf>`, `global_after: Option<PathBuf>`) を受け取り、ファイルが存在する場合だけ `dofile(...)` を埋め込む。
+
 ## per-plugin 設定ファイル (config_root)
 
 `options.config_root` 配下に `<host>/<owner>/<repo>/` の階層でプラグインごとの Lua 設定ファイルを配置できる。例: `~/.config/nvim/rc/plugins/github.com/nvim-telescope/telescope.nvim/`。
@@ -126,19 +137,21 @@ src/
 rvpm は **lazy.nvim 方式の完全制御** + **merge 最適化** + **generate 時の事前 glob** を全部取りしている。loader.lua の構造:
 
 ```
-Phase 0:  vim.go.loadplugins = false          ← Neovim の auto-source 無効化
-Phase 0.5: load_lazy helper 定義              ← lazy 用の実行時ローダー
-Phase 1:  全プラグインの init.lua (依存順)    ← pre-rtp phase
-Phase 2:  merged/ を rtp に 1 回 append       ← merge=true プラグインがあれば
-Phase 3:  eager プラグインを依存順で処理:
-            非 merge は vim.opt.rtp:append(plugin.path)
-            before.lua
-            plugin/**/*.{vim,lua} を事前 glob 済みファイル名で直接 source
-            ftdetect/**/*.{vim,lua} を augroup filetypedetect 内で source
-            after/plugin/**/*.{vim,lua} を source
-            after.lua
-            User autocmd "rvpm_loaded_<name>" 発火 (on_source チェーン用)
-Phase 4:  lazy プラグインの trigger 登録      ← on_cmd / on_ft / on_map / on_event / on_path / on_source
+Phase 0:   vim.go.loadplugins = false          ← Neovim の auto-source 無効化
+Phase 0.5: load_lazy helper 定義               ← lazy 用の実行時ローダー
+Phase 0.7: global before.lua                   ← ~/.config/rvpm/before.lua (存在する場合)
+Phase 1:   全プラグインの init.lua (依存順)   ← pre-rtp phase
+Phase 2:   merged/ を rtp に 1 回 append       ← merge=true プラグインがあれば
+Phase 3:   eager プラグインを依存順で処理:
+             非 merge は vim.opt.rtp:append(plugin.path)
+             before.lua
+             plugin/**/*.{vim,lua} を事前 glob 済みファイル名で直接 source
+             ftdetect/**/*.{vim,lua} を augroup filetypedetect 内で source
+             after/plugin/**/*.{vim,lua} を source
+             after.lua
+             User autocmd "rvpm_loaded_<name>" 発火 (on_source チェーン用)
+Phase 4:   lazy プラグインの trigger 登録     ← on_cmd / on_ft / on_map / on_event / on_path / on_source
+Phase 4.5: global after.lua                   ← ~/.config/rvpm/after.lua (存在する場合)
 ```
 
 重要な設計ポイント:
@@ -238,7 +251,7 @@ let _permit = sem.acquire_owned().await.unwrap();
 | `add <repo>` | `run_add()` | TOML 追加 + sync |
 | `update [query]` | `run_update()` | 既存プラグインの pull (clone しない) |
 | `remove [query]` | `run_remove()` | TOML + ディレクトリ削除 + generate |
-| `edit [query] [--init\|--before\|--after]` | `run_edit()` | per-plugin init/before/after.lua をエディタで編集。フラグ指定でファイル選択をスキップ |
+| `edit [query] [--init\|--before\|--after] [--global]` | `run_edit()` | per-plugin init/before/after.lua をエディタで編集。フラグ指定でファイル選択をスキップ。`--global` で global hooks (`~/.config/rvpm/before.lua` / `after.lua`) を編集。インタラクティブ選択時は `[ Global hooks ]` sentinel でも同じ動作 |
 | `set [query] [flags]` | `run_set()` | lazy/merge/on_* などを対話式 or 引数で変更。`on_cmd` 等は comma-separated / JSON array 両対応、`--on-map` は JSON object/array で table 形式もサポート。`[ Open config.toml in $EDITOR ]` sentinel で TOML 直接編集に逃げられる |
 | `config` | `run_config()` | `config.toml` を `$EDITOR` で直接開く (終了後に sync 実行) |
 | `init [--write]` | `run_init()` | Neovim `init.lua` に loader.lua を繋ぐ `dofile(...)` スニペットを案内。`--write` で自動追記 (init.lua がなければ新規作成)。`$NVIM_APPNAME` を尊重 |
@@ -253,6 +266,8 @@ let _permit = sem.acquire_owned().await.unwrap();
 | パス | 用途 |
 |------|------|
 | `~/.config/rvpm/config.toml` | メイン設定ファイル (固定) |
+| `~/.config/rvpm/before.lua` | グローバル before hook (Phase 0.7、全 init.lua より前。存在すれば自動適用) |
+| `~/.config/rvpm/after.lua` | グローバル after hook (Phase 4.5、全 lazy trigger 登録後。存在すれば自動適用) |
 | `~/.config/rvpm/plugins/<host>/<owner>/<repo>/` | per-plugin init/before/after.lua (`options.config_root` で上書き) |
 | `~/.cache/rvpm/repos/<host>/<owner>/<repo>/` | プラグインのクローン先 |
 | `~/.cache/rvpm/merged/` | merge=true プラグインのリンク集約先 |
