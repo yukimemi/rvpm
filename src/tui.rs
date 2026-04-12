@@ -312,10 +312,10 @@ impl TuiState {
 
         let title = Paragraph::new(Line::from(vec![
             Span::styled(
-                " P L U G I N   L I S T ",
+                " rvpm ",
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Magenta)
+                    .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
