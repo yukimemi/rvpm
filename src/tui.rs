@@ -205,7 +205,7 @@ impl TuiState {
         }
     }
 
-    pub fn draw(&self, f: &mut Frame) {
+    pub fn draw(&self, f: &mut Frame, message: &str) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -223,7 +223,10 @@ impl TuiState {
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  syncing...", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("  {}", message),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]))
         .block(
             Block::default()

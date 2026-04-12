@@ -454,7 +454,7 @@ async fn run_sync(prune: bool) -> Result<()> {
     let total_tasks = config.plugins.len();
 
     while finished_tasks < total_tasks {
-        terminal.draw(|f| tui_state.draw(f))?;
+        terminal.draw(|f| tui_state.draw(f, "syncing..."))?;
         tokio::select! {
             Some((url, status)) = rx.recv() => { tui_state.update_status(&url, status); }
             Some(res) = set.join_next() => {
@@ -481,7 +481,7 @@ async fn run_sync(prune: bool) -> Result<()> {
             .unwrap_or(usize::MAX)
     });
 
-    terminal.draw(|f| tui_state.draw(f))?;
+    terminal.draw(|f| tui_state.draw(f, "syncing..."))?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -679,7 +679,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
     let total = config.plugins.len();
     let mut done = 0;
     while done < total {
-        terminal.draw(|f| tui_state.draw(f))?;
+        terminal.draw(|f| tui_state.draw(f, "checking..."))?;
         tokio::select! {
             Some((url, status)) = rx.recv() => {
                 tui_state.update_status(&url, status);
@@ -964,14 +964,14 @@ async fn run_update(query: Option<String>) -> Result<()> {
     let mut finished_tasks = 0;
 
     while finished_tasks < total_tasks {
-        terminal.draw(|f| tui_state.draw(f))?;
+        terminal.draw(|f| tui_state.draw(f, "updating..."))?;
         tokio::select! {
             Some((url, status)) = rx.recv() => { tui_state.update_status(&url, status); }
             Some(_) = set.join_next() => { finished_tasks += 1; }
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
         }
     }
-    terminal.draw(|f| tui_state.draw(f))?;
+    terminal.draw(|f| tui_state.draw(f, "updating..."))?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
