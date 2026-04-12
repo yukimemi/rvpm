@@ -157,6 +157,65 @@ on_map = [
 ]
 ```
 
+### `[options]` reference
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `config_root` | `string` | `~/.config/rvpm/plugins` | Root directory for per-plugin `init.lua` / `before.lua` / `after.lua`. Supports `~` and `{{ vars.xxx }}` templates |
+| `concurrency` | `integer` | unlimited | Max number of parallel git operations during `sync` / `update` |
+| `base_dir` | `string` | `~/.cache/rvpm` | Root for all rvpm data (repos, merged, loader.lua). Setting this moves everything together |
+| `loader_path` | `string` | `{base_dir}/loader.lua` | Override only the loader.lua output path. Takes precedence over `base_dir` for the loader file |
+
+### `[[plugins]]` reference
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `url` | `string` | **(required)** | Plugin repository. `owner/repo` (GitHub shorthand), full URL, or local path |
+| `name` | `string` | same as `url` | Friendly name used in `rvpm_loaded_<name>` User autocmd and log messages |
+| `dst` | `string` | `{base_dir}/repos/<host>/<owner>/<repo>` | Custom clone destination (overrides the default path layout) |
+| `lazy` | `bool` | `false` | If `true`, the plugin is not loaded at startup — requires at least one trigger (`on_cmd`, `on_ft`, etc.) |
+| `merge` | `bool` | `true` | If `true`, the plugin directory is linked into `{base_dir}/merged/` and shares a single runtimepath entry |
+| `rev` | `string` | HEAD | Branch, tag, or commit hash to check out after clone/pull |
+| `depends` | `string[]` | none | Plugin URLs that must be loaded before this one (topological sort) |
+| `cond` | `string` | none | Lua expression. When set, the plugin's loader code is wrapped in `if <cond> then ... end` |
+| `build` | `string` | none | Shell command to run after clone (not yet implemented) |
+
+### Lazy trigger fields
+
+All trigger fields are optional. When multiple triggers are specified on the same plugin they are OR-ed: **any one** firing loads the plugin.
+
+| Key | Type | Accepts | Description |
+|---|---|---|---|
+| `on_cmd` | `string \| string[]` | `"Foo"` or `["Foo", "Bar"]` | Load when the user runs `:Foo`. Supports bang, range, count, completion |
+| `on_ft` | `string \| string[]` | `"rust"` or `["rust", "toml"]` | Load on `FileType` event, then re-trigger so `ftplugin/` fires |
+| `on_event` | `string \| string[]` | `"BufReadPre"` or `["BufReadPre", "User LazyDone"]` | Load on Neovim event. `"User Xxx"` shorthand creates a User autocmd with `pattern = "Xxx"` |
+| `on_path` | `string \| string[]` | `"*.rs"` or `["*.rs", "Cargo.toml"]` | Load on `BufRead` / `BufNewFile` matching the glob pattern |
+| `on_source` | `string \| string[]` | `"plenary"` or `["plenary", "nui"]` | Load when the named plugin fires its `rvpm_loaded_<name>` User autocmd (dependency chain) |
+| `on_map` | `string \| MapSpec \| array` | see below | Load on keypress. Accepts simple `"<leader>f"` or table form |
+
+#### `on_map` formats
+
+```toml
+# Simple string — normal mode, no desc
+on_map = "<leader>f"
+
+# Array of simple strings
+on_map = ["<leader>f", "<leader>g"]
+
+# Table form with mode and desc
+on_map = [
+  "<leader>f",
+  { lhs = "<leader>v", mode = ["n", "x"] },
+  { lhs = "<leader>g", mode = "n", desc = "Grep files" },
+]
+```
+
+| MapSpec field | Type | Default | Description |
+|---|---|---|---|
+| `lhs` | `string` | **(required)** | The key sequence that triggers loading |
+| `mode` | `string \| string[]` | `"n"` | Vim mode(s) for the keymap (`"n"`, `"x"`, `"i"`, etc.) |
+| `desc` | `string` | none | Description shown in `:map` / which-key **before** the plugin is loaded |
+
 ### Per-plugin hooks
 
 Drop Lua files under `{config_root}/<host>/<owner>/<repo>/` and rvpm will
