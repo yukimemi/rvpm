@@ -376,6 +376,39 @@ async fn run_sync(prune: bool) -> Result<()> {
             let res = repo.sync().await;
             match res {
                 Ok(_) => {
+                    // build コマンドがあれば clone/pull 後に実行
+                    if let Some(build_cmd) = &plugin.build {
+                        let _ = tx
+                            .send((
+                                plugin.url.clone(),
+                                PluginStatus::Syncing(format!("Building: {}", build_cmd)),
+                            ))
+                            .await;
+                        let (prog, args) = parse_build_command(build_cmd);
+                        let build_output = tokio::process::Command::new(&prog)
+                            .args(&args)
+                            .current_dir(&dst_path)
+                            .output()
+                            .await;
+                        match build_output {
+                            Ok(o) if !o.status.success() => {
+                                let stderr = String::from_utf8_lossy(&o.stderr);
+                                eprintln!(
+                                    "Warning: build failed for '{}': {}",
+                                    plugin.display_name(),
+                                    stderr.trim()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: build command failed for '{}': {}",
+                                    plugin.display_name(),
+                                    e
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
                     let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
                     Ok((plugin, dst_path))
                 }
@@ -2159,6 +2192,34 @@ fn find_lua(dir: &Path, name: &str) -> Option<String> {
 /// ディレクトリが存在しない場合は空配列を返す (Resilience)。
 /// `colors/` ディレクトリからカラースキーム名 (ファイル名から拡張子を除去) を収集する。
 /// 例: `colors/catppuccin.lua` → `"catppuccin"`, `colors/catppuccin-latte.vim` → `"catppuccin-latte"`
+/// build コマンドを解析して (実行プログラム, 引数リスト) を返す。
+/// `:` で始まる場合は Neovim コマンドとして `nvim --headless -c "..." -c "qa!"` に変換。
+/// それ以外はシェルコマンドとして `sh -c "..."` (Windows: `cmd /C "..."`) に変換。
+fn parse_build_command(build_cmd: &str) -> (String, Vec<String>) {
+    if let Some(vim_cmd) = build_cmd.strip_prefix(':') {
+        (
+            "nvim".to_string(),
+            vec![
+                "--headless".to_string(),
+                "-c".to_string(),
+                vim_cmd.to_string(),
+                "-c".to_string(),
+                "qa!".to_string(),
+            ],
+        )
+    } else if cfg!(windows) {
+        (
+            "cmd".to_string(),
+            vec!["/C".to_string(), build_cmd.to_string()],
+        )
+    } else {
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), build_cmd.to_string()],
+        )
+    }
+}
+
 fn collect_colorschemes(plugin_path: &Path) -> Vec<String> {
     let dir = plugin_path.join("colors");
     if !dir.exists() {
@@ -2940,6 +3001,38 @@ lazy = false"#;
     }
 
     #[test]
+    // -----------------------------------------------------------------
+    // build コマンドのテスト
+    // -----------------------------------------------------------------
+    #[test]
+    fn test_parse_build_command_shell() {
+        let (cmd, args) = parse_build_command("cargo build --release");
+        if cfg!(windows) {
+            assert_eq!(cmd, "cmd");
+            assert_eq!(args, vec!["/C", "cargo build --release"]);
+        } else {
+            assert_eq!(cmd, "sh");
+            assert_eq!(args, vec!["-c", "cargo build --release"]);
+        }
+    }
+
+    #[test]
+    fn test_parse_build_command_vim_prefix() {
+        let (cmd, args) = parse_build_command(":call mkdp#util#install()");
+        assert_eq!(cmd, "nvim");
+        assert!(args.iter().any(|a| a == "--headless"));
+        // vim コマンド部分が含まれる
+        assert!(args.iter().any(|a| a.contains("mkdp#util#install()")));
+    }
+
+    #[test]
+    fn test_parse_build_command_vim_simple() {
+        let (cmd, args) = parse_build_command(":TSUpdate");
+        assert_eq!(cmd, "nvim");
+        assert!(args.iter().any(|a| a == "--headless"));
+        assert!(args.iter().any(|a| a.contains("TSUpdate")));
+    }
+
     fn test_find_unused_repos() {
         let root = tempdir().unwrap();
         let repos_dir = root.path().join("repos");
