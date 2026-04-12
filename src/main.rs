@@ -650,7 +650,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
     let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
     let mut tui_state = TuiState::new(urls);
 
-    // 初回のインストール状態チェック (進捗 TUI 付き)
+    // バックグラウンドでステータスチェック開始 (TUI は即表示)
     let (tx, mut rx) = mpsc::channel::<(String, PluginStatus)>(100);
     let mut set = JoinSet::new();
     for plugin in config.plugins.iter() {
@@ -675,22 +675,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
         });
     }
     drop(tx);
-
-    let total = config.plugins.len();
-    let mut done = 0;
-    while done < total {
-        terminal.draw(|f| tui_state.draw(f, "checking..."))?;
-        tokio::select! {
-            Some((url, status)) = rx.recv() => {
-                tui_state.update_status(&url, status);
-            }
-            Some(_) = set.join_next() => { done += 1; }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
-        }
-    }
-    while let Ok((url, status)) = rx.try_recv() {
-        tui_state.update_status(&url, status);
-    }
+    let mut bg_done = false;
 
     // アクション後に config とステータスを再読み込みしてTUIを復帰するヘルパー
     async fn reload_state(
@@ -713,9 +698,24 @@ async fn run_list(no_tui: bool) -> Result<()> {
     }
 
     loop {
+        // バックグラウンドのステータス更新を非ブロッキングで受信
+        if !bg_done {
+            loop {
+                match rx.try_recv() {
+                    Ok((url, status)) => tui_state.update_status(&url, status),
+                    Err(_) => break,
+                }
+            }
+            if set.is_empty() {
+                bg_done = true;
+            }
+            // JoinSet のタスク完了も drain
+            while let Some(Ok(_)) = set.try_join_next() {}
+        }
+
         terminal.draw(|f| tui_state.draw_list(f, &config, &config_root))?;
 
-        if crossterm::event::poll(std::time::Duration::from_millis(100))?
+        if crossterm::event::poll(std::time::Duration::from_millis(50))?
             && let crossterm::event::Event::Key(key) = crossterm::event::read()?
         {
             if key.kind != crossterm::event::KeyEventKind::Press {
