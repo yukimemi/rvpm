@@ -590,10 +590,7 @@ impl TuiState {
                 )]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled(
-                        "  j/k  \u{2193}/\u{2191}  ",
-                        Style::default().fg(Color::Cyan),
-                    ),
+                    Span::styled("  j / k       ", Style::default().fg(Color::Cyan)),
                     Span::styled("Move down / up", Style::default().fg(Color::White)),
                 ]),
                 Line::from(vec![
