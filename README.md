@@ -6,6 +6,8 @@
 [![Release](https://github.com/yukimemi/rvpm/actions/workflows/release.yml/badge.svg)](https://github.com/yukimemi/rvpm/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+![demo](demo.gif)
+
 rvpm clones plugins in parallel, links `merge = true` plugins into a single
 runtime-path entry, and ahead-of-time compiles a static `loader.lua` that
 sources everything without any runtime glob cost.

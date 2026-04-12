@@ -1,11 +1,14 @@
 # rvpm demo — README GIF
 # Usage: vhs demo.tape
+# Note: On Windows, run from WSL (vhs hangs on Set Theme in native Windows)
+# Note: FontFamily must be installed in the system. Adjust if tofu appears.
 
 Output demo.gif
 Set Shell "bash"
 Set FontSize 16
-Set Width 1400
-Set Height 750
+Set FontFamily "PlemolJP Console NF"
+Set Width 900
+Set Height 600
 Set Padding 20
 Set TypingSpeed 50ms
 Set Theme "Catppuccin Mocha"
@@ -22,53 +25,52 @@ Sleep 500ms
 Type "rvpm init --write"
 Sleep 500ms
 Enter
-Sleep 2s
+Sleep 3s
 
-# 2. Add plugins
+# 2. Add plugins (one eager, one lazy+on_cmd, one lazy colorscheme)
 Type "rvpm add folke/snacks.nvim"
 Sleep 500ms
 Enter
-Sleep 8s
+Sleep 3s
 
 Type "rvpm add nvim-telescope/telescope.nvim --on-cmd Telescope"
 Sleep 500ms
 Enter
-Sleep 8s
+Sleep 3s
 
 Type "rvpm add catppuccin/nvim --lazy true"
 Sleep 500ms
 Enter
-Sleep 8s
+Sleep 3s
 
-# 3. Show list TUI
+# 3. List TUI
 Type "rvpm list"
 Sleep 500ms
 Enter
 Sleep 2s
 
 # Navigate
-Sleep 500ms
 Type "j"
-Sleep 300ms
+Sleep 400ms
 Type "j"
-Sleep 300ms
+Sleep 400ms
 Type "k"
-Sleep 500ms
+Sleep 600ms
 
 # Search
 Type "/"
 Sleep 500ms
 Type "tele"
-Sleep 1s
+Sleep 1500ms
 Enter
-Sleep 500ms
+Sleep 800ms
 
 # Help popup
 Type "?"
-Sleep 2s
+Sleep 3s
 Type "?"
 Sleep 500ms
 
-# Quit
+# Quit list
 Type "q"
 Sleep 1s
