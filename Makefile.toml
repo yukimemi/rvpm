@@ -1,0 +1,31 @@
+[tasks.default]
+alias = "check"
+
+[tasks.check]
+description = "Run fmt + clippy + test (same as CI)"
+dependencies = ["fmt-check", "clippy", "test"]
+
+[tasks.fmt-check]
+description = "Check formatting"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+
+[tasks.fmt]
+description = "Apply formatting"
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.clippy]
+description = "Run clippy with warnings as errors"
+command = "cargo"
+args = ["clippy", "--all-targets", "--", "-D", "warnings"]
+
+[tasks.test]
+description = "Run all tests"
+command = "cargo"
+args = ["test"]
+
+[tasks.publish-dry]
+description = "Dry-run crates.io publish"
+command = "cargo"
+args = ["publish", "--dry-run", "--allow-dirty"]

@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "if": "Bash(jj git push *)|Bash(git push *)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo make check"
+          }
+        ]
+      }
+    ]
+  }
+}
