@@ -77,9 +77,24 @@ enum Commands {
     },
 
     /// Edit per-plugin init/before/after.lua in $EDITOR
+    ///
+    /// Without --init / --before / --after, prompts which file to edit.
+    /// With a flag, opens that file directly (skips the file selector).
     Edit {
         /// Fuzzy match plugin url (omit to pick interactively)
         query: Option<String>,
+
+        /// Open init.lua directly
+        #[arg(long)]
+        init: bool,
+
+        /// Open before.lua directly
+        #[arg(long)]
+        before: bool,
+
+        /// Open after.lua directly
+        #[arg(long)]
+        after: bool,
     },
 
     /// Tweak a plugin's options interactively
@@ -192,8 +207,13 @@ async fn main() -> Result<()> {
         Commands::Add { repo, name } => {
             run_add(repo, name).await?;
         }
-        Commands::Edit { query } => {
-            if run_edit(query).await? {
+        Commands::Edit {
+            query,
+            init,
+            before,
+            after,
+        } => {
+            if run_edit(query, init, before, after).await? {
                 let _ = run_sync(false).await;
             }
         }
@@ -581,7 +601,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         disable_raw_mode()?;
                         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                         terminal.show_cursor()?;
-                        if run_edit(Some(url)).await? {
+                        if run_edit(Some(url), false, false, false).await? {
                             let _ = run_sync(false).await;
                         }
                         let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
@@ -881,7 +901,12 @@ async fn run_init(write: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_edit(query: Option<String>) -> Result<bool> {
+async fn run_edit(
+    query: Option<String>,
+    flag_init: bool,
+    flag_before: bool,
+    flag_after: bool,
+) -> Result<bool> {
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
@@ -910,16 +935,24 @@ async fn run_edit(query: Option<String>) -> Result<bool> {
 
     println!("\n>> Editing configuration for: {}", plugin.url);
 
-    let files = vec!["init.lua", "before.lua", "after.lua"];
-    let file_selection = Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
-        .with_prompt("Select file to edit")
-        .default(0)
-        .items(&files)
-        .interact_opt()?;
-
-    let file_name = match file_selection {
-        Some(index) => files[index],
-        None => return Ok(false),
+    // --init / --before / --after フラグがあれば対話式をスキップ
+    let file_name = if flag_init {
+        "init.lua"
+    } else if flag_before {
+        "before.lua"
+    } else if flag_after {
+        "after.lua"
+    } else {
+        let files = vec!["init.lua", "before.lua", "after.lua"];
+        let file_selection = Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt("Select file to edit")
+            .default(0)
+            .items(&files)
+            .interact_opt()?;
+        match file_selection {
+            Some(index) => files[index],
+            None => return Ok(false),
+        }
     };
 
     let config_root = resolve_config_root(config.options.config_root.as_deref());

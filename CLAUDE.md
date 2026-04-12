@@ -238,7 +238,7 @@ let _permit = sem.acquire_owned().await.unwrap();
 | `add <repo>` | `run_add()` | TOML 追加 + sync |
 | `update [query]` | `run_update()` | 既存プラグインの pull (clone しない) |
 | `remove [query]` | `run_remove()` | TOML + ディレクトリ削除 + generate |
-| `edit [query]` | `run_edit()` | per-plugin init/before/after.lua をエディタで編集 |
+| `edit [query] [--init\|--before\|--after]` | `run_edit()` | per-plugin init/before/after.lua をエディタで編集。フラグ指定でファイル選択をスキップ |
 | `set [query] [flags]` | `run_set()` | lazy/merge/on_* などを対話式 or 引数で変更。`on_cmd` 等は comma-separated / JSON array 両対応、`--on-map` は JSON object/array で table 形式もサポート。`[ Open config.toml in $EDITOR ]` sentinel で TOML 直接編集に逃げられる |
 | `config` | `run_config()` | `config.toml` を `$EDITOR` で直接開く (終了後に sync 実行) |
 | `init [--write]` | `run_init()` | Neovim `init.lua` に loader.lua を繋ぐ `dofile(...)` スニペットを案内。`--write` で自動追記 (init.lua がなければ新規作成)。`$NVIM_APPNAME` を尊重 |

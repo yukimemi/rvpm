@@ -70,7 +70,13 @@ Download the latest archive from the
 
 Extract the binary into any directory on your `PATH`.
 
-### From source with Cargo
+### From crates.io
+
+```sh
+cargo install rvpm
+```
+
+### From source (latest main)
 
 ```sh
 cargo install --git https://github.com/yukimemi/rvpm
@@ -178,13 +184,88 @@ vim.keymap.set("n", "<leader>ff", "<cmd>Telescope find_files<cr>")
 | `rvpm add <repo>` | Add a plugin and sync |
 | `rvpm update [query]` | `git pull` installed plugins |
 | `rvpm remove [query]` | Remove a plugin from `config.toml` and delete its directory |
-| `rvpm edit [query]` | Edit per-plugin `init/before/after.lua` in `$EDITOR` |
+| `rvpm edit [query] [--init\|--before\|--after]` | Edit per-plugin Lua config in `$EDITOR`. Flag skips the file picker |
 | `rvpm set [query] [flags]` | Interactively or non-interactively tweak plugin options (lazy, merge, on\_\*, rev) |
 | `rvpm config` | Open `config.toml` in `$EDITOR` |
 | `rvpm init [--write]` | Print (or write) the `dofile(...)` snippet to wire `loader.lua` into `init.lua` |
 | `rvpm list [--no-tui]` | TUI plugin list with action keys; `--no-tui` for pipe-friendly plain text |
 
 Run `rvpm <command> --help` for flag-level details.
+
+### Usage examples
+
+```sh
+# ── Sync & generate ──────────────────────────────────────
+
+# Clone/pull everything and regenerate loader.lua
+rvpm sync
+
+# Same, but also remove plugin dirs no longer in config.toml
+rvpm sync --prune
+
+# Only regenerate loader.lua (after editing init/before/after.lua)
+rvpm generate
+
+# ── Add / remove ─────────────────────────────────────────
+
+# Add a plugin (creates entry in config.toml and syncs immediately)
+rvpm add nvim-lua/plenary.nvim
+rvpm add nvim-telescope/telescope.nvim --name telescope
+
+# Remove interactively (fuzzy-select prompt)
+rvpm remove
+
+# Remove by name match
+rvpm remove telescope
+
+# ── Edit per-plugin hooks ────────────────────────────────
+
+# Pick a plugin interactively, then pick which file to edit
+rvpm edit
+
+# Jump straight to a specific file (skips both selectors)
+rvpm edit telescope --after
+rvpm edit plenary --init
+rvpm edit treesitter --before
+
+# ── Set plugin options ───────────────────────────────────
+
+# Interactive mode (fuzzy-select plugin → pick option → edit)
+rvpm set
+
+# Non-interactive: set multiple flags at once
+rvpm set telescope --lazy true --on-cmd "Telescope"
+rvpm set nvim-cmp --on-event '["InsertEnter", "CmdlineEnter"]'
+
+# on_map with full JSON object form (mode + desc)
+rvpm set which-key --on-map '{"lhs":"<leader>?","mode":["n","x"],"desc":"Which Key"}'
+
+# Pin to a specific tag
+rvpm set telescope --rev "0.1.8"
+
+# Drop into $EDITOR for manual TOML editing from the set menu
+# → pick a plugin → select [ Open config.toml in $EDITOR ]
+
+# ── Config / init ────────────────────────────────────────
+
+# Open config.toml directly in $EDITOR (runs sync on close)
+rvpm config
+
+# Print the dofile(...) snippet for init.lua
+rvpm init
+
+# Auto-create (or append to) ~/.config/nvim/init.lua
+rvpm init --write
+
+# ── List / status ────────────────────────────────────────
+
+# TUI with interactive actions ([S] sync, [u] update, [d] remove, …)
+rvpm list
+
+# Plain text for scripting / piping
+rvpm list --no-tui
+rvpm list --no-tui | grep Missing
+```
 
 ## Design highlights
 
