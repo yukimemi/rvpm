@@ -227,7 +227,7 @@ impl TuiState {
         f.render_widget(title, chunks[0]);
 
         let header = Row::new(
-            ["", "Plugin URL", "Mode", "Merge", "Rev", "I B A", "Detail"]
+            ["", "Plugin", "Mode", "Merge", "Rev", "I B A", "Detail"]
                 .iter()
                 .map(|h| {
                     Cell::from(*h).style(
@@ -332,7 +332,7 @@ impl TuiState {
 
                 Row::new(vec![
                     Cell::from(inst_icon).style(Style::default().fg(inst_color)),
-                    Cell::from(p.url.clone()).style(Style::default().fg(Color::White)),
+                    Cell::from(p.display_name()).style(Style::default().fg(Color::White)),
                     Cell::from(mode.0).style(Style::default().fg(mode.1)),
                     Cell::from(merged.0).style(Style::default().fg(merged.1)),
                     Cell::from(rev).style(Style::default().fg(Color::Magenta)),
@@ -343,10 +343,10 @@ impl TuiState {
             .collect();
 
         // URL 列をコンテンツの最大長に合わせる (最小 20、最大 60)
-        let url_col_w = config
+        let name_col_w = config
             .plugins
             .iter()
-            .map(|p| p.url.len())
+            .map(|p| p.display_name().len())
             .max()
             .unwrap_or(20)
             .clamp(20, 60) as u16;
@@ -362,13 +362,13 @@ impl TuiState {
         let table = Table::new(
             rows,
             [
-                Constraint::Length(3),         // アイコン
-                Constraint::Length(url_col_w), // URL (動的)
-                Constraint::Length(6),         // Mode
-                Constraint::Length(6),         // Merge
-                Constraint::Length(rev_col_w), // Rev (動的)
-                Constraint::Length(7),         // I B A (hooks)
-                Constraint::Min(10),           // Detail (残り全部)
+                Constraint::Length(3),          // アイコン
+                Constraint::Length(name_col_w), // Plugin name (動的)
+                Constraint::Length(6),          // Mode
+                Constraint::Length(6),          // Merge
+                Constraint::Length(rev_col_w),  // Rev (動的)
+                Constraint::Length(7),          // I B A (hooks)
+                Constraint::Min(10),            // Detail (残り全部)
             ],
         )
         .header(header)
