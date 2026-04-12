@@ -25,10 +25,10 @@ sources everything without any runtime glob cost.
 
 ## Features
 
-- **Fast startup** — Phase 0–4 loader model with `vim.go.loadplugins = false`
+- **Fast startup** — 9-phase loader model with `vim.go.loadplugins = false`
   and pre-globbed `plugin/` / `ftdetect/` / `after/plugin/` file lists
-- **Global hooks** — `~/.config/rvpm/before.lua` (Phase 0.7, before all plugin
-  `init.lua`) and `~/.config/rvpm/after.lua` (Phase 4.5, after all lazy trigger
+- **Global hooks** — `~/.config/rvpm/before.lua` (phase 3, before all plugin
+  `init.lua`) and `~/.config/rvpm/after.lua` (phase 9, after all lazy trigger
   registrations); auto-detected at generate time, no config required
 - **Merge optimization** — `merge = true` plugins share a single
   `vim.opt.rtp:append(...)` entry via junction/symlink
@@ -254,8 +254,8 @@ automatically at generate time — no configuration entry needed:
 
 | File | Phase | When it runs |
 |---|---|---|
-| `~/.config/rvpm/before.lua` | 0.7 | After `load_lazy` helper is defined, before any per-plugin `init.lua` |
-| `~/.config/rvpm/after.lua` | 4.5 | After all lazy trigger registrations |
+| `~/.config/rvpm/before.lua` | 3 | After `load_lazy` helper is defined, before any per-plugin `init.lua` |
+| `~/.config/rvpm/after.lua` | 9 | After all lazy trigger registrations |
 
 These are useful for any setup that must happen before plugins are initialised
 (e.g. setting `vim.g.*` globals) or for post-load orchestration that doesn't
@@ -340,8 +340,8 @@ rvpm edit lspconfig --before
 rvpm edit
 
 # Jump straight to the global before/after hooks
-rvpm edit --global --before    # ~/.config/rvpm/before.lua (Phase 0.7)
-rvpm edit --global --after     # ~/.config/rvpm/after.lua  (Phase 4.5)
+rvpm edit --global --before    # ~/.config/rvpm/before.lua (phase 3)
+rvpm edit --global --after     # ~/.config/rvpm/after.lua  (phase 9)
 
 # ── Set plugin options ───────────────────────────────────
 
@@ -384,15 +384,15 @@ rvpm list --no-tui | grep Missing
 
 ## Design highlights
 
-### Phase 0–4 loader model
+### Loader model
 
 ```
-Phase 0:   vim.go.loadplugins = false         -- disable Neovim's auto-source
-Phase 0.5: load_lazy helper                   -- runtime loader for lazy plugins
-Phase 0.7: global before.lua                  -- ~/.config/rvpm/before.lua (if present)
-Phase 1:   all init.lua (dependency order)   -- pre-rtp phase
-Phase 2:   rtp:append(merged_dir)             -- once, if any merge=true plugins
-Phase 3:   eager plugins in dependency order:
+Phase 1: vim.go.loadplugins = false         -- disable Neovim's auto-source
+Phase 2: load_lazy helper                   -- runtime loader for lazy plugins
+Phase 3: global before.lua                  -- ~/.config/rvpm/before.lua (if present)
+Phase 4: all init.lua (dependency order)   -- pre-rtp phase
+Phase 5: rtp:append(merged_dir)             -- once, if any merge=true plugins
+Phase 6: eager plugins in dependency order:
              if not merge: rtp:append(plugin_path)
              before.lua
              source plugin/**/*.{vim,lua}    -- pre-globbed at generate time
@@ -400,11 +400,11 @@ Phase 3:   eager plugins in dependency order:
              source after/plugin/**
              after.lua
              User autocmd "rvpm_loaded_<name>"
-Phase 4:   lazy trigger registrations (on_cmd / on_ft / on_map / etc)
-Phase 4.3: ColorSchemePre handlers            -- auto-registered for lazy plugins
+Phase 7: lazy trigger registrations (on_cmd / on_ft / on_map / etc)
+Phase 8: ColorSchemePre handlers            -- auto-registered for lazy plugins
                                               --   whose colors/ dir was detected at
                                               --   generate time (no config needed)
-Phase 4.5: global after.lua                  -- ~/.config/rvpm/after.lua (if present)
+Phase 9: global after.lua                  -- ~/.config/rvpm/after.lua (if present)
 ```
 
 Because the file lists are baked in at `rvpm generate` time, the loader does
@@ -443,8 +443,8 @@ Beyond ordering, `depends` now also affects **loading**:
 | Path | Purpose |
 |---|---|
 | `~/.config/rvpm/config.toml` | Main configuration (fixed location) |
-| `~/.config/rvpm/before.lua` | Global before hook — runs at Phase 0.7, before all plugin `init.lua` |
-| `~/.config/rvpm/after.lua` | Global after hook — runs at Phase 4.5, after all lazy trigger registrations |
+| `~/.config/rvpm/before.lua` | Global before hook — runs at phase 3, before all plugin `init.lua` |
+| `~/.config/rvpm/after.lua` | Global after hook — runs at phase 9, after all lazy trigger registrations |
 | `~/.config/rvpm/plugins/<host>/<owner>/<repo>/` | Per-plugin `init/before/after.lua` (`options.config_root` to override) |
 | `~/.cache/rvpm/repos/<host>/<owner>/<repo>/` | Plugin clones |
 | `~/.cache/rvpm/merged/` | Linked root for `merge = true` plugins |

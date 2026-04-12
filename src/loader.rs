@@ -89,9 +89,9 @@ fn push_with_cond(lua: &mut String, cond: &Option<String>, body: &str) {
 /// generate_loader に渡すグローバルオプション。
 #[derive(Default)]
 pub struct LoaderOptions {
-    /// `~/.config/rvpm/before.lua` が存在すれば Some (Phase 0.7)
+    /// `~/.config/rvpm/before.lua` が存在すれば Some (グローバル before.lua)
     pub global_before: Option<String>,
-    /// `~/.config/rvpm/after.lua` が存在すれば Some (Phase 4.5)
+    /// `~/.config/rvpm/after.lua` が存在すれば Some (グローバル after.lua)
     pub global_after: Option<String>,
 }
 
@@ -105,7 +105,7 @@ pub fn generate_loader(
     //
     // 以下のケースで lazy を eager に昇格する:
     //   1. eager が lazy に depends → lazy を eager に
-    //   2. lazy が on_source で eager を参照 → その lazy は Phase 3 後の
+    //   2. lazy が on_source で eager を参照 → その lazy は phase 6 後の
     //      User autocmd を受けないと永遠にロードされないので eager に昇格
     //
     // チェーン対応: A(eager) ← B(lazy, on_source=["A"]) ← C(lazy, on_source=["B"])
@@ -168,7 +168,7 @@ pub fn generate_loader(
     }
 
     // lazy→lazy deps: 各 lazy plugin の depends にある lazy plugin を先にロードする
-    // ための依存マップを作る (Phase 4 の trigger 生成で使う)
+    // ための依存マップを作る (phase 7 の trigger 生成で使う)
     let lazy_names: std::collections::HashSet<String> = scripts
         .iter()
         .filter(|s| s.lazy)
@@ -197,7 +197,7 @@ pub fn generate_loader(
     lua.push_str("-- rvpm generated loader.lua\n\n");
 
     // ======================================================
-    // Phase 0: Neovim の auto-source を無効化 (lazy.nvim 方式)
+    // Neovim の auto-source を無効化 (lazy.nvim 方式)
     // これにより二重 source を防ぎ、rvpm が全ロード順序を制御する
     // ======================================================
     lua.push_str("vim.go.loadplugins = false\n\n");
@@ -225,7 +225,7 @@ end
 "#);
 
     // ======================================================
-    // Phase 0.7: グローバル before.lua (全プラグインの前)
+    // グローバル before.lua (全プラグインの前)
     // leader / vim options / 基本設定を書く場所
     // ======================================================
     if let Some(before) = &opts.global_before {
@@ -233,7 +233,7 @@ end
     }
 
     // ======================================================
-    // Phase 1: 全プラグインの init.lua (依存順)
+    // 全プラグインの init.lua (依存順)
     // init は "pre-rtp" phase であり、全プラグイン共通
     // ======================================================
     for s in &scripts {
@@ -245,7 +245,7 @@ end
     lua.push('\n');
 
     // ======================================================
-    // Phase 2: merge=true プラグインがあれば merged rtp を 1 回 append
+    // merged rtp append (merge=true プラグインがあれば 1 回)
     // ======================================================
     if scripts.iter().any(|s| s.merge) {
         let merged_path = merged_dir.to_string_lossy().replace('\\', "/");
@@ -253,7 +253,7 @@ end
     }
 
     // ======================================================
-    // Phase 3: eager プラグイン処理 (依存順)
+    // eager プラグイン処理 (依存順)
     // 非 merge: rtp 追加 → before → plugin/ → ftdetect/ → after/plugin/ → after
     // merge   : before → plugin/ → ftdetect/ → after/plugin/ → after
     // 事前 glob 済みのファイルを直接 source する (起動時 glob 不要)
@@ -310,7 +310,7 @@ end
     lua.push('\n');
 
     // ======================================================
-    // Phase 4: lazy プラグインの trigger 登録
+    // lazy trigger 登録
     // 各プラグインの plugin/ ftdetect/ after/plugin ファイルリストを
     // ローカル変数として emit し、trigger closure から参照する
     // ======================================================
@@ -535,7 +535,7 @@ end
     }
 
     // ======================================================
-    // Phase 4.3: ColorSchemePre handler (lazy colorscheme 自動ロード)
+    // ColorSchemePre handler (lazy colorscheme 自動ロード)
     // lazy plugin の colors/ に含まれるカラースキーム名をマップ化し、
     // `:colorscheme <name>` 実行時に対応プラグインをロードする
     // ======================================================
@@ -589,7 +589,7 @@ end
     }
 
     // ======================================================
-    // Phase 4.5: グローバル after.lua (全プラグインの後)
+    // グローバル after.lua (全プラグインの後)
     // colorscheme / 最終 UI 調整を書く場所
     // ======================================================
     if let Some(after) = &opts.global_after {
@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn test_eager_depending_on_lazy_promotes_to_eager() {
-        // Lazy A に Eager B が depends → A は eager に昇格して Phase 3 で B より先にロード
+        // Lazy A に Eager B が depends → A は eager に昇格して phase 6 で B より先にロード
         let mut a = PluginScripts::for_test("snacks.nvim", "/path/snacks");
         a.lazy = true;
         a.on_cmd = Some(vec!["Snacks".to_string()]);
@@ -625,7 +625,7 @@ mod tests {
         b.plugin_files = vec!["/path/telescope/plugin/telescope.lua".to_string()];
 
         let lua = gen_loader(Path::new("/merged"), &[a, b]);
-        // A が Phase 3 (eager) で source されている (lazy trigger ではない)
+        // A が phase 6 (eager) で source されている (lazy trigger ではない)
         let snacks_source = lua
             .find("source /path/snacks/plugin/snacks.lua")
             .expect("snacks should be sourced eagerly");
@@ -646,7 +646,7 @@ mod tests {
     #[test]
     fn test_on_source_referencing_eager_promotes_to_eager() {
         // Lazy A の on_source が Eager B を参照 → A は eager に昇格
-        // (Phase 3 で B の rvpm_loaded 発火時に Phase 4 のリスナーが未登録の問題を回避)
+        // (phase 6 で B の rvpm_loaded 発火時に phase 7 のリスナーが未登録の問題を回避)
         let mut b = PluginScripts::for_test("snacks.nvim", "/path/snacks");
         b.lazy = false;
         b.plugin_files = vec!["/path/snacks/plugin/snacks.lua".to_string()];
@@ -657,7 +657,7 @@ mod tests {
         a.plugin_files = vec!["/path/telescope/plugin/telescope.lua".to_string()];
 
         let lua = gen_loader(Path::new("/merged"), &[b, a]);
-        // A が Phase 3 (eager) で source されている
+        // A が phase 6 (eager) で source されている
         assert!(
             lua.contains("source /path/telescope/plugin/telescope.lua"),
             "on_source→eager plugin should be promoted and sourced eagerly"
@@ -869,16 +869,16 @@ mod tests {
     #[test]
     fn test_eager_with_on_source_is_harmless() {
         // Eager plugin が on_source を持っている (設定ミス)
-        // → 無視される (on_source は Phase 4 で lazy のみ処理)
+        // → 無視される (on_source は phase 7 で lazy のみ処理)
         let mut a = PluginScripts::for_test("a", "/path/a");
         a.lazy = false;
         a.on_source = Some(vec!["nonexistent".to_string()]);
         a.plugin_files = vec!["/path/a/plugin/a.lua".to_string()];
 
         let lua = gen_loader(Path::new("/merged"), &[a]);
-        // Phase 3 で正常に source される
+        // phase 6 で正常に source される
         assert!(lua.contains("source /path/a/plugin/a.lua"));
-        // on_source trigger は Phase 4 に出ない (eager なので skip)
+        // on_source trigger は phase 7 に出ない (eager なので skip)
         assert!(!lua.contains("rvpm_loaded_nonexistent"));
     }
 
@@ -1133,7 +1133,7 @@ mod tests {
         a.ftdetect_files = vec!["/path/a/ftdetect/a.vim".to_string()];
         let lua = gen_loader(Path::new("/merged"), &[a]);
         // eager phase 内の ftdetect source を探し、その直前/直後に augroup begin/end があるか確認
-        // (load_lazy helper 内の augroup とは別に、Phase 3 の augroup が必要)
+        // (load_lazy helper 内の augroup とは別に、phase 6 の augroup が必要)
         let ftdetect_source_pos = lua
             .find("vim.cmd(\"source /path/a/ftdetect/a.vim\")")
             .expect("ftdetect source missing");
