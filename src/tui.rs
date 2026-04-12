@@ -1,9 +1,11 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Gauge, List, ListItem, Paragraph, Row, Table, TableState},
+    widgets::{
+        Block, Borders, Cell, Clear, Gauge, List, ListItem, Paragraph, Row, Table, TableState,
+    },
 };
 use std::collections::HashMap;
 
@@ -544,26 +546,6 @@ impl TuiState {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan)),
             )
-        } else if self.show_help {
-            // ヘルプポップアップ表示中
-            Paragraph::new(Line::from(vec![
-                Span::styled(" Navigation: ", Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    "j/k \u{2193}\u{2191}  g/G Home/End  C-d/u C-f/b  / n/N",
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled("  Actions: ", Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    "e:edit s:set S:sync u/U:update d:delete  ",
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled("[?] close", Style::default().fg(Color::Cyan)),
-            ]))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
         } else {
             Paragraph::new(Line::from(vec![
                 Span::styled(" e", Style::default().fg(Color::Cyan)),
@@ -586,6 +568,95 @@ impl TuiState {
             .block(Block::default().borders(Borders::ALL))
         };
         f.render_widget(footer, chunks[2]);
+
+        // ── Help popup overlay ──
+        if self.show_help {
+            let area = f.area();
+            let popup_w = 48u16.min(area.width.saturating_sub(4));
+            let popup_h = 16u16.min(area.height.saturating_sub(4));
+            let popup = Rect::new(
+                (area.width.saturating_sub(popup_w)) / 2,
+                (area.height.saturating_sub(popup_h)) / 2,
+                popup_w,
+                popup_h,
+            );
+
+            let help_lines = vec![
+                Line::from(vec![Span::styled(
+                    "  Navigation",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(
+                        "  j/k  \u{2193}/\u{2191}  ",
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled("Move down / up", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  g / G       ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Go to top / bottom", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  C-d / C-u   ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Half page down / up", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  C-f / C-b   ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Full page down / up", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  / n N       ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Search / next / prev", Style::default().fg(Color::White)),
+                ]),
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "  Actions",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  e           ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Edit hooks", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  s           ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Set plugin options", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  S           ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Sync all", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  u / U       ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Update selected / all", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  d           ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Delete selected", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  q / Esc     ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Quit", Style::default().fg(Color::White)),
+                ]),
+            ];
+
+            f.render_widget(Clear, popup);
+            f.render_widget(
+                Paragraph::new(help_lines).block(
+                    Block::default()
+                        .title(" Help [?] ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan)),
+                ),
+                popup,
+            );
+        }
     }
 }
 
