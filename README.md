@@ -132,11 +132,11 @@ lazy  = false
 name    = "telescope"
 url     = "nvim-telescope/telescope.nvim"
 lazy    = true
-depends = ["plenary"]
+depends = ["plenary.nvim"]
 # Trigger on command — plugin loads when the user runs :Telescope
 on_cmd  = ["Telescope"]
 # Or as a User autocmd chained off another plugin
-on_source = ["plenary"]
+on_source = ["plenary.nvim"]
 
 [[plugins]]
 name    = "nvim-treesitter"
@@ -176,7 +176,7 @@ on_map = [
 | `lazy` | `bool` | `false` | If `true`, the plugin is not loaded at startup — requires at least one trigger (`on_cmd`, `on_ft`, etc.) |
 | `merge` | `bool` | `true` | If `true`, the plugin directory is linked into `{base_dir}/merged/` and shares a single runtimepath entry |
 | `rev` | `string` | HEAD | Branch, tag, or commit hash to check out after clone/pull |
-| `depends` | `string[]` | none | Plugin URLs that must be loaded before this one (topological sort) |
+| `depends` | `string[]` | none | Plugins that must be loaded first. Accepts `display_name` (e.g. `"plenary.nvim"`) or `url` (e.g. `"nvim-lua/plenary.nvim"`) |
 | `cond` | `string` | none | Lua expression. When set, the plugin's loader code is wrapped in `if <cond> then ... end` |
 | `build` | `string` | none | Shell command to run after clone (not yet implemented) |
 
@@ -190,7 +190,7 @@ All trigger fields are optional. When multiple triggers are specified on the sam
 | `on_ft` | `string \| string[]` | `"rust"` or `["rust", "toml"]` | Load on `FileType` event, then re-trigger so `ftplugin/` fires |
 | `on_event` | `string \| string[]` | `"BufReadPre"` or `["BufReadPre", "User LazyDone"]` | Load on Neovim event. `"User Xxx"` shorthand creates a User autocmd with `pattern = "Xxx"` |
 | `on_path` | `string \| string[]` | `"*.rs"` or `["*.rs", "Cargo.toml"]` | Load on `BufRead` / `BufNewFile` matching the glob pattern |
-| `on_source` | `string \| string[]` | `"plenary"` or `["plenary", "nui"]` | Load when the named plugin fires its `rvpm_loaded_<name>` User autocmd (dependency chain) |
+| `on_source` | `string \| string[]` | `"plenary.nvim"` or `["plenary.nvim", "nui.nvim"]` | Load when the named plugin fires its `rvpm_loaded_<name>` User autocmd. Value must match the target plugin's `display_name` |
 | `on_map` | `string \| MapSpec \| array` | see below | Load on keypress. Accepts simple `"<leader>f"` or table form |
 
 #### `on_map` formats

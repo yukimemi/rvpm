@@ -303,7 +303,16 @@ async fn run_sync(prune: bool) -> Result<()> {
         let base_dir = base_dir.clone();
         let tx = tx.clone();
         let sem = semaphore.clone();
-        if plugin.cond.is_some() {
+        // cond はランタイム Lua 式なので generate 時に merge するか判定できない。
+        // merge=true のまま merged/ にリンクすると cond=false でも lua/ モジュールが
+        // rtp 経由で require 可能になってしまうため、安全のため merge を無効化する。
+        if plugin.cond.is_some() && plugin.merge {
+            eprintln!(
+                "Warning: plugin '{}' has both `cond` and `merge = true`. \
+                 merge is disabled for cond plugins (runtime condition cannot be \
+                 evaluated at generate time).",
+                plugin.display_name()
+            );
             plugin.merge = false;
         }
 
@@ -358,6 +367,17 @@ async fn run_sync(prune: bool) -> Result<()> {
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
         }
     }
+
+    // JoinSet は完了順で返すので plugin_scripts が依存順になっていない。
+    // config.plugins の順序 (sort_plugins 済み) に合わせて re-sort する。
+    plugin_scripts.sort_by_key(|ps| {
+        config
+            .plugins
+            .iter()
+            .position(|p| p.display_name() == ps.name)
+            .unwrap_or(usize::MAX)
+    });
+
     terminal.draw(|f| tui_state.draw(f))?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     disable_raw_mode()?;

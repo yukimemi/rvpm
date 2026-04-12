@@ -188,11 +188,7 @@ impl Plugin {
         let url = self.url.trim_end_matches(".git");
         // SSH の `:` を `/` に正規化してからスラッシュで split
         let normalized = url.replace(':', "/");
-        normalized
-            .rsplit('/')
-            .next()
-            .unwrap_or(url)
-            .to_string()
+        normalized.rsplit('/').next().unwrap_or(url).to_string()
     }
 
     /// `name` が明示されていればそれを、なければ `default_name()` を返す。
@@ -231,44 +227,58 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     Ok(config)
 }
 
+/// `depends` の値は **URL でも display_name でも引ける** ように lookup する。
+/// これにより `depends = ["plenary.nvim"]` (名前) でも `depends = ["nvim-lua/plenary.nvim"]`
+/// (URL) でも同じプラグインを参照できる。`on_source` と同じ identifier 空間。
 pub fn sort_plugins(plugins: &mut Vec<Plugin>) -> Result<()> {
     let mut sorted = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut visiting = std::collections::HashSet::new();
 
-    let plugin_map: std::collections::HashMap<String, &Plugin> =
-        plugins.iter().map(|p| (p.url.clone(), p)).collect();
+    // URL と display_name の両方で引けるマップを構築
+    let mut plugin_map: std::collections::HashMap<String, &Plugin> =
+        std::collections::HashMap::new();
+    for p in plugins.iter() {
+        plugin_map.insert(p.url.clone(), p);
+        plugin_map.insert(p.display_name(), p);
+    }
 
     fn visit(
-        url: &str,
+        key: &str,
         plugin_map: &std::collections::HashMap<String, &Plugin>,
         visited: &mut std::collections::HashSet<String>,
         visiting: &mut std::collections::HashSet<String>,
         sorted: &mut Vec<Plugin>,
     ) -> Result<()> {
-        if visited.contains(url) {
+        if visited.contains(key) {
             return Ok(());
         }
-        if visiting.contains(url) {
-            eprintln!("Warning: Cyclic dependency detected: {}", url);
+        if visiting.contains(key) {
+            eprintln!("Warning: Cyclic dependency detected: {}", key);
             return Ok(());
         }
 
-        visiting.insert(url.to_string());
+        visiting.insert(key.to_string());
 
-        if let Some(plugin) = plugin_map.get(url) {
+        if let Some(plugin) = plugin_map.get(key) {
+            // 重複防止: URL で visited チェック (display_name 経由で同じプラグインを2回入れない)
+            if visited.contains(&plugin.url) {
+                visiting.remove(key);
+                return Ok(());
+            }
             if let Some(deps) = &plugin.depends {
                 for dep in deps {
                     visit(dep, plugin_map, visited, visiting, sorted)?;
                 }
             }
-            visited.insert(url.to_string());
-            visiting.remove(url);
+            visited.insert(plugin.url.clone());
+            visited.insert(plugin.display_name());
+            visiting.remove(key);
             sorted.push((*plugin).clone());
         } else {
-            eprintln!("Warning: Dependency not found in config: {}", url);
-            visited.insert(url.to_string());
-            visiting.remove(url);
+            eprintln!("Warning: Dependency not found in config: {}", key);
+            visited.insert(key.to_string());
+            visiting.remove(key);
         }
         Ok(())
     }
@@ -449,6 +459,47 @@ on_event = "BufReadPre"
 
         assert_eq!(plugins[0].url, "B");
         assert_eq!(plugins[1].url, "A");
+    }
+
+    #[test]
+    fn test_sort_plugins_depends_by_display_name() {
+        // depends に display_name (リポジトリ名) を使っても解決できる
+        let mut plugins = vec![
+            Plugin {
+                url: "nvim-telescope/telescope.nvim".to_string(),
+                depends: Some(vec!["plenary.nvim".to_string()]),
+                ..Default::default()
+            },
+            Plugin {
+                url: "nvim-lua/plenary.nvim".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        sort_plugins(&mut plugins).unwrap();
+        // plenary が先に来る
+        assert_eq!(plugins[0].url, "nvim-lua/plenary.nvim");
+        assert_eq!(plugins[1].url, "nvim-telescope/telescope.nvim");
+    }
+
+    #[test]
+    fn test_sort_plugins_depends_by_url_still_works() {
+        // depends に URL をそのまま使っても引ける (既存互換)
+        let mut plugins = vec![
+            Plugin {
+                url: "nvim-telescope/telescope.nvim".to_string(),
+                depends: Some(vec!["nvim-lua/plenary.nvim".to_string()]),
+                ..Default::default()
+            },
+            Plugin {
+                url: "nvim-lua/plenary.nvim".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        sort_plugins(&mut plugins).unwrap();
+        assert_eq!(plugins[0].url, "nvim-lua/plenary.nvim");
+        assert_eq!(plugins[1].url, "nvim-telescope/telescope.nvim");
     }
 
     #[test]

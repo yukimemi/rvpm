@@ -67,7 +67,7 @@ lazy  = false
 name = "telescope"
 url  = "nvim-telescope/telescope.nvim"
 lazy = true
-depends = ["plenary"]
+depends = ["plenary.nvim"]
 # rev: ブランチ / タグ / コミットハッシュ
 # rev = "v0.1.0"
 
@@ -76,7 +76,7 @@ on_cmd    = ["Telescope"]                    # string | string[]
 on_ft     = ["rust", "toml"]                 # string | string[]
 on_event  = ["BufReadPre", "User LazyDone"]  # "User Xxx" は User イベント + pattern に展開される
 on_path   = ["*.rs", "Cargo.toml"]           # BufRead/BufNewFile の glob
-on_source = ["plenary"]                      # 他プラグインのロード完了 User イベントで起動
+on_source = ["plenary.nvim"]                  # 他プラグインのロード完了 User イベントで起動 (display_name で指定)
 # on_map は string (単純) / table (mode + desc 指定) 混在可
 on_map = [
   "<leader>f",                                              # mode = ["n"] (default)
