@@ -48,7 +48,11 @@ pub struct Plugin {
     pub name: Option<String>,
     pub url: String,
     pub dst: Option<String>,
-    #[serde(default)]
+    /// None = 未指定 (on_* があれば自動 true), Some(false) = 明示 eager, Some(true) = 明示 lazy
+    #[serde(default, rename = "lazy")]
+    pub lazy_raw: Option<bool>,
+    /// parse 後に解決された値。コード上はこちらを参照する。
+    #[serde(skip)]
     pub lazy: bool,
     #[serde(default = "default_merge")]
     pub merge: bool,
@@ -224,7 +228,23 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     let rendered = Tera::one_off(toml_str, &context, false)?;
 
     // 4. Final Parse
-    let config: Config = toml::from_str(&rendered)?;
+    let mut config: Config = toml::from_str(&rendered)?;
+
+    // 5. lazy 自動解決: on_* トリガーがあれば lazy = true にする (明示 false は尊重)
+    for plugin in config.plugins.iter_mut() {
+        let has_trigger = plugin.on_cmd.is_some()
+            || plugin.on_ft.is_some()
+            || plugin.on_map.is_some()
+            || plugin.on_event.is_some()
+            || plugin.on_path.is_some()
+            || plugin.on_source.is_some();
+        plugin.lazy = match plugin.lazy_raw {
+            Some(v) => v,                // 明示指定を尊重
+            None if has_trigger => true, // トリガーあり → 自動 lazy
+            None => false,               // トリガーなし → eager
+        };
+    }
+
     Ok(config)
 }
 
@@ -424,6 +444,119 @@ on_map = [
         assert_eq!(maps[2].lhs, "<leader>c");
         assert_eq!(maps[2].mode, vec!["n".to_string(), "v".to_string()]);
         assert_eq!(maps[2].desc.as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn test_lazy_auto_true_when_on_cmd_set() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+on_cmd = "Foo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(
+            config.plugins[0].lazy,
+            "on_cmd が設定されていれば lazy = true になるべき"
+        );
+    }
+
+    #[test]
+    fn test_lazy_auto_true_when_on_event_set() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+on_event = "BufReadPre"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(
+            config.plugins[0].lazy,
+            "on_event が設定されていれば lazy = true になるべき"
+        );
+    }
+
+    #[test]
+    fn test_lazy_auto_true_when_on_ft_set() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+on_ft = ["rust"]
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(config.plugins[0].lazy);
+    }
+
+    #[test]
+    fn test_lazy_auto_true_when_on_map_set() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+on_map = ["<leader>f"]
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(config.plugins[0].lazy);
+    }
+
+    #[test]
+    fn test_lazy_auto_true_when_on_source_set() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+on_source = "telescope.nvim"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(config.plugins[0].lazy);
+    }
+
+    #[test]
+    fn test_lazy_auto_true_when_on_path_set() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+on_path = "*.rs"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(config.plugins[0].lazy);
+    }
+
+    #[test]
+    fn test_lazy_explicit_false_overrides_auto() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+lazy = false
+on_cmd = "Foo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(
+            !config.plugins[0].lazy,
+            "lazy = false が明示されていればそちらを尊重"
+        );
+    }
+
+    #[test]
+    fn test_no_trigger_stays_eager() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(!config.plugins[0].lazy, "トリガーなしは eager のまま");
     }
 
     #[test]
