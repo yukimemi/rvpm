@@ -29,6 +29,8 @@ pub struct TuiState {
     pub search_mode: bool,
     /// 検索モード中の入力バッファ
     pub search_input: String,
+    /// ヘルプ表示中
+    pub show_help: bool,
 }
 
 impl TuiState {
@@ -50,6 +52,7 @@ impl TuiState {
             search_cursor: 0,
             search_mode: false,
             search_input: String::new(),
+            show_help: false,
         }
     }
 
@@ -541,44 +544,44 @@ impl TuiState {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan)),
             )
+        } else if self.show_help {
+            // ヘルプポップアップ表示中
+            Paragraph::new(Line::from(vec![
+                Span::styled(" Navigation: ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    "j/k \u{2193}\u{2191}  g/G Home/End  C-d/u C-f/b  / n/N",
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled("  Actions: ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    "e:edit s:set S:sync u/U:update d:delete  ",
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled("[?] close", Style::default().fg(Color::Cyan)),
+            ]))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
         } else {
             Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " [q] Quit ",
-                    Style::default().fg(Color::Black).bg(Color::DarkGray),
-                ),
-                Span::styled(
-                    " [j/k] Move ",
-                    Style::default().fg(Color::Black).bg(Color::DarkGray),
-                ),
-                Span::styled(
-                    " [g/G] Top/End ",
-                    Style::default().fg(Color::Black).bg(Color::DarkGray),
-                ),
-                Span::styled(
-                    " [/] Search [n/N] ",
-                    Style::default().fg(Color::Black).bg(Color::DarkGray),
-                ),
-                Span::styled(
-                    " [e] Edit ",
-                    Style::default().fg(Color::Black).bg(Color::Magenta),
-                ),
-                Span::styled(
-                    " [s] Set ",
-                    Style::default().fg(Color::Black).bg(Color::Cyan),
-                ),
-                Span::styled(
-                    " [S] Sync ",
-                    Style::default().fg(Color::Black).bg(Color::Green),
-                ),
-                Span::styled(
-                    " [u/U] Update ",
-                    Style::default().fg(Color::Black).bg(Color::Yellow),
-                ),
-                Span::styled(
-                    " [d] Delete ",
-                    Style::default().fg(Color::Black).bg(Color::Red),
-                ),
+                Span::styled(" e", Style::default().fg(Color::Cyan)),
+                Span::styled(":edit ", Style::default().fg(Color::DarkGray)),
+                Span::styled("s", Style::default().fg(Color::Cyan)),
+                Span::styled(":set ", Style::default().fg(Color::DarkGray)),
+                Span::styled("S", Style::default().fg(Color::Cyan)),
+                Span::styled(":sync ", Style::default().fg(Color::DarkGray)),
+                Span::styled("u/U", Style::default().fg(Color::Cyan)),
+                Span::styled(":update ", Style::default().fg(Color::DarkGray)),
+                Span::styled("d", Style::default().fg(Color::Cyan)),
+                Span::styled(":delete ", Style::default().fg(Color::DarkGray)),
+                Span::styled("/", Style::default().fg(Color::Cyan)),
+                Span::styled(":search ", Style::default().fg(Color::DarkGray)),
+                Span::styled("?", Style::default().fg(Color::Cyan)),
+                Span::styled(":help ", Style::default().fg(Color::DarkGray)),
+                Span::styled("q", Style::default().fg(Color::Cyan)),
+                Span::styled(":quit", Style::default().fg(Color::DarkGray)),
             ]))
             .block(Block::default().borders(Borders::ALL))
         };

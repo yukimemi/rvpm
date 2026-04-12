@@ -687,6 +687,9 @@ async fn run_list(no_tui: bool) -> Result<()> {
                 crossterm::event::KeyCode::Char('/') => {
                     tui_state.start_search();
                 }
+                crossterm::event::KeyCode::Char('?') => {
+                    tui_state.show_help = !tui_state.show_help;
+                }
                 crossterm::event::KeyCode::Char('n') => tui_state.search_next(),
                 crossterm::event::KeyCode::Char('N') => tui_state.search_prev(),
 
