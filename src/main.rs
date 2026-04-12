@@ -359,6 +359,7 @@ async fn run_sync(prune: bool) -> Result<()> {
             plugin.merge = false;
         }
 
+        let config_for_build = config.clone();
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
             let dst_path = if let Some(d) = &plugin.dst {
@@ -384,7 +385,26 @@ async fn run_sync(prune: bool) -> Result<()> {
                                 PluginStatus::Syncing(format!("Building: {}", build_cmd)),
                             ))
                             .await;
-                        let (prog, args) = parse_build_command(build_cmd, &dst_path);
+                        // 自身 + depends の path を rtp に追加
+                        let mut rtp_dirs = vec![dst_path.clone()];
+                        if let Some(deps) = &plugin.depends {
+                            for dep in deps {
+                                // dep は display_name or URL → canonical_path で解決
+                                if let Some(dep_plugin) = config_for_build
+                                    .plugins
+                                    .iter()
+                                    .find(|p| p.display_name() == *dep || p.url == *dep)
+                                {
+                                    let dep_path = if let Some(d) = &dep_plugin.dst {
+                                        PathBuf::from(d)
+                                    } else {
+                                        base_dir.join("repos").join(dep_plugin.canonical_path())
+                                    };
+                                    rtp_dirs.push(dep_path);
+                                }
+                            }
+                        }
+                        let (prog, args) = parse_build_command(build_cmd, &rtp_dirs);
                         let build_output = tokio::process::Command::new(&prog)
                             .args(&args)
                             .current_dir(&dst_path)
@@ -2193,21 +2213,22 @@ fn find_lua(dir: &Path, name: &str) -> Option<String> {
 /// `colors/` ディレクトリからカラースキーム名 (ファイル名から拡張子を除去) を収集する。
 /// 例: `colors/catppuccin.lua` → `"catppuccin"`, `colors/catppuccin-latte.vim` → `"catppuccin-latte"`
 /// build コマンドを解析して (実行プログラム, 引数リスト) を返す。
-/// `:` で始まる場合は Neovim コマンドとして実行。plugin_dir を rtp に追加して
-/// プラグインのコマンドや autoload 関数を使えるようにする。
+/// `:` で始まる場合は Neovim コマンドとして実行。rtp_dirs (自身 + 依存先) を
+/// rtp に追加してコマンドや autoload 関数を使えるようにする。
 /// それ以外はシェルコマンドとして `sh -c "..."` (Windows: `cmd /C "..."`) に変換。
-fn parse_build_command(build_cmd: &str, plugin_dir: &Path) -> (String, Vec<String>) {
+fn parse_build_command(build_cmd: &str, rtp_dirs: &[PathBuf]) -> (String, Vec<String>) {
     if let Some(vim_cmd) = build_cmd.strip_prefix(':') {
-        let rtp_add = format!(
-            "set rtp+={}",
-            plugin_dir.to_string_lossy().replace('\\', "/")
-        );
+        let rtp_cmds: Vec<String> = rtp_dirs
+            .iter()
+            .map(|d| format!("set rtp+={}", d.to_string_lossy().replace('\\', "/")))
+            .collect();
+        let rtp_cmd = rtp_cmds.join(" | ");
         (
             "nvim".to_string(),
             vec![
                 "--headless".to_string(),
                 "--cmd".to_string(),
-                rtp_add,
+                rtp_cmd,
                 "-c".to_string(),
                 vim_cmd.to_string(),
                 "-c".to_string(),
@@ -3007,14 +3028,14 @@ lazy = false"#;
         assert!(result.contains("rev = \"v1.0\""));
     }
 
-    #[test]
     // -----------------------------------------------------------------
     // build コマンドのテスト
     // -----------------------------------------------------------------
+
     #[test]
     fn test_parse_build_command_shell() {
-        let dir = std::path::Path::new("/path/to/plugin");
-        let (cmd, args) = parse_build_command("cargo build --release", dir);
+        let dirs = vec![PathBuf::from("/path/to/plugin")];
+        let (cmd, args) = parse_build_command("cargo build --release", &dirs);
         if cfg!(windows) {
             assert_eq!(cmd, "cmd");
             assert_eq!(args, vec!["/C", "cargo build --release"]);
@@ -3026,18 +3047,17 @@ lazy = false"#;
 
     #[test]
     fn test_parse_build_command_vim_prefix() {
-        let dir = std::path::Path::new("/path/to/plugin");
-        let (cmd, args) = parse_build_command(":call mkdp#util#install()", dir);
+        let dirs = vec![PathBuf::from("/path/to/plugin")];
+        let (cmd, args) = parse_build_command(":call mkdp#util#install()", &dirs);
         assert_eq!(cmd, "nvim");
         assert!(args.iter().any(|a| a == "--headless"));
-        // vim コマンド部分が含まれる
         assert!(args.iter().any(|a| a.contains("mkdp#util#install()")));
     }
 
     #[test]
     fn test_parse_build_command_vim_simple() {
-        let dir = std::path::Path::new("/path/to/plugin");
-        let (cmd, args) = parse_build_command(":TSUpdate", dir);
+        let dirs = vec![PathBuf::from("/path/to/plugin")];
+        let (cmd, args) = parse_build_command(":TSUpdate", &dirs);
         assert_eq!(cmd, "nvim");
         assert!(args.iter().any(|a| a == "--headless"));
         assert!(args.iter().any(|a| a.contains("TSUpdate")));
@@ -3045,10 +3065,9 @@ lazy = false"#;
 
     #[test]
     fn test_parse_build_command_vim_adds_rtp() {
-        let dir = std::path::Path::new("/path/to/my-plugin");
-        let (cmd, args) = parse_build_command(":MyBuild", dir);
+        let dirs = vec![PathBuf::from("/path/to/my-plugin")];
+        let (cmd, args) = parse_build_command(":MyBuild", &dirs);
         assert_eq!(cmd, "nvim");
-        // --cmd "set rtp+=/path/to/my-plugin" が引数に含まれる
         assert!(args.iter().any(|a| a == "--cmd"));
         assert!(
             args.iter()
@@ -3056,6 +3075,24 @@ lazy = false"#;
             "should add plugin dir to rtp: {:?}",
             args
         );
+    }
+
+    #[test]
+    fn test_parse_build_command_vim_includes_deps_rtp() {
+        let dirs = vec![
+            PathBuf::from("/path/to/plugin"),
+            PathBuf::from("/path/to/dep1"),
+            PathBuf::from("/path/to/dep2"),
+        ];
+        let (cmd, args) = parse_build_command(":Build", &dirs);
+        assert_eq!(cmd, "nvim");
+        let rtp_arg = args
+            .iter()
+            .find(|a| a.contains("set rtp+="))
+            .expect("should have rtp cmd");
+        assert!(rtp_arg.contains("/path/to/plugin"), "self: {}", rtp_arg);
+        assert!(rtp_arg.contains("/path/to/dep1"), "dep1: {}", rtp_arg);
+        assert!(rtp_arg.contains("/path/to/dep2"), "dep2: {}", rtp_arg);
     }
 
     fn test_find_unused_repos() {
