@@ -19,6 +19,12 @@ pub struct TuiState {
     pub plugins: Vec<String>,
     pub status_map: HashMap<String, PluginStatus>,
     pub table_state: TableState,
+    /// `/` or `?` 検索のパターン
+    pub search_pattern: Option<String>,
+    /// 検索にヒットしたインデックス一覧 (ソート済み)
+    pub search_matches: Vec<usize>,
+    /// 検索の現在位置 (search_matches 内のインデックス)
+    pub search_cursor: usize,
 }
 
 impl TuiState {
@@ -35,6 +41,9 @@ impl TuiState {
             plugins: plugin_urls,
             status_map,
             table_state,
+            search_pattern: None,
+            search_matches: Vec::new(),
+            search_cursor: 0,
         }
     }
 
@@ -68,6 +77,78 @@ impl TuiState {
 
     pub fn selected_url(&self) -> Option<String> {
         self.table_state.selected().map(|i| self.plugins[i].clone())
+    }
+
+    /// g — 先頭へ
+    pub fn go_top(&mut self) {
+        if !self.plugins.is_empty() {
+            self.table_state.select(Some(0));
+        }
+    }
+
+    /// G — 末尾へ
+    pub fn go_bottom(&mut self) {
+        if !self.plugins.is_empty() {
+            self.table_state.select(Some(self.plugins.len() - 1));
+        }
+    }
+
+    /// 指定行数だけ下へ移動 (末尾でクランプ)
+    pub fn move_down(&mut self, n: usize) {
+        if self.plugins.is_empty() {
+            return;
+        }
+        let current = self.table_state.selected().unwrap_or(0);
+        let target = (current + n).min(self.plugins.len() - 1);
+        self.table_state.select(Some(target));
+    }
+
+    /// 指定行数だけ上へ移動 (先頭でクランプ)
+    pub fn move_up(&mut self, n: usize) {
+        let current = self.table_state.selected().unwrap_or(0);
+        let target = current.saturating_sub(n);
+        self.table_state.select(Some(target));
+    }
+
+    /// 検索を実行してマッチ一覧を更新。最初のマッチに移動。
+    pub fn search(&mut self, pattern: &str) {
+        let pat = pattern.to_lowercase();
+        self.search_matches = self
+            .plugins
+            .iter()
+            .enumerate()
+            .filter(|(_, url)| url.to_lowercase().contains(&pat))
+            .map(|(i, _)| i)
+            .collect();
+        self.search_pattern = Some(pattern.to_string());
+        self.search_cursor = 0;
+        if let Some(&idx) = self.search_matches.first() {
+            self.table_state.select(Some(idx));
+        }
+    }
+
+    /// n — 次の検索結果へ
+    pub fn search_next(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.search_cursor = (self.search_cursor + 1) % self.search_matches.len();
+        self.table_state
+            .select(Some(self.search_matches[self.search_cursor]));
+    }
+
+    /// N — 前の検索結果へ
+    pub fn search_prev(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.search_cursor = if self.search_cursor == 0 {
+            self.search_matches.len() - 1
+        } else {
+            self.search_cursor - 1
+        };
+        self.table_state
+            .select(Some(self.search_matches[self.search_cursor]));
     }
 
     pub fn update_status(&mut self, url: &str, status: PluginStatus) {
@@ -395,6 +476,14 @@ impl TuiState {
                 Style::default().fg(Color::Black).bg(Color::DarkGray),
             ),
             Span::styled(
+                " [g/G] Top/End ",
+                Style::default().fg(Color::Black).bg(Color::DarkGray),
+            ),
+            Span::styled(
+                " [/] Search [n/N] ",
+                Style::default().fg(Color::Black).bg(Color::DarkGray),
+            ),
+            Span::styled(
                 " [e] Edit ",
                 Style::default().fg(Color::Black).bg(Color::Magenta),
             ),
@@ -409,10 +498,6 @@ impl TuiState {
             Span::styled(
                 " [u/U] Update ",
                 Style::default().fg(Color::Black).bg(Color::Yellow),
-            ),
-            Span::styled(
-                " [g] Generate ",
-                Style::default().fg(Color::Black).bg(Color::Blue),
             ),
             Span::styled(
                 " [d] Delete ",

@@ -628,12 +628,67 @@ async fn run_list(no_tui: bool) -> Result<()> {
 
             match key.code {
                 crossterm::event::KeyCode::Char('q') => break,
+
+                // ── Ctrl 修飾キー (plain match より先に判定) ──
+                crossterm::event::KeyCode::Char('d')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    tui_state.move_down(10);
+                }
+                crossterm::event::KeyCode::Char('u')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    tui_state.move_up(10);
+                }
+                crossterm::event::KeyCode::Char('f')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    tui_state.move_down(20);
+                }
+                crossterm::event::KeyCode::Char('b')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    tui_state.move_up(20);
+                }
+
+                // ── vim-like navigation ──
                 crossterm::event::KeyCode::Char('j') | crossterm::event::KeyCode::Down => {
                     tui_state.next()
                 }
                 crossterm::event::KeyCode::Char('k') | crossterm::event::KeyCode::Up => {
                     tui_state.previous()
                 }
+                crossterm::event::KeyCode::Char('g') | crossterm::event::KeyCode::Home => {
+                    tui_state.go_top();
+                }
+                crossterm::event::KeyCode::Char('G') | crossterm::event::KeyCode::End => {
+                    tui_state.go_bottom();
+                }
+                crossterm::event::KeyCode::Char('/') => {
+                    disable_raw_mode()?;
+                    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                    terminal.show_cursor()?;
+                    if let Some(pat) = read_input_with_esc("Search", "")?
+                        && !pat.is_empty()
+                    {
+                        tui_state.search(&pat);
+                    }
+                    enable_raw_mode()?;
+                    execute!(std::io::stdout(), EnterAlternateScreen)?;
+                    terminal.clear()?;
+                }
+                crossterm::event::KeyCode::Char('n') => tui_state.search_next(),
+                crossterm::event::KeyCode::Char('N') => tui_state.search_prev(),
+
+                // ── actions ──
                 crossterm::event::KeyCode::Char('e') => {
                     if let Some(url) = tui_state.selected_url() {
                         disable_raw_mode()?;
@@ -701,15 +756,6 @@ async fn run_list(no_tui: bool) -> Result<()> {
                     let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
                     config = c;
                     tui_state = s;
-                }
-                crossterm::event::KeyCode::Char('g') => {
-                    disable_raw_mode()?;
-                    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                    terminal.show_cursor()?;
-                    let _ = run_generate().await;
-                    enable_raw_mode()?;
-                    execute!(std::io::stdout(), EnterAlternateScreen)?;
-                    terminal.clear()?;
                 }
                 crossterm::event::KeyCode::Char('d') => {
                     if let Some(url) = tui_state.selected_url() {
