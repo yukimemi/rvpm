@@ -24,6 +24,8 @@ pub struct PluginScripts {
     pub on_path: Option<Vec<String>>,
     pub on_source: Option<Vec<String>>,
     pub depends: Option<Vec<String>>,
+    /// 事前コンパイル: colors/*.{vim,lua} からファイル名 (拡張子なし) を抽出したカラースキーム名
+    pub colorschemes: Vec<String>,
     pub cond: Option<String>,
 }
 
@@ -49,6 +51,7 @@ impl PluginScripts {
             on_path: None,
             on_source: None,
             depends: None,
+            colorschemes: Vec::new(),
             cond: None,
         }
     }
@@ -532,6 +535,60 @@ end
     }
 
     // ======================================================
+    // Phase 4.3: ColorSchemePre handler (lazy colorscheme 自動ロード)
+    // lazy plugin の colors/ に含まれるカラースキーム名をマップ化し、
+    // `:colorscheme <name>` 実行時に対応プラグインをロードする
+    // ======================================================
+    {
+        // colorscheme → plugin の load_lazy 呼び出しコードを集める
+        let mut cs_entries: Vec<String> = Vec::new();
+        for s in &scripts {
+            if !s.lazy || s.colorschemes.is_empty() {
+                continue;
+            }
+            let path = s.path.replace('\\', "/");
+            let safe = sanitize_name(&s.name);
+            let before = s
+                .before
+                .as_ref()
+                .map(|p| format!("\"{}\"", p.replace('\\', "/")))
+                .unwrap_or_else(|| "nil".to_string());
+            let after = s
+                .after
+                .as_ref()
+                .map(|p| format!("\"{}\"", p.replace('\\', "/")))
+                .unwrap_or_else(|| "nil".to_string());
+            for cs in &s.colorschemes {
+                cs_entries.push(format!(
+                    "[\"{cs}\"] = function() load_lazy(\"{name}\", \"{path}\", _rvpm_pf_{safe}, _rvpm_fd_{safe}, _rvpm_ap_{safe}, {before}, {after}) end",
+                    cs = cs,
+                    name = s.name,
+                    path = path,
+                    safe = safe,
+                    before = before,
+                    after = after,
+                ));
+            }
+        }
+
+        if !cs_entries.is_empty() {
+            lua.push_str("local _rvpm_colorschemes = {\n");
+            for entry in &cs_entries {
+                lua.push_str(&format!("  {},\n", entry));
+            }
+            lua.push_str("}\n");
+            lua.push_str(
+                "vim.api.nvim_create_autocmd(\"ColorSchemePre\", {\n\
+                 \x20 callback = function(ev)\n\
+                 \x20   local loader = _rvpm_colorschemes[ev.match]\n\
+                 \x20   if loader then loader() end\n\
+                 \x20 end,\n\
+                 })\n\n",
+            );
+        }
+    }
+
+    // ======================================================
     // Phase 4.5: グローバル after.lua (全プラグインの後)
     // colorscheme / 最終 UI 調整を書く場所
     // ======================================================
@@ -852,6 +909,74 @@ mod tests {
         assert!(
             lua.contains("rvpm_loaded_a"),
             "B on_source trigger for A exists"
+        );
+    }
+
+    // ========================================================
+    // colorscheme 自動検出テスト
+    // ========================================================
+
+    #[test]
+    fn test_lazy_plugin_with_colorschemes_emits_colorscheme_pre_handler() {
+        let mut s = PluginScripts::for_test("catppuccin", "/path/catppuccin");
+        s.lazy = true;
+        s.colorschemes = vec!["catppuccin".to_string(), "catppuccin-latte".to_string()];
+        s.plugin_files = vec!["/path/catppuccin/plugin/catppuccin.lua".to_string()];
+
+        let lua = gen_loader(Path::new("/merged"), &[s]);
+        assert!(
+            lua.contains("ColorSchemePre"),
+            "should register ColorSchemePre autocmd for lazy colorscheme"
+        );
+        assert!(lua.contains("catppuccin"), "should reference catppuccin");
+        assert!(
+            lua.contains("catppuccin-latte"),
+            "should reference catppuccin-latte"
+        );
+    }
+
+    #[test]
+    fn test_eager_plugin_with_colorschemes_no_handler() {
+        let mut s = PluginScripts::for_test("catppuccin", "/path/catppuccin");
+        s.lazy = false;
+        s.colorschemes = vec!["catppuccin".to_string()];
+
+        let lua = gen_loader(Path::new("/merged"), &[s]);
+        assert!(
+            !lua.contains("ColorSchemePre"),
+            "eager plugin should NOT register ColorSchemePre handler"
+        );
+    }
+
+    #[test]
+    fn test_multiple_lazy_colorscheme_plugins_combined_handler() {
+        let mut a = PluginScripts::for_test("catppuccin", "/path/catppuccin");
+        a.lazy = true;
+        a.colorschemes = vec!["catppuccin".to_string()];
+        a.plugin_files = vec!["/path/catppuccin/plugin/c.lua".to_string()];
+
+        let mut b = PluginScripts::for_test("tokyonight", "/path/tokyonight");
+        b.lazy = true;
+        b.colorschemes = vec!["tokyonight".to_string(), "tokyonight-night".to_string()];
+        b.plugin_files = vec!["/path/tokyonight/plugin/t.lua".to_string()];
+
+        let lua = gen_loader(Path::new("/merged"), &[a, b]);
+        assert!(lua.contains("catppuccin"));
+        assert!(lua.contains("tokyonight"));
+        assert!(lua.contains("tokyonight-night"));
+    }
+
+    #[test]
+    fn test_colorscheme_handler_loads_correct_plugin() {
+        let mut s = PluginScripts::for_test("catppuccin", "/path/catppuccin");
+        s.lazy = true;
+        s.colorschemes = vec!["catppuccin".to_string()];
+        s.plugin_files = vec!["/path/catppuccin/plugin/c.lua".to_string()];
+
+        let lua = gen_loader(Path::new("/merged"), &[s]);
+        assert!(
+            lua.contains("load_lazy(\"catppuccin\""),
+            "ColorSchemePre handler should call load_lazy for the matching plugin"
         );
     }
 

@@ -1956,6 +1956,33 @@ fn find_lua(dir: &Path, name: &str) -> Option<String> {
 /// 指定ディレクトリ配下を再帰的に walk し、`.vim` / `.lua` ファイルをソートして返す。
 /// lazy.nvim の Util.walk + source_runtime のフィルタと同等。
 /// ディレクトリが存在しない場合は空配列を返す (Resilience)。
+/// `colors/` ディレクトリからカラースキーム名 (ファイル名から拡張子を除去) を収集する。
+/// 例: `colors/catppuccin.lua` → `"catppuccin"`, `colors/catppuccin-latte.vim` → `"catppuccin-latte"`
+fn collect_colorschemes(plugin_path: &Path) -> Vec<String> {
+    let dir = plugin_path.join("colors");
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+        .filter_map(|e| {
+            let path = e.path();
+            let ext = path.extension()?.to_str()?;
+            if ext == "lua" || ext == "vim" {
+                Some(path.file_stem()?.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn collect_source_files(plugin_path: &Path, subdir: &str) -> Vec<String> {
     let dir = plugin_path.join(subdir);
     if !dir.exists() {
@@ -2003,6 +2030,7 @@ fn build_plugin_scripts(
         on_path: plugin.on_path.clone(),
         on_source: plugin.on_source.clone(),
         depends: plugin.depends.clone(),
+        colorschemes: collect_colorschemes(plugin_path),
         cond: plugin.cond.clone(),
     }
 }
