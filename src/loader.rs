@@ -109,7 +109,10 @@ pub fn generate_loader(
     // → B 昇格 → C も昇格。ループで収束するまで繰り返す。
     // ======================================================
     let mut scripts = scripts.to_vec();
-    loop {
+    // 安全ガード: 各 iteration で少なくとも 1 つ昇格するので最大 N 回で収束。
+    // 万が一のロジックバグでも無限ループにならないように回数制限。
+    let max_iterations = scripts.len() + 1;
+    for _ in 0..max_iterations {
         let eager_names: std::collections::HashSet<String> = scripts
             .iter()
             .filter(|s| !s.lazy)
@@ -664,6 +667,112 @@ mod tests {
             after_trigger.contains("load_lazy(\"snacks.nvim\""),
             "telescope trigger should load snacks.nvim dependency first:\n{}",
             &after_trigger[..500.min(after_trigger.len())]
+        );
+    }
+
+    #[test]
+    fn test_mixed_depends_and_on_source() {
+        // A(eager, depends=["B"]) が B(lazy) に依存 → B 昇格
+        // C(lazy, on_source=["B"]) が B を参照 → B は now eager → C 昇格
+        let mut a = PluginScripts::for_test("a", "/path/a");
+        a.lazy = false;
+        a.depends = Some(vec!["b".to_string()]);
+        a.plugin_files = vec!["/path/a/plugin/a.lua".to_string()];
+
+        let mut b = PluginScripts::for_test("b", "/path/b");
+        b.lazy = true;
+        b.plugin_files = vec!["/path/b/plugin/b.lua".to_string()];
+
+        let mut c = PluginScripts::for_test("c", "/path/c");
+        c.lazy = true;
+        c.on_source = Some(vec!["b".to_string()]);
+        c.plugin_files = vec!["/path/c/plugin/c.lua".to_string()];
+
+        let lua = gen_loader(Path::new("/merged"), &[b, a, c]);
+        // 全部 eager に昇格して source
+        assert!(lua.contains("source /path/a/plugin/a.lua"));
+        assert!(lua.contains("source /path/b/plugin/b.lua"));
+        assert!(lua.contains("source /path/c/plugin/c.lua"));
+        let pb = lua.find("source /path/b/plugin/b.lua").unwrap();
+        let pa = lua.find("source /path/a/plugin/a.lua").unwrap();
+        let pc = lua.find("source /path/c/plugin/c.lua").unwrap();
+        assert!(pb < pa, "b must load before a (a depends on b)");
+        assert!(pb < pc, "b must load before c (c on_source b)");
+    }
+
+    #[test]
+    fn test_circular_on_source_does_not_infinite_loop() {
+        // A(lazy, on_source=["B"]) + B(lazy, on_source=["A"])
+        // 両方 lazy で互いに on_source → eager 昇格は起きない (eager がないので)
+        // ループせずに収束すること
+        let mut a = PluginScripts::for_test("a", "/path/a");
+        a.lazy = true;
+        a.on_source = Some(vec!["b".to_string()]);
+
+        let mut b = PluginScripts::for_test("b", "/path/b");
+        b.lazy = true;
+        b.on_source = Some(vec!["a".to_string()]);
+
+        // パニックしなければ OK (無限ループしない)
+        let lua = gen_loader(Path::new("/merged"), &[a, b]);
+        // 両方 lazy のまま (eager 昇格は起きない)
+        assert!(!lua.contains("source /path/a/plugin"), "a should stay lazy");
+        assert!(!lua.contains("source /path/b/plugin"), "b should stay lazy");
+    }
+
+    #[test]
+    fn test_self_referential_depends_does_not_crash() {
+        // A(lazy, depends=["A"]) — 自己参照
+        let mut a = PluginScripts::for_test("a", "/path/a");
+        a.lazy = true;
+        a.depends = Some(vec!["a".to_string()]);
+        // パニックしなければ OK
+        let _lua = gen_loader(Path::new("/merged"), &[a]);
+    }
+
+    #[test]
+    fn test_eager_with_on_source_is_harmless() {
+        // Eager plugin が on_source を持っている (設定ミス)
+        // → 無視される (on_source は Phase 4 で lazy のみ処理)
+        let mut a = PluginScripts::for_test("a", "/path/a");
+        a.lazy = false;
+        a.on_source = Some(vec!["nonexistent".to_string()]);
+        a.plugin_files = vec!["/path/a/plugin/a.lua".to_string()];
+
+        let lua = gen_loader(Path::new("/merged"), &[a]);
+        // Phase 3 で正常に source される
+        assert!(lua.contains("source /path/a/plugin/a.lua"));
+        // on_source trigger は Phase 4 に出ない (eager なので skip)
+        assert!(!lua.contains("rvpm_loaded_nonexistent"));
+    }
+
+    #[test]
+    fn test_reverse_depends_on_source_combo() {
+        // A(lazy, on_cmd=["FooA"]) → B(lazy, depends=["A"], on_source=["A"])
+        // B は depends でも on_source でも A を参照。A は lazy のまま。
+        // B のトリガー発火時に A が先にロードされる (depends chain)。
+        // on_source はさらに A の rvpm_loaded でも B をロードする (二重ガードで安全)。
+        let mut a = PluginScripts::for_test("a", "/path/a");
+        a.lazy = true;
+        a.on_cmd = Some(vec!["FooA".to_string()]);
+        a.plugin_files = vec!["/path/a/plugin/a.lua".to_string()];
+
+        let mut b = PluginScripts::for_test("b", "/path/b");
+        b.lazy = true;
+        b.depends = Some(vec!["a".to_string()]);
+        b.on_source = Some(vec!["a".to_string()]);
+        b.plugin_files = vec!["/path/b/plugin/b.lua".to_string()];
+
+        let lua = gen_loader(Path::new("/merged"), &[a, b]);
+        // 両方 lazy のまま (eager 参照がない)
+        // B の trigger 内で A が先にロードされる
+        assert!(
+            lua.contains("nvim_create_user_command(\"FooA\""),
+            "A trigger exists"
+        );
+        assert!(
+            lua.contains("rvpm_loaded_a"),
+            "B on_source trigger for A exists"
         );
     }
 
