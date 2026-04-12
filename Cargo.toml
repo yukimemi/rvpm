@@ -1,6 +1,6 @@
 [package]
 name = "rvpm"
-version = "0.13.0"
+version = "1.0.0"
 edition = "2024"
 description = "Fast Neovim plugin manager with pre-compiled loader and merge optimization"
 license = "MIT"
