@@ -736,8 +736,14 @@ mod tests {
         // パニック・無限ループしなければ OK
         let lua = gen_loader(Path::new("/merged"), &[a, b]);
         // 両方 lazy のまま (eager がないので昇格しない)
-        assert!(lua.contains("nvim_create_user_command(\"FooA\""), "a trigger exists");
-        assert!(lua.contains("nvim_create_user_command(\"FooB\""), "b trigger exists");
+        assert!(
+            lua.contains("nvim_create_user_command(\"FooA\""),
+            "a trigger exists"
+        );
+        assert!(
+            lua.contains("nvim_create_user_command(\"FooB\""),
+            "b trigger exists"
+        );
     }
 
     #[test]
@@ -757,8 +763,14 @@ mod tests {
 
         let lua = gen_loader(Path::new("/merged"), &[a, b]);
         // B は eager に昇格されて source
-        assert!(lua.contains("source /path/b/plugin/b.lua"), "b should be promoted");
-        assert!(lua.contains("source /path/a/plugin/a.lua"), "a should be sourced");
+        assert!(
+            lua.contains("source /path/b/plugin/b.lua"),
+            "b should be promoted"
+        );
+        assert!(
+            lua.contains("source /path/a/plugin/a.lua"),
+            "a should be sourced"
+        );
     }
 
     #[test]
