@@ -704,11 +704,8 @@ async fn run_list(no_tui: bool) -> Result<()> {
     loop {
         // バックグラウンドのステータス更新を非ブロッキングで受信
         if !bg_done {
-            loop {
-                match rx.try_recv() {
-                    Ok((url, status)) => tui_state.update_status(&url, status),
-                    Err(_) => break,
-                }
+            while let Ok((url, status)) = rx.try_recv() {
+                tui_state.update_status(&url, status);
             }
             if set.is_empty() {
                 bg_done = true;
@@ -3106,6 +3103,7 @@ lazy = false"#;
         assert!(rtp_arg.contains("/path/to/dep2"), "dep2: {}", rtp_arg);
     }
 
+    #[test]
     fn test_find_unused_repos() {
         let root = tempdir().unwrap();
         let repos_dir = root.path().join("repos");
