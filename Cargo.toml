@@ -2,6 +2,13 @@
 name = "rvpm"
 version = "0.1.0"
 edition = "2024"
+description = "Fast Neovim plugin manager with pre-compiled loader and merge optimization"
+license = "MIT"
+repository = "https://github.com/yukimemi/rvpm"
+homepage = "https://github.com/yukimemi/rvpm"
+readme = "README.md"
+keywords = ["neovim", "plugin-manager", "vim", "lazy-loading"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # CLI & UI
