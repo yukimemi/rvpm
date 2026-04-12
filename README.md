@@ -175,10 +175,10 @@ on_map = [
 | `url` | `string` | **(required)** | Plugin repository. `owner/repo` (GitHub shorthand), full URL, or local path |
 | `name` | `string` | repo name from `url` (e.g. `telescope.nvim`) | Friendly name used in `rvpm_loaded_<name>` User autocmd, `on_source` chain, and log messages. Auto-derived by taking the last path component of the URL and stripping `.git` |
 | `dst` | `string` | `{base_dir}/repos/<host>/<owner>/<repo>` | Custom clone destination (overrides the default path layout) |
-| `lazy` | `bool` | `false` | If `true`, the plugin is not loaded at startup — requires at least one trigger (`on_cmd`, `on_ft`, etc.) |
+| `lazy` | `bool` | `false` | If `true`, the plugin is not loaded at startup. Normally used with at least one trigger (`on_cmd`, `on_ft`, etc.), but a lazy plugin can also be loaded implicitly when it appears in another plugin's `depends` list (see below) |
 | `merge` | `bool` | `true` | If `true`, the plugin directory is linked into `{base_dir}/merged/` and shares a single runtimepath entry |
 | `rev` | `string` | HEAD | Branch, tag, or commit hash to check out after clone/pull |
-| `depends` | `string[]` | none | Plugins that must be loaded first. Accepts `display_name` (e.g. `"snacks.nvim"`) or `url` (e.g. `"folke/snacks.nvim"`) |
+| `depends` | `string[]` | none | Plugins that must be loaded before this one. Accepts `display_name` (e.g. `"snacks.nvim"`) or `url` (e.g. `"folke/snacks.nvim"`). **Eager plugin depending on a lazy plugin:** the lazy dep is auto-promoted to eager (a warning is printed to stderr). **Lazy plugin depending on a lazy plugin:** the dep(s) are loaded first inside the trigger callback via a `load_lazy` chain guarded against double-loading |
 | `cond` | `string` | none | Lua expression. When set, the plugin's loader code is wrapped in `if <cond> then ... end` |
 | `build` | `string` | none | Shell command to run after clone (not yet implemented) |
 
@@ -393,6 +393,18 @@ emit warnings instead of hard-failing (resilience principle). The sort
 ordering is preserved all the way through to the generated `loader.lua`, so
 `before.lua` / `after.lua` hooks run in the correct order relative to
 dependencies.
+
+Beyond ordering, `depends` now also affects **loading**:
+
+- **Eager plugin → lazy dep**: a pre-pass during `generate_loader` detects this
+  situation and auto-promotes the lazy dependency to eager, printing a note to
+  stderr. This ensures the dep is unconditionally available before the eager
+  plugin sources its files.
+- **Lazy plugin → lazy dep**: the dependency is loaded on-demand. When the
+  trigger fires, the generated callback calls `load_lazy` for each lazy dep
+  (in dependency order) before loading the plugin itself. A double-load guard
+  (`if loaded["<name>"] then return end`) prevents redundant sourcing when
+  multiple plugins share the same dep and their triggers fire close together.
 
 ## Directory layout (defaults)
 
