@@ -85,16 +85,18 @@ cargo install --git https://github.com/yukimemi/rvpm
 ## Quick start
 
 ```sh
-# 1. Add your first plugin (creates ~/.config/rvpm/config.toml if needed)
-rvpm add nvim-lua/plenary.nvim
-
-# 2. Wire the generated loader into your Neovim init.lua
+# 1. One-time setup (creates both config.toml and init.lua)
 rvpm init --write
-# → Creates or appends to ~/.config/nvim/init.lua (respects $NVIM_APPNAME)
+# → ~/.config/rvpm/config.toml  (plugin configuration, auto-created)
+# → ~/.config/nvim/init.lua     (loader wiring, auto-created or appended)
+# Respects $NVIM_APPNAME for custom Neovim configs.
 
-# 3. Later, add more plugins and resync
+# 2. Add plugins
+rvpm add nvim-lua/plenary.nvim
 rvpm add nvim-telescope/telescope.nvim
-rvpm sync
+
+# 3. Open config.toml to tweak settings (lazy, triggers, etc.)
+rvpm config
 
 # 4. Explore the TUI
 rvpm list
@@ -248,14 +250,14 @@ rvpm set telescope --rev "0.1.8"
 
 # ── Config / init ────────────────────────────────────────
 
-# Open config.toml directly in $EDITOR (runs sync on close)
-rvpm config
+# One-time setup: creates config.toml + init.lua in one shot
+rvpm init --write
 
-# Print the dofile(...) snippet for init.lua
+# Print the snippet without writing (dry run)
 rvpm init
 
-# Auto-create (or append to) ~/.config/nvim/init.lua
-rvpm init --write
+# Open config.toml in $EDITOR (auto-creates if missing; runs sync on close)
+rvpm config
 
 # ── List / status ────────────────────────────────────────
 
