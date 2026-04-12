@@ -1775,10 +1775,15 @@ fn find_plugin_line_in_toml(toml_content: &str, url: &str) -> usize {
 /// `$EDITOR` が `+<line>` 形式の行ジャンプをサポートするか簡易判定。
 /// nvim/vim/vi/nano/emacs ファミリーは真。VS Code / helix 等は偽。
 fn editor_supports_line_jump(editor_cmd: &str) -> bool {
-    let base = std::path::Path::new(editor_cmd)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
+    // Unix の Path は `\` をパス区切りと認識しないため、手動で両方で split する
+    let file_name = editor_cmd
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(editor_cmd);
+    let base = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name)
         .to_lowercase();
     matches!(base.as_str(), "nvim" | "vim" | "vi" | "nano" | "emacs")
 }
