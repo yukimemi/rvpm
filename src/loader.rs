@@ -23,6 +23,7 @@ pub struct PluginScripts {
     pub on_event: Option<Vec<String>>,
     pub on_path: Option<Vec<String>>,
     pub on_source: Option<Vec<String>>,
+    pub depends: Option<Vec<String>>,
     pub cond: Option<String>,
 }
 
@@ -47,6 +48,7 @@ impl PluginScripts {
             on_event: None,
             on_path: None,
             on_source: None,
+            depends: None,
             cond: None,
         }
     }
@@ -95,6 +97,52 @@ pub fn generate_loader(
     scripts: &[PluginScripts],
     opts: &LoaderOptions,
 ) -> String {
+    // ======================================================
+    // Pre-pass: eager プラグインが depends する lazy プラグインを eager に自動昇格
+    // (lazy.nvim の dependencies と同じセマンティクス)
+    // ======================================================
+    let mut scripts = scripts.to_vec();
+    let eager_names: std::collections::HashSet<String> = scripts
+        .iter()
+        .filter(|s| !s.lazy)
+        .flat_map(|s| s.depends.iter().flatten().cloned())
+        .collect();
+    for s in scripts.iter_mut() {
+        if s.lazy && eager_names.contains(&s.name) {
+            eprintln!(
+                "Note: '{}' is lazy but depended on by an eager plugin — promoting to eager.",
+                s.name
+            );
+            s.lazy = false;
+        }
+    }
+
+    // lazy→lazy deps: 各 lazy plugin の depends にある lazy plugin を先にロードする
+    // ための依存マップを作る (Phase 4 の trigger 生成で使う)
+    let lazy_names: std::collections::HashSet<String> = scripts
+        .iter()
+        .filter(|s| s.lazy)
+        .map(|s| s.name.clone())
+        .collect();
+    let lazy_deps_map: std::collections::HashMap<String, Vec<String>> = scripts
+        .iter()
+        .filter(|s| s.lazy)
+        .filter_map(|s| {
+            let deps: Vec<String> = s
+                .depends
+                .iter()
+                .flatten()
+                .filter(|d| lazy_names.contains(*d))
+                .cloned()
+                .collect();
+            if deps.is_empty() {
+                None
+            } else {
+                Some((s.name.clone(), deps))
+            }
+        })
+        .collect();
+
     let mut lua = String::new();
     lua.push_str("-- rvpm generated loader.lua\n\n");
 
@@ -138,7 +186,7 @@ end
     // Phase 1: 全プラグインの init.lua (依存順)
     // init は "pre-rtp" phase であり、全プラグイン共通
     // ======================================================
-    for s in scripts {
+    for s in &scripts {
         if let Some(init) = &s.init {
             let body = format!("dofile(\"{}\")\n", init.replace('\\', "/"));
             push_with_cond(&mut lua, &s.cond, &body);
@@ -160,7 +208,7 @@ end
     // merge   : before → plugin/ → ftdetect/ → after/plugin/ → after
     // 事前 glob 済みのファイルを直接 source する (起動時 glob 不要)
     // ======================================================
-    for s in scripts {
+    for s in &scripts {
         if s.lazy {
             continue;
         }
@@ -216,7 +264,7 @@ end
     // 各プラグインの plugin/ ftdetect/ after/plugin ファイルリストを
     // ローカル変数として emit し、trigger closure から参照する
     // ======================================================
-    for s in scripts {
+    for s in &scripts {
         if !s.lazy {
             continue;
         }
@@ -254,8 +302,46 @@ end
             lua_str_list(&s.after_plugin_files)
         ));
 
+        // deps がある場合は load_lazy の前に依存先をロードするコードを生成
+        // 依存先のファイルリスト変数も current plugin の body 内で宣言する
+        let mut deps_load = String::new();
+        if let Some(deps) = lazy_deps_map.get(&s.name) {
+            for dep in deps {
+                if let Some(dep_script) = scripts.iter().find(|ds| ds.name == *dep) {
+                    let dp = dep_script.path.replace('\\', "/");
+                    let db = dep_script
+                        .before
+                        .as_ref()
+                        .map(|p| format!("\"{}\"", p.replace('\\', "/")))
+                        .unwrap_or_else(|| "nil".to_string());
+                    let da = dep_script
+                        .after
+                        .as_ref()
+                        .map(|p| format!("\"{}\"", p.replace('\\', "/")))
+                        .unwrap_or_else(|| "nil".to_string());
+                    let dsafe = sanitize_name(dep);
+                    // 依存先のファイルリスト変数を宣言 (重複宣言は load_lazy の guard で安全)
+                    body.push_str(&format!(
+                        "local _rvpm_pf_{dsafe} = {}\n",
+                        lua_str_list(&dep_script.plugin_files)
+                    ));
+                    body.push_str(&format!(
+                        "local _rvpm_fd_{dsafe} = {}\n",
+                        lua_str_list(&dep_script.ftdetect_files)
+                    ));
+                    body.push_str(&format!(
+                        "local _rvpm_ap_{dsafe} = {}\n",
+                        lua_str_list(&dep_script.after_plugin_files)
+                    ));
+                    deps_load.push_str(&format!(
+                        "load_lazy(\"{dep}\", \"{dp}\", _rvpm_pf_{dsafe}, _rvpm_fd_{dsafe}, _rvpm_ap_{dsafe}, {db}, {da})\n  ",
+                    ));
+                }
+            }
+        }
+
         let load_call = format!(
-            "load_lazy(\"{}\", \"{}\", {}, {}, {}, {}, {})",
+            "{deps_load}load_lazy(\"{}\", \"{}\", {}, {}, {}, {}, {})",
             s.name, path, pf_var, fd_var, ap_var, before, after
         );
 
@@ -416,6 +502,69 @@ mod tests {
     // ========================================================
     // 新モデル: lazy.nvim 方式 + merge optimization + 事前コンパイル
     // ========================================================
+
+    // ========================================================
+    // depends テスト
+    // ========================================================
+
+    #[test]
+    fn test_eager_depending_on_lazy_promotes_to_eager() {
+        // Lazy A に Eager B が depends → A は eager に昇格して Phase 3 で B より先にロード
+        let mut a = PluginScripts::for_test("snacks.nvim", "/path/snacks");
+        a.lazy = true;
+        a.on_cmd = Some(vec!["Snacks".to_string()]);
+        a.plugin_files = vec!["/path/snacks/plugin/snacks.lua".to_string()];
+
+        let mut b = PluginScripts::for_test("telescope.nvim", "/path/telescope");
+        b.lazy = false;
+        b.depends = Some(vec!["snacks.nvim".to_string()]);
+        b.plugin_files = vec!["/path/telescope/plugin/telescope.lua".to_string()];
+
+        let lua = gen_loader(Path::new("/merged"), &[a, b]);
+        // A が Phase 3 (eager) で source されている (lazy trigger ではない)
+        let snacks_source = lua
+            .find("source /path/snacks/plugin/snacks.lua")
+            .expect("snacks should be sourced eagerly");
+        let telescope_source = lua
+            .find("source /path/telescope/plugin/telescope.lua")
+            .expect("telescope should be sourced");
+        assert!(
+            snacks_source < telescope_source,
+            "snacks (promoted eager) must load before telescope"
+        );
+        // A の on_cmd trigger は登録されない (eager になったので不要)
+        assert!(
+            !lua.contains("nvim_create_user_command(\"Snacks\""),
+            "promoted plugin should not register lazy triggers"
+        );
+    }
+
+    #[test]
+    fn test_lazy_depending_on_lazy_loads_deps_first() {
+        // Lazy A に Lazy B が depends → B の trigger 発火時に A を先にロード
+        let mut a = PluginScripts::for_test("snacks.nvim", "/path/snacks");
+        a.lazy = true;
+        a.plugin_files = vec!["/path/snacks/plugin/snacks.lua".to_string()];
+
+        let mut b = PluginScripts::for_test("telescope.nvim", "/path/telescope");
+        b.lazy = true;
+        b.on_cmd = Some(vec!["Telescope".to_string()]);
+        b.depends = Some(vec!["snacks.nvim".to_string()]);
+        b.plugin_files = vec!["/path/telescope/plugin/telescope.lua".to_string()];
+
+        let lua = gen_loader(Path::new("/merged"), &[a, b]);
+        // B の trigger 内で A の load_lazy が B の前に呼ばれる
+        let trigger_section = lua
+            .find("nvim_create_user_command(\"Telescope\"")
+            .expect("telescope trigger missing");
+        let after_trigger = &lua[trigger_section..];
+        // trigger callback 内に snacks の load_lazy 呼び出しがある
+        assert!(
+            after_trigger.contains("load_lazy(\"snacks.nvim\""),
+            "telescope trigger should load snacks.nvim dependency first:\n{}",
+            &after_trigger[..500.min(after_trigger.len())]
+        );
+    }
 
     // ========================================================
     // グローバル hooks テスト

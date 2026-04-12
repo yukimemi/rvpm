@@ -2002,6 +2002,7 @@ fn build_plugin_scripts(
         on_event: plugin.on_event.clone(),
         on_path: plugin.on_path.clone(),
         on_source: plugin.on_source.clone(),
+        depends: plugin.depends.clone(),
         cond: plugin.cond.clone(),
     }
 }
