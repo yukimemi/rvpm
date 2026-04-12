@@ -67,6 +67,9 @@ enum Commands {
     Generate,
 
     /// Add a plugin and sync
+    ///
+    /// Accepts the same trigger flags as `set` to configure the plugin
+    /// in one shot: `rvpm add owner/repo --on-cmd Foo`
     Add {
         /// Plugin repo: owner/repo, URL, or local path
         repo: String,
@@ -74,6 +77,30 @@ enum Commands {
         /// Friendly name (optional)
         #[arg(long)]
         name: Option<String>,
+
+        /// Set lazy flag
+        #[arg(long)]
+        lazy: Option<bool>,
+
+        /// Set on_cmd. Comma-separated or JSON array.
+        #[arg(long)]
+        on_cmd: Option<String>,
+
+        /// Set on_ft. Comma-separated or JSON array.
+        #[arg(long)]
+        on_ft: Option<String>,
+
+        /// Set on_map. Comma-separated or JSON array/object.
+        #[arg(long)]
+        on_map: Option<String>,
+
+        /// Set on_event. Comma-separated or JSON array.
+        #[arg(long)]
+        on_event: Option<String>,
+
+        /// Set rev (branch/tag/commit)
+        #[arg(long)]
+        rev: Option<String>,
     },
 
     /// Edit per-plugin or global hook files in $EDITOR
@@ -210,8 +237,17 @@ async fn main() -> Result<()> {
         Commands::Generate => {
             run_generate().await?;
         }
-        Commands::Add { repo, name } => {
-            run_add(repo, name).await?;
+        Commands::Add {
+            repo,
+            name,
+            lazy,
+            on_cmd,
+            on_ft,
+            on_map,
+            on_event,
+            rev,
+        } => {
+            run_add(repo, name, lazy, on_cmd, on_ft, on_map, on_event, rev).await?;
         }
         Commands::Edit {
             query,
@@ -888,7 +924,17 @@ async fn run_update(query: Option<String>) -> Result<()> {
 
 use toml_edit::{DocumentMut, Item, table, value};
 
-async fn run_add(repo: String, name: Option<String>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn run_add(
+    repo: String,
+    name: Option<String>,
+    lazy: Option<bool>,
+    on_cmd: Option<String>,
+    on_ft: Option<String>,
+    on_map: Option<String>,
+    on_event: Option<String>,
+    rev: Option<String>,
+) -> Result<()> {
     let config_path = rvpm_config_path();
     ensure_config_exists(&config_path)?;
     let toml_content = std::fs::read_to_string(&config_path)?;
@@ -910,9 +956,33 @@ async fn run_add(repo: String, name: Option<String>) -> Result<()> {
     if let Some(n) = name {
         new_plugin["name"] = value(n);
     }
+    if let Some(l) = lazy {
+        new_plugin["lazy"] = value(l);
+    }
+    if let Some(r) = &rev {
+        new_plugin["rev"] = value(r.as_str());
+    }
     if let Item::Table(t) = new_plugin {
         plugins.push(t);
     }
+    // on_* フラグがあれば set_plugin_list_field / set_plugin_map_field で追加
+    let maybe_parse = |raw: Option<String>| -> Result<Option<Vec<String>>> {
+        raw.map(|s| parse_cli_string_list(&s)).transpose()
+    };
+    if let Some(items) = maybe_parse(on_cmd)? {
+        set_plugin_list_field(&mut doc, &repo, "on_cmd", items)?;
+    }
+    if let Some(items) = maybe_parse(on_ft)? {
+        set_plugin_list_field(&mut doc, &repo, "on_ft", items)?;
+    }
+    if let Some(raw) = on_map {
+        let specs = parse_on_map_cli(&raw)?;
+        set_plugin_map_field(&mut doc, &repo, specs)?;
+    }
+    if let Some(items) = maybe_parse(on_event)? {
+        set_plugin_list_field(&mut doc, &repo, "on_event", items)?;
+    }
+
     std::fs::write(&config_path, doc.to_string())?;
     println!("Added plugin to config: {}", repo);
     let _ = run_sync(false).await;
