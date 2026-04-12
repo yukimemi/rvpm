@@ -801,6 +801,7 @@ use toml_edit::{DocumentMut, Item, table, value};
 
 async fn run_add(repo: String, name: Option<String>) -> Result<()> {
     let config_path = rvpm_config_path();
+    ensure_config_exists(&config_path)?;
     let toml_content = std::fs::read_to_string(&config_path)?;
     let mut doc = toml_content.parse::<DocumentMut>()?;
     if doc.get("plugins").is_none() {
@@ -832,17 +833,11 @@ async fn run_add(repo: String, name: Option<String>) -> Result<()> {
 use dialoguer::{FuzzySelect, Select};
 
 /// `rvpm config` — config.toml を $EDITOR で直接開く。
-/// ファイルが無ければ作らずにエラーを返す (init されていない場合のガード)。
+/// ファイルが無ければテンプレートで自動作成してから開く。
 /// 常に `Ok(true)` を返すので呼び出し側で sync を走らせる前提。
 async fn run_config() -> Result<bool> {
     let config_path = rvpm_config_path();
-    if !config_path.exists() {
-        anyhow::bail!(
-            "config file not found: {}\n\
-             Create it first or run `rvpm add <repo>` to bootstrap.",
-            config_path.display()
-        );
-    }
+    ensure_config_exists(&config_path)?;
     println!("Opening {}", config_path.display());
     open_editor_at_line(&config_path, 1)?;
     Ok(true)
@@ -1602,6 +1597,27 @@ fn resolve_concurrency(config_value: Option<usize>) -> usize {
 fn rvpm_config_path() -> PathBuf {
     let home = dirs::home_dir().expect("Could not find home directory");
     home.join(".config").join("rvpm").join("config.toml")
+}
+
+/// config.toml が存在しなければ最小テンプレートで新規作成する。
+/// 既に存在する場合は何もしない (冪等)。作成した場合は true を返す。
+fn ensure_config_exists(config_path: &Path) -> Result<bool> {
+    if config_path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let template = "\
+[options]
+# config_root = \"~/.config/rvpm/plugins\"  # per-plugin init/before/after.lua
+# concurrency = 10                         # parallel git operations
+# base_dir = \"~/.cache/rvpm\"              # repos / merged / loader.lua root
+# loader_path = \"~/.cache/rvpm/loader.lua\"
+";
+    std::fs::write(config_path, template)?;
+    println!("Created {}", config_path.display());
+    Ok(true)
 }
 
 /// `~` / `~/foo` / `~\foo` 形式を home dir に展開する。
