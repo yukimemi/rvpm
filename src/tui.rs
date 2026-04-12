@@ -19,12 +19,16 @@ pub struct TuiState {
     pub plugins: Vec<String>,
     pub status_map: HashMap<String, PluginStatus>,
     pub table_state: TableState,
-    /// `/` or `?` 検索のパターン
+    /// `/` 検索のパターン
     pub search_pattern: Option<String>,
     /// 検索にヒットしたインデックス一覧 (ソート済み)
     pub search_matches: Vec<usize>,
     /// 検索の現在位置 (search_matches 内のインデックス)
     pub search_cursor: usize,
+    /// 検索モード (TUI 内インライン検索)
+    pub search_mode: bool,
+    /// 検索モード中の入力バッファ
+    pub search_input: String,
 }
 
 impl TuiState {
@@ -44,6 +48,8 @@ impl TuiState {
             search_pattern: None,
             search_matches: Vec::new(),
             search_cursor: 0,
+            search_mode: false,
+            search_input: String::new(),
         }
     }
 
@@ -135,6 +141,43 @@ impl TuiState {
         self.search_cursor = (self.search_cursor + 1) % self.search_matches.len();
         self.table_state
             .select(Some(self.search_matches[self.search_cursor]));
+    }
+
+    /// 検索モードを開始
+    pub fn start_search(&mut self) {
+        self.search_mode = true;
+        self.search_input.clear();
+    }
+
+    /// 検索モードで文字を入力 (インクリメンタル)
+    pub fn search_type(&mut self, c: char) {
+        self.search_input.push(c);
+        self.search(&self.search_input.clone());
+    }
+
+    /// 検索モードで Backspace
+    pub fn search_backspace(&mut self) {
+        self.search_input.pop();
+        if self.search_input.is_empty() {
+            self.search_matches.clear();
+            self.search_pattern = None;
+        } else {
+            self.search(&self.search_input.clone());
+        }
+    }
+
+    /// 検索モードを確定
+    pub fn search_confirm(&mut self) {
+        self.search_mode = false;
+        // search_pattern は保持 (n/N で引き続き使える)
+    }
+
+    /// 検索モードをキャンセル
+    pub fn search_cancel(&mut self) {
+        self.search_mode = false;
+        self.search_input.clear();
+        self.search_matches.clear();
+        self.search_pattern = None;
     }
 
     /// N — 前の検索結果へ
@@ -466,45 +509,79 @@ impl TuiState {
         .highlight_symbol("\u{25b8} "); // ▸
         f.render_stateful_widget(table, chunks[1], &mut self.table_state);
 
-        let footer = Paragraph::new(Line::from(vec![
-            Span::styled(
-                " [q] Quit ",
-                Style::default().fg(Color::Black).bg(Color::DarkGray),
-            ),
-            Span::styled(
-                " [j/k] Move ",
-                Style::default().fg(Color::Black).bg(Color::DarkGray),
-            ),
-            Span::styled(
-                " [g/G] Top/End ",
-                Style::default().fg(Color::Black).bg(Color::DarkGray),
-            ),
-            Span::styled(
-                " [/] Search [n/N] ",
-                Style::default().fg(Color::Black).bg(Color::DarkGray),
-            ),
-            Span::styled(
-                " [e] Edit ",
-                Style::default().fg(Color::Black).bg(Color::Magenta),
-            ),
-            Span::styled(
-                " [s] Set ",
-                Style::default().fg(Color::Black).bg(Color::Cyan),
-            ),
-            Span::styled(
-                " [S] Sync ",
-                Style::default().fg(Color::Black).bg(Color::Green),
-            ),
-            Span::styled(
-                " [u/U] Update ",
-                Style::default().fg(Color::Black).bg(Color::Yellow),
-            ),
-            Span::styled(
-                " [d] Delete ",
-                Style::default().fg(Color::Black).bg(Color::Red),
-            ),
-        ]))
-        .block(Block::default().borders(Borders::ALL));
+        let footer = if self.search_mode {
+            // 検索モード: vim-like "/" プロンプト
+            let match_info = if self.search_matches.is_empty() && !self.search_input.is_empty() {
+                " (no match)".to_string()
+            } else if !self.search_matches.is_empty() {
+                format!(
+                    " ({}/{})",
+                    self.search_cursor + 1,
+                    self.search_matches.len()
+                )
+            } else {
+                String::new()
+            };
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "/",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(&self.search_input, Style::default().fg(Color::White)),
+                Span::styled(
+                    "\u{2588}", // █ カーソル
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(match_info, Style::default().fg(Color::DarkGray)),
+            ]))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            )
+        } else {
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " [q] Quit ",
+                    Style::default().fg(Color::Black).bg(Color::DarkGray),
+                ),
+                Span::styled(
+                    " [j/k] Move ",
+                    Style::default().fg(Color::Black).bg(Color::DarkGray),
+                ),
+                Span::styled(
+                    " [g/G] Top/End ",
+                    Style::default().fg(Color::Black).bg(Color::DarkGray),
+                ),
+                Span::styled(
+                    " [/] Search [n/N] ",
+                    Style::default().fg(Color::Black).bg(Color::DarkGray),
+                ),
+                Span::styled(
+                    " [e] Edit ",
+                    Style::default().fg(Color::Black).bg(Color::Magenta),
+                ),
+                Span::styled(
+                    " [s] Set ",
+                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                ),
+                Span::styled(
+                    " [S] Sync ",
+                    Style::default().fg(Color::Black).bg(Color::Green),
+                ),
+                Span::styled(
+                    " [u/U] Update ",
+                    Style::default().fg(Color::Black).bg(Color::Yellow),
+                ),
+                Span::styled(
+                    " [d] Delete ",
+                    Style::default().fg(Color::Black).bg(Color::Red),
+                ),
+            ]))
+            .block(Block::default().borders(Borders::ALL))
+        };
         f.render_widget(footer, chunks[2]);
     }
 }

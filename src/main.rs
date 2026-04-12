@@ -626,8 +626,20 @@ async fn run_list(no_tui: bool) -> Result<()> {
                 continue;
             }
 
+            // ── 検索モード: インライン入力 ──
+            if tui_state.search_mode {
+                match key.code {
+                    crossterm::event::KeyCode::Esc => tui_state.search_cancel(),
+                    crossterm::event::KeyCode::Enter => tui_state.search_confirm(),
+                    crossterm::event::KeyCode::Backspace => tui_state.search_backspace(),
+                    crossterm::event::KeyCode::Char(c) => tui_state.search_type(c),
+                    _ => {}
+                }
+                continue;
+            }
+
             match key.code {
-                crossterm::event::KeyCode::Char('q') => break,
+                crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => break,
 
                 // ── Ctrl 修飾キー (plain match より先に判定) ──
                 crossterm::event::KeyCode::Char('d')
@@ -673,17 +685,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                     tui_state.go_bottom();
                 }
                 crossterm::event::KeyCode::Char('/') => {
-                    disable_raw_mode()?;
-                    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                    terminal.show_cursor()?;
-                    if let Some(pat) = read_input_with_esc("Search", "")?
-                        && !pat.is_empty()
-                    {
-                        tui_state.search(&pat);
-                    }
-                    enable_raw_mode()?;
-                    execute!(std::io::stdout(), EnterAlternateScreen)?;
-                    terminal.clear()?;
+                    tui_state.start_search();
                 }
                 crossterm::event::KeyCode::Char('n') => tui_state.search_next(),
                 crossterm::event::KeyCode::Char('N') => tui_state.search_prev(),
