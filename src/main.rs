@@ -522,6 +522,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
     let toml_content = std::fs::read_to_string(&config_path)?;
     let mut config = parse_config(&toml_content)?;
     let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
+    let config_root = resolve_config_root(config.options.config_root.as_deref());
 
     if no_tui {
         // 非対話モード: plain text 出力 (旧 status コマンド相当)
@@ -616,7 +617,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
     }
 
     loop {
-        terminal.draw(|f| tui_state.draw_list(f, &config))?;
+        terminal.draw(|f| tui_state.draw_list(f, &config, &config_root))?;
 
         if crossterm::event::poll(std::time::Duration::from_millis(100))?
             && let crossterm::event::Event::Key(key) = crossterm::event::read()?
@@ -945,14 +946,18 @@ async fn run_edit(
         } else if flag_after {
             "after.lua"
         } else {
-            let files = vec!["before.lua", "after.lua"];
+            let file_names = ["before.lua", "after.lua"];
+            let display_items: Vec<String> = file_names
+                .iter()
+                .map(|f| file_with_icon(&config_dir, f))
+                .collect();
             let sel = Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
-                .with_prompt("Select global hook to edit")
+                .with_prompt("Select global hook to edit (\u{25cf}=exists \u{25cb}=new)")
                 .default(0)
-                .items(&files)
+                .items(&display_items)
                 .interact_opt()?;
             match sel {
-                Some(index) => files[index],
+                Some(index) => file_names[index],
                 None => return Ok(false),
             }
         };
@@ -970,6 +975,13 @@ async fn run_edit(
     let config = parse_config(&toml_content)?;
 
     // 対話モード: plugin 選択肢に [ Global hooks ] sentinel を追加
+    // 各プラグインの init/before/after.lua 存在をサークルアイコンで表示
+    let config_root = resolve_config_root(config.options.config_root.as_deref());
+    let config_dir = rvpm_config_path()
+        .parent()
+        .expect("config path has parent")
+        .to_path_buf();
+
     let plugin = if let Some(q) = query {
         config
             .plugins
@@ -977,29 +989,61 @@ async fn run_edit(
             .find(|p| p.url == q || p.url.contains(&q))
             .context("Plugin not found")?
     } else {
-        const GLOBAL_SENTINEL: &str = "[ Global hooks ]";
-        let mut items: Vec<String> = vec![GLOBAL_SENTINEL.to_string()];
-        items.extend(config.plugins.iter().map(|p| p.url.clone()));
+        // URL の最大幅を揃えてサークルを右に並べる
+        let global_label = "[ Global hooks ]".to_string();
+        let max_url_len = config
+            .plugins
+            .iter()
+            .map(|p| p.url.len())
+            .max()
+            .unwrap_or(20)
+            .max(global_label.len());
+
+        let global_indicators = hook_indicators(&config_dir);
+        let mut items: Vec<String> = vec![format!(
+            "{:<width$}  {}",
+            global_label,
+            global_indicators,
+            width = max_url_len
+        )];
+        let mut urls: Vec<String> = vec![String::new()]; // sentinel placeholder
+
+        for p in config.plugins.iter() {
+            let plugin_config_dir = config_root.join(p.canonical_path());
+            let indicators = hook_indicators(&plugin_config_dir);
+            let has_any = plugin_config_dir.join("init.lua").exists()
+                || plugin_config_dir.join("before.lua").exists()
+                || plugin_config_dir.join("after.lua").exists();
+            let suffix = if has_any {
+                format!("  {}", indicators)
+            } else {
+                String::new()
+            };
+            items.push(format!("{:<width$}{}", p.url, suffix, width = max_url_len));
+            urls.push(p.url.clone());
+        }
+
         let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
-            .with_prompt("Select plugin to edit")
+            .with_prompt("Select plugin to edit (I=init B=before A=after)")
             .default(0)
             .items(&items)
             .interact_opt()?;
         match selection {
             Some(0) => {
-                // Global hooks → 再帰的に --global を呼ぶ
                 return Box::pin(run_edit(None, false, false, false, true)).await;
             }
             Some(index) => config
                 .plugins
                 .iter()
-                .find(|p| p.url == items[index])
+                .find(|p| p.url == urls[index])
                 .unwrap(),
             None => return Ok(false),
         }
     };
 
     println!("\n>> Editing configuration for: {}", plugin.url);
+
+    let plugin_config_dir = config_root.join(plugin.canonical_path());
 
     // --init / --before / --after フラグがあれば対話式をスキップ
     let file_name = if flag_init {
@@ -1009,20 +1053,21 @@ async fn run_edit(
     } else if flag_after {
         "after.lua"
     } else {
-        let files = vec!["init.lua", "before.lua", "after.lua"];
+        let file_names = ["init.lua", "before.lua", "after.lua"];
+        let display_items: Vec<String> = file_names
+            .iter()
+            .map(|f| file_with_icon(&plugin_config_dir, f))
+            .collect();
         let file_selection = Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
-            .with_prompt("Select file to edit")
+            .with_prompt("Select file to edit (\u{25cf}=exists \u{25cb}=new)")
             .default(0)
-            .items(&files)
+            .items(&display_items)
             .interact_opt()?;
         match file_selection {
-            Some(index) => files[index],
+            Some(index) => file_names[index],
             None => return Ok(false),
         }
     };
-
-    let config_root = resolve_config_root(config.options.config_root.as_deref());
-    let plugin_config_dir = config_root.join(plugin.canonical_path());
     std::fs::create_dir_all(&plugin_config_dir)?;
     let target_file = plugin_config_dir.join(file_name);
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
@@ -1946,6 +1991,37 @@ fn read_input_with_esc(prompt: &str, initial: &str) -> Result<Option<String>> {
     crossterm::terminal::disable_raw_mode()?;
     println!();
     result
+}
+
+/// init/before/after.lua の存在チェックしてサークルアイコンの文字列を返す
+/// 例: "● ○ ●" (init あり、before なし、after あり)
+fn hook_indicators(dir: &Path) -> String {
+    let i = if dir.join("init.lua").exists() {
+        "\u{25cf}"
+    } else {
+        "\u{25cb}"
+    };
+    let b = if dir.join("before.lua").exists() {
+        "\u{25cf}"
+    } else {
+        "\u{25cb}"
+    };
+    let a = if dir.join("after.lua").exists() {
+        "\u{25cf}"
+    } else {
+        "\u{25cb}"
+    };
+    format!("{} {} {}", i, b, a)
+}
+
+/// ファイル名に存在アイコンを付ける
+fn file_with_icon(dir: &Path, name: &str) -> String {
+    let icon = if dir.join(name).exists() {
+        "\u{25cf}"
+    } else {
+        "\u{25cb}"
+    };
+    format!("{} {}", icon, name)
 }
 
 fn find_lua(dir: &Path, name: &str) -> Option<String> {

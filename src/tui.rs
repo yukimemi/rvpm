@@ -153,7 +153,12 @@ impl TuiState {
         f.render_widget(gauge, chunks[2]);
     }
 
-    pub fn draw_list(&mut self, f: &mut Frame, config: &crate::config::Config) {
+    pub fn draw_list(
+        &mut self,
+        f: &mut Frame,
+        config: &crate::config::Config,
+        config_root: &std::path::Path,
+    ) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -222,7 +227,7 @@ impl TuiState {
         f.render_widget(title, chunks[0]);
 
         let header = Row::new(
-            ["", "Plugin URL", "Mode", "Merge", "Rev", "Detail"]
+            ["", "Plugin URL", "Mode", "Merge", "Rev", "I B A", "Detail"]
                 .iter()
                 .map(|h| {
                     Cell::from(*h).style(
@@ -298,12 +303,40 @@ impl TuiState {
                 };
                 let rev = p.rev.as_deref().unwrap_or("-");
 
+                // I B A 列: init/before/after.lua の存在チェック
+                let pcdir = config_root.join(p.canonical_path());
+                let hook_i = if pcdir.join("init.lua").exists() {
+                    "\u{25cf}"
+                } else {
+                    "\u{25cb}"
+                };
+                let hook_b = if pcdir.join("before.lua").exists() {
+                    "\u{25cf}"
+                } else {
+                    "\u{25cb}"
+                };
+                let hook_a = if pcdir.join("after.lua").exists() {
+                    "\u{25cf}"
+                } else {
+                    "\u{25cb}"
+                };
+                let hooks_text = format!("{} {} {}", hook_i, hook_b, hook_a);
+                let has_hooks = pcdir.join("init.lua").exists()
+                    || pcdir.join("before.lua").exists()
+                    || pcdir.join("after.lua").exists();
+                let hooks_color = if has_hooks {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                };
+
                 Row::new(vec![
                     Cell::from(inst_icon).style(Style::default().fg(inst_color)),
                     Cell::from(p.url.clone()).style(Style::default().fg(Color::White)),
                     Cell::from(mode.0).style(Style::default().fg(mode.1)),
                     Cell::from(merged.0).style(Style::default().fg(merged.1)),
                     Cell::from(rev).style(Style::default().fg(Color::Magenta)),
+                    Cell::from(hooks_text).style(Style::default().fg(hooks_color)),
                     Cell::from(detail_text).style(Style::default().fg(detail_color)),
                 ])
             })
@@ -334,6 +367,7 @@ impl TuiState {
                 Constraint::Length(6),         // Mode
                 Constraint::Length(6),         // Merge
                 Constraint::Length(rev_col_w), // Rev (動的)
+                Constraint::Length(7),         // I B A (hooks)
                 Constraint::Min(10),           // Detail (残り全部)
             ],
         )
