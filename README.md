@@ -45,6 +45,10 @@ Neovim startup reads exactly the files it needs and nothing else.
   `on_path` / `on_source` (plugin chain), with `User Xxx` pattern shorthand,
   bang/range/count/complete aware commands, keymaps with mode + desc, and
   `<Ignore>`-prefixed replay for safety
+- **Colorscheme auto-detection** — lazy plugins whose clone contains a
+  `colors/*.vim` or `colors/*.lua` file automatically gain a `ColorSchemePre`
+  autocmd handler so `:colorscheme <name>` loads the plugin on demand; no
+  extra config required
 - **Dependency ordering** — topological sort on `depends`, resilient to cycles
   and missing references
 - **Windows first-class** — hardcoded `~/.config` / `~/.cache` layout for
@@ -218,6 +222,44 @@ on_map = [
 | `mode` | `string \| string[]` | `"n"` | Vim mode(s) for the keymap (`"n"`, `"x"`, `"i"`, etc.) |
 | `desc` | `string` | none | Description shown in `:map` / which-key **before** the plugin is loaded |
 
+### Colorscheme lazy loading
+
+Lazy plugins that ship a `colors/` directory (containing `.vim` or `.lua`
+files) are automatically given a `ColorSchemePre` autocmd handler at generate
+time. No extra config field is required.
+
+When Neovim processes `:colorscheme <name>`, it fires `ColorSchemePre` before
+switching the scheme. rvpm intercepts this event, loads the matching lazy
+plugin, and then lets the colorscheme apply normally. This mirrors what
+lazy.nvim does at runtime — rvpm bakes the decision in at generate time instead.
+
+Eager plugins are unaffected: their `colors/` directory is already on the
+runtimepath and Neovim finds it without any handler.
+
+**Recommendation:** if you have multiple colorscheme plugins installed, mark all
+but your active one as `lazy = true`. rvpm will register the `ColorSchemePre`
+handler for each one so they remain switchable on demand without adding startup
+cost.
+
+**Example:**
+
+```toml
+[[plugins]]
+url  = "folke/tokyonight.nvim"
+lazy = true
+# No on_cmd / on_event needed — rvpm detects colors/*.lua at generate time
+# and registers a ColorSchemePre autocmd automatically.
+
+[[plugins]]
+url  = "catppuccin/nvim"
+name = "catppuccin"
+lazy = true
+```
+
+With this config, running `:colorscheme tokyonight` or `:colorscheme catppuccin`
+in Neovim will load the respective plugin just in time, with zero startup
+overhead when neither is the initial colorscheme.
+
 ### Global hooks
 
 Place Lua files directly under `~/.config/rvpm/` and rvpm picks them up
@@ -372,6 +414,9 @@ Phase 3:   eager plugins in dependency order:
              after.lua
              User autocmd "rvpm_loaded_<name>"
 Phase 4:   lazy trigger registrations (on_cmd / on_ft / on_map / etc)
+Phase 4.3: ColorSchemePre handlers            -- auto-registered for lazy plugins
+                                              --   whose colors/ dir was detected at
+                                              --   generate time (no config needed)
 Phase 4.5: global after.lua                  -- ~/.config/rvpm/after.lua (if present)
 ```
 
