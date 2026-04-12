@@ -217,13 +217,13 @@ impl TuiState {
 
         let title = Paragraph::new(Line::from(vec![
             Span::styled(
-                " R V P M ",
+                " rvpm ",
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  [Processing...]", Style::default().fg(Color::Cyan)),
+            Span::styled("  syncing...", Style::default().fg(Color::DarkGray)),
         ]))
         .block(
             Block::default()
