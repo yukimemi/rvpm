@@ -10,6 +10,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Hybrid CLI**: 引数による一発操作 + `FuzzySelect` / TUI によるインタラクティブ操作を両立。
 - **Pre-compiled loader**: `vim.go.loadplugins = false` で Neovim の plugin loading を無効化し、generate 時に静的な loader.lua を生成。merge 最適化と事前 glob で起動時 I/O を削減。
 
+## Git ワークフロー
+
+- **main ブランチに直接 push しない。** 変更は必ずフィーチャーブランチを切り、Pull Request を作成する。
+- ブランチ名は変更内容を端的に表す (例: `feat/add-only-sync-new-plugin`)。
+- **PR のタイトル・本文は英語で書く。** コミットメッセージも英語。
+
 ## Development Commands
 
 ```bash
