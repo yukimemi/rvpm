@@ -7,6 +7,60 @@ use ratatui::{
 };
 use std::collections::HashMap;
 
+/// TUI で使用するアイコンセット。IconStyle に応じて切り替える。
+pub struct Icons {
+    pub waiting: &'static str,
+    pub syncing: &'static str,
+    pub finished: &'static str,
+    pub failed: &'static str,
+    /// list TUI 用
+    pub installed: &'static str,
+    pub missing: &'static str,
+    pub modified: &'static str,
+    pub hook_on: &'static str,
+    pub hook_off: &'static str,
+}
+
+impl Icons {
+    pub fn from_style(style: crate::config::IconStyle) -> Self {
+        match style {
+            crate::config::IconStyle::Nerd => Self {
+                waiting: "\u{f0292}",  // 󰊒
+                syncing: "\u{21bb}",   // ↻
+                finished: "\u{f00c}",  //
+                failed: "\u{2716}",    // ✖
+                installed: "\u{f00c}", //
+                missing: "\u{f05e}",   //
+                modified: "\u{f071}",  //
+                hook_on: "\u{25cf}",   // ●
+                hook_off: "\u{25cb}",  // ○
+            },
+            crate::config::IconStyle::Unicode => Self {
+                waiting: "\u{25cb}",   // ○
+                syncing: "\u{21bb}",   // ↻
+                finished: "\u{2713}",  // ✓
+                failed: "\u{2717}",    // ✗
+                installed: "\u{2713}", // ✓
+                missing: "\u{2718}",   // ✘
+                modified: "\u{26a0}",  // ⚠
+                hook_on: "\u{25cf}",   // ●
+                hook_off: "\u{25cb}",  // ○
+            },
+            crate::config::IconStyle::Ascii => Self {
+                waiting: ".",
+                syncing: "*",
+                finished: "+",
+                failed: "x",
+                installed: "+",
+                missing: "!",
+                modified: "~",
+                hook_on: "o",
+                hook_off: "-",
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginStatus {
     Waiting,
@@ -233,7 +287,7 @@ impl TuiState {
         }
     }
 
-    pub fn draw(&mut self, f: &mut Frame, message: &str) {
+    pub fn draw(&mut self, f: &mut Frame, message: &str, icons: &Icons) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -312,11 +366,13 @@ impl TuiState {
                     .unwrap_or(PluginStatus::Waiting);
                 let (icon, color, msg) = match &status {
                     PluginStatus::Waiting => {
-                        ("\u{f0292}", Color::DarkGray, "Waiting...".to_string())
+                        (icons.waiting, Color::DarkGray, "Waiting...".to_string())
                     }
-                    PluginStatus::Syncing(m) => ("\u{21bb}", Color::Cyan, m.clone()),
-                    PluginStatus::Finished => ("\u{f00c}", Color::Green, "Finished".to_string()),
-                    PluginStatus::Failed(e) => ("\u{2716}", Color::Red, e.clone()),
+                    PluginStatus::Syncing(m) => (icons.syncing, Color::Cyan, m.clone()),
+                    PluginStatus::Finished => {
+                        (icons.finished, Color::Green, "Finished".to_string())
+                    }
+                    PluginStatus::Failed(e) => (icons.failed, Color::Red, e.clone()),
                 };
                 Row::new(vec![
                     Cell::from(format!(" {} ", icon)).style(Style::default().fg(color)),
@@ -364,6 +420,7 @@ impl TuiState {
         f: &mut Frame,
         config: &crate::config::Config,
         config_root: &std::path::Path,
+        icons: &Icons,
     ) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -451,14 +508,14 @@ impl TuiState {
                     .cloned()
                     .unwrap_or(PluginStatus::Waiting);
                 let (inst_icon, inst_color) = match &install_status {
-                    PluginStatus::Finished => ("\u{f00c}", Color::Green), //
-                    PluginStatus::Failed(m) if m == "Missing" => ("\u{f05e}", Color::Red), //
-                    PluginStatus::Failed(_) => ("\u{2716}", Color::Red),  // ✖
+                    PluginStatus::Finished => (icons.installed, Color::Green),
+                    PluginStatus::Failed(m) if m == "Missing" => (icons.missing, Color::Red),
+                    PluginStatus::Failed(_) => (icons.failed, Color::Red),
                     PluginStatus::Syncing(m) if m.contains("Modified") => {
-                        ("\u{f071}", Color::Yellow)
-                    } //
-                    PluginStatus::Syncing(_) => ("\u{21bb}", Color::Cyan), // ↻
-                    PluginStatus::Waiting => ("?", Color::DarkGray),
+                        (icons.modified, Color::Yellow)
+                    }
+                    PluginStatus::Syncing(_) => (icons.syncing, Color::Cyan),
+                    PluginStatus::Waiting => (icons.waiting, Color::DarkGray),
                 };
 
                 // 詳細列: エラー/変更時はその内容、正常時はトリガー情報
@@ -496,7 +553,7 @@ impl TuiState {
                     ("Eager", Color::Green)
                 };
                 let merged = if p.merge {
-                    ("\u{2713}", Color::Cyan) // ✓
+                    (icons.installed, Color::Cyan)
                 } else {
                     ("-", Color::DarkGray)
                 };
@@ -505,19 +562,19 @@ impl TuiState {
                 // I B A 列: init/before/after.lua の存在チェック
                 let pcdir = config_root.join(p.canonical_path());
                 let hook_i = if pcdir.join("init.lua").exists() {
-                    "\u{25cf}"
+                    icons.hook_on
                 } else {
-                    "\u{25cb}"
+                    icons.hook_off
                 };
                 let hook_b = if pcdir.join("before.lua").exists() {
-                    "\u{25cf}"
+                    icons.hook_on
                 } else {
-                    "\u{25cb}"
+                    icons.hook_off
                 };
                 let hook_a = if pcdir.join("after.lua").exists() {
-                    "\u{25cf}"
+                    icons.hook_on
                 } else {
-                    "\u{25cb}"
+                    icons.hook_off
                 };
                 let hooks_text = format!("{} {} {}", hook_i, hook_b, hook_a);
                 let has_hooks = pcdir.join("init.lua").exists()
@@ -769,5 +826,28 @@ mod tests {
             matches!(&state.status_map["c"], PluginStatus::Syncing(m) if m.contains("Modified"))
         );
         assert!(matches!(&state.status_map["d"], PluginStatus::Failed(m) if m != "Missing"));
+    }
+
+    #[test]
+    fn test_icons_nerd_uses_private_use_area() {
+        let icons = Icons::from_style(crate::config::IconStyle::Nerd);
+        assert!(icons.finished.contains('\u{f00c}'));
+    }
+
+    #[test]
+    fn test_icons_unicode_uses_standard_symbols() {
+        let icons = Icons::from_style(crate::config::IconStyle::Unicode);
+        assert_eq!(icons.finished, "\u{2713}"); // ✓
+        assert_eq!(icons.failed, "\u{2717}"); // ✗
+        assert_eq!(icons.waiting, "\u{25cb}"); // ○
+    }
+
+    #[test]
+    fn test_icons_ascii_uses_only_ascii() {
+        let icons = Icons::from_style(crate::config::IconStyle::Ascii);
+        assert!(icons.finished.is_ascii());
+        assert!(icons.failed.is_ascii());
+        assert!(icons.waiting.is_ascii());
+        assert!(icons.syncing.is_ascii());
     }
 }

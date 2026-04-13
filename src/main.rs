@@ -412,6 +412,8 @@ async fn run_sync(prune: bool) -> Result<()> {
     }
     std::fs::create_dir_all(&merged_dir)?;
 
+    let icons = crate::tui::Icons::from_style(config.options.icons);
+
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -491,7 +493,7 @@ async fn run_sync(prune: bool) -> Result<()> {
     let total_tasks = config.plugins.len();
 
     while finished_tasks < total_tasks {
-        terminal.draw(|f| tui_state.draw(f, "syncing..."))?;
+        terminal.draw(|f| tui_state.draw(f, "syncing...", &icons))?;
 
         // sync/update 中のイベントキューを drain してスクロール操作を受け付ける
         while crossterm::event::poll(std::time::Duration::from_millis(0))? {
@@ -546,7 +548,7 @@ async fn run_sync(prune: bool) -> Result<()> {
         }
     }
 
-    terminal.draw(|f| tui_state.draw(f, "syncing..."))?;
+    terminal.draw(|f| tui_state.draw(f, "syncing...", &icons))?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     // TUI cleanup — 各ステップが失敗しても次を続行してターミナルを確実に復元する
     let _ = disable_raw_mode();
@@ -744,6 +746,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
     let mut config = parse_config(&toml_content)?;
     let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
     let config_root = resolve_config_root(config.options.config_root.as_deref());
+    let mut icons = crate::tui::Icons::from_style(config.options.icons);
 
     if no_tui {
         // 非対話モード: plain text 出力 (旧 status コマンド相当)
@@ -835,7 +838,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
             while let Some(Ok(_)) = set.try_join_next() {}
         }
 
-        terminal.draw(|f| tui_state.draw_list(f, &config, &config_root))?;
+        terminal.draw(|f| tui_state.draw_list(f, &config, &config_root, &icons))?;
 
         if crossterm::event::poll(std::time::Duration::from_millis(50))?
             && let crossterm::event::Event::Key(key) = crossterm::event::read()?
@@ -921,6 +924,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                             let _ = run_sync(false).await;
                         }
                         let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                        icons = crate::tui::Icons::from_style(c.options.icons);
                         config = c;
                         tui_state = s;
                     }
@@ -947,6 +951,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                             let _ = run_sync(false).await;
                         }
                         let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                        icons = crate::tui::Icons::from_style(c.options.icons);
                         config = c;
                         tui_state = s;
                     }
@@ -967,6 +972,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         terminal.show_cursor()?;
                         let _ = run_update(Some(url)).await;
                         let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                        icons = crate::tui::Icons::from_style(c.options.icons);
                         config = c;
                         tui_state = s;
                     }
@@ -987,6 +993,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         terminal.show_cursor()?;
                         let _ = run_remove(Some(url)).await;
                         let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                        icons = crate::tui::Icons::from_style(c.options.icons);
                         config = c;
                         tui_state = s;
                     }
@@ -1007,6 +1014,7 @@ async fn run_update(query: Option<String>) -> Result<()> {
     let toml_content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
     let config_data = parse_config(&toml_content)?;
+    let icons = crate::tui::Icons::from_style(config_data.options.icons);
     let config = Arc::new(config_data);
     let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
 
@@ -1088,7 +1096,7 @@ async fn run_update(query: Option<String>) -> Result<()> {
     let mut finished_tasks = 0;
 
     while finished_tasks < total_tasks {
-        terminal.draw(|f| tui_state.draw(f, "updating..."))?;
+        terminal.draw(|f| tui_state.draw(f, "updating...", &icons))?;
 
         // sync/update 中のイベントキューを drain してスクロール操作を受け付ける
         while crossterm::event::poll(std::time::Duration::from_millis(0))? {
@@ -1103,7 +1111,7 @@ async fn run_update(query: Option<String>) -> Result<()> {
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
         }
     }
-    terminal.draw(|f| tui_state.draw(f, "updating..."))?;
+    terminal.draw(|f| tui_state.draw(f, "updating...", &icons))?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);

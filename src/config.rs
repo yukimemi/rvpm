@@ -10,6 +10,19 @@ pub struct Config {
     pub plugins: Vec<Plugin>,
 }
 
+/// TUI で使用するアイコンスタイル。
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IconStyle {
+    /// Nerd Font アイコン (デフォルト)
+    #[default]
+    Nerd,
+    /// 標準 Unicode 記号 (○ ↻ ✓ ✗ 等)
+    Unicode,
+    /// ASCII のみ (. * + x 等)
+    Ascii,
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone)]
 pub struct Options {
     pub config_root: Option<String>,
@@ -20,6 +33,9 @@ pub struct Options {
     /// 全てがこの配下にまとまる。`loader_path` が別途指定されていればそちらが優先。
     /// `~/...` 形式を受け付ける。
     pub base_dir: Option<String>,
+    /// TUI アイコンスタイル: "nerd" (default), "unicode", "ascii"
+    #[serde(default)]
+    pub icons: IconStyle,
 }
 
 /// Keymap 仕様. TOML では文字列 (`"<leader>f"`) またはテーブル
@@ -380,6 +396,44 @@ url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
         assert_eq!(config.options.base_dir, None);
+    }
+
+    #[test]
+    fn test_parse_config_icons_defaults_to_nerd() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.options.icons, IconStyle::Nerd);
+    }
+
+    #[test]
+    fn test_parse_config_accepts_icons_unicode() {
+        let toml = r#"
+[options]
+icons = "unicode"
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.options.icons, IconStyle::Unicode);
+    }
+
+    #[test]
+    fn test_parse_config_accepts_icons_ascii() {
+        let toml = r#"
+[options]
+icons = "ascii"
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.options.icons, IconStyle::Ascii);
     }
 
     #[test]
