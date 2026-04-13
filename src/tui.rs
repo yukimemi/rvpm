@@ -3,9 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Cell, Clear, Gauge, List, ListItem, Paragraph, Row, Table, TableState,
-    },
+    widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState},
 };
 use std::collections::HashMap;
 
@@ -199,13 +197,43 @@ impl TuiState {
             .select(Some(self.search_matches[self.search_cursor]));
     }
 
+    /// sync/update 中にスクロール系キー入力を処理する。
+    /// terminal_height はページ計算に使う。
+    pub fn handle_scroll_key(&mut self, key: crossterm::event::KeyEvent, terminal_height: u16) {
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return;
+        }
+        let half_page = (terminal_height as usize).saturating_sub(8) / 2;
+        let full_page = half_page * 2;
+        use crossterm::event::{KeyCode, KeyModifiers};
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.next(),
+            KeyCode::Char('k') | KeyCode::Up => self.previous(),
+            KeyCode::Char('g') | KeyCode::Home => self.go_top(),
+            KeyCode::Char('G') | KeyCode::End => self.go_bottom(),
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_down(half_page)
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_up(half_page)
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_down(full_page)
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_up(full_page)
+            }
+            _ => {}
+        }
+    }
+
     pub fn update_status(&mut self, url: &str, status: PluginStatus) {
         if let Some(s) = self.status_map.get_mut(url) {
             *s = status;
         }
     }
 
-    pub fn draw(&self, f: &mut Frame, message: &str) {
+    pub fn draw(&mut self, f: &mut Frame, message: &str) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -214,6 +242,17 @@ impl TuiState {
                 Constraint::Length(3),
             ])
             .split(f.area());
+
+        let finished_count = self
+            .status_map
+            .values()
+            .filter(|s| matches!(s, PluginStatus::Finished))
+            .count();
+        let failed_count = self
+            .status_map
+            .values()
+            .filter(|s| matches!(s, PluginStatus::Failed(_)))
+            .count();
 
         let title = Paragraph::new(Line::from(vec![
             Span::styled(
@@ -224,9 +263,26 @@ impl TuiState {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("  {}", message),
+                format!("  {} ", message),
                 Style::default().fg(Color::DarkGray),
             ),
+            Span::styled(
+                format!("{}", finished_count),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled("/", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", self.plugins.len()),
+                Style::default().fg(Color::White),
+            ),
+            if failed_count > 0 {
+                Span::styled(
+                    format!(" ({}err)", failed_count),
+                    Style::default().fg(Color::Red),
+                )
+            } else {
+                Span::raw("")
+            },
         ]))
         .block(
             Block::default()
@@ -235,10 +291,17 @@ impl TuiState {
         );
         f.render_widget(title, chunks[0]);
 
-        // URL の最大幅に合わせてパディング (+2 でゆとり)
-        let max_url_len = self.plugins.iter().map(|u| u.len()).max().unwrap_or(20) + 2;
+        // URL 列幅をターミナル幅に合わせて制限 (icon:4 + status_msg:~20 + border:4)
+        let available = chunks[1].width.saturating_sub(28) as usize;
+        let max_url_len = self
+            .plugins
+            .iter()
+            .map(|u| u.len())
+            .max()
+            .unwrap_or(20)
+            .min(available);
 
-        let items: Vec<ListItem> = self
+        let rows: Vec<Row> = self
             .plugins
             .iter()
             .map(|url| {
@@ -255,30 +318,36 @@ impl TuiState {
                     PluginStatus::Finished => ("\u{f00c}", Color::Green, "Finished".to_string()),
                     PluginStatus::Failed(e) => ("\u{2716}", Color::Red, e.clone()),
                 };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {} ", icon), Style::default().fg(color)),
-                    Span::styled(
-                        format!("{:<width$}", url, width = max_url_len),
-                        Style::default().fg(Color::White),
-                    ),
-                    Span::styled(msg, Style::default().fg(Color::DarkGray)),
-                ]))
+                Row::new(vec![
+                    Cell::from(format!(" {} ", icon)).style(Style::default().fg(color)),
+                    Cell::from(url.as_str()).style(Style::default().fg(Color::White)),
+                    Cell::from(msg).style(Style::default().fg(Color::DarkGray)),
+                ])
             })
             .collect();
 
-        let list = List::new(items).block(
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(4),
+                Constraint::Length(max_url_len as u16),
+                Constraint::Min(10),
+            ],
+        )
+        .block(
             Block::default()
                 .title(" Plugins ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Magenta)),
-        );
-        f.render_widget(list, chunks[1]);
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Indexed(237))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("\u{25b8} ");
+        f.render_stateful_widget(table, chunks[1], &mut self.table_state);
 
-        let finished_count = self
-            .status_map
-            .values()
-            .filter(|s| matches!(s, PluginStatus::Finished))
-            .count();
         let ratio = if !self.plugins.is_empty() {
             finished_count as f64 / self.plugins.len() as f64
         } else {
