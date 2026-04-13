@@ -1084,14 +1084,15 @@ async fn run_add(
                 println!("Building: {}", build_cmd);
                 let mut rtp_dirs = vec![dst_path.clone()];
                 let mut visited = std::collections::HashSet::new();
-                let mut stack: Vec<String> =
-                    plugin.depends.iter().flatten().cloned().collect();
+                let mut stack: Vec<String> = plugin.depends.iter().flatten().cloned().collect();
                 while let Some(dep) = stack.pop() {
                     if !visited.insert(dep.clone()) {
                         continue;
                     }
-                    if let Some(dep_plugin) =
-                        config.plugins.iter().find(|p| p.display_name() == dep || p.url == dep)
+                    if let Some(dep_plugin) = config
+                        .plugins
+                        .iter()
+                        .find(|p| p.display_name() == dep || p.url == dep)
                     {
                         let dep_path = if let Some(d) = &dep_plugin.dst {
                             PathBuf::from(d)
