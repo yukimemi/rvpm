@@ -333,16 +333,14 @@ fn resolve_plugin_dst(plugin: &crate::config::Plugin, base_dir: &Path) -> PathBu
 }
 
 /// プラグインの build コマンドを実行する (依存 rtp 解決込み)。
-/// build が未設定なら何もしない。
+/// build が未設定なら None を返す。失敗時はエラーメッセージを返す。
 async fn execute_build_command(
     plugin: &crate::config::Plugin,
     dst_path: &Path,
     config: &crate::config::Config,
     base_dir: &Path,
-) {
-    let Some(build_cmd) = &plugin.build else {
-        return;
-    };
+) -> Option<String> {
+    let build_cmd = plugin.build.as_ref()?;
     let mut rtp_dirs = vec![dst_path.to_path_buf()];
     let mut visited = std::collections::HashSet::new();
     let mut stack: Vec<String> = plugin.depends.iter().flatten().cloned().collect();
@@ -363,28 +361,29 @@ async fn execute_build_command(
         }
     }
     let (prog, args) = parse_build_command(build_cmd, &rtp_dirs);
-    match tokio::process::Command::new(&prog)
+    let build_timeout = std::time::Duration::from_secs(300); // 5 minutes
+    let mut child = match tokio::process::Command::new(&prog)
         .args(&args)
         .current_dir(dst_path)
-        .output()
-        .await
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
     {
-        Ok(o) if !o.status.success() => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            eprintln!(
-                "Warning: build failed for '{}': {}",
-                plugin.display_name(),
-                stderr.trim()
-            );
-        }
+        Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "Warning: build command failed for '{}': {}",
-                plugin.display_name(),
-                e
-            );
+            return Some(format!("build spawn failed: {}", e));
         }
-        _ => {}
+    };
+    match tokio::time::timeout(build_timeout, child.wait()).await {
+        Ok(Ok(status)) if !status.success() => {
+            Some(format!("build failed (exit code: {:?})", status.code()))
+        }
+        Ok(Err(e)) => Some(format!("build error: {}", e)),
+        Err(_) => {
+            let _ = child.kill().await;
+            Some(format!("build timed out ({}s)", build_timeout.as_secs()))
+        }
+        _ => None,
     }
 }
 
@@ -451,7 +450,17 @@ async fn run_sync(prune: bool) -> Result<()> {
                             ))
                             .await;
                     }
-                    execute_build_command(&plugin, &dst_path, &config_for_build, &base_dir).await;
+                    if let Some(err) =
+                        execute_build_command(&plugin, &dst_path, &config_for_build, &base_dir)
+                            .await
+                    {
+                        let _ = tx
+                            .send((
+                                plugin.url.clone(),
+                                PluginStatus::Syncing(format!("Build warning: {}", err)),
+                            ))
+                            .await;
+                    }
                     let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
                     Ok((plugin, dst_path))
                 }
@@ -464,6 +473,10 @@ async fn run_sync(prune: bool) -> Result<()> {
             }
         });
     }
+
+    // 全タスクを spawn し終えたので元の tx を drop。
+    // これにより全タスク完了後に rx が閉じ、channel のリークを防ぐ。
+    drop(tx);
 
     let mut plugin_scripts = Vec::new();
     let mut finished_tasks = 0;
@@ -516,9 +529,10 @@ async fn run_sync(prune: bool) -> Result<()> {
 
     terminal.draw(|f| tui_state.draw(f, "syncing..."))?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // TUI cleanup — 各ステップが失敗しても次を続行してターミナルを確実に復元する
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
     println!("Generating loader.lua...");
     let loader_path = resolve_loader_path(config.options.loader_path.as_deref(), &base_dir);
     write_loader_to_path(
@@ -1107,7 +1121,11 @@ async fn run_add(
         if let Err(e) = git_repo.sync().await {
             eprintln!("Warning: failed to sync '{}': {}", plugin.display_name(), e);
         } else {
-            execute_build_command(&plugin, &dst_path, &config_data, &base_dir).await;
+            if let Some(err) =
+                execute_build_command(&plugin, &dst_path, &config_data, &base_dir).await
+            {
+                eprintln!("Warning: {}: {}", plugin.display_name(), err);
+            }
 
             if plugin.merge && !plugin.lazy {
                 std::fs::create_dir_all(&merged_dir).ok();
