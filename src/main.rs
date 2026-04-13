@@ -450,10 +450,10 @@ async fn run_sync(prune: bool) -> Result<()> {
                             ))
                             .await;
                     }
-                    if let Some(err) =
+                    let build_warn =
                         execute_build_command(&plugin, &dst_path, &config_for_build, &base_dir)
-                            .await
-                    {
+                            .await;
+                    if let Some(ref err) = build_warn {
                         let _ = tx
                             .send((
                                 plugin.url.clone(),
@@ -462,7 +462,7 @@ async fn run_sync(prune: bool) -> Result<()> {
                             .await;
                     }
                     let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
-                    Ok((plugin, dst_path))
+                    Ok((plugin, dst_path, build_warn))
                 }
                 Err(e) => {
                     let _ = tx
@@ -479,6 +479,7 @@ async fn run_sync(prune: bool) -> Result<()> {
     drop(tx);
 
     let mut plugin_scripts = Vec::new();
+    let mut build_warnings: Vec<(String, String)> = Vec::new();
     let mut finished_tasks = 0;
     let total_tasks = config.plugins.len();
 
@@ -496,7 +497,10 @@ async fn run_sync(prune: bool) -> Result<()> {
             Some((url, status)) = rx.recv() => { tui_state.update_status(&url, status); }
             Some(res) = set.join_next() => {
                 finished_tasks += 1;
-                if let Ok(Ok((plugin, dst_path))) = res {
+                if let Ok(Ok((plugin, dst_path, build_warn))) = res {
+                    if let Some(warn) = build_warn {
+                        build_warnings.push((plugin.url.clone(), warn));
+                    }
                     // lazy プラグインは merge しない (trigger 前に merged/ 経由で
                     // lua モジュールが rtp に漏れて lazy の意味がなくなるため)
                     if plugin.merge && !plugin.lazy {
@@ -543,21 +547,12 @@ async fn run_sync(prune: bool) -> Result<()> {
     let _ = terminal.show_cursor();
 
     // sync 結果のサマリーを出力 (TUI 閉じた後なので見える)
+    // plugins 順で出力して決定的な順序を保つ
     let failed: Vec<_> = tui_state
-        .status_map
+        .plugins
         .iter()
-        .filter_map(|(url, status)| match status {
-            PluginStatus::Failed(msg) => Some((url.clone(), msg.clone())),
-            _ => None,
-        })
-        .collect();
-    let warned: Vec<_> = tui_state
-        .status_map
-        .iter()
-        .filter_map(|(url, status)| match status {
-            PluginStatus::Syncing(msg) if msg.starts_with("Build warning:") => {
-                Some((url.clone(), msg.clone()))
-            }
+        .filter_map(|url| match tui_state.status_map.get(url) {
+            Some(PluginStatus::Failed(msg)) => Some((url.as_str(), msg.as_str())),
             _ => None,
         })
         .collect();
@@ -567,9 +562,9 @@ async fn run_sync(prune: bool) -> Result<()> {
             eprintln!("  \u{2717} {}: {}", url, msg);
         }
     }
-    if !warned.is_empty() {
-        eprintln!("\n{} warning(s):", warned.len());
-        for (url, msg) in &warned {
+    if !build_warnings.is_empty() {
+        eprintln!("\n{} build warning(s):", build_warnings.len());
+        for (url, msg) in &build_warnings {
             eprintln!("  \u{26a0} {}: {}", url, msg);
         }
     }
