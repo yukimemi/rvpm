@@ -501,6 +501,19 @@ async fn run_sync(prune: bool) -> Result<()> {
             .unwrap_or(usize::MAX)
     });
 
+    // lazy → eager 昇格後に merge が必要なプラグインを追加で merge する。
+    // sync 時点では lazy のため merge されなかったが、depends/on_source により
+    // eager に昇格されるプラグインは merged/ にリンクが必要。
+    let promoted = crate::loader::promote_lazy_to_eager(&mut plugin_scripts);
+    if !promoted.is_empty() {
+        for ps in &plugin_scripts {
+            if promoted.contains(&ps.name) && ps.merge {
+                let dst = PathBuf::from(&ps.path);
+                let _ = merge_plugin(&dst, &merged_dir);
+            }
+        }
+    }
+
     terminal.draw(|f| tui_state.draw(f, "syncing..."))?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     disable_raw_mode()?;
@@ -582,6 +595,22 @@ async fn run_generate() -> Result<()> {
         };
         let plugin_config_dir = config_root.join(plugin.canonical_path());
         plugin_scripts.push(build_plugin_scripts(plugin, &dst_path, &plugin_config_dir));
+    }
+
+    // lazy → eager 昇格を適用。generate 単独実行時は merged/ が stale な可能性が
+    // あるため、全 eager + merge プラグインを再構築する。
+    crate::loader::promote_lazy_to_eager(&mut plugin_scripts);
+    if merged_dir.exists() {
+        let _ = std::fs::remove_dir_all(&merged_dir);
+    }
+    std::fs::create_dir_all(&merged_dir)?;
+    for ps in &plugin_scripts {
+        if !ps.lazy && ps.merge {
+            let dst = PathBuf::from(&ps.path);
+            if dst.exists() {
+                let _ = merge_plugin(&dst, &merged_dir);
+            }
+        }
     }
 
     println!("Generating loader.lua...");
