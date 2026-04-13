@@ -335,6 +335,8 @@ end
         let ap_var = format!("_rvpm_ap_{}", safe);
 
         let mut body = String::new();
+        // do...end ブロックで local 変数をスコープ化 (Lua の 200 ローカル変数制限回避)
+        body.push_str("do\n");
         // ファイルリストをローカルテーブルとして宣言
         body.push_str(&format!(
             "local {} = {}\n",
@@ -531,6 +533,7 @@ end
             ));
         }
 
+        body.push_str("end\n");
         push_with_cond(&mut lua, &s.cond, &body);
     }
 
@@ -547,7 +550,6 @@ end
                 continue;
             }
             let path = s.path.replace('\\', "/");
-            let safe = sanitize_name(&s.name);
             let before = s
                 .before
                 .as_ref()
@@ -558,13 +560,19 @@ end
                 .as_ref()
                 .map(|p| format!("\"{}\"", p.replace('\\', "/")))
                 .unwrap_or_else(|| "nil".to_string());
+            // ファイルリストをインライン展開 (do...end スコープ外のため変数参照不可)
+            let pf_inline = lua_str_list(&s.plugin_files);
+            let fd_inline = lua_str_list(&s.ftdetect_files);
+            let ap_inline = lua_str_list(&s.after_plugin_files);
             for cs in &s.colorschemes {
                 cs_entries.push(format!(
-                    "[\"{cs}\"] = function() load_lazy(\"{name}\", \"{path}\", _rvpm_pf_{safe}, _rvpm_fd_{safe}, _rvpm_ap_{safe}, {before}, {after}) end",
+                    "[\"{cs}\"] = function() load_lazy(\"{name}\", \"{path}\", {pf}, {fd}, {ap}, {before}, {after}) end",
                     cs = cs,
                     name = s.name,
                     path = path,
-                    safe = safe,
+                    pf = pf_inline,
+                    fd = fd_inline,
+                    ap = ap_inline,
                     before = before,
                     after = after,
                 ));
