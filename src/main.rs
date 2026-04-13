@@ -472,11 +472,11 @@ async fn run_sync(prune: bool) -> Result<()> {
     while finished_tasks < total_tasks {
         terminal.draw(|f| tui_state.draw(f, "syncing..."))?;
 
-        // sync/update 中のキー入力でスクロール操作を受け付ける
-        if crossterm::event::poll(std::time::Duration::from_millis(0))?
-            && let crossterm::event::Event::Key(key) = crossterm::event::read()?
-        {
-            tui_state.handle_scroll_key(key, terminal.size()?.height);
+        // sync/update 中のイベントキューを drain してスクロール操作を受け付ける
+        while crossterm::event::poll(std::time::Duration::from_millis(0))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                tui_state.handle_scroll_key(key, terminal.size()?.height);
+            }
         }
 
         tokio::select! {
@@ -993,11 +993,11 @@ async fn run_update(query: Option<String>) -> Result<()> {
     while finished_tasks < total_tasks {
         terminal.draw(|f| tui_state.draw(f, "updating..."))?;
 
-        // sync/update 中のキー入力でスクロール操作を受け付ける
-        if crossterm::event::poll(std::time::Duration::from_millis(0))?
-            && let crossterm::event::Event::Key(key) = crossterm::event::read()?
-        {
-            tui_state.handle_scroll_key(key, terminal.size()?.height);
+        // sync/update 中のイベントキューを drain してスクロール操作を受け付ける
+        while crossterm::event::poll(std::time::Duration::from_millis(0))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                tui_state.handle_scroll_key(key, terminal.size()?.height);
+            }
         }
 
         tokio::select! {
