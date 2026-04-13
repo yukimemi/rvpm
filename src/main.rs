@@ -310,6 +310,84 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
+/// cond + merge=true の組み合わせを検出し、merge を無効化して警告する。
+fn warn_and_disable_merge_if_cond(plugin: &mut crate::config::Plugin) {
+    if plugin.cond.is_some() && plugin.merge {
+        eprintln!(
+            "Warning: plugin '{}' has both `cond` and `merge = true`. \
+             merge is disabled for cond plugins (runtime condition cannot be \
+             evaluated at generate time).",
+            plugin.display_name()
+        );
+        plugin.merge = false;
+    }
+}
+
+/// プラグインの clone 先パスを解決する。
+fn resolve_plugin_dst(plugin: &crate::config::Plugin, base_dir: &Path) -> PathBuf {
+    if let Some(d) = &plugin.dst {
+        PathBuf::from(d)
+    } else {
+        base_dir.join("repos").join(plugin.canonical_path())
+    }
+}
+
+/// プラグインの build コマンドを実行する (依存 rtp 解決込み)。
+/// build が未設定なら何もしない。
+async fn execute_build_command(
+    plugin: &crate::config::Plugin,
+    dst_path: &Path,
+    config: &crate::config::Config,
+    base_dir: &Path,
+) {
+    let Some(build_cmd) = &plugin.build else {
+        return;
+    };
+    let mut rtp_dirs = vec![dst_path.to_path_buf()];
+    let mut visited = std::collections::HashSet::new();
+    let mut stack: Vec<String> = plugin.depends.iter().flatten().cloned().collect();
+    while let Some(dep) = stack.pop() {
+        if !visited.insert(dep.clone()) {
+            continue;
+        }
+        if let Some(dep_plugin) = config
+            .plugins
+            .iter()
+            .find(|p| p.display_name() == dep || p.url == dep)
+        {
+            let dep_path = resolve_plugin_dst(dep_plugin, base_dir);
+            rtp_dirs.push(dep_path);
+            if let Some(deeper) = &dep_plugin.depends {
+                stack.extend(deeper.clone());
+            }
+        }
+    }
+    let (prog, args) = parse_build_command(build_cmd, &rtp_dirs);
+    match tokio::process::Command::new(&prog)
+        .args(&args)
+        .current_dir(dst_path)
+        .output()
+        .await
+    {
+        Ok(o) if !o.status.success() => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            eprintln!(
+                "Warning: build failed for '{}': {}",
+                plugin.display_name(),
+                stderr.trim()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: build command failed for '{}': {}",
+                plugin.display_name(),
+                e
+            );
+        }
+        _ => {}
+    }
+}
+
 async fn run_sync(prune: bool) -> Result<()> {
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)
@@ -346,27 +424,12 @@ async fn run_sync(prune: bool) -> Result<()> {
         let base_dir = base_dir.clone();
         let tx = tx.clone();
         let sem = semaphore.clone();
-        // cond はランタイム Lua 式なので generate 時に merge するか判定できない。
-        // merge=true のまま merged/ にリンクすると cond=false でも lua/ モジュールが
-        // rtp 経由で require 可能になってしまうため、安全のため merge を無効化する。
-        if plugin.cond.is_some() && plugin.merge {
-            eprintln!(
-                "Warning: plugin '{}' has both `cond` and `merge = true`. \
-                 merge is disabled for cond plugins (runtime condition cannot be \
-                 evaluated at generate time).",
-                plugin.display_name()
-            );
-            plugin.merge = false;
-        }
+        warn_and_disable_merge_if_cond(&mut plugin);
 
         let config_for_build = config.clone();
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
-            let dst_path = if let Some(d) = &plugin.dst {
-                PathBuf::from(d)
-            } else {
-                base_dir.join("repos").join(plugin.canonical_path())
-            };
+            let dst_path = resolve_plugin_dst(&plugin, &base_dir);
             let _ = tx
                 .send((
                     plugin.url.clone(),
@@ -377,65 +440,18 @@ async fn run_sync(prune: bool) -> Result<()> {
             let res = repo.sync().await;
             match res {
                 Ok(_) => {
-                    // build コマンドがあれば clone/pull 後に実行
-                    if let Some(build_cmd) = &plugin.build {
+                    if plugin.build.is_some() {
                         let _ = tx
                             .send((
                                 plugin.url.clone(),
-                                PluginStatus::Syncing(format!("Building: {}", build_cmd)),
+                                PluginStatus::Syncing(format!(
+                                    "Building: {}",
+                                    plugin.build.as_deref().unwrap_or_default()
+                                )),
                             ))
                             .await;
-                        // 自身 + depends の path を rtp に追加 (再帰的に辿る)
-                        let mut rtp_dirs = vec![dst_path.clone()];
-                        let mut visited = std::collections::HashSet::new();
-                        let mut stack: Vec<String> =
-                            plugin.depends.iter().flatten().cloned().collect();
-                        while let Some(dep) = stack.pop() {
-                            if !visited.insert(dep.clone()) {
-                                continue; // 循環防止
-                            }
-                            if let Some(dep_plugin) = config_for_build
-                                .plugins
-                                .iter()
-                                .find(|p| p.display_name() == dep || p.url == dep)
-                            {
-                                let dep_path = if let Some(d) = &dep_plugin.dst {
-                                    PathBuf::from(d)
-                                } else {
-                                    base_dir.join("repos").join(dep_plugin.canonical_path())
-                                };
-                                rtp_dirs.push(dep_path);
-                                // dep の depends も辿る
-                                if let Some(deeper) = &dep_plugin.depends {
-                                    stack.extend(deeper.clone());
-                                }
-                            }
-                        }
-                        let (prog, args) = parse_build_command(build_cmd, &rtp_dirs);
-                        let build_output = tokio::process::Command::new(&prog)
-                            .args(&args)
-                            .current_dir(&dst_path)
-                            .output()
-                            .await;
-                        match build_output {
-                            Ok(o) if !o.status.success() => {
-                                let stderr = String::from_utf8_lossy(&o.stderr);
-                                eprintln!(
-                                    "Warning: build failed for '{}': {}",
-                                    plugin.display_name(),
-                                    stderr.trim()
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "Warning: build command failed for '{}': {}",
-                                    plugin.display_name(),
-                                    e
-                                );
-                            }
-                            _ => {}
-                        }
                     }
+                    execute_build_command(&plugin, &dst_path, &config_for_build, &base_dir).await;
                     let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
                     Ok((plugin, dst_path))
                 }
@@ -1044,94 +1060,26 @@ async fn run_add(
         set_plugin_list_field(&mut doc, &repo, "on_event", items)?;
     }
 
-    std::fs::write(&config_path, doc.to_string())?;
+    let toml_content = doc.to_string();
+    std::fs::write(&config_path, &toml_content)?;
     println!("Added plugin to config: {}", repo);
 
     // 追加したプラグインだけ clone + merge し、loader.lua を再生成する
-    // (全プラグインを sync するのは無駄なので)
-    let toml_content = std::fs::read_to_string(&config_path)?;
-    let mut config_data = parse_config(&toml_content)?;
-    crate::config::sort_plugins(&mut config_data.plugins)?;
-    let config = Arc::new(config_data);
-    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
+    let config_data = parse_config(&toml_content)?;
+    let base_dir = resolve_base_dir(config_data.options.base_dir.as_deref());
     let merged_dir = base_dir.join("merged");
 
-    if let Some(mut plugin) = config.plugins.iter().find(|p| p.url == repo).cloned() {
-        // cond + merge の警告 (run_sync と同じ)
-        if plugin.cond.is_some() && plugin.merge {
-            eprintln!(
-                "Warning: plugin '{}' has both `cond` and `merge = true`. \
-                 merge is disabled for cond plugins (runtime condition cannot be \
-                 evaluated at generate time).",
-                plugin.display_name()
-            );
-            plugin.merge = false;
-        }
-
-        let dst_path = if let Some(d) = &plugin.dst {
-            PathBuf::from(d)
-        } else {
-            base_dir.join("repos").join(plugin.canonical_path())
-        };
+    if let Some(mut plugin) = config_data.plugins.iter().find(|p| p.url == repo).cloned() {
+        warn_and_disable_merge_if_cond(&mut plugin);
+        let dst_path = resolve_plugin_dst(&plugin, &base_dir);
 
         println!("Syncing {}...", plugin.display_name());
         let git_repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
         if let Err(e) = git_repo.sync().await {
             eprintln!("Warning: failed to sync '{}': {}", plugin.display_name(), e);
         } else {
-            // build コマンドがあれば実行
-            if let Some(build_cmd) = &plugin.build {
-                println!("Building: {}", build_cmd);
-                let mut rtp_dirs = vec![dst_path.clone()];
-                let mut visited = std::collections::HashSet::new();
-                let mut stack: Vec<String> = plugin.depends.iter().flatten().cloned().collect();
-                while let Some(dep) = stack.pop() {
-                    if !visited.insert(dep.clone()) {
-                        continue;
-                    }
-                    if let Some(dep_plugin) = config
-                        .plugins
-                        .iter()
-                        .find(|p| p.display_name() == dep || p.url == dep)
-                    {
-                        let dep_path = if let Some(d) = &dep_plugin.dst {
-                            PathBuf::from(d)
-                        } else {
-                            base_dir.join("repos").join(dep_plugin.canonical_path())
-                        };
-                        rtp_dirs.push(dep_path);
-                        if let Some(deeper) = &dep_plugin.depends {
-                            stack.extend(deeper.clone());
-                        }
-                    }
-                }
-                let (prog, args) = parse_build_command(build_cmd, &rtp_dirs);
-                match tokio::process::Command::new(&prog)
-                    .args(&args)
-                    .current_dir(&dst_path)
-                    .output()
-                    .await
-                {
-                    Ok(o) if !o.status.success() => {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        eprintln!(
-                            "Warning: build failed for '{}': {}",
-                            plugin.display_name(),
-                            stderr.trim()
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Warning: build command failed for '{}': {}",
-                            plugin.display_name(),
-                            e
-                        );
-                    }
-                    _ => {}
-                }
-            }
+            execute_build_command(&plugin, &dst_path, &config_data, &base_dir).await;
 
-            // merge=true かつ lazy でなければ merged/ にリンク
             if plugin.merge && !plugin.lazy {
                 std::fs::create_dir_all(&merged_dir).ok();
                 let _ = merge_plugin(&dst_path, &merged_dir);
@@ -1139,7 +1087,6 @@ async fn run_add(
         }
     }
 
-    // loader.lua を再生成
     run_generate().await?;
     Ok(())
 }
