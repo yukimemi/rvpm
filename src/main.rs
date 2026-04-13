@@ -363,13 +363,17 @@ async fn execute_build_command(
         }
     }
     let (prog, args) = parse_build_command(build_cmd, &rtp_dirs);
-    match tokio::process::Command::new(&prog)
-        .args(&args)
-        .current_dir(dst_path)
-        .output()
-        .await
+    let build_timeout = std::time::Duration::from_secs(300); // 5 minutes
+    match tokio::time::timeout(
+        build_timeout,
+        tokio::process::Command::new(&prog)
+            .args(&args)
+            .current_dir(dst_path)
+            .output(),
+    )
+    .await
     {
-        Ok(o) if !o.status.success() => {
+        Ok(Ok(o)) if !o.status.success() => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             eprintln!(
                 "Warning: build failed for '{}': {}",
@@ -377,11 +381,18 @@ async fn execute_build_command(
                 stderr.trim()
             );
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!(
                 "Warning: build command failed for '{}': {}",
                 plugin.display_name(),
                 e
+            );
+        }
+        Err(_) => {
+            eprintln!(
+                "Warning: build timed out for '{}' ({}s)",
+                plugin.display_name(),
+                build_timeout.as_secs()
             );
         }
         _ => {}
@@ -465,6 +476,10 @@ async fn run_sync(prune: bool) -> Result<()> {
         });
     }
 
+    // 全タスクを spawn し終えたので元の tx を drop。
+    // これにより全タスク完了後に rx が閉じ、channel のリークを防ぐ。
+    drop(tx);
+
     let mut plugin_scripts = Vec::new();
     let mut finished_tasks = 0;
     let total_tasks = config.plugins.len();
@@ -503,9 +518,10 @@ async fn run_sync(prune: bool) -> Result<()> {
 
     terminal.draw(|f| tui_state.draw(f, "syncing..."))?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // TUI cleanup — 各ステップが失敗しても次を続行してターミナルを確実に復元する
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
     println!("Generating loader.lua...");
     let loader_path = resolve_loader_path(config.options.loader_path.as_deref(), &base_dir);
     write_loader_to_path(
