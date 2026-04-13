@@ -310,16 +310,17 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
-/// cond + merge=true の組み合わせを検出し、merge を無効化して警告する。
-fn warn_and_disable_merge_if_cond(plugin: &mut crate::config::Plugin) {
+/// cond + merge=true の組み合わせを検出し、merge を無効化する。
+/// 警告メッセージを返す (呼び出し元でまとめて表示)。
+fn warn_and_disable_merge_if_cond(plugin: &mut crate::config::Plugin) -> Option<String> {
     if plugin.cond.is_some() && plugin.merge {
-        eprintln!(
-            "Warning: plugin '{}' has both `cond` and `merge = true`. \
-             merge is disabled for cond plugins (runtime condition cannot be \
-             evaluated at generate time).",
-            plugin.display_name()
-        );
         plugin.merge = false;
+        Some(format!(
+            "{}: cond + merge=true -> merge disabled",
+            plugin.display_name()
+        ))
+    } else {
+        None
     }
 }
 
@@ -394,6 +395,13 @@ async fn run_sync(prune: bool) -> Result<()> {
 
     let mut config_data = parse_config(&toml_content)?;
     crate::config::sort_plugins(&mut config_data.plugins)?;
+    // TUI 開始前に cond+merge を処理 (警告は後でまとめて出す)
+    let mut cond_warnings: Vec<String> = Vec::new();
+    for plugin in config_data.plugins.iter_mut() {
+        if let Some(w) = warn_and_disable_merge_if_cond(plugin) {
+            cond_warnings.push(w);
+        }
+    }
     let config = Arc::new(config_data);
 
     let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
@@ -419,11 +427,10 @@ async fn run_sync(prune: bool) -> Result<()> {
     let mut set = JoinSet::new();
 
     for plugin in config.plugins.iter() {
-        let mut plugin = plugin.clone();
+        let plugin = plugin.clone();
         let base_dir = base_dir.clone();
         let tx = tx.clone();
         let sem = semaphore.clone();
-        warn_and_disable_merge_if_cond(&mut plugin);
 
         let config_for_build = config.clone();
         set.spawn(async move {
@@ -566,6 +573,18 @@ async fn run_sync(prune: bool) -> Result<()> {
         eprintln!("\n{} build warning(s):", build_warnings.len());
         for (url, msg) in &build_warnings {
             eprintln!("  \u{26a0} {}: {}", url, msg);
+        }
+    }
+    if !promoted.is_empty() {
+        eprintln!("\n{} plugin(s) promoted lazy -> eager:", promoted.len());
+        for name in &promoted {
+            eprintln!("  -> {}", name);
+        }
+    }
+    if !cond_warnings.is_empty() {
+        eprintln!("\n{} cond/merge warning(s):", cond_warnings.len());
+        for w in &cond_warnings {
+            eprintln!("  \u{26a0} {}", w);
         }
     }
 
@@ -1159,7 +1178,9 @@ async fn run_add(
     let merged_dir = base_dir.join("merged");
 
     if let Some(mut plugin) = config_data.plugins.iter().find(|p| p.url == repo).cloned() {
-        warn_and_disable_merge_if_cond(&mut plugin);
+        if let Some(w) = warn_and_disable_merge_if_cond(&mut plugin) {
+            eprintln!("Warning: {}", w);
+        }
         let dst_path = resolve_plugin_dst(&plugin, &base_dir);
 
         println!("Syncing {}...", plugin.display_name());
