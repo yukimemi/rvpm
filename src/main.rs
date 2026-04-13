@@ -541,6 +541,39 @@ async fn run_sync(prune: bool) -> Result<()> {
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
+
+    // sync 結果のサマリーを出力 (TUI 閉じた後なので見える)
+    let failed: Vec<_> = tui_state
+        .status_map
+        .iter()
+        .filter_map(|(url, status)| match status {
+            PluginStatus::Failed(msg) => Some((url.clone(), msg.clone())),
+            _ => None,
+        })
+        .collect();
+    let warned: Vec<_> = tui_state
+        .status_map
+        .iter()
+        .filter_map(|(url, status)| match status {
+            PluginStatus::Syncing(msg) if msg.starts_with("Build warning:") => {
+                Some((url.clone(), msg.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    if !failed.is_empty() {
+        eprintln!("\n{} error(s):", failed.len());
+        for (url, msg) in &failed {
+            eprintln!("  \u{2717} {}: {}", url, msg);
+        }
+    }
+    if !warned.is_empty() {
+        eprintln!("\n{} warning(s):", warned.len());
+        for (url, msg) in &warned {
+            eprintln!("  \u{26a0} {}: {}", url, msg);
+        }
+    }
+
     println!("Generating loader.lua...");
     let loader_path = resolve_loader_path(config.options.loader_path.as_deref(), &base_dir);
     write_loader_to_path(
