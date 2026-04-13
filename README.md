@@ -160,6 +160,92 @@ on_map = [
 | `base_dir` | `string` | `~/.cache/rvpm` | Root for all rvpm data (repos, merged, loader.lua). Setting this moves everything together |
 | `loader_path` | `string` | `{base_dir}/loader.lua` | Override only the loader.lua output path. Takes precedence over `base_dir` for the loader file |
 
+### Tera templates
+
+The entire `config.toml` is processed by [Tera](https://keats.github.io/tera/) before TOML parsing. You can use `{{ vars.xxx }}`, `{{ env.HOME }}`, `{{ is_windows }}`, `{% if %}` blocks, and more.
+
+#### Available context
+
+| Variable | Type | Description |
+|---|---|---|
+| `vars.*` | any | User-defined variables from `[vars]` |
+| `env.*` | string | Environment variables (e.g. `{{ env.HOME }}`) |
+| `is_windows` | bool | `true` on Windows, `false` otherwise |
+
+#### Variables referencing other variables
+
+Variables can reference each other — including forward references:
+
+```toml
+[vars]
+base = "~/.cache/rvpm"
+full = "{{ vars.base }}/custom"   # → "~/.cache/rvpm/custom"
+
+# Forward reference works too
+greeting = "Hello {{ vars.name }}"
+name = "yukimemi"
+# greeting → "Hello yukimemi"
+```
+
+#### Conditional plugin inclusion
+
+Use `{% if %}` to completely exclude plugins from `loader.lua` at generate time:
+
+```toml
+[vars]
+use_blink = true
+use_cmp = false
+use_telescope = false
+use_snacks = true
+
+[options]
+
+# ── Completion: pick one ─────────────────────────
+{% if vars.use_blink %}
+[[plugins]]
+url = "saghen/blink.cmp"
+on_event = ["InsertEnter", "CmdlineEnter"]
+{% endif %}
+
+{% if vars.use_cmp %}
+[[plugins]]
+url = "hrsh7th/nvim-cmp"
+on_event = "InsertEnter"
+{% endif %}
+
+# ── Fuzzy finder: pick one ───────────────────────
+{% if vars.use_telescope %}
+[[plugins]]
+url = "nvim-telescope/telescope.nvim"
+on_cmd = "Telescope"
+{% endif %}
+
+{% if vars.use_snacks %}
+[[plugins]]
+url = "folke/snacks.nvim"
+{% endif %}
+```
+
+#### Platform-specific plugins
+
+```toml
+[options]
+
+{% if is_windows %}
+[[plugins]]
+url = "thinca/vim-winenv"
+{% endif %}
+
+[[plugins]]
+url = "folke/snacks.nvim"
+cond = "{{ is_windows }}"  # runtime cond: included in loader but guarded
+```
+
+> **`{% if %}` vs `cond`**: `{% if %}` removes the plugin entirely at generate
+> time — it won't be cloned, merged, or appear in `loader.lua`. `cond` keeps
+> the plugin in `loader.lua` but wraps it in `if <expr> then ... end` for
+> runtime evaluation.
+
 ### `[[plugins]]` reference
 
 | Key | Type | Default | Description |
