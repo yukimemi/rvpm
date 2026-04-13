@@ -95,25 +95,17 @@ pub struct LoaderOptions {
     pub global_after: Option<String>,
 }
 
-pub fn generate_loader(
-    merged_dir: &Path,
-    scripts: &[PluginScripts],
-    opts: &LoaderOptions,
-) -> String {
-    // ======================================================
-    // Pre-pass: lazy → eager 自動昇格 (反復)
-    //
-    // 以下のケースで lazy を eager に昇格する:
-    //   1. eager が lazy に depends → lazy を eager に
-    //   2. lazy が on_source で eager を参照 → その lazy は phase 6 後の
-    //      User autocmd を受けないと永遠にロードされないので eager に昇格
-    //
-    // チェーン対応: A(eager) ← B(lazy, on_source=["A"]) ← C(lazy, on_source=["B"])
-    // → B 昇格 → C も昇格。ループで収束するまで繰り返す。
-    // ======================================================
-    let mut scripts = scripts.to_vec();
-    // 安全ガード: 各 iteration で少なくとも 1 つ昇格するので最大 N 回で収束。
-    // 万が一のロジックバグでも無限ループにならないように回数制限。
+/// lazy → eager 自動昇格を行い、昇格されたプラグイン名のリストを返す。
+///
+/// 以下のケースで lazy を eager に昇格する:
+///   1. eager が lazy に depends → lazy を eager に
+///   2. lazy が on_source で eager を参照 → その lazy は phase 6 後の
+///      User autocmd を受けないと永遠にロードされないので eager に昇格
+///
+/// チェーン対応: A(eager) ← B(lazy, on_source=["A"]) ← C(lazy, on_source=["B"])
+/// → B 昇格 → C も昇格。ループで収束するまで繰り返す。
+pub fn promote_lazy_to_eager(scripts: &mut [PluginScripts]) -> Vec<String> {
+    let mut promoted = Vec::new();
     let max_iterations = scripts.len() + 1;
     for _ in 0..max_iterations {
         let eager_names: std::collections::HashSet<String> = scripts
@@ -122,14 +114,12 @@ pub fn generate_loader(
             .map(|s| s.name.clone())
             .collect();
 
-        // eager が depends する lazy の名前を収集
         let depended_by_eager: std::collections::HashSet<String> = scripts
             .iter()
             .filter(|s| !s.lazy)
             .flat_map(|s| s.depends.iter().flatten().cloned())
             .collect();
 
-        // 昇格対象を先に集める (借用の衝突回避)
         let to_promote: Vec<(String, &'static str)> = scripts
             .iter()
             .filter(|s| s.lazy)
@@ -163,9 +153,20 @@ pub fn generate_loader(
             );
             if let Some(s) = scripts.iter_mut().find(|s| s.name == *name) {
                 s.lazy = false;
+                promoted.push(name.clone());
             }
         }
     }
+    promoted
+}
+
+pub fn generate_loader(
+    merged_dir: &Path,
+    scripts: &[PluginScripts],
+    opts: &LoaderOptions,
+) -> String {
+    let mut scripts = scripts.to_vec();
+    promote_lazy_to_eager(&mut scripts);
 
     // lazy→lazy deps: 各 lazy plugin の depends にある lazy plugin を先にロードする
     // ための依存マップを作る (phase 7 の trigger 生成で使う)
@@ -1579,5 +1580,64 @@ mod tests {
         assert!(lua.contains("nvim_create_autocmd({ \"BufRead\" }"));
         assert!(lua.contains("pattern = { \"*.rs\", \"Cargo.toml\" }"));
         assert!(lua.contains("pattern = { \"rvpm_loaded_plenary.nvim\" }"));
+    }
+
+    // ========================================================
+    // promote_lazy_to_eager 単体テスト
+    // ========================================================
+
+    #[test]
+    fn test_promote_lazy_to_eager_returns_promoted_names() {
+        let mut a = PluginScripts::for_test("plenary.nvim", "/path/plenary");
+        a.lazy = true;
+        a.merge = true;
+
+        let mut b = PluginScripts::for_test("telescope.nvim", "/path/telescope");
+        b.lazy = false;
+        b.depends = Some(vec!["plenary.nvim".to_string()]);
+
+        let mut scripts = vec![a, b];
+        let promoted = promote_lazy_to_eager(&mut scripts);
+
+        assert_eq!(promoted, vec!["plenary.nvim".to_string()]);
+        assert!(!scripts[0].lazy, "plenary should be promoted to eager");
+        assert!(!scripts[1].lazy, "telescope should remain eager");
+    }
+
+    #[test]
+    fn test_promote_lazy_to_eager_chain() {
+        let mut a = PluginScripts::for_test("a", "/path/a");
+        a.lazy = true;
+
+        let mut b = PluginScripts::for_test("b", "/path/b");
+        b.lazy = true;
+        b.depends = Some(vec!["a".to_string()]);
+
+        let mut c = PluginScripts::for_test("c", "/path/c");
+        c.lazy = false;
+        c.depends = Some(vec!["b".to_string()]);
+
+        let mut scripts = vec![a, b, c];
+        let promoted = promote_lazy_to_eager(&mut scripts);
+
+        assert!(promoted.contains(&"a".to_string()));
+        assert!(promoted.contains(&"b".to_string()));
+        assert!(!scripts[0].lazy);
+        assert!(!scripts[1].lazy);
+    }
+
+    #[test]
+    fn test_promote_lazy_to_eager_no_promotion_needed() {
+        let a = PluginScripts::for_test("a", "/path/a");
+        let mut b = PluginScripts::for_test("b", "/path/b");
+        b.lazy = true;
+        b.on_cmd = Some(vec!["Cmd".to_string()]);
+
+        let mut scripts = vec![a, b];
+        let promoted = promote_lazy_to_eager(&mut scripts);
+
+        assert!(promoted.is_empty());
+        assert!(!scripts[0].lazy);
+        assert!(scripts[1].lazy);
     }
 }
