@@ -104,8 +104,8 @@ pub struct LoaderOptions {
 ///
 /// チェーン対応: A(eager) ← B(lazy, on_source=["A"]) ← C(lazy, on_source=["B"])
 /// → B 昇格 → C も昇格。ループで収束するまで繰り返す。
-pub fn promote_lazy_to_eager(scripts: &mut [PluginScripts]) -> Vec<String> {
-    let mut promoted = Vec::new();
+pub fn promote_lazy_to_eager(scripts: &mut [PluginScripts]) -> std::collections::HashSet<String> {
+    let mut promoted = std::collections::HashSet::new();
     let max_iterations = scripts.len() + 1;
     for _ in 0..max_iterations {
         let eager_names: std::collections::HashSet<String> = scripts
@@ -153,7 +153,7 @@ pub fn promote_lazy_to_eager(scripts: &mut [PluginScripts]) -> Vec<String> {
             );
             if let Some(s) = scripts.iter_mut().find(|s| s.name == *name) {
                 s.lazy = false;
-                promoted.push(name.clone());
+                promoted.insert(name.clone());
             }
         }
     }
@@ -1599,7 +1599,8 @@ mod tests {
         let mut scripts = vec![a, b];
         let promoted = promote_lazy_to_eager(&mut scripts);
 
-        assert_eq!(promoted, vec!["plenary.nvim".to_string()]);
+        assert!(promoted.contains("plenary.nvim"));
+        assert_eq!(promoted.len(), 1);
         assert!(!scripts[0].lazy, "plenary should be promoted to eager");
         assert!(!scripts[1].lazy, "telescope should remain eager");
     }
@@ -1620,8 +1621,8 @@ mod tests {
         let mut scripts = vec![a, b, c];
         let promoted = promote_lazy_to_eager(&mut scripts);
 
-        assert!(promoted.contains(&"a".to_string()));
-        assert!(promoted.contains(&"b".to_string()));
+        assert!(promoted.contains("a"));
+        assert!(promoted.contains("b"));
         assert!(!scripts[0].lazy);
         assert!(!scripts[1].lazy);
     }
