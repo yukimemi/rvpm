@@ -515,7 +515,7 @@ impl TuiState {
                         (icons.modified, Color::Yellow)
                     }
                     PluginStatus::Syncing(_) => (icons.syncing, Color::Cyan),
-                    PluginStatus::Waiting => ("?", Color::DarkGray),
+                    PluginStatus::Waiting => (icons.waiting, Color::DarkGray),
                 };
 
                 // 詳細列: エラー/変更時はその内容、正常時はトリガー情報

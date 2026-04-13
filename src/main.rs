@@ -746,7 +746,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
     let mut config = parse_config(&toml_content)?;
     let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
     let config_root = resolve_config_root(config.options.config_root.as_deref());
-    let icons = crate::tui::Icons::from_style(config.options.icons);
+    let mut icons = crate::tui::Icons::from_style(config.options.icons);
 
     if no_tui {
         // 非対話モード: plain text 出力 (旧 status コマンド相当)
@@ -924,6 +924,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                             let _ = run_sync(false).await;
                         }
                         let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                        icons = crate::tui::Icons::from_style(c.options.icons);
                         config = c;
                         tui_state = s;
                     }
@@ -950,6 +951,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                             let _ = run_sync(false).await;
                         }
                         let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                        icons = crate::tui::Icons::from_style(c.options.icons);
                         config = c;
                         tui_state = s;
                     }
@@ -970,6 +972,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         terminal.show_cursor()?;
                         let _ = run_update(Some(url)).await;
                         let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                        icons = crate::tui::Icons::from_style(c.options.icons);
                         config = c;
                         tui_state = s;
                     }
@@ -990,6 +993,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         terminal.show_cursor()?;
                         let _ = run_remove(Some(url)).await;
                         let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                        icons = crate::tui::Icons::from_style(c.options.icons);
                         config = c;
                         tui_state = s;
                     }
