@@ -146,11 +146,7 @@ pub fn promote_lazy_to_eager(scripts: &mut [PluginScripts]) -> std::collections:
             break;
         }
 
-        for (name, reason) in &to_promote {
-            eprintln!(
-                "Note: '{}' is lazy but {} — promoting to eager.",
-                name, reason
-            );
+        for (name, _reason) in &to_promote {
             if let Some(s) = scripts.iter_mut().find(|s| s.name == *name) {
                 s.lazy = false;
                 promoted.insert(name.clone());

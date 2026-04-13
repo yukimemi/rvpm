@@ -310,16 +310,17 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
-/// cond + merge=true の組み合わせを検出し、merge を無効化して警告する。
-fn warn_and_disable_merge_if_cond(plugin: &mut crate::config::Plugin) {
+/// cond + merge=true の組み合わせを検出し、merge を無効化する。
+/// 警告メッセージを返す (呼び出し元でまとめて表示)。
+fn warn_and_disable_merge_if_cond(plugin: &mut crate::config::Plugin) -> Option<String> {
     if plugin.cond.is_some() && plugin.merge {
-        eprintln!(
-            "Warning: plugin '{}' has both `cond` and `merge = true`. \
-             merge is disabled for cond plugins (runtime condition cannot be \
-             evaluated at generate time).",
-            plugin.display_name()
-        );
         plugin.merge = false;
+        Some(format!(
+            "{}: cond + merge=true -> merge disabled",
+            plugin.display_name()
+        ))
+    } else {
+        None
     }
 }
 
@@ -394,6 +395,13 @@ async fn run_sync(prune: bool) -> Result<()> {
 
     let mut config_data = parse_config(&toml_content)?;
     crate::config::sort_plugins(&mut config_data.plugins)?;
+    // TUI 開始前に cond+merge を処理 (警告は後でまとめて出す)
+    let mut cond_warnings: Vec<String> = Vec::new();
+    for plugin in config_data.plugins.iter_mut() {
+        if let Some(w) = warn_and_disable_merge_if_cond(plugin) {
+            cond_warnings.push(w);
+        }
+    }
     let config = Arc::new(config_data);
 
     let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
@@ -419,11 +427,10 @@ async fn run_sync(prune: bool) -> Result<()> {
     let mut set = JoinSet::new();
 
     for plugin in config.plugins.iter() {
-        let mut plugin = plugin.clone();
+        let plugin = plugin.clone();
         let base_dir = base_dir.clone();
         let tx = tx.clone();
         let sem = semaphore.clone();
-        warn_and_disable_merge_if_cond(&mut plugin);
 
         let config_for_build = config.clone();
         set.spawn(async move {
@@ -568,6 +575,20 @@ async fn run_sync(prune: bool) -> Result<()> {
             eprintln!("  \u{26a0} {}: {}", url, msg);
         }
     }
+    if !promoted.is_empty() {
+        let mut sorted_promoted: Vec<_> = promoted.iter().collect();
+        sorted_promoted.sort();
+        eprintln!("\n{} plugin(s) promoted lazy -> eager:", promoted.len());
+        for name in &sorted_promoted {
+            eprintln!("  -> {}", name);
+        }
+    }
+    if !cond_warnings.is_empty() {
+        eprintln!("\n{} cond/merge warning(s):", cond_warnings.len());
+        for w in &cond_warnings {
+            eprintln!("  \u{26a0} {}", w);
+        }
+    }
 
     println!("Generating loader.lua...");
     let loader_path = resolve_loader_path(config.options.loader_path.as_deref(), &base_dir);
@@ -629,8 +650,13 @@ async fn run_generate() -> Result<()> {
     let toml_content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
     let mut config = parse_config(&toml_content)?;
-    // depends に基づいた依存順に並べる (run_sync と同じ扱い)
     crate::config::sort_plugins(&mut config.plugins)?;
+    // cond + merge=true を正規化 (run_sync と同じ)
+    for plugin in config.plugins.iter_mut() {
+        if let Some(w) = warn_and_disable_merge_if_cond(plugin) {
+            eprintln!("Warning: {}", w);
+        }
+    }
     let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
     let merged_dir = base_dir.join("merged");
     let loader_path = resolve_loader_path(config.options.loader_path.as_deref(), &base_dir);
@@ -1159,7 +1185,9 @@ async fn run_add(
     let merged_dir = base_dir.join("merged");
 
     if let Some(mut plugin) = config_data.plugins.iter().find(|p| p.url == repo).cloned() {
-        warn_and_disable_merge_if_cond(&mut plugin);
+        if let Some(w) = warn_and_disable_merge_if_cond(&mut plugin) {
+            eprintln!("Warning: {}", w);
+        }
         let dst_path = resolve_plugin_dst(&plugin, &base_dir);
 
         println!("Syncing {}...", plugin.display_name());
