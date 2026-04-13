@@ -312,11 +312,11 @@ impl TuiState {
                     .unwrap_or(PluginStatus::Waiting);
                 let (icon, color, msg) = match &status {
                     PluginStatus::Waiting => {
-                        ("\u{f0292}", Color::DarkGray, "Waiting...".to_string())
+                        ("\u{25cb}", Color::DarkGray, "Waiting...".to_string()) // ○
                     }
-                    PluginStatus::Syncing(m) => ("\u{21bb}", Color::Cyan, m.clone()),
-                    PluginStatus::Finished => ("\u{f00c}", Color::Green, "Finished".to_string()),
-                    PluginStatus::Failed(e) => ("\u{2716}", Color::Red, e.clone()),
+                    PluginStatus::Syncing(m) => ("\u{21bb}", Color::Cyan, m.clone()), // ↻
+                    PluginStatus::Finished => ("\u{2713}", Color::Green, "Finished".to_string()), // ✓
+                    PluginStatus::Failed(e) => ("\u{2717}", Color::Red, e.clone()), // ✗
                 };
                 Row::new(vec![
                     Cell::from(format!(" {} ", icon)).style(Style::default().fg(color)),
@@ -344,8 +344,7 @@ impl TuiState {
             Style::default()
                 .bg(Color::Indexed(237))
                 .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("\u{25b8} ");
+        );
         f.render_stateful_widget(table, chunks[1], &mut self.table_state);
 
         let ratio = if !self.plugins.is_empty() {
