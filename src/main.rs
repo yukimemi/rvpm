@@ -484,6 +484,14 @@ async fn run_sync(prune: bool) -> Result<()> {
 
     while finished_tasks < total_tasks {
         terminal.draw(|f| tui_state.draw(f, "syncing..."))?;
+
+        // sync/update 中のイベントキューを drain してスクロール操作を受け付ける
+        while crossterm::event::poll(std::time::Duration::from_millis(0))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                tui_state.handle_scroll_key(key, terminal.size()?.height);
+            }
+        }
+
         tokio::select! {
             Some((url, status)) = rx.recv() => { tui_state.update_status(&url, status); }
             Some(res) = set.join_next() => {
@@ -1020,11 +1028,21 @@ async fn run_update(query: Option<String>) -> Result<()> {
         });
     }
 
+    drop(tx);
+
     let total_tasks = target_plugins.len();
     let mut finished_tasks = 0;
 
     while finished_tasks < total_tasks {
         terminal.draw(|f| tui_state.draw(f, "updating..."))?;
+
+        // sync/update 中のイベントキューを drain してスクロール操作を受け付ける
+        while crossterm::event::poll(std::time::Duration::from_millis(0))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                tui_state.handle_scroll_key(key, terminal.size()?.height);
+            }
+        }
+
         tokio::select! {
             Some((url, status)) = rx.recv() => { tui_state.update_status(&url, status); }
             Some(_) = set.join_next() => { finished_tasks += 1; }
@@ -1033,9 +1051,9 @@ async fn run_update(query: Option<String>) -> Result<()> {
     }
     terminal.draw(|f| tui_state.draw(f, "updating..."))?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
 
     println!("Update complete. Regenerating loader.lua...");
     run_generate().await?;
