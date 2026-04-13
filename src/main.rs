@@ -1046,7 +1046,100 @@ async fn run_add(
 
     std::fs::write(&config_path, doc.to_string())?;
     println!("Added plugin to config: {}", repo);
-    let _ = run_sync(false).await;
+
+    // 追加したプラグインだけ clone + merge し、loader.lua を再生成する
+    // (全プラグインを sync するのは無駄なので)
+    let toml_content = std::fs::read_to_string(&config_path)?;
+    let mut config_data = parse_config(&toml_content)?;
+    crate::config::sort_plugins(&mut config_data.plugins)?;
+    let config = Arc::new(config_data);
+    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
+    let merged_dir = base_dir.join("merged");
+
+    if let Some(mut plugin) = config.plugins.iter().find(|p| p.url == repo).cloned() {
+        // cond + merge の警告 (run_sync と同じ)
+        if plugin.cond.is_some() && plugin.merge {
+            eprintln!(
+                "Warning: plugin '{}' has both `cond` and `merge = true`. \
+                 merge is disabled for cond plugins (runtime condition cannot be \
+                 evaluated at generate time).",
+                plugin.display_name()
+            );
+            plugin.merge = false;
+        }
+
+        let dst_path = if let Some(d) = &plugin.dst {
+            PathBuf::from(d)
+        } else {
+            base_dir.join("repos").join(plugin.canonical_path())
+        };
+
+        println!("Syncing {}...", plugin.display_name());
+        let git_repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
+        if let Err(e) = git_repo.sync().await {
+            eprintln!("Warning: failed to sync '{}': {}", plugin.display_name(), e);
+        } else {
+            // build コマンドがあれば実行
+            if let Some(build_cmd) = &plugin.build {
+                println!("Building: {}", build_cmd);
+                let mut rtp_dirs = vec![dst_path.clone()];
+                let mut visited = std::collections::HashSet::new();
+                let mut stack: Vec<String> =
+                    plugin.depends.iter().flatten().cloned().collect();
+                while let Some(dep) = stack.pop() {
+                    if !visited.insert(dep.clone()) {
+                        continue;
+                    }
+                    if let Some(dep_plugin) =
+                        config.plugins.iter().find(|p| p.display_name() == dep || p.url == dep)
+                    {
+                        let dep_path = if let Some(d) = &dep_plugin.dst {
+                            PathBuf::from(d)
+                        } else {
+                            base_dir.join("repos").join(dep_plugin.canonical_path())
+                        };
+                        rtp_dirs.push(dep_path);
+                        if let Some(deeper) = &dep_plugin.depends {
+                            stack.extend(deeper.clone());
+                        }
+                    }
+                }
+                let (prog, args) = parse_build_command(build_cmd, &rtp_dirs);
+                match tokio::process::Command::new(&prog)
+                    .args(&args)
+                    .current_dir(&dst_path)
+                    .output()
+                    .await
+                {
+                    Ok(o) if !o.status.success() => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        eprintln!(
+                            "Warning: build failed for '{}': {}",
+                            plugin.display_name(),
+                            stderr.trim()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: build command failed for '{}': {}",
+                            plugin.display_name(),
+                            e
+                        );
+                    }
+                    _ => {}
+                }
+            }
+
+            // merge=true かつ lazy でなければ merged/ にリンク
+            if plugin.merge && !plugin.lazy {
+                std::fs::create_dir_all(&merged_dir).ok();
+                let _ = merge_plugin(&dst_path, &merged_dir);
+            }
+        }
+    }
+
+    // loader.lua を再生成
+    run_generate().await?;
     Ok(())
 }
 
