@@ -434,11 +434,12 @@ end
         }
 
         // ---- on_ft: FileType を再トリガーして ftplugin/ を発火 ----
+        // vim.schedule でラップして autocmd ネストを回避
         if let Some(fts) = &s.on_ft {
             body.push_str(&format!(
                 "vim.api.nvim_create_autocmd(\"FileType\", {{ pattern = {{ \"{}\" }}, once = true, callback = function(ev)\n\
                  \x20 {load}\n\
-                 \x20 vim.api.nvim_exec_autocmds(\"FileType\", {{ buffer = ev.buf, modeline = false }})\n\
+                 \x20 vim.schedule(function() if vim.api.nvim_buf_is_valid(ev.buf) then vim.api.nvim_exec_autocmds(\"FileType\", {{ buffer = ev.buf, modeline = false }}) end end)\n\
                  end }})\n",
                 fts.join("\", \""),
                 load = load_call,
@@ -488,7 +489,7 @@ end
                 body.push_str(&format!(
                     "vim.api.nvim_create_autocmd({{ \"{}\" }}, {{ once = true, callback = function(ev)\n\
                      \x20 {load}\n\
-                     \x20 vim.api.nvim_exec_autocmds(ev.event, {{ buffer = ev.buf, data = ev.data, modeline = false }})\n\
+                     \x20 vim.schedule(function() if vim.api.nvim_buf_is_valid(ev.buf) then vim.api.nvim_exec_autocmds(ev.event, {{ buffer = ev.buf, data = ev.data, modeline = false }}) end end)\n\
                      end }})\n",
                     regular.join("\", \""),
                     load = load_call,
@@ -499,7 +500,7 @@ end
                 body.push_str(&format!(
                     "vim.api.nvim_create_autocmd(\"User\", {{ pattern = \"{pat}\", once = true, callback = function(ev)\n\
                      \x20 {load}\n\
-                     \x20 vim.api.nvim_exec_autocmds(\"User\", {{ pattern = \"{pat}\", data = ev.data, modeline = false }})\n\
+                     \x20 vim.schedule(function() vim.api.nvim_exec_autocmds(\"User\", {{ pattern = \"{pat}\", data = ev.data, modeline = false }}) end)\n\
                      end }})\n",
                     pat = pat,
                     load = load_call,
@@ -508,11 +509,12 @@ end
         }
 
         // ---- on_path: BufRead/BufNewFile 再発火で buffer 状態を復元 ----
+        // vim.schedule でラップして autocmd ネストを回避
         if let Some(paths) = &s.on_path {
             body.push_str(&format!(
                 "vim.api.nvim_create_autocmd({{ \"BufRead\", \"BufNewFile\" }}, {{ pattern = {{ \"{}\" }}, once = true, callback = function(ev)\n\
                  \x20 {load}\n\
-                 \x20 vim.api.nvim_exec_autocmds(ev.event, {{ buffer = ev.buf, data = ev.data, modeline = false }})\n\
+                 \x20 vim.schedule(function() if vim.api.nvim_buf_is_valid(ev.buf) then vim.api.nvim_exec_autocmds(ev.event, {{ buffer = ev.buf, data = ev.data, modeline = false }}) end end)\n\
                  end }})\n",
                 paths.join("\", \""),
                 load = load_call,
@@ -1313,10 +1315,10 @@ mod tests {
         let mut s = make_lazy_plugin("nvim-rust");
         s.on_ft = Some(vec!["rust".to_string()]);
         let lua = gen_loader(Path::new("/merged"), &[s]);
-        // ロード後に FileType を exec_autocmds で再発火
+        // ロード後に vim.schedule + buf_is_valid でラップして FileType を再発火
         assert!(
-            lua.contains("nvim_exec_autocmds(\"FileType\""),
-            "on_ft callback must re-trigger FileType after load so ftplugin/ fires"
+            lua.contains("vim.schedule(function() if vim.api.nvim_buf_is_valid(ev.buf) then vim.api.nvim_exec_autocmds(\"FileType\""),
+            "on_ft callback must re-trigger FileType via vim.schedule with buf validity check"
         );
         assert!(
             lua.contains("buffer = ev.buf"),
@@ -1329,10 +1331,10 @@ mod tests {
         let mut s = make_lazy_plugin("lsp");
         s.on_event = Some(vec!["BufReadPre".to_string()]);
         let lua = gen_loader(Path::new("/merged"), &[s]);
-        // ロード後に ev.event を buffer と data 付きで再発火
+        // ロード後に vim.schedule + buf_is_valid でラップして ev.event を再発火
         assert!(
-            lua.contains("nvim_exec_autocmds(ev.event"),
-            "on_event callback must re-fire the triggering event"
+            lua.contains("vim.schedule(function() if vim.api.nvim_buf_is_valid(ev.buf) then vim.api.nvim_exec_autocmds(ev.event"),
+            "on_event callback must re-fire via vim.schedule with buf validity check"
         );
         assert!(lua.contains("buffer = ev.buf"));
         assert!(lua.contains("data = ev.data"));
@@ -1384,10 +1386,10 @@ mod tests {
         let mut s = make_lazy_plugin("rust-tools");
         s.on_path = Some(vec!["*.rs".to_string()]);
         let lua = gen_loader(Path::new("/merged"), &[s]);
-        // BufRead/BufNewFile の再発火
+        // vim.schedule + buf_is_valid でラップして BufRead/BufNewFile を再発火
         assert!(
-            lua.contains("nvim_exec_autocmds(ev.event"),
-            "on_path callback must re-fire the BufRead/BufNewFile event"
+            lua.contains("vim.schedule(function() if vim.api.nvim_buf_is_valid(ev.buf) then vim.api.nvim_exec_autocmds(ev.event"),
+            "on_path callback must re-fire via vim.schedule with buf validity check"
         );
         assert!(lua.contains("buffer = ev.buf"));
     }
