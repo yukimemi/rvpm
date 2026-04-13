@@ -576,8 +576,10 @@ async fn run_sync(prune: bool) -> Result<()> {
         }
     }
     if !promoted.is_empty() {
+        let mut sorted_promoted: Vec<_> = promoted.iter().collect();
+        sorted_promoted.sort();
         eprintln!("\n{} plugin(s) promoted lazy -> eager:", promoted.len());
-        for name in &promoted {
+        for name in &sorted_promoted {
             eprintln!("  -> {}", name);
         }
     }
@@ -648,8 +650,13 @@ async fn run_generate() -> Result<()> {
     let toml_content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
     let mut config = parse_config(&toml_content)?;
-    // depends に基づいた依存順に並べる (run_sync と同じ扱い)
     crate::config::sort_plugins(&mut config.plugins)?;
+    // cond + merge=true を正規化 (run_sync と同じ)
+    for plugin in config.plugins.iter_mut() {
+        if let Some(w) = warn_and_disable_merge_if_cond(plugin) {
+            eprintln!("Warning: {}", w);
+        }
+    }
     let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
     let merged_dir = base_dir.join("merged");
     let loader_path = resolve_loader_path(config.options.loader_path.as_deref(), &base_dir);
