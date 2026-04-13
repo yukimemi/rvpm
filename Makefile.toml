@@ -29,3 +29,15 @@ args = ["test"]
 description = "Dry-run crates.io publish"
 command = "cargo"
 args = ["publish", "--dry-run", "--allow-dirty"]
+
+[tasks.hook-install]
+description = "Install git pre-push hook that runs 'cargo make check'"
+script_runner = "@duckscript"
+script = '''
+hook_dir = set ".git/hooks"
+hook_file = set "${hook_dir}/pre-push"
+mkdir ${hook_dir}
+hook_content = set "#!/bin/sh\n# Installed by: cargo make hook-install\ncargo make check"
+writefile ${hook_file} ${hook_content}
+echo "Installed pre-push hook -> ${hook_file}"
+'''
