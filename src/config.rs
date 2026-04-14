@@ -207,6 +207,7 @@ const MAX_VARS_RESOLVE_ITERATIONS: usize = 10;
 
 /// [vars] セクションを TOML 全体パースなしでテキストから抽出する。
 /// `{% if %}` 等の Tera 構文が含まれていても安全。
+/// `[vars.sub]` のようなサブテーブルも正しく含める。
 fn extract_vars_section(toml_str: &str) -> String {
     let mut in_vars = false;
     let mut vars_lines = vec!["[vars]".to_string()];
@@ -226,13 +227,25 @@ fn extract_vars_section(toml_str: &str) -> String {
             }
             continue;
         }
-        // 次のセクション開始 ([options], [[plugins]] 等) or Tera ブロックタグで vars 終了
-        if trimmed.starts_with('[') || trimmed.starts_with("{%") {
+        // [vars] or [vars.xxx] のサブテーブルは含める
+        // それ以外のセクション ([options], [[plugins]] 等) or Tera ブロックタグで終了
+        if trimmed.starts_with('[') {
+            let section_name = trimmed
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .replace(' ', "");
+            if section_name.starts_with("[vars.") || section_name.starts_with("[vars]") {
+                vars_lines.push(line.to_string());
+                continue;
+            }
             break;
         }
-        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-            vars_lines.push(line.to_string());
+        if trimmed.starts_with("{%") {
+            break;
         }
+        vars_lines.push(line.to_string());
     }
     vars_lines.join("\n")
 }
@@ -249,34 +262,45 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     let vars_parsed: VarsOnly = toml::from_str(&vars_toml)
         .map_err(|e| anyhow::anyhow!("Failed to parse [vars] section: {}", e))?;
 
-    // 3. vars 内の相互参照を反復レンダリングで解決
-    let mut vars_value = vars_parsed
-        .vars
-        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-    for _ in 0..MAX_VARS_RESOLVE_ITERATIONS {
-        let mut ctx = Context::new();
-        ctx.insert("vars", &vars_value);
-        let vars_str = serde_json::to_string(&vars_value)?;
-        let rendered_str = Tera::one_off(&vars_str, &ctx, false)?;
-        let new_value: serde_json::Value = serde_json::from_str(&rendered_str)?;
-        if new_value == vars_value {
-            break;
-        }
-        vars_value = new_value;
-    }
-
-    // 4. Tera Context の構築 (解決済み vars + env + is_windows)
-    let mut context = Context::new();
-    context.insert("vars", &vars_value);
-    context.insert("is_windows", &cfg!(windows));
-
+    // 3. env + is_windows を先に用意 (vars 内でも参照可能にする)
     let mut env_map = std::collections::HashMap::new();
     for (key, value) in std::env::vars() {
         env_map.insert(key, value);
     }
+
+    // 4. vars 内の相互参照を反復レンダリングで解決
+    let mut vars_value = vars_parsed
+        .vars
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    let mut converged = false;
+    for _ in 0..MAX_VARS_RESOLVE_ITERATIONS {
+        let mut ctx = Context::new();
+        ctx.insert("vars", &vars_value);
+        ctx.insert("env", &env_map);
+        ctx.insert("is_windows", &cfg!(windows));
+        let vars_str = serde_json::to_string(&vars_value)?;
+        let rendered_str = Tera::one_off(&vars_str, &ctx, false)?;
+        let new_value: serde_json::Value = serde_json::from_str(&rendered_str)?;
+        if new_value == vars_value {
+            converged = true;
+            break;
+        }
+        vars_value = new_value;
+    }
+    if !converged {
+        eprintln!(
+            "Warning: [vars] cross-references did not converge after {} iterations",
+            MAX_VARS_RESOLVE_ITERATIONS
+        );
+    }
+
+    // 5. Tera Context の構築 (解決済み vars + env + is_windows)
+    let mut context = Context::new();
+    context.insert("vars", &vars_value);
+    context.insert("is_windows", &cfg!(windows));
     context.insert("env", &env_map);
 
-    // 5. 全体を Tera でレンダリング ({% if %} 等が動く)
+    // 6. 全体を Tera でレンダリング ({% if %} 等が動く)
     let rendered = Tera::one_off(toml_str, &context, false)?;
 
     // 6. TOML パース
