@@ -160,11 +160,21 @@ rvpm reads `config.toml` from `~/.config/rvpm/<appname>/config.toml`, where `<ap
 
 This mirrors Neovim's `$NVIM_APPNAME` convention, so running `NVIM_APPNAME=nvim-test nvim` pairs with `NVIM_APPNAME=nvim-test rvpm sync` for fully isolated test configs.
 
+> **💡 Recommendation: leave `config_root` and `cache_root` unset.** The defaults
+> are already `<appname>`-aware. Setting a literal path (e.g.
+> `cache_root = "~/dotfiles/rvpm"`) **breaks appname isolation** — every
+> `$NVIM_APPNAME` variant will share the same cache.
+>
+> If you need a custom root *and* appname isolation, use Tera templates:
+> ```toml
+> cache_root = "{{ env.HOME }}/dotfiles/rvpm/{{ env.NVIM_APPNAME }}"
+> ```
+
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `config_root` | `string` | `~/.config/rvpm/<appname>/plugins` | Root directory for per-plugin `init.lua` / `before.lua` / `after.lua`. Supports `~` and `{{ vars.xxx }}` templates |
+| `config_root` | `string` | `~/.config/rvpm/<appname>/plugins` | Root directory for per-plugin `init.lua` / `before.lua` / `after.lua`. Supports `~` and Tera templates. **Recommended: leave unset** to preserve appname isolation |
 | `concurrency` | `integer` | `8` | Max number of parallel git operations during `sync` / `update`. Kept moderate to avoid GitHub rate limits |
-| `cache_root` | `string` | `~/.cache/rvpm/<appname>` | Root for all rvpm cache (`plugins/repos/`, `plugins/merged/`, `plugins/loader.lua`, `store/`). Setting this moves everything together |
+| `cache_root` | `string` | `~/.cache/rvpm/<appname>` | Root for all rvpm cache (`plugins/repos/`, `plugins/merged/`, `plugins/loader.lua`, `store/`). **Recommended: leave unset** to preserve appname isolation |
 
 ### Tera templates
 
