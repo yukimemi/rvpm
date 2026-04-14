@@ -35,7 +35,7 @@ junction = "1.4"
 walkdir = "2.5"
 
 # Git (in-process, no fork)
-gix = { version = "0.72", default-features = false, features = [
+gix = { version = "0.81", default-features = false, features = [
     "blocking-network-client",
     "blocking-http-transport-reqwest-rust-tls",
     "worktree-mutation",
