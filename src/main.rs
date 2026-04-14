@@ -839,16 +839,20 @@ async fn run_list(no_tui: bool) -> Result<()> {
         print!("{}", message);
         std::io::stdout().flush()?;
         crossterm::terminal::enable_raw_mode()?;
-        loop {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()?
-                && key.kind == crossterm::event::KeyEventKind::Press
-            {
-                break;
+        let res = loop {
+            match crossterm::event::read() {
+                Ok(crossterm::event::Event::Key(key))
+                    if key.kind == crossterm::event::KeyEventKind::Press =>
+                {
+                    break Ok(());
+                }
+                Ok(_) => {}
+                Err(e) => break Err(e.into()),
             }
-        }
-        crossterm::terminal::disable_raw_mode()?;
+        };
+        let _ = crossterm::terminal::disable_raw_mode();
         println!();
-        Ok(())
+        res
     }
 
     // アクション後に config とステータスを再読み込みしてTUIを復帰するヘルパー
