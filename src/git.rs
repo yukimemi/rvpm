@@ -207,12 +207,12 @@ fn gix_reset_to_remote(dst: &Path) -> Result<()> {
         };
 
         if let Some(mut tr) = tracking_ref {
-            tr.peel_to_id_in_place()?.detach()
+            tr.peel_to_id()?.detach()
         } else {
             // フォールバック: <remote>/HEAD
             let remote_head = format!("refs/remotes/{}/HEAD", remote_name);
             if let Ok(mut r) = repo.find_reference(&remote_head) {
-                r.peel_to_id_in_place()?.detach()
+                r.peel_to_id()?.detach()
             } else {
                 return Ok(());
             }
