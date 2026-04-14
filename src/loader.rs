@@ -454,9 +454,13 @@ end
                 };
                 body.push_str(&format!(
                     "vim.keymap.set({modes}, \"{lhs}\", function()\n\
+                     \x20 local op = vim.v.operator\n\
+                     \x20 local cnt = vim.v.count1\n\
+                     \x20 local reg = vim.v.register\n\
                      \x20 vim.keymap.del({modes}, \"{lhs}\")\n\
                      \x20 {load}\n\
-                     \x20 local feed = vim.api.nvim_replace_termcodes(\"<Ignore>{lhs}\", true, true, true)\n\
+                     \x20 local prefix = (reg ~= '\"' and '\"' .. reg or \"\") .. op .. (cnt > 1 and cnt or \"\")\n\
+                     \x20 local feed = vim.api.nvim_replace_termcodes(\"<Ignore>\" .. prefix .. \"{lhs}\", true, true, true)\n\
                      \x20 vim.api.nvim_feedkeys(feed, \"m\", false)\n\
                      end{opts})\n",
                     modes = modes_lua,
@@ -1449,6 +1453,31 @@ mod tests {
         assert!(
             lua.contains("desc = \"Grep files\""),
             "desc should be emitted in keymap opts"
+        );
+    }
+
+    #[test]
+    fn test_on_map_replays_operator_and_count() {
+        let mut s = make_lazy_plugin("textobj-entire");
+        s.on_map = Some(vec![MapSpec {
+            lhs: "ae".to_string(),
+            mode: vec!["x".to_string(), "o".to_string()],
+            desc: None,
+        }]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
+        // operator-pending mode で yae / dae / "ayae 等が動くように
+        // vim.v.operator, vim.v.count1, vim.v.register を保存してリプレイに含める
+        assert!(
+            lua.contains("vim.v.operator"),
+            "on_map must capture vim.v.operator for operator-pending replay"
+        );
+        assert!(
+            lua.contains("vim.v.count1"),
+            "on_map must capture count for replay"
+        );
+        assert!(
+            lua.contains("vim.v.register"),
+            "on_map must capture register for replay"
         );
     }
 
