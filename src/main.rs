@@ -45,7 +45,7 @@ generated loader.lua into your Neovim init.lua.",
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -230,7 +230,7 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    match cli.command.unwrap_or(Commands::List { no_tui: false }) {
         Commands::Sync { prune } => {
             run_sync(prune).await?;
         }
