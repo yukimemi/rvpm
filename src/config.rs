@@ -202,6 +202,9 @@ impl Plugin {
     }
 }
 
+/// vars 内の相互参照を解決する最大反復回数。
+const MAX_VARS_RESOLVE_ITERATIONS: usize = 10;
+
 /// [vars] セクションを TOML 全体パースなしでテキストから抽出する。
 /// `{% if %}` 等の Tera 構文が含まれていても安全。
 fn extract_vars_section(toml_str: &str) -> String {
@@ -209,19 +212,26 @@ fn extract_vars_section(toml_str: &str) -> String {
     let mut vars_lines = vec!["[vars]".to_string()];
     for line in toml_str.lines() {
         let trimmed = line.trim();
-        if trimmed == "[vars]" {
-            in_vars = true;
+        // [vars] セクション開始を検出 (空白やコメント付きにも対応)
+        if !in_vars {
+            let stripped = trimmed
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .replace(' ', "");
+            if stripped == "[vars]" {
+                in_vars = true;
+                continue;
+            }
             continue;
         }
-        if in_vars {
-            // 次のセクション開始 or Tera ブロックタグで vars 終了
-            if (trimmed.starts_with('[') && !trimmed.starts_with("[[")) || trimmed.starts_with("{%")
-            {
-                break;
-            }
-            if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                vars_lines.push(line.to_string());
-            }
+        // 次のセクション開始 ([options], [[plugins]] 等) or Tera ブロックタグで vars 終了
+        if trimmed.starts_with('[') || trimmed.starts_with("{%") {
+            break;
+        }
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            vars_lines.push(line.to_string());
         }
     }
     vars_lines.join("\n")
@@ -236,14 +246,14 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     struct VarsOnly {
         vars: Option<serde_json::Value>,
     }
-    let vars_parsed: VarsOnly = toml::from_str(&vars_toml).unwrap_or(VarsOnly { vars: None });
+    let vars_parsed: VarsOnly = toml::from_str(&vars_toml)
+        .map_err(|e| anyhow::anyhow!("Failed to parse [vars] section: {}", e))?;
 
     // 3. vars 内の相互参照を反復レンダリングで解決
     let mut vars_value = vars_parsed
         .vars
         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-    for _ in 0..10 {
-        // 安全ガード: 最大 10 回で収束
+    for _ in 0..MAX_VARS_RESOLVE_ITERATIONS {
         let mut ctx = Context::new();
         ctx.insert("vars", &vars_value);
         let vars_str = serde_json::to_string(&vars_value)?;
