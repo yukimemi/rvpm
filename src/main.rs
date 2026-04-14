@@ -2,6 +2,8 @@ mod config;
 mod git;
 mod link;
 mod loader;
+mod store;
+mod store_tui;
 mod tui;
 
 use crate::config::parse_config;
@@ -224,6 +226,8 @@ enum Commands {
         #[arg(long)]
         write: bool,
     },
+    /// Browse and install Neovim plugins from GitHub
+    Store,
 }
 
 #[tokio::main]
@@ -296,6 +300,9 @@ async fn main() -> Result<()> {
         }
         Commands::Init { write } => {
             run_init(write).await?;
+        }
+        Commands::Store => {
+            run_store().await?;
         }
     }
 
@@ -2560,6 +2567,207 @@ fn build_plugin_scripts(
         colorschemes: collect_colorschemes(plugin_path),
         cond: plugin.cond.clone(),
     }
+}
+
+/// `rvpm store` — GitHub からプラグインを検索して追加する TUI。
+async fn run_store() -> Result<()> {
+    use crate::store_tui::StoreTuiState;
+
+    let mut state = StoreTuiState::new();
+
+    // 初期表示: 人気プラグインをバックグラウンドで取得
+    let popular = tokio::task::spawn_blocking(crate::store::fetch_popular);
+
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = ratatui::Terminal::new(backend)?;
+
+    // 人気プラグインの結果を待つ
+    if let Ok(Ok(repos)) = popular.await {
+        state.set_plugins(repos);
+    }
+
+    // README を非同期で取得するためのチャネル
+    let (readme_tx, mut readme_rx) = tokio::sync::mpsc::channel::<(String, String)>(1);
+    let mut last_selected: Option<String> = None;
+
+    loop {
+        terminal.draw(|f| state.draw(f))?;
+
+        // README 非同期受信
+        if let Ok((full_name, content)) = readme_rx.try_recv()
+            && state
+                .selected_repo()
+                .map(|r| r.full_name == full_name)
+                .unwrap_or(false)
+        {
+            state.readme_content = Some(content);
+            state.readme_loading = false;
+        }
+
+        // 選択変更時に README を非同期取得
+        let current_selected = state.selected_repo().map(|r| r.full_name.clone());
+        if current_selected != last_selected {
+            last_selected = current_selected.clone();
+            if let Some(repo) = state.selected_repo().cloned() {
+                state.readme_loading = true;
+                state.readme_content = None;
+                state.readme_scroll = 0;
+                let tx = readme_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let content = crate::store::fetch_readme(&repo)
+                        .unwrap_or_else(|e| format!("Error: {}", e));
+                    let _ = tx.blocking_send((repo.full_name.clone(), content));
+                });
+            }
+        }
+
+        // キー入力処理
+        if crossterm::event::poll(std::time::Duration::from_millis(50))?
+            && let crossterm::event::Event::Key(key) = crossterm::event::read()?
+        {
+            if key.kind != crossterm::event::KeyEventKind::Press {
+                continue;
+            }
+
+            if state.search_mode {
+                match key.code {
+                    crossterm::event::KeyCode::Esc => {
+                        state.search_mode = false;
+                    }
+                    crossterm::event::KeyCode::Enter => {
+                        state.search_mode = false;
+                        let query = state.search_input.clone();
+                        state.message = Some(format!("Searching '{}'...", query));
+                        terminal.draw(|f| state.draw(f))?;
+                        let result = tokio::task::spawn_blocking(move || {
+                            crate::store::search_plugins(&query)
+                        })
+                        .await;
+                        match result {
+                            Ok(Ok(repos)) => {
+                                state.message = Some(format!("{} results", repos.len()));
+                                state.set_plugins(repos);
+                            }
+                            Ok(Err(e)) => {
+                                state.message = Some(format!("Error: {}", e));
+                            }
+                            Err(e) => {
+                                state.message = Some(format!("Error: {}", e));
+                            }
+                        }
+                    }
+                    crossterm::event::KeyCode::Backspace => {
+                        state.search_input.pop();
+                    }
+                    crossterm::event::KeyCode::Char(c) => {
+                        state.search_input.push(c);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            match key.code {
+                crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => break,
+                crossterm::event::KeyCode::Char('/') => {
+                    state.search_mode = true;
+                    state.search_input.clear();
+                    state.message = None;
+                }
+                crossterm::event::KeyCode::Char('j') | crossterm::event::KeyCode::Down => {
+                    state.next();
+                }
+                crossterm::event::KeyCode::Char('k') | crossterm::event::KeyCode::Up => {
+                    state.previous();
+                }
+                crossterm::event::KeyCode::Char('d')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    state.scroll_readme_down(10);
+                }
+                crossterm::event::KeyCode::Char('u')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    state.scroll_readme_up(10);
+                }
+                crossterm::event::KeyCode::Char('s') => {
+                    state.sort_mode = state.sort_mode.next();
+                    state.sort_plugins();
+                    state.message = Some(format!("Sort: {}", state.sort_mode.label()));
+                }
+                crossterm::event::KeyCode::Char('R') => {
+                    crate::store::clear_search_cache();
+                    state.message = Some("Cache cleared. Searching...".to_string());
+                    terminal.draw(|f| state.draw(f))?;
+                    let result = tokio::task::spawn_blocking(crate::store::fetch_popular).await;
+                    match result {
+                        Ok(Ok(repos)) => {
+                            state.message = Some(format!("{} plugins", repos.len()));
+                            state.set_plugins(repos);
+                        }
+                        _ => {
+                            state.message = Some("Refresh failed".to_string());
+                        }
+                    }
+                }
+                crossterm::event::KeyCode::Char('o') => {
+                    // ブラウザで開く
+                    if let Some(repo) = state.selected_repo() {
+                        let url = repo.html_url.clone();
+                        let _ = open::that(&url);
+                    }
+                }
+                crossterm::event::KeyCode::Enter => {
+                    // config.toml に追加
+                    if let Some(repo) = state.selected_repo() {
+                        let url = repo.full_name.clone();
+                        let _ = disable_raw_mode();
+                        let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+                        let _ = terminal.show_cursor();
+
+                        println!("Adding {}...", url);
+                        // run_add の最小版: config.toml に追記して sync
+                        let result =
+                            run_add(url.clone(), None, None, None, None, None, None, None).await;
+                        match result {
+                            Ok(_) => println!("Added {} successfully!", url),
+                            Err(e) => eprintln!("Failed to add {}: {}", url, e),
+                        }
+
+                        // TUI に戻る
+                        print!("\nPress any key to return to store...");
+                        use std::io::Write;
+                        std::io::stdout().flush().ok();
+                        enable_raw_mode()?;
+                        loop {
+                            if let crossterm::event::Event::Key(k) = crossterm::event::read()?
+                                && k.kind == crossterm::event::KeyEventKind::Press
+                            {
+                                break;
+                            }
+                        }
+                        disable_raw_mode()?;
+                        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                        enable_raw_mode()?;
+                        state.message = Some(format!("Added {}", url));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
+    Ok(())
 }
 
 #[cfg(test)]
