@@ -547,7 +547,9 @@ impl TuiState {
                     PluginStatus::Waiting => ("Checking...".to_string(), Color::DarkGray),
                 };
 
-                let mode = if p.lazy {
+                let mode = if p.dev {
+                    ("Dev", Color::Magenta)
+                } else if p.lazy {
                     ("Lazy", Color::Yellow)
                 } else {
                     ("Eager", Color::Green)

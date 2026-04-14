@@ -429,6 +429,22 @@ async fn run_sync(prune: bool) -> Result<()> {
     let mut set = JoinSet::new();
 
     for plugin in config.plugins.iter() {
+        // dev プラグインは sync をスキップ (ローカル開発中のためリセットしない)
+        if plugin.dev {
+            let dst_path = resolve_plugin_dst(plugin, &base_dir);
+            if !dst_path.exists() {
+                let _ = tx.try_send((
+                    plugin.url.clone(),
+                    PluginStatus::Failed(format!(
+                        "dev directory not found: {}",
+                        dst_path.display()
+                    )),
+                ));
+            } else {
+                let _ = tx.try_send((plugin.url.clone(), PluginStatus::Finished));
+            }
+            continue;
+        }
         let plugin = plugin.clone();
         let base_dir = base_dir.clone();
         let tx = tx.clone();
@@ -487,10 +503,22 @@ async fn run_sync(prune: bool) -> Result<()> {
     // これにより全タスク完了後に rx が閉じ、channel のリークを防ぐ。
     drop(tx);
 
+    // dev プラグインは sync しないが loader には含めるので先に scripts を作る
     let mut plugin_scripts = Vec::new();
+    let config_root = resolve_config_root(config.options.config_root.as_deref());
+    for plugin in config.plugins.iter().filter(|p| p.dev) {
+        let dst_path = resolve_plugin_dst(plugin, &base_dir);
+        let plugin_config_dir = config_root.join(plugin.canonical_path());
+        if plugin.merge && !plugin.lazy {
+            let _ = merge_plugin(&dst_path, &merged_dir);
+        }
+        plugin_scripts.push(build_plugin_scripts(plugin, &dst_path, &plugin_config_dir));
+    }
+
     let mut build_warnings: Vec<(String, String)> = Vec::new();
     let mut finished_tasks = 0;
-    let total_tasks = config.plugins.len();
+    let dev_count = config.plugins.iter().filter(|p| p.dev).count();
+    let total_tasks = config.plugins.len() - dev_count;
 
     while finished_tasks < total_tasks {
         terminal.draw(|f| tui_state.draw(f, "syncing...", &icons))?;
@@ -1022,6 +1050,10 @@ async fn run_update(query: Option<String>) -> Result<()> {
         .plugins
         .iter()
         .filter(|p| {
+            // dev プラグインは update スキップ
+            if p.dev {
+                return false;
+            }
             if let Some(q) = &query {
                 p.url.contains(q.as_str())
                     || p.name
