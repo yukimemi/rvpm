@@ -167,8 +167,10 @@ This mirrors Neovim's `$NVIM_APPNAME` convention, so running `NVIM_APPNAME=nvim-
 >
 > If you need a custom root *and* appname isolation, use Tera templates:
 > ```toml
-> cache_root = "{{ env.HOME }}/dotfiles/rvpm/{{ env.NVIM_APPNAME }}"
+> cache_root = "~/dotfiles/rvpm/{{ env.NVIM_APPNAME }}"
 > ```
+> Prefer `~/` over `{{ env.HOME }}` — `~` is portable (Windows too), while
+> `HOME` is not set on Windows.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
