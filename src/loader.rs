@@ -454,11 +454,12 @@ end
                 };
                 body.push_str(&format!(
                     "vim.keymap.set({modes}, \"{lhs}\", function()\n\
-                     \x20 local op = vim.v.operator or \"\"\n\
-                     \x20 local cnt = vim.v.count1 ~= 1 and vim.v.count1 or \"\"\n\
+                     \x20 local op = vim.v.operator\n\
+                     \x20 local cnt = vim.v.count1\n\
+                     \x20 local reg = vim.v.register\n\
                      \x20 vim.keymap.del({modes}, \"{lhs}\")\n\
                      \x20 {load}\n\
-                     \x20 local prefix = (op ~= \"\" and op or \"\") .. (cnt ~= \"\" and tostring(cnt) or \"\")\n\
+                     \x20 local prefix = (reg ~= '\"' and '\"' .. reg or \"\") .. op .. (cnt > 1 and cnt or \"\")\n\
                      \x20 local feed = vim.api.nvim_replace_termcodes(\"<Ignore>\" .. prefix .. \"{lhs}\", true, true, true)\n\
                      \x20 vim.api.nvim_feedkeys(feed, \"m\", false)\n\
                      end{opts})\n",
@@ -1464,8 +1465,8 @@ mod tests {
             desc: None,
         }]);
         let lua = gen_loader(Path::new("/merged"), &[s]);
-        // operator-pending mode で yae / dae 等が動くように
-        // vim.v.operator と vim.v.count1 を保存してリプレイに含める
+        // operator-pending mode で yae / dae / "ayae 等が動くように
+        // vim.v.operator, vim.v.count1, vim.v.register を保存してリプレイに含める
         assert!(
             lua.contains("vim.v.operator"),
             "on_map must capture vim.v.operator for operator-pending replay"
@@ -1473,6 +1474,10 @@ mod tests {
         assert!(
             lua.contains("vim.v.count1"),
             "on_map must capture count for replay"
+        );
+        assert!(
+            lua.contains("vim.v.register"),
+            "on_map must capture register for replay"
         );
     }
 
