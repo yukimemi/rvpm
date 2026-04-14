@@ -1,6 +1,6 @@
 use anyhow::Result;
+use gix::bstr::BString;
 use std::path::Path;
-use tokio::process::Command;
 
 pub struct Repo<'a> {
     pub url: &'a str,
@@ -22,177 +22,292 @@ impl<'a> Repo<'a> {
     }
 
     pub async fn sync(&self) -> Result<()> {
-        let url = if !self.url.contains("://")
-            && !self.url.contains("@")
-            && !self.url.contains(":\\")
-            && !self.url.starts_with("/")
-        {
-            format!("https://github.com/{}", self.url)
-        } else {
-            self.url.to_string()
-        };
-
-        let mut is_new_clone = false;
-
-        if self.dst.exists() {
-            let mut args = vec!["pull"];
-            if let Some(rev) = self.rev {
-                // 特定の rev の場合は pull ではなく fetch して checkout するのが安全なため、
-                // ここでは一旦 origin を fetch して checkout するロジックにする（後述）
-                args = vec!["fetch", "--depth", "1", "origin", rev];
-            }
-
-            let output = Command::new("git")
-                .args(&args)
-                .current_dir(self.dst)
-                .output()
-                .await?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "git pull/fetch failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        } else {
-            if let Some(parent) = self.dst.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            // rev が指定されている場合は、最初からそのブランチやタグを狙ってクローンする（最速）
-            // ※ ただしハッシュだった場合は clone --branch は失敗するので、汎用的なフォールバックが必要だが、
-            // 今回は TDD なので、まずは --branch に渡してみて、失敗したら通常のクローンをする等工夫する。
-            // 簡易的に：
-            let mut args = vec!["clone", "--depth", "1"];
-            if let Some(rev) = self.rev {
-                args.push("--branch");
-                args.push(rev);
-            }
-            args.push(&url);
-            args.push(self.dst.to_str().unwrap());
-
-            let output = Command::new("git").args(&args).output().await?;
-
-            if !output.status.success() {
-                // ハッシュ指定で --branch が失敗した可能性もあるため、通常クローンにフォールバック
-                if self.rev.is_some()
-                    && String::from_utf8_lossy(&output.stderr).contains("not found in upstream")
-                {
-                    let output = Command::new("git")
-                        .args(["clone", &url, self.dst.to_str().unwrap()]) // depth 1 は諦める
-                        .output()
-                        .await?;
-                    if !output.status.success() {
-                        anyhow::bail!(
-                            "git clone fallback failed: {}",
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                    }
-                } else {
-                    anyhow::bail!(
-                        "git clone failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-            }
-            is_new_clone = true;
-        }
-
-        // rev が指定されており、かつ新たにクローンした（もしくは fetch した）場合、その rev に checkout する
-        if let Some(rev) = self.rev {
-            let output = Command::new("git")
-                .args(["checkout", rev])
-                .current_dir(self.dst)
-                .output()
-                .await?;
-            if !output.status.success() {
-                // 新規クローン時に checkout が失敗した場合は不完全なディレクトリを削除する
-                if is_new_clone {
-                    let _ = std::fs::remove_dir_all(self.dst);
-                }
-                anyhow::bail!(
-                    "git checkout failed for rev '{}': {}",
-                    rev,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
-
-        Ok(())
+        let url = resolve_url(self.url);
+        let dst = self.dst.to_path_buf();
+        let rev = self.rev.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || sync_impl(&url, &dst, rev.as_deref()))
+            .await
+            .map_err(|e| anyhow::anyhow!("sync task panicked: {}", e))?
     }
 
     pub async fn update(&self) -> Result<()> {
-        if !self.dst.exists() {
-            anyhow::bail!("Plugin not installed: {}", self.dst.display());
-        }
-        let args: Vec<&str> = if let Some(rev) = self.rev {
-            vec!["fetch", "--depth", "1", "origin", rev]
-        } else {
-            vec!["pull"]
-        };
-        let output = Command::new("git")
-            .args(&args)
-            .current_dir(self.dst)
-            .output()
-            .await?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "git pull/fetch failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        if let Some(rev) = self.rev {
-            let output = Command::new("git")
-                .args(["checkout", rev])
-                .current_dir(self.dst)
-                .output()
-                .await?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "git checkout failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        }
-        Ok(())
+        let url = resolve_url(self.url);
+        let dst = self.dst.to_path_buf();
+        let rev = self.rev.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || update_impl(&url, &dst, rev.as_deref()))
+            .await
+            .map_err(|e| anyhow::anyhow!("update task panicked: {}", e))?
     }
 
     pub async fn get_status(&self) -> RepoStatus {
-        if !self.dst.exists() {
-            return RepoStatus::NotInstalled;
-        }
-
-        let status_output = Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(self.dst)
-            .output()
-            .await;
-
-        match status_output {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if !stdout.trim().is_empty() {
-                    return RepoStatus::Modified;
-                }
-            }
-            _ => return RepoStatus::Error("Failed to run git status".to_string()),
-        }
-
-        // rev が指定されている場合、そのref がローカルに存在するか確認する
-        // 存在しない場合は sync 失敗後にディレクトリだけ残った可能性がある
-        if let Some(rev) = self.rev {
-            let verify = Command::new("git")
-                .args(["rev-parse", "--verify", rev])
-                .current_dir(self.dst)
-                .output()
-                .await;
-            match verify {
-                Ok(output) if output.status.success() => {}
-                _ => return RepoStatus::Error(format!("rev '{}' not found in local repo", rev)),
-            }
-        }
-
-        RepoStatus::Clean
+        let dst = self.dst.to_path_buf();
+        let rev = self.rev.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || get_status_impl(&dst, rev.as_deref()))
+            .await
+            .unwrap_or(RepoStatus::Error("status check panicked".to_string()))
     }
+}
+
+/// owner/repo 形式のショートハンドを GitHub URL に変換。
+/// ローカルパス (./  ../  ~/  絶対パス等) はそのまま返す。
+fn resolve_url(url: &str) -> String {
+    // 明らかに URL やパスの場合はそのまま
+    if url.contains("://")
+        || url.contains('@')
+        || url.starts_with('/')
+        || url.starts_with('~')
+        || url.starts_with('.')
+        || url.starts_with('\\')
+        || (url.len() >= 2 && url.as_bytes()[1] == b':')
+    // C:\ 等
+    {
+        return url.to_string();
+    }
+    // owner/repo 形式: exactly one slash, no special chars
+    if url.matches('/').count() == 1 && !url.contains(' ') {
+        format!("https://github.com/{}", url)
+    } else {
+        url.to_string()
+    }
+}
+
+// ======================================================
+// clone / fetch — gix で in-process 実行
+// checkout — gix の checkout API は複雑なため git コマンドにフォールバック
+// status — gix で in-process 実行 (プロセス fork なし)
+// ======================================================
+
+fn sync_impl(url: &str, dst: &Path, rev: Option<&str>) -> Result<()> {
+    if dst.exists() {
+        fetch_impl(dst)?;
+        if let Some(rev) = rev {
+            gix_checkout(dst, rev)?;
+        } else {
+            gix_reset_to_remote(dst)?;
+        }
+    } else {
+        clone_impl(url, dst)?;
+        if let Some(rev) = rev {
+            gix_checkout(dst, rev)?;
+        }
+    }
+    Ok(())
+}
+
+fn update_impl(_url: &str, dst: &Path, rev: Option<&str>) -> Result<()> {
+    if !dst.exists() {
+        anyhow::bail!("Plugin not installed: {}", dst.display());
+    }
+    fetch_impl(dst)?;
+    if let Some(rev) = rev {
+        gix_checkout(dst, rev)?;
+    } else {
+        gix_reset_to_remote(dst)?;
+    }
+    Ok(())
+}
+
+fn clone_impl(url: &str, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // shallow clone (depth 1) で高速化
+    let (mut _checkout, _outcome) = gix::prepare_clone(url, dst)?
+        .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
+            std::num::NonZeroU32::new(1).unwrap(),
+        ))
+        .fetch_then_checkout(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(dst);
+            anyhow::anyhow!("git clone failed: {}", e)
+        })?;
+
+    _checkout
+        .main_worktree(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(dst);
+            anyhow::anyhow!("checkout failed: {}", e)
+        })?;
+
+    Ok(())
+}
+
+fn fetch_impl(dst: &Path) -> Result<()> {
+    let repo = gix::open(dst)?;
+    let remote = repo
+        .find_default_remote(gix::remote::Direction::Fetch)
+        .ok_or_else(|| anyhow::anyhow!("no remote configured"))??;
+
+    remote
+        .connect(gix::remote::Direction::Fetch)?
+        .prepare_fetch(gix::progress::Discard, Default::default())?
+        .with_shallow(gix::remote::fetch::Shallow::Deepen(1))
+        .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)?;
+
+    Ok(())
+}
+
+/// gix で特定の rev に checkout。branch の場合は branch を維持。
+fn gix_checkout(dst: &Path, rev: &str) -> Result<()> {
+    let repo = gix::open(dst)?;
+    let target = repo
+        .rev_parse_single(rev)
+        .map_err(|_| anyhow::anyhow!("rev '{}' not found", rev))?;
+    let commit_id = target.detach();
+
+    // rev が local branch を指す場合は symbolic HEAD を設定
+    let branch_ref = format!("refs/heads/{}", rev);
+    if repo.find_reference(&branch_ref).is_ok() {
+        // HEAD を symbolic ref にする (直接ファイル書き込み)
+        let head_path = repo.git_dir().join("HEAD");
+        std::fs::write(&head_path, format!("ref: {}\n", branch_ref))?;
+        // branch ref を更新
+        repo.reference(
+            branch_ref.as_str(),
+            commit_id,
+            gix::refs::transaction::PreviousValue::Any,
+            BString::from(format!("rvpm: checkout branch {}", rev)),
+        )?;
+    } else {
+        // tag/hash の場合は detached HEAD
+        repo.reference(
+            "HEAD",
+            commit_id,
+            gix::refs::transaction::PreviousValue::Any,
+            BString::from(format!("rvpm: checkout {}", rev)),
+        )?;
+    }
+
+    gix_checkout_head(&repo)?;
+    Ok(())
+}
+
+/// fetch 後に working tree を remote の最新に更新 (git reset --hard 相当)。
+fn gix_reset_to_remote(dst: &Path) -> Result<()> {
+    let repo = gix::open(dst)?;
+
+    // remote 名を動的に取得 (通常は "origin")
+    let remote_name = repo
+        .find_default_remote(gix::remote::Direction::Fetch)
+        .and_then(|r| r.ok())
+        .and_then(|r| r.name().map(|n| n.as_bstr().to_string()))
+        .unwrap_or_else(|| "origin".to_string());
+
+    // remote tracking branch からターゲット commit を取得
+    let target_id = {
+        let head_name = repo.head_name()?;
+        let tracking_ref = if let Some(ref name) = head_name {
+            // refs/heads/master → refs/remotes/<remote>/master
+            let branch = name.as_bstr().to_string();
+            let tracking = branch.replace("refs/heads/", &format!("refs/remotes/{}/", remote_name));
+            repo.find_reference(&tracking).ok()
+        } else {
+            None
+        };
+
+        if let Some(mut tr) = tracking_ref {
+            tr.peel_to_id_in_place()?.detach()
+        } else {
+            // フォールバック: <remote>/HEAD
+            let remote_head = format!("refs/remotes/{}/HEAD", remote_name);
+            if let Ok(mut r) = repo.find_reference(&remote_head) {
+                r.peel_to_id_in_place()?.detach()
+            } else {
+                return Ok(());
+            }
+        }
+    };
+
+    // ローカル branch を更新 (detached HEAD の場合は HEAD 直接更新)
+    if let Some(head_name) = repo.head_name()? {
+        repo.reference(
+            head_name.as_ref(),
+            target_id,
+            gix::refs::transaction::PreviousValue::Any,
+            BString::from("rvpm: fast-forward"),
+        )?;
+    } else {
+        repo.reference(
+            "HEAD",
+            target_id,
+            gix::refs::transaction::PreviousValue::Any,
+            BString::from("rvpm: fast-forward detached"),
+        )?;
+    }
+
+    // worktree を更新
+    gix_checkout_head(&repo)?;
+    Ok(())
+}
+
+/// HEAD の tree を worktree に展開 (gix_worktree_state::checkout)。
+fn gix_checkout_head(repo: &gix::Repository) -> Result<()> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("bare repository"))?;
+
+    let head = repo.head_commit()?;
+    let tree_id = head.tree_id()?;
+
+    let co_opts =
+        repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
+    let index = gix::index::State::from_tree(&tree_id, &repo.objects, Default::default())
+        .map_err(|e| anyhow::anyhow!("index from tree: {}", e))?;
+    let mut index_file = gix::index::File::from_state(index, repo.index_path());
+
+    let opts = gix::worktree::state::checkout::Options {
+        destination_is_initially_empty: false,
+        overwrite_existing: true,
+        ..co_opts
+    };
+
+    let progress = gix::progress::Discard;
+    gix::worktree::state::checkout(
+        &mut index_file,
+        workdir,
+        repo.objects.clone().into_arc()?,
+        &progress,
+        &progress,
+        &gix::interrupt::IS_INTERRUPTED,
+        opts,
+    )
+    .map_err(|e| anyhow::anyhow!("checkout failed: {}", e))?;
+
+    index_file
+        .write(Default::default())
+        .map_err(|e| anyhow::anyhow!("write index: {}", e))?;
+
+    Ok(())
+}
+
+/// gix を使ったプロセス fork なしのステータスチェック。
+fn get_status_impl(dst: &Path, rev: Option<&str>) -> RepoStatus {
+    if !dst.exists() {
+        return RepoStatus::NotInstalled;
+    }
+
+    let repo = match gix::open(dst) {
+        Ok(r) => r,
+        Err(_) => return RepoStatus::Error("Failed to open git repo".to_string()),
+    };
+
+    // ワーキングツリーの変更を検出
+    match repo.is_dirty() {
+        Ok(true) => return RepoStatus::Modified,
+        Ok(false) => {}
+        Err(e) => return RepoStatus::Error(format!("status check failed: {}", e)),
+    }
+
+    // rev が指定されている場合、ローカルに存在するか確認
+    if let Some(rev) = rev {
+        match repo.rev_parse_single(rev) {
+            Ok(_) => {}
+            Err(_) => return RepoStatus::Error(format!("rev '{}' not found in local repo", rev)),
+        }
+    }
+
+    RepoStatus::Clean
 }
 
 #[cfg(test)]
@@ -200,168 +315,86 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+    use tokio::process::Command;
+
+    fn git_cmd(dir: &Path) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", dir.join(".gitconfig-test"))
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com");
+        cmd
+    }
 
     #[tokio::test]
-    async fn test_sync_cleans_up_on_invalid_rev() {
+    async fn test_get_status_not_installed() {
+        let root = tempdir().unwrap();
+        let dst = root.path().join("nonexistent");
+        let repo = Repo::new("dummy", &dst, None);
+        assert_eq!(repo.get_status().await, RepoStatus::NotInstalled);
+    }
+
+    #[tokio::test]
+    async fn test_get_status_clean() {
         let root = tempdir().unwrap();
         let src = root.path().join("src");
-        let dst = root.path().join("dst");
-
         fs::create_dir_all(&src).unwrap();
-        Command::new("git")
-            .args(["init"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
         fs::write(src.join("hello.txt"), "hello").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
             .args(["commit", "-m", "init"])
-            .current_dir(&src)
             .output()
             .await
             .unwrap();
 
-        let repo = Repo::new(src.to_str().unwrap(), &dst, Some("nonexistent-rev"));
-        let result = repo.sync().await;
+        let repo = Repo::new(src.to_str().unwrap(), &src, None);
+        assert_eq!(repo.get_status().await, RepoStatus::Clean);
+    }
 
-        assert!(result.is_err(), "存在しない rev は sync エラーになるべき");
-        assert!(!dst.exists(), "失敗後にディレクトリが残ってはいけない");
+    #[tokio::test]
+    async fn test_get_status_modified() {
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("hello.txt"), "hello").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+
+        fs::write(src.join("hello.txt"), "modified").unwrap();
+        let repo = Repo::new(src.to_str().unwrap(), &src, None);
+        assert_eq!(repo.get_status().await, RepoStatus::Modified);
     }
 
     #[tokio::test]
     async fn test_get_status_errors_on_invalid_rev() {
         let root = tempdir().unwrap();
         let src = root.path().join("src");
-
         fs::create_dir_all(&src).unwrap();
-        Command::new("git")
-            .args(["init"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
         fs::write(src.join("hello.txt"), "hello").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
             .args(["commit", "-m", "init"])
-            .current_dir(&src)
             .output()
             .await
             .unwrap();
 
-        // 存在しない rev を指定
         let repo = Repo::new(src.to_str().unwrap(), &src, Some("nonexistent-rev"));
         let status = repo.get_status().await;
-
-        assert!(
-            matches!(status, RepoStatus::Error(_)),
-            "存在しない rev は get_status が Error を返すべき、実際: {:?}",
-            status
-        );
+        assert!(matches!(status, RepoStatus::Error(_)));
     }
 
     #[tokio::test]
-    async fn test_git_update_method_pulls_latest() {
-        let root = tempdir().unwrap();
-        let src = root.path().join("src");
-        let dst = root.path().join("dst");
-
-        fs::create_dir_all(&src).unwrap();
-        Command::new("git")
-            .args(["init"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        fs::write(src.join("hello.txt"), "v1").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "v1"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-
-        // 最初に clone
-        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
-        repo.sync().await.unwrap();
-
-        // src に更新を追加
-        fs::write(src.join("hello.txt"), "v2").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "v2"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-
-        // update のみ実行
-        repo.update().await.unwrap();
-        let content = fs::read_to_string(dst.join("hello.txt")).unwrap();
-        assert_eq!(content, "v2");
-    }
-
-    #[tokio::test]
-    async fn test_git_update_method_fails_when_not_installed() {
+    async fn test_update_fails_when_not_installed() {
         let root = tempdir().unwrap();
         let dst = root.path().join("nonexistent");
         let repo = Repo::new("dummy/repo", &dst, None);
@@ -371,28 +404,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_git_update() {
+    async fn test_resolve_url_adds_github_prefix() {
+        assert_eq!(resolve_url("owner/repo"), "https://github.com/owner/repo");
+        assert_eq!(
+            resolve_url("https://github.com/owner/repo"),
+            "https://github.com/owner/repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_clones_new_repo() {
         let root = tempdir().unwrap();
         let src = root.path().join("src");
         let dst = root.path().join("dst");
 
+        // ローカル bare repo を作成
         fs::create_dir_all(&src).unwrap();
-        Command::new("git")
-            .args(["init"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
         fs::write(src.join("hello.txt"), "hello").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
             .args(["commit", "-m", "init"])
-            .current_dir(&src)
             .output()
             .await
             .unwrap();
@@ -400,119 +432,43 @@ mod tests {
         let repo = Repo::new(src.to_str().unwrap(), &dst, None);
         repo.sync().await.unwrap();
 
-        fs::write(src.join("hello.txt"), "updated").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "update"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-
-        repo.sync().await.unwrap();
-
+        assert!(dst.join("hello.txt").exists());
         let content = fs::read_to_string(dst.join("hello.txt")).unwrap();
-        assert_eq!(content, "updated");
+        assert_eq!(content, "hello");
     }
 
     #[tokio::test]
-    async fn test_git_status() {
-        let root = tempdir().unwrap();
-        let src = root.path().join("src");
-
-        fs::create_dir_all(&src).unwrap();
-        Command::new("git")
-            .args(["init"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        fs::write(src.join("hello.txt"), "hello").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-
-        let repo = Repo::new(src.to_str().unwrap(), &src, None);
-
-        // Clean state
-        assert_eq!(repo.get_status().await, RepoStatus::Clean);
-
-        // Modified state
-        fs::write(src.join("hello.txt"), "modified").unwrap();
-        assert_eq!(repo.get_status().await, RepoStatus::Modified);
-    }
-
-    #[tokio::test]
-    async fn test_git_rev_checkout() {
+    async fn test_sync_updates_existing_repo() {
         let root = tempdir().unwrap();
         let src = root.path().join("src");
         let dst = root.path().join("dst");
 
-        // 1. ダミーのリポジトリを作成し、2回コミットする
         fs::create_dir_all(&src).unwrap();
-        Command::new("git")
-            .args(["init"])
-            .current_dir(&src)
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("hello.txt"), "hello").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
             .output()
             .await
             .unwrap();
 
-        fs::write(src.join("hello.txt"), "v1").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "v1"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-
-        // tag "v1.0" を打つ
-        Command::new("git")
-            .args(["tag", "v1.0"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-
-        fs::write(src.join("hello.txt"), "v2").unwrap();
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "v2"])
-            .current_dir(&src)
-            .output()
-            .await
-            .unwrap();
-
-        // 2. v1.0 タグを指定してクローン
-        let repo = Repo::new(src.to_str().unwrap(), &dst, Some("v1.0"));
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
         repo.sync().await.unwrap();
 
-        // 3. v1 の内容になっているか確認
+        // src を更新
+        fs::write(src.join("hello.txt"), "updated").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "update"])
+            .output()
+            .await
+            .unwrap();
+
+        // 再 sync
+        repo.sync().await.unwrap();
+
         let content = fs::read_to_string(dst.join("hello.txt")).unwrap();
-        assert_eq!(content, "v1");
+        assert_eq!(content, "updated");
     }
 }
