@@ -218,32 +218,108 @@ impl Plugin {
     }
 }
 
+/// vars 内の相互参照を解決する最大反復回数。
+const MAX_VARS_RESOLVE_ITERATIONS: usize = 10;
+
+/// [vars] セクションを TOML 全体パースなしでテキストから抽出する。
+/// `{% if %}` 等の Tera 構文が含まれていても安全。
+/// `[vars.sub]` のようなサブテーブルも正しく含める。
+fn extract_vars_section(toml_str: &str) -> String {
+    let mut in_vars = false;
+    let mut vars_lines = vec!["[vars]".to_string()];
+    for line in toml_str.lines() {
+        let trimmed = line.trim();
+        // [vars] セクション開始を検出 (空白やコメント付きにも対応)
+        if !in_vars {
+            let stripped = trimmed
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .replace(' ', "");
+            if stripped == "[vars]" {
+                in_vars = true;
+                continue;
+            }
+            continue;
+        }
+        // [vars] or [vars.xxx] のサブテーブルは含める
+        // それ以外のセクション ([options], [[plugins]] 等) or Tera ブロックタグで終了
+        if trimmed.starts_with('[') {
+            let section_name = trimmed
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .replace(' ', "");
+            if section_name.starts_with("[vars.") || section_name.starts_with("[vars]") {
+                vars_lines.push(line.to_string());
+                continue;
+            }
+            break;
+        }
+        if trimmed.starts_with("{%") {
+            break;
+        }
+        vars_lines.push(line.to_string());
+    }
+    vars_lines.join("\n")
+}
+
 pub fn parse_config(toml_str: &str) -> Result<Config> {
-    // 1. Raw Parse
+    // 1. [vars] セクションをテキストベースで抽出 (TOML パーサー不要)
+    let vars_toml = extract_vars_section(toml_str);
+
+    // 2. vars を TOML パースして初期値を取得
     #[derive(Deserialize)]
-    struct Raw {
+    struct VarsOnly {
         vars: Option<serde_json::Value>,
     }
-    let raw: Raw = toml::from_str(toml_str)?;
+    let vars_parsed: VarsOnly = toml::from_str(&vars_toml)
+        .map_err(|e| anyhow::anyhow!("Failed to parse [vars] section: {}", e))?;
 
-    // 2. Tera Context の構築
-    let mut context = Context::new();
-    if let Some(v) = raw.vars.as_ref() {
-        context.insert("vars", v);
-    }
-    context.insert("is_windows", &cfg!(windows));
-
-    // 環境変数の追加
+    // 3. env + is_windows を先に用意 (vars 内でも参照可能にする)
     let mut env_map = std::collections::HashMap::new();
     for (key, value) in std::env::vars() {
         env_map.insert(key, value);
     }
+
+    // 4. vars 内の相互参照を反復レンダリングで解決
+    let mut vars_value = vars_parsed
+        .vars
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    let mut converged = false;
+    for _ in 0..MAX_VARS_RESOLVE_ITERATIONS {
+        let mut ctx = Context::new();
+        ctx.insert("vars", &vars_value);
+        ctx.insert("env", &env_map);
+        ctx.insert("is_windows", &cfg!(windows));
+        let vars_str = serde_json::to_string(&vars_value)?;
+        let rendered_str = Tera::one_off(&vars_str, &ctx, false)?;
+        let new_value: serde_json::Value = serde_json::from_str(&rendered_str)?;
+        if new_value == vars_value {
+            converged = true;
+            break;
+        }
+        vars_value = new_value;
+    }
+    if !converged {
+        eprintln!(
+            "Warning: [vars] cross-references did not converge after {} iterations",
+            MAX_VARS_RESOLVE_ITERATIONS
+        );
+    }
+
+    // 5. Tera Context の構築 (解決済み vars + env + is_windows)
+    let mut context = Context::new();
+    context.insert("vars", &vars_value);
+    context.insert("is_windows", &cfg!(windows));
     context.insert("env", &env_map);
 
-    // 3. Tera でレンダリング
+    // 6. 全体を Tera でレンダリング ({% if %} 等が動く)
     let rendered = Tera::one_off(toml_str, &context, false)?;
 
-    // 4. Final Parse
+    // 6. TOML パース
     let mut config: Config = toml::from_str(&rendered)?;
 
     // 5. lazy 自動解決: on_* トリガーがあれば lazy = true にする (明示 false は尊重)
@@ -853,5 +929,105 @@ merge = false
 
         // No explicit name → default_name
         assert_eq!(p1.display_name(), "plenary.nvim");
+    }
+
+    // ========================================================
+    // Tera テンプレート拡張テスト
+    // ========================================================
+
+    #[test]
+    fn test_tera_if_block_excludes_plugin() {
+        let toml = r#"
+[vars]
+use_blink = false
+
+[options]
+
+[[plugins]]
+url = "owner/always"
+
+{% if vars.use_blink %}
+[[plugins]]
+url = "owner/blink"
+{% endif %}
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins.len(), 1);
+        assert_eq!(config.plugins[0].url, "owner/always");
+    }
+
+    #[test]
+    fn test_tera_if_block_includes_plugin_when_true() {
+        let toml = r#"
+[vars]
+use_blink = true
+
+[options]
+
+[[plugins]]
+url = "owner/always"
+
+{% if vars.use_blink %}
+[[plugins]]
+url = "owner/blink"
+{% endif %}
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins.len(), 2);
+    }
+
+    #[test]
+    fn test_vars_reference_other_vars() {
+        let toml = r#"
+[vars]
+base = "/tmp"
+full = "{{ vars.base }}/plugins"
+
+[options]
+
+[[plugins]]
+url = "owner/repo"
+dst = "{{ vars.full }}/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins[0].dst, Some("/tmp/plugins/repo".to_string()));
+    }
+
+    #[test]
+    fn test_vars_forward_reference() {
+        let toml = r#"
+[vars]
+full = "{{ vars.base }}/plugins"
+base = "/tmp"
+
+[options]
+
+[[plugins]]
+url = "owner/repo"
+dst = "{{ vars.full }}/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins[0].dst, Some("/tmp/plugins/repo".to_string()));
+    }
+
+    #[test]
+    fn test_tera_is_windows_in_if_block() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/always"
+
+{% if is_windows %}
+[[plugins]]
+url = "owner/win-only"
+{% endif %}
+"#;
+        let config = parse_config(toml).unwrap();
+        if cfg!(windows) {
+            assert_eq!(config.plugins.len(), 2);
+        } else {
+            assert_eq!(config.plugins.len(), 1);
+        }
     }
 }
