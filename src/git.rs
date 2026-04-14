@@ -48,8 +48,23 @@ impl<'a> Repo<'a> {
     }
 }
 
+/// owner/repo 形式のショートハンドを GitHub URL に変換。
+/// ローカルパス (./  ../  ~/  絶対パス等) はそのまま返す。
 fn resolve_url(url: &str) -> String {
-    if !url.contains("://") && !url.contains('@') && !url.contains(":\\") && !url.starts_with('/') {
+    // 明らかに URL やパスの場合はそのまま
+    if url.contains("://")
+        || url.contains('@')
+        || url.starts_with('/')
+        || url.starts_with('~')
+        || url.starts_with('.')
+        || url.starts_with('\\')
+        || (url.len() >= 2 && url.as_bytes()[1] == b':')
+    // C:\ 等
+    {
+        return url.to_string();
+    }
+    // owner/repo 形式: exactly one slash, no special chars
+    if url.matches('/').count() == 1 && !url.contains(' ') {
         format!("https://github.com/{}", url)
     } else {
         url.to_string()
@@ -204,13 +219,20 @@ fn gix_reset_to_remote(dst: &Path) -> Result<()> {
         }
     };
 
-    // ローカル branch を更新
+    // ローカル branch を更新 (detached HEAD の場合は HEAD 直接更新)
     if let Some(head_name) = repo.head_name()? {
         repo.reference(
             head_name.as_ref(),
             target_id,
             gix::refs::transaction::PreviousValue::Any,
             BString::from("rvpm: fast-forward"),
+        )?;
+    } else {
+        repo.reference(
+            "HEAD",
+            target_id,
+            gix::refs::transaction::PreviousValue::Any,
+            BString::from("rvpm: fast-forward detached"),
         )?;
     }
 
@@ -274,7 +296,7 @@ fn get_status_impl(dst: &Path, rev: Option<&str>) -> RepoStatus {
     match repo.is_dirty() {
         Ok(true) => return RepoStatus::Modified,
         Ok(false) => {}
-        Err(_) => return RepoStatus::Clean, // フォールバック
+        Err(e) => return RepoStatus::Error(format!("status check failed: {}", e)),
     }
 
     // rev が指定されている場合、ローカルに存在するか確認
