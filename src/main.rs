@@ -805,6 +805,24 @@ async fn run_list(no_tui: bool) -> Result<()> {
     drop(tx);
     let mut bg_done = false;
 
+    /// メッセージを表示して任意のキー入力を待つ。
+    fn wait_for_keypress(message: &str) -> Result<()> {
+        use std::io::Write;
+        print!("{}", message);
+        std::io::stdout().flush()?;
+        crossterm::terminal::enable_raw_mode()?;
+        loop {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()?
+                && key.kind == crossterm::event::KeyEventKind::Press
+            {
+                break;
+            }
+        }
+        crossterm::terminal::disable_raw_mode()?;
+        println!();
+        Ok(())
+    }
+
     // アクション後に config とステータスを再読み込みしてTUIを復帰するヘルパー
     async fn reload_state(
         config_path: &Path,
@@ -961,7 +979,9 @@ async fn run_list(no_tui: bool) -> Result<()> {
                     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                     terminal.show_cursor()?;
                     let _ = run_sync(false).await;
+                    wait_for_keypress("\nPress any key to return to list...")?;
                     let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                    icons = crate::tui::Icons::from_style(c.options.icons);
                     config = c;
                     tui_state = s;
                 }
@@ -971,6 +991,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                         terminal.show_cursor()?;
                         let _ = run_update(Some(url)).await;
+                        wait_for_keypress("\nPress any key to return to list...")?;
                         let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
                         icons = crate::tui::Icons::from_style(c.options.icons);
                         config = c;
@@ -982,7 +1003,9 @@ async fn run_list(no_tui: bool) -> Result<()> {
                     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                     terminal.show_cursor()?;
                     let _ = run_update(None).await;
+                    wait_for_keypress("\nPress any key to return to list...")?;
                     let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                    icons = crate::tui::Icons::from_style(c.options.icons);
                     config = c;
                     tui_state = s;
                 }
