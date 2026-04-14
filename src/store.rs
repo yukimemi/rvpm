@@ -50,10 +50,11 @@ impl GitHubRepo {
     }
 }
 
-/// キャッシュディレクトリ。
+/// キャッシュディレクトリ。rvpm の他の cache と同じ ~/.cache/rvpm/ 配下に置く。
 fn store_cache_dir() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from(".cache"))
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".cache")
         .join("rvpm")
         .join("store")
 }
@@ -101,23 +102,27 @@ pub fn search_plugins(query: &str) -> Result<Vec<GitHubRepo>> {
         return Ok(repos);
     }
 
-    // GitHub API 検索
+    // GitHub API 検索 — reqwest の query() で安全にエンコード
     let search_query = if query.is_empty() {
         "topic:neovim-plugin".to_string()
     } else {
         format!("topic:neovim-plugin {}", query)
     };
 
-    let url = format!(
-        "https://api.github.com/search/repositories?q={}&sort=stars&order=desc&per_page=100",
-        urlencoding(&search_query)
-    );
-
     let client = reqwest::blocking::Client::builder()
         .user_agent("rvpm")
         .build()?;
 
-    let resp: SearchResponse = client.get(&url).send()?.json()?;
+    let resp: SearchResponse = client
+        .get("https://api.github.com/search/repositories")
+        .query(&[
+            ("q", search_query.as_str()),
+            ("sort", "stars"),
+            ("order", "desc"),
+            ("per_page", "100"),
+        ])
+        .send()?
+        .json()?;
 
     // キャッシュに保存
     if let Some(parent) = cache_path.parent() {
@@ -169,11 +174,6 @@ pub fn fetch_readme(repo: &GitHubRepo) -> Result<String> {
     std::fs::write(&cache_path, &text).ok();
 
     Ok(text)
-}
-
-/// 簡易 URL エンコード。
-fn urlencoding(s: &str) -> String {
-    s.replace(' ', "+").replace(':', "%3A").replace('#', "%23")
 }
 
 /// 検索キャッシュをクリア (強制リフレッシュ用)。
@@ -234,13 +234,5 @@ mod tests {
         assert!(name.starts_with("search_"));
         assert!(!name.contains(' '));
         assert!(!name.contains(':'));
-    }
-
-    #[test]
-    fn test_urlencoding() {
-        assert_eq!(
-            urlencoding("topic:neovim-plugin foo"),
-            "topic%3Aneovim-plugin+foo"
-        );
     }
 }

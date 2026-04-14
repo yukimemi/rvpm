@@ -75,7 +75,11 @@ impl StoreTuiState {
                 .plugins
                 .sort_by(|a, b| b.stargazers_count.cmp(&a.stargazers_count)),
             SortMode::Updated => self.plugins.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)),
-            SortMode::Name => self.plugins.sort_by(|a, b| a.full_name.cmp(&b.full_name)),
+            SortMode::Name => self.plugins.sort_by(|a, b| {
+                a.plugin_name()
+                    .cmp(b.plugin_name())
+                    .then_with(|| a.full_name.cmp(&b.full_name))
+            }),
         }
     }
 

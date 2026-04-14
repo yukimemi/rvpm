@@ -2650,6 +2650,7 @@ async fn run_store() -> Result<()> {
                             Ok(Ok(repos)) => {
                                 state.message = Some(format!("{} results", repos.len()));
                                 state.set_plugins(repos);
+                                last_selected = None; // 新しい結果で README 再取得を強制
                             }
                             Ok(Err(e)) => {
                                 state.message = Some(format!("Error: {}", e));
@@ -2711,6 +2712,7 @@ async fn run_store() -> Result<()> {
                         Ok(Ok(repos)) => {
                             state.message = Some(format!("{} plugins", repos.len()));
                             state.set_plugins(repos);
+                            last_selected = None; // 新しい結果で README 再取得を強制
                         }
                         _ => {
                             state.message = Some("Refresh failed".to_string());
