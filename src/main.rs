@@ -431,7 +431,18 @@ async fn run_sync(prune: bool) -> Result<()> {
     for plugin in config.plugins.iter() {
         // dev プラグインは sync をスキップ (ローカル開発中のためリセットしない)
         if plugin.dev {
-            let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
+            let dst_path = resolve_plugin_dst(plugin, &base_dir);
+            if !dst_path.exists() {
+                let _ = tx.try_send((
+                    plugin.url.clone(),
+                    PluginStatus::Failed(format!(
+                        "dev directory not found: {}",
+                        dst_path.display()
+                    )),
+                ));
+            } else {
+                let _ = tx.try_send((plugin.url.clone(), PluginStatus::Finished));
+            }
             continue;
         }
         let plugin = plugin.clone();
