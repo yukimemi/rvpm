@@ -88,6 +88,10 @@ pub struct Plugin {
     pub build: Option<String>,
     pub rev: Option<String>,
     pub cond: Option<String>,
+    /// dev = true のプラグインは sync/update をスキップする。
+    /// ローカル開発中のプラグインに使う。
+    #[serde(default)]
+    pub dev: bool,
 }
 
 /// TOML 上で `on_cmd = "Foo"` (単一文字列) または `on_cmd = ["Foo", "Bar"]` (配列)
@@ -1029,5 +1033,31 @@ url = "owner/win-only"
         } else {
             assert_eq!(config.plugins.len(), 1);
         }
+    }
+
+    #[test]
+    fn test_parse_config_dev_defaults_to_false() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(!config.plugins[0].dev);
+    }
+
+    #[test]
+    fn test_parse_config_dev_option() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+dev = true
+dst = "~/src/owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(config.plugins[0].dev);
     }
 }
