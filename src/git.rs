@@ -97,14 +97,17 @@ fn clone_impl(url: &str, dst: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
+    // shallow clone (depth 1) で高速化
     let (mut _checkout, _outcome) = gix::prepare_clone(url, dst)?
+        .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(
+            std::num::NonZeroU32::new(1).unwrap(),
+        ))
         .fetch_then_checkout(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
         .map_err(|e| {
             let _ = std::fs::remove_dir_all(dst);
             anyhow::anyhow!("git clone failed: {}", e)
         })?;
 
-    // checkout working tree
     _checkout
         .main_worktree(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)
         .map_err(|e| {
@@ -121,23 +124,16 @@ fn fetch_impl(dst: &Path) -> Result<()> {
         .find_default_remote(gix::remote::Direction::Fetch)
         .ok_or_else(|| anyhow::anyhow!("no remote configured"))??;
 
-    // fetch_ref mapping を設定して local ref も更新させる
-    let outcome = remote
+    remote
         .connect(gix::remote::Direction::Fetch)?
         .prepare_fetch(gix::progress::Discard, Default::default())?
-        .with_write_packed_refs_only(false)
+        .with_shallow(gix::remote::fetch::Shallow::Deepen(1))
         .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)?;
-
-    // ローカルの tracking ref を更新
-    // gix の fetch は refspec に従って ref を更新するが、
-    // shallow clone では tracking ref の更新が不完全な場合がある。
-    // FETCH_HEAD は必ず更新されるのでそれを使う。
-    let _ = outcome;
 
     Ok(())
 }
 
-/// gix で特定の rev に checkout。
+/// gix で特定の rev に checkout。branch の場合は branch を維持。
 fn gix_checkout(dst: &Path, rev: &str) -> Result<()> {
     let repo = gix::open(dst)?;
     let target = repo
@@ -145,15 +141,29 @@ fn gix_checkout(dst: &Path, rev: &str) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("rev '{}' not found", rev))?;
     let commit_id = target.detach();
 
-    // HEAD を更新
-    repo.reference(
-        "HEAD",
-        commit_id,
-        gix::refs::transaction::PreviousValue::Any,
-        BString::from(format!("rvpm: checkout {}", rev)),
-    )?;
+    // rev が local branch を指す場合は symbolic HEAD を設定
+    let branch_ref = format!("refs/heads/{}", rev);
+    if repo.find_reference(&branch_ref).is_ok() {
+        // HEAD を symbolic ref にする (直接ファイル書き込み)
+        let head_path = repo.git_dir().join("HEAD");
+        std::fs::write(&head_path, format!("ref: {}\n", branch_ref))?;
+        // branch ref を更新
+        repo.reference(
+            branch_ref.as_str(),
+            commit_id,
+            gix::refs::transaction::PreviousValue::Any,
+            BString::from(format!("rvpm: checkout branch {}", rev)),
+        )?;
+    } else {
+        // tag/hash の場合は detached HEAD
+        repo.reference(
+            "HEAD",
+            commit_id,
+            gix::refs::transaction::PreviousValue::Any,
+            BString::from(format!("rvpm: checkout {}", rev)),
+        )?;
+    }
 
-    // worktree を更新
     gix_checkout_head(&repo)?;
     Ok(())
 }
@@ -162,18 +172,21 @@ fn gix_checkout(dst: &Path, rev: &str) -> Result<()> {
 fn gix_reset_to_remote(dst: &Path) -> Result<()> {
     let repo = gix::open(dst)?;
 
-    // remote tracking branch からターゲット commit を取得。
-    // gix の fetch は FETCH_HEAD を作らないが、origin/* を更新する。
-    // HEAD が指す branch の upstream (origin/master 等) を探す。
+    // remote 名を動的に取得 (通常は "origin")
+    let remote_name = repo
+        .find_default_remote(gix::remote::Direction::Fetch)
+        .and_then(|r| r.ok())
+        .and_then(|r| r.name().map(|n| n.as_bstr().to_string()))
+        .unwrap_or_else(|| "origin".to_string());
+
+    // remote tracking branch からターゲット commit を取得
     let target_id = {
         let head_name = repo.head_name()?;
         let tracking_ref = if let Some(ref name) = head_name {
-            // refs/heads/master → refs/remotes/origin/master
-            let short = name
-                .as_bstr()
-                .to_string()
-                .replace("refs/heads/", "refs/remotes/origin/");
-            repo.find_reference(&short).ok()
+            // refs/heads/master → refs/remotes/<remote>/master
+            let branch = name.as_bstr().to_string();
+            let tracking = branch.replace("refs/heads/", &format!("refs/remotes/{}/", remote_name));
+            repo.find_reference(&tracking).ok()
         } else {
             None
         };
@@ -181,8 +194,9 @@ fn gix_reset_to_remote(dst: &Path) -> Result<()> {
         if let Some(mut tr) = tracking_ref {
             tr.peel_to_id_in_place()?.detach()
         } else {
-            // フォールバック: origin/HEAD
-            if let Ok(mut r) = repo.find_reference("refs/remotes/origin/HEAD") {
+            // フォールバック: <remote>/HEAD
+            let remote_head = format!("refs/remotes/{}/HEAD", remote_name);
+            if let Ok(mut r) = repo.find_reference(&remote_head) {
                 r.peel_to_id_in_place()?.detach()
             } else {
                 return Ok(());
