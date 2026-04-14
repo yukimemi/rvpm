@@ -50,12 +50,17 @@ impl GitHubRepo {
     }
 }
 
-/// キャッシュディレクトリ。rvpm の他の cache と同じ ~/.cache/rvpm/ 配下に置く。
+/// キャッシュディレクトリ。~/.cache/rvpm/<appname>/store/ に配置。
+/// <appname> は $RVPM_APPNAME → $NVIM_APPNAME → "nvim" の順で決定。
 fn store_cache_dir() -> PathBuf {
+    let appname = std::env::var("RVPM_APPNAME")
+        .or_else(|_| std::env::var("NVIM_APPNAME"))
+        .unwrap_or_else(|_| "nvim".to_string());
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".cache")
         .join("rvpm")
+        .join(appname)
         .join("store")
 }
 
