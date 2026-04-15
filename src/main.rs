@@ -515,7 +515,7 @@ async fn run_sync(prune: bool) -> Result<()> {
     let config_root = resolve_config_root(config.options.config_root.as_deref());
     for plugin in config.plugins.iter().filter(|p| p.dev) {
         let dst_path = resolve_plugin_dst(plugin, &cache_root);
-        let plugin_config_dir = config_root.join(plugin.canonical_path());
+        let plugin_config_dir = resolve_plugin_config_dir(&config_root, plugin);
         if plugin.merge && !plugin.lazy {
             let _ = merge_plugin(&dst_path, &merged_dir);
         }
@@ -551,7 +551,7 @@ async fn run_sync(prune: bool) -> Result<()> {
                         let _ = merge_plugin(&dst_path, &merged_dir);
                     }
                     let config_root = resolve_config_root(config.options.config_root.as_deref());
-                    let plugin_config_dir = config_root.join(plugin.canonical_path());
+                    let plugin_config_dir = resolve_plugin_config_dir(&config_root, &plugin);
                     let scripts = build_plugin_scripts(&plugin, &dst_path, &plugin_config_dir);
                     plugin_scripts.push(scripts);
                 }
@@ -633,7 +633,7 @@ async fn run_sync(prune: bool) -> Result<()> {
         &merged_dir,
         &plugin_scripts,
         &loader_path,
-        &build_loader_options(),
+        &build_loader_options(&config_root),
     )?;
     println!("Done! -> {}", loader_path.display());
 
@@ -702,7 +702,7 @@ async fn run_generate() -> Result<()> {
     let config_root = resolve_config_root(config.options.config_root.as_deref());
     for plugin in &config.plugins {
         let dst_path = resolve_plugin_dst(plugin, &cache_root);
-        let plugin_config_dir = config_root.join(plugin.canonical_path());
+        let plugin_config_dir = resolve_plugin_config_dir(&config_root, plugin);
         plugin_scripts.push(build_plugin_scripts(plugin, &dst_path, &plugin_config_dir));
     }
 
@@ -727,7 +727,7 @@ async fn run_generate() -> Result<()> {
         &merged_dir,
         &plugin_scripts,
         &loader_path,
-        &build_loader_options(),
+        &build_loader_options(&config_root),
     )?;
     println!("Done! -> {}", loader_path.display());
     print_init_lua_hint_if_missing(&config);
@@ -1335,12 +1335,18 @@ async fn run_edit(
     flag_after: bool,
     flag_global: bool,
 ) -> Result<bool> {
-    // --global: グローバル hooks (~/.config/rvpm/before.lua / after.lua)
+    // --global: グローバル hooks (<config_root>/before.lua / after.lua)
     if flag_global {
-        let config_dir = rvpm_config_path()
-            .parent()
-            .expect("config path has parent")
-            .to_path_buf();
+        // config_root を決めるため config.toml を先読み (存在しなければデフォルト)。
+        let config_path = rvpm_config_path();
+        let config_root = if config_path.exists() {
+            let toml_content = std::fs::read_to_string(&config_path)?;
+            let config = parse_config(&toml_content)?;
+            resolve_config_root(config.options.config_root.as_deref())
+        } else {
+            resolve_config_root(None)
+        };
+        let config_dir = config_root.clone();
         std::fs::create_dir_all(&config_dir)?;
 
         let file_name = if flag_before {
@@ -1379,10 +1385,8 @@ async fn run_edit(
     // 対話モード: plugin 選択肢に [ Global hooks ] sentinel を追加
     // 各プラグインの init/before/after.lua 存在をサークルアイコンで表示
     let config_root = resolve_config_root(config.options.config_root.as_deref());
-    let config_dir = rvpm_config_path()
-        .parent()
-        .expect("config path has parent")
-        .to_path_buf();
+    // global hook のアイコン表示用 (実使用は run_edit --global 経由)
+    let config_dir = config_root.clone();
 
     let plugin = if let Some(q) = query {
         config
@@ -1411,7 +1415,7 @@ async fn run_edit(
         let mut urls: Vec<String> = vec![String::new()]; // sentinel placeholder
 
         for p in config.plugins.iter() {
-            let plugin_config_dir = config_root.join(p.canonical_path());
+            let plugin_config_dir = resolve_plugin_config_dir(&config_root, p);
             let indicators = hook_indicators(&plugin_config_dir);
             let has_any = plugin_config_dir.join("init.lua").exists()
                 || plugin_config_dir.join("before.lua").exists()
@@ -1445,7 +1449,7 @@ async fn run_edit(
 
     println!("\n>> Editing configuration for: {}", plugin.url);
 
-    let plugin_config_dir = config_root.join(plugin.canonical_path());
+    let plugin_config_dir = resolve_plugin_config_dir(&config_root, plugin);
 
     // --init / --before / --after フラグがあれば対話式をスキップ
     let file_name = if flag_init {
@@ -2068,15 +2072,11 @@ fn update_plugin_config(
     Ok(())
 }
 
-/// config.toml の隣にある before.lua / after.lua を検出して LoaderOptions を構築する。
-fn build_loader_options() -> crate::loader::LoaderOptions {
-    let config_dir = rvpm_config_path()
-        .parent()
-        .expect("config path has parent")
-        .to_path_buf();
+/// `<config_root>/before.lua` / `after.lua` を検出して LoaderOptions を構築する。
+fn build_loader_options(config_root: &Path) -> crate::loader::LoaderOptions {
     crate::loader::LoaderOptions {
-        global_before: find_lua(&config_dir, "before.lua"),
-        global_after: find_lua(&config_dir, "after.lua"),
+        global_before: find_lua(config_root, "before.lua"),
+        global_after: find_lua(config_root, "after.lua"),
     }
 }
 
@@ -2112,14 +2112,20 @@ fn resolve_concurrency(config_value: Option<usize>) -> usize {
 //
 // ユーザー側で別のパスにしたければ TOML の options で上書きできる:
 //   - options.cache_root  → 全キャッシュの root (plugins/ と store/ が配下)
-//   - options.config_root → per-plugin init/before/after.lua の置き場
+//   - options.config_root → 全コンフィグの root (config.toml / 全 global hook /
+//                           plugins/ が配下)
+//
+// config_root と cache_root は対称構造:
+//   <config_root>/config.toml
+//   <config_root>/before.lua / after.lua             (global hooks)
+//   <config_root>/plugins/<host>/<owner>/<repo>/     (per-plugin hooks)
+//   <cache_root>/plugins/{repos,merged,loader.lua}   (plugins 本体)
+//   <cache_root>/store/                              (store キャッシュ)
 //
 // $RVPM_APPNAME > $NVIM_APPNAME > "nvim" の順で appname が決まり、
 // デフォルトパスの末尾に appname が入る:
-//   ~/.config/rvpm/<appname>/config.toml
-//   ~/.config/rvpm/<appname>/plugins/
-//   ~/.cache/rvpm/<appname>/plugins/{repos,merged,loader.lua}
-//   ~/.cache/rvpm/<appname>/store/
+//   ~/.config/rvpm/<appname>/
+//   ~/.cache/rvpm/<appname>/
 // ====================================================================
 
 /// `~/.config/rvpm/config.toml` (固定)
@@ -2200,20 +2206,23 @@ fn resolve_cache_root(config_cache_root: Option<&str>) -> PathBuf {
     }
 }
 
-/// per-plugin の init/before/after.lua を置く root を決定する。
+/// config.toml / global hook / per-plugin hook の親 root を決定する。
 /// `options.config_root` が設定されていればそれを tilde 展開して返す。
-/// 未設定なら `~/.config/rvpm/<appname>/plugins` (デフォルト)。
+/// 未設定なら `~/.config/rvpm/<appname>` (デフォルト)。
 fn resolve_config_root(config_root: Option<&str>) -> PathBuf {
     match config_root {
         Some(raw) => expand_tilde(raw),
         None => {
             let home = dirs::home_dir().expect("Could not find home directory");
-            home.join(".config")
-                .join("rvpm")
-                .join(appname())
-                .join("plugins")
+            home.join(".config").join("rvpm").join(appname())
         }
     }
+}
+
+/// 指定プラグインの per-plugin hook ディレクトリ (`<config_root>/plugins/<host>/<owner>/<repo>`)
+/// を返す。
+fn resolve_plugin_config_dir(config_root: &Path, plugin: &config::Plugin) -> PathBuf {
+    config_root.join("plugins").join(plugin.canonical_path())
 }
 
 /// loader.lua のパス。常に `<cache_root>/plugins/loader.lua`。
@@ -2959,25 +2968,46 @@ mod tests {
     fn test_resolve_config_root_uses_default_when_none() {
         let home = dirs::home_dir().unwrap();
         let result = resolve_config_root(None);
-        // appname は env に依存するので親だけ確認
+        // デフォルトは `~/.config/rvpm/<appname>` (plugins は含まない)
         assert!(result.starts_with(home.join(".config").join("rvpm")));
-        assert!(result.ends_with("plugins"));
+        assert!(!result.ends_with("plugins"));
+        // 末尾は appname (env 依存)
+        assert_eq!(
+            result.parent(),
+            Some(home.join(".config").join("rvpm").as_path())
+        );
     }
 
     #[test]
     fn test_resolve_config_root_expands_tilde() {
         let home = dirs::home_dir().unwrap();
         assert_eq!(
-            resolve_config_root(Some("~/dotfiles/nvim/plugins")),
-            home.join("dotfiles").join("nvim").join("plugins")
+            resolve_config_root(Some("~/dotfiles/nvim")),
+            home.join("dotfiles").join("nvim")
         );
     }
 
     #[test]
     fn test_resolve_config_root_accepts_absolute_path() {
         assert_eq!(
-            resolve_config_root(Some("/etc/rvpm/plugins")),
-            PathBuf::from("/etc/rvpm/plugins")
+            resolve_config_root(Some("/etc/rvpm")),
+            PathBuf::from("/etc/rvpm")
+        );
+    }
+
+    #[test]
+    fn test_resolve_plugin_config_dir_joins_plugins_subdir() {
+        let plugin = config::Plugin {
+            url: "folke/snacks.nvim".to_string(),
+            ..Default::default()
+        };
+        let root = PathBuf::from("/tmp/rvpm");
+        let got = resolve_plugin_config_dir(&root, &plugin);
+        assert_eq!(
+            got,
+            PathBuf::from("/tmp/rvpm")
+                .join("plugins")
+                .join(plugin.canonical_path())
         );
     }
 

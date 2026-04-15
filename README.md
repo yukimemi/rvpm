@@ -19,92 +19,85 @@ sources everything without any runtime glob cost.
 - **Pre-compiled loader** — `rvpm generate` walks plugin directories at CLI
   time and bakes the file list into `loader.lua`; Neovim just sources a
   fixed list of `dofile()` / `source` calls
-- **Merge optimization** — `merge = true` plugins share a single rtp entry
 - **Full lazy-loading** — `on_cmd`, `on_ft`, `on_map`, `on_event`, `on_path`,
   `on_source`, auto-detected `ColorSchemePre`, and `depends`-aware loading
+- **Merge optimization** — `merge = true` plugins share a single rtp entry
+- **Plugin discovery TUI** — `rvpm store` browses the GitHub `neovim-plugin`
+  topic with live README preview and one-keystroke install
 - **Resilient** — cyclic dependencies, missing plugins, and config errors
   produce warnings, not crashes
 
-## Features
+<details>
+<summary><b>More features</b></summary>
 
 - **Fast startup** — 9-phase loader model with `vim.go.loadplugins = false`
   and pre-globbed `plugin/` / `ftdetect/` / `after/plugin/` file lists
-- **Global hooks** — `~/.config/rvpm/before.lua` (phase 3, before all plugin
-  `init.lua`) and `~/.config/rvpm/after.lua` (phase 9, after all lazy trigger
-  registrations); auto-detected at generate time, no config required
-- **Merge optimization** — `merge = true` plugins share a single
-  `vim.opt.rtp:append(...)` entry via junction/symlink
-- **Full lazy triggers** — `on_cmd` / `on_ft` / `on_map` / `on_event` /
-  `on_path` / `on_source` (plugin chain), with `User Xxx` pattern shorthand,
-  bang/range/count/complete aware commands, keymaps with mode + desc, and
-  `<Ignore>`-prefixed replay for safety
+- **Global hooks** — `before.lua` / `after.lua` alongside `config.toml`
+  are auto-detected at generate time; no config entry needed
+- **Lazy trigger fidelity** — `User Xxx` pattern shorthand, bang/range/count/
+  complete-aware commands, keymaps with mode + desc, and `<Ignore>`-prefixed
+  replay for safety; operator-pending mode preserves `v:operator` /
+  `v:count1` / `v:register`
 - **Colorscheme auto-detection** — lazy plugins whose clone contains a
   `colors/*.vim` or `colors/*.lua` file automatically gain a `ColorSchemePre`
-  autocmd handler so `:colorscheme <name>` loads the plugin on demand; no
-  extra config required
-- **Dependency ordering** — topological sort on `depends`, resilient to cycles
-  and missing references
+  autocmd handler so `:colorscheme <name>` loads the plugin on demand
+- **Dependency ordering** — topological sort on `depends`, resilient to
+  cycles and missing references; eager→lazy deps are auto-promoted
 - **Windows first-class** — hardcoded `~/.config` / `~/.cache` layout for
   dotfiles portability, junction instead of symlink to avoid permission
   issues
-- **Interactive TUI** (`rvpm list`) — plugin list with action keys for
-  sync/update/generate/remove/edit/set
+- **Interactive TUI** — `rvpm list` with sync / update / generate / remove /
+  edit / set action keys
 - **CLI-driven set** — `rvpm set foo --on-event '["BufReadPre","User Started"]'`
-  or full JSON object form for on_map with mode/desc
+  or full JSON object form for `on_map` with mode/desc
 - **TOML direct edit escape hatch** — `rvpm config` / `rvpm set` sub-menu to
   jump to the plugin's block in `$EDITOR`
 - **Init.lua integration** — `rvpm init --write` wires the generated loader
   into `~/.config/$NVIM_APPNAME/init.lua` (creates the file if missing)
 
+</details>
+
 ## Installation
 
-### From a pre-built binary
-
-Download the latest archive from the
-[Releases](https://github.com/yukimemi/rvpm/releases) page for your platform:
-
-- **Linux (x86_64)**: `rvpm-x86_64-unknown-linux-gnu.tar.gz`
-- **macOS (Intel)**: `rvpm-x86_64-apple-darwin.tar.gz`
-- **macOS (Apple Silicon)**: `rvpm-aarch64-apple-darwin.tar.gz`
-- **Windows (x86_64)**: `rvpm-x86_64-pc-windows-msvc.zip`
-
-Extract the binary into any directory on your `PATH`.
-
-### From crates.io
-
 ```sh
+# From crates.io
 cargo install rvpm
-```
 
-### From source (latest main)
-
-```sh
+# Or from source (latest main)
 cargo install --git https://github.com/yukimemi/rvpm
 ```
+
+Pre-built binaries are also available on the
+[Releases](https://github.com/yukimemi/rvpm/releases) page for Linux
+(x86_64), macOS (Intel / Apple Silicon), and Windows (x86_64). Extract the
+binary into any directory on your `PATH`.
 
 ## Quick start
 
 ```sh
 # 1. One-time setup (creates both config.toml and init.lua)
 rvpm init --write
-# → ~/.config/rvpm/config.toml  (plugin configuration, auto-created)
-# → ~/.config/nvim/init.lua     (loader wiring, auto-created or appended)
-# Respects $NVIM_APPNAME for custom Neovim configs.
+# → ~/.config/rvpm/<appname>/config.toml  (plugin configuration)
+# → ~/.config/nvim/init.lua               (loader wiring)
+# <appname> = $RVPM_APPNAME → $NVIM_APPNAME → "nvim"
 
 # 2. Add plugins
 rvpm add folke/snacks.nvim
 rvpm add nvim-telescope/telescope.nvim
 
-# 3. Open config.toml to tweak settings (lazy, triggers, etc.)
-rvpm config
+# 3. Browse the GitHub "neovim-plugin" topic and install from the TUI
+rvpm store
 
-# 4. Explore the TUI
+# 4. Manage installed plugins interactively
 rvpm list
+
+# 5. Open config.toml to tweak settings (lazy, triggers, etc.)
+rvpm config
 ```
 
 ## Configuration
 
-`~/.config/rvpm/config.toml`:
+`~/.config/rvpm/<appname>/config.toml`:
 
 ```toml
 [vars]
@@ -112,14 +105,14 @@ rvpm list
 nvim_rc = "~/.config/nvim/rc"
 
 [options]
-# Per-plugin init/before/after.lua directory
-# Default: ~/.config/rvpm/plugins
-config_root = "{{ vars.nvim_rc }}/plugins"
-# Parallel git operations limit (default: 8)
-concurrency = 10
-# Optional: move all rvpm cache (plugins + store) under a custom root.
+# Root of all rvpm config (config.toml, global hooks, plugins/ subdir)
+# Default: ~/.config/rvpm/<appname>
+# config_root = "{{ vars.nvim_rc }}"
+# Root of all rvpm cache (clones, merged rtp, loader.lua, store cache)
 # Default: ~/.cache/rvpm/<appname>
 # cache_root = "~/dotfiles/nvim/rvpm"
+# Parallel git operations limit (default: 8)
+concurrency = 10
 
 [[plugins]]
 name  = "snacks"
@@ -127,17 +120,17 @@ url   = "folke/snacks.nvim"
 # No on_* triggers → eager (loaded at startup)
 
 [[plugins]]
-name    = "telescope"
-url     = "nvim-telescope/telescope.nvim"
-depends = ["snacks.nvim"]
+name      = "telescope"
+url       = "nvim-telescope/telescope.nvim"
+depends   = ["snacks.nvim"]
 # on_cmd is set → lazy is auto-inferred as true
-on_cmd  = ["Telescope"]
+on_cmd    = ["Telescope"]
 on_source = ["snacks.nvim"]
 
 [[plugins]]
-url     = "neovim/nvim-lspconfig"
+url      = "neovim/nvim-lspconfig"
 # on_ft / on_event → auto lazy
-on_ft   = ["rust", "toml", "lua"]
+on_ft    = ["rust", "toml", "lua"]
 on_event = ["BufReadPre", "User LazyVimStarted"]
 
 [[plugins]]
@@ -152,37 +145,61 @@ on_map = [
 
 ### `[options]` reference
 
-rvpm reads `config.toml` from `~/.config/rvpm/<appname>/config.toml`, where `<appname>` is determined by:
+rvpm reads `config.toml` from `~/.config/rvpm/<appname>/config.toml`, where
+`<appname>` resolves to:
 
 1. `$RVPM_APPNAME` if set, else
 2. `$NVIM_APPNAME` if set, else
 3. `"nvim"` (default)
 
-This mirrors Neovim's `$NVIM_APPNAME` convention, so running `NVIM_APPNAME=nvim-test nvim` pairs with `NVIM_APPNAME=nvim-test rvpm sync` for fully isolated test configs.
+This mirrors Neovim's `$NVIM_APPNAME` convention, so running
+`NVIM_APPNAME=nvim-test nvim` pairs with `NVIM_APPNAME=nvim-test rvpm sync`
+for fully isolated test configs.
 
-> **💡 Recommendation: leave `config_root` and `cache_root` unset.** The defaults
-> are already `<appname>`-aware. Setting a literal path (e.g.
-> `cache_root = "~/dotfiles/rvpm"`) **breaks appname isolation** — every
-> `$NVIM_APPNAME` variant will share the same cache.
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `config_root` | `string` | `~/.config/rvpm/<appname>` | Root for all rvpm config (`config.toml`, global `before.lua` / `after.lua`, and `plugins/<host>/<owner>/<repo>/` per-plugin hooks). Supports `~` and Tera templates. **Recommended: leave unset** |
+| `cache_root` | `string` | `~/.cache/rvpm/<appname>` | Root for all rvpm cache (`plugins/repos/`, `plugins/merged/`, `plugins/loader.lua`, `store/`). **Recommended: leave unset** |
+| `concurrency` | `integer` | `8` | Max number of parallel git operations during `sync` / `update`. Kept moderate to avoid GitHub rate limits |
+
+> **Symmetric layout.** `config_root` and `cache_root` are structurally
+> parallel — each owns a `plugins/` subdirectory at the same depth:
 >
-> If you need a custom root *and* appname isolation, use Tera templates:
+> ```text
+> ~/.config/rvpm/<appname>/                ← config_root
+>     ├── config.toml
+>     ├── before.lua       (global, phase 3)
+>     ├── after.lua        (global, phase 9)
+>     └── plugins/<host>/<owner>/<repo>/   (per-plugin init/before/after.lua)
+>
+> ~/.cache/rvpm/<appname>/                 ← cache_root
+>     ├── plugins/
+>     │   ├── repos/<host>/<owner>/<repo>/  (clones)
+>     │   ├── merged/                       (linked rtp for merge=true)
+>     │   └── loader.lua                    (generated)
+>     └── store/                            (`rvpm store` cache)
+> ```
+>
+> **💡 Leave `config_root` and `cache_root` unset** — the defaults are already
+> `<appname>`-aware. Setting a literal path (e.g. `cache_root = "~/dotfiles/rvpm"`)
+> **breaks appname isolation**: every `$NVIM_APPNAME` variant will share the same
+> cache. If you need a custom root *and* appname isolation, use a Tera template:
 > ```toml
 > cache_root = "~/dotfiles/rvpm/{{ env.NVIM_APPNAME }}"
 > ```
 > Prefer `~/` over `{{ env.HOME }}` — `~` is portable (Windows too), while
-> `HOME` is not set on Windows.
-
-| Key | Type | Default | Description |
-|---|---|---|---|
-| `config_root` | `string` | `~/.config/rvpm/<appname>/plugins` | Root directory for per-plugin `init.lua` / `before.lua` / `after.lua`. Supports `~` and Tera templates. **Recommended: leave unset** to preserve appname isolation |
-| `concurrency` | `integer` | `8` | Max number of parallel git operations during `sync` / `update`. Kept moderate to avoid GitHub rate limits |
-| `cache_root` | `string` | `~/.cache/rvpm/<appname>` | Root for all rvpm cache (`plugins/repos/`, `plugins/merged/`, `plugins/loader.lua`, `store/`). **Recommended: leave unset** to preserve appname isolation |
+> `$HOME` is not set on Windows.
 
 ### Tera templates
 
-The entire `config.toml` is processed by [Tera](https://keats.github.io/tera/) before TOML parsing. You can use `{{ vars.xxx }}`, `{{ env.HOME }}`, `{{ is_windows }}`, `{% if %}` blocks, and more.
+The entire `config.toml` is processed by [Tera](https://keats.github.io/tera/)
+before TOML parsing. You can use `{{ vars.xxx }}`, `{{ env.HOME }}`,
+`{{ is_windows }}`, `{% if %}` blocks, and more.
 
-#### Available context
+<details>
+<summary><b>Available context & examples</b></summary>
+
+#### Context
 
 | Variable | Type | Description |
 |---|---|---|
@@ -213,7 +230,6 @@ Use `{% if %}` to completely exclude plugins from `loader.lua` at generate time:
 [vars]
 use_blink = true
 use_cmp = false
-use_telescope = false
 use_snacks = true
 
 [options]
@@ -231,13 +247,6 @@ url = "hrsh7th/nvim-cmp"
 on_event = "InsertEnter"
 {% endif %}
 
-# ── Fuzzy finder: pick one ───────────────────────
-{% if vars.use_telescope %}
-[[plugins]]
-url = "nvim-telescope/telescope.nvim"
-on_cmd = "Telescope"
-{% endif %}
-
 {% if vars.use_snacks %}
 [[plugins]]
 url = "folke/snacks.nvim"
@@ -247,8 +256,6 @@ url = "folke/snacks.nvim"
 #### Platform-specific plugins
 
 ```toml
-[options]
-
 {% if is_windows %}
 [[plugins]]
 url = "thinca/vim-winenv"
@@ -264,7 +271,12 @@ cond = "{{ is_windows }}"  # runtime cond: included in loader but guarded
 > the plugin in `loader.lua` but wraps it in `if <expr> then ... end` for
 > runtime evaluation.
 
+</details>
+
 ### `[[plugins]]` reference
+
+<details>
+<summary><b>All plugin fields</b></summary>
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -279,9 +291,15 @@ cond = "{{ is_windows }}"  # runtime cond: included in loader but guarded
 | `build` | `string` | none | Shell command to run after clone (not yet implemented) |
 | `dev` | `bool` | `false` | When `true`, `sync` and `update` skip this plugin entirely (no clone/fetch/reset). Use for local development — the plugin stays on the rtp but rvpm won't touch the working tree |
 
+</details>
+
 ### Lazy trigger fields
 
-All trigger fields are optional. When multiple triggers are specified on the same plugin they are OR-ed: **any one** firing loads the plugin.
+All trigger fields are optional. When multiple triggers are specified on the
+same plugin they are OR-ed: **any one** firing loads the plugin.
+
+<details>
+<summary><b>All lazy triggers &amp; on_map formats</b></summary>
 
 | Key | Type | Accepts | Description |
 |---|---|---|---|
@@ -315,11 +333,16 @@ on_map = [
 | `mode` | `string \| string[]` | `"n"` | Vim mode(s) for the keymap (`"n"`, `"x"`, `"i"`, etc.) |
 | `desc` | `string` | none | Description shown in `:map` / which-key **before** the plugin is loaded |
 
+</details>
+
 ### Colorscheme lazy loading
 
 Lazy plugins that ship a `colors/` directory (containing `.vim` or `.lua`
 files) are automatically given a `ColorSchemePre` autocmd handler at generate
 time. No extra config field is required.
+
+<details>
+<summary><b>How it works &amp; example</b></summary>
 
 When Neovim processes `:colorscheme <name>`, it fires `ColorSchemePre` before
 switching the scheme. rvpm intercepts this event, loads the matching lazy
@@ -328,12 +351,10 @@ plugin, and then lets the colorscheme apply normally.
 Eager plugins are unaffected: their `colors/` directory is already on the
 runtimepath and Neovim finds it without any handler.
 
-**Recommendation:** if you have multiple colorscheme plugins installed, mark all
-but your active one as `lazy = true`. rvpm will register the `ColorSchemePre`
-handler for each one so they remain switchable on demand without adding startup
-cost.
-
-**Example:**
+**Recommendation:** if you have multiple colorscheme plugins installed, mark
+all but your active one as `lazy = true`. rvpm will register the
+`ColorSchemePre` handler for each one so they remain switchable on demand
+without adding startup cost.
 
 ```toml
 [[plugins]]
@@ -346,7 +367,7 @@ name = "catppuccin"
 lazy = true  # explicit — ColorSchemePre is auto-registered, not an on_* field
 ```
 
-> Note: colorscheme plugins don't have `on_*` triggers, so `lazy = true` must be
+> Colorscheme plugins don't have `on_*` triggers, so `lazy = true` must be
 > written explicitly. rvpm handles the rest (scanning `colors/` and registering
 > `ColorSchemePre`).
 
@@ -354,32 +375,44 @@ With this config, running `:colorscheme tokyonight` or `:colorscheme catppuccin`
 in Neovim will load the respective plugin just in time, with zero startup
 overhead when neither is the initial colorscheme.
 
-### Global hooks
+</details>
 
-Place Lua files directly under `~/.config/rvpm/` and rvpm picks them up
-automatically at generate time — no configuration entry needed:
+### Hooks
+
+Global hooks (`before.lua` / `after.lua` directly under `{config_root}/`)
+and per-plugin hooks (under `{config_root}/plugins/<host>/<owner>/<repo>/`)
+are auto-discovered — no config entries needed.
+
+<details>
+<summary><b>Hook file reference</b></summary>
+
+#### Global hooks
+
+Place Lua files directly under `{config_root}/` (default:
+`~/.config/rvpm/<appname>/`) and rvpm picks them up automatically at
+generate time:
 
 | File | Phase | When it runs |
 |---|---|---|
-| `~/.config/rvpm/before.lua` | 3 | After `load_lazy` helper is defined, before any per-plugin `init.lua` |
-| `~/.config/rvpm/after.lua` | 9 | After all lazy trigger registrations |
+| `before.lua` | 3 | After `load_lazy` helper is defined, before any per-plugin `init.lua` |
+| `after.lua`  | 9 | After all lazy trigger registrations |
 
-These are useful for any setup that must happen before plugins are initialised
-(e.g. setting `vim.g.*` globals) or for post-load orchestration that doesn't
+Useful for setup that must happen before plugins are initialised
+(e.g. setting `vim.g.*` globals) or post-load orchestration that doesn't
 belong to any single plugin.
 
-### Per-plugin hooks
+#### Per-plugin hooks
 
-Drop Lua files under `{config_root}/<host>/<owner>/<repo>/` and rvpm will
-include them in the generated loader:
+Drop Lua files under `{config_root}/plugins/<host>/<owner>/<repo>/` and
+rvpm will include them in the generated loader:
 
 | File | When it runs |
 |---|---|
-| `init.lua` | Before `runtimepath` is touched (pre-rtp phase) |
+| `init.lua`   | Before `runtimepath` is touched (pre-rtp phase) |
 | `before.lua` | Right after the plugin's rtp is added, before `plugin/*` is sourced |
-| `after.lua` | After `plugin/*` is sourced (safe to call plugin APIs) |
+| `after.lua`  | After `plugin/*` is sourced (safe to call plugin APIs) |
 
-Example: `~/.config/rvpm/plugins/github.com/nvim-telescope/telescope.nvim/after.lua`
+Example: `~/.config/rvpm/<appname>/plugins/github.com/nvim-telescope/telescope.nvim/after.lua`
 
 ```lua
 require("telescope").setup({
@@ -387,6 +420,8 @@ require("telescope").setup({
 })
 vim.keymap.set("n", "<leader>ff", "<cmd>Telescope find_files<cr>")
 ```
+
+</details>
 
 ## Commands
 
@@ -397,15 +432,46 @@ vim.keymap.set("n", "<leader>ff", "<cmd>Telescope find_files<cr>")
 | `rvpm add <repo>` | Add a plugin and sync |
 | `rvpm update [query]` | `git pull` installed plugins |
 | `rvpm remove [query]` | Remove a plugin from `config.toml` and delete its directory |
-| `rvpm edit [query] [--init\|--before\|--after] [--global]` | Edit per-plugin Lua config in `$EDITOR`. Flag skips the file picker. `--global` (or selecting `[ Global hooks ]` in the interactive picker) edits `~/.config/rvpm/before.lua` / `after.lua` |
+| `rvpm edit [query] [--init\|--before\|--after] [--global]` | Edit per-plugin Lua config in `$EDITOR`. Flag skips the file picker. `--global` edits the global `before.lua` / `after.lua` |
 | `rvpm set [query] [flags]` | Interactively or non-interactively tweak plugin options (lazy, merge, on\_\*, rev) |
 | `rvpm config` | Open `config.toml` in `$EDITOR` |
 | `rvpm init [--write]` | Print (or write) the `dofile(...)` snippet to wire `loader.lua` into `init.lua` |
 | `rvpm list [--no-tui]` | TUI plugin list with action keys; `--no-tui` for pipe-friendly plain text |
+| `rvpm store` | TUI plugin browser over the GitHub `neovim-plugin` topic; Enter to install, `o` to open in browser |
 
 Run `rvpm <command> --help` for flag-level details.
 
-### Usage examples
+### `rvpm store` — plugin discovery TUI
+
+Browse, search, and install plugins from GitHub without leaving the terminal.
+`rvpm store` queries the GitHub Search API for repositories tagged with the
+`neovim-plugin` topic, displays them in a split-pane TUI, and fetches each
+plugin's `README.md` on demand for preview.
+
+**Key bindings:**
+
+| Key | Action |
+|---|---|
+| `j` / `k` / `↓` / `↑` | Move selection |
+| `Ctrl-d` / `Ctrl-u` | Scroll README pane |
+| `/` | Search (`topic:neovim-plugin <query>` against GitHub Search API) |
+| `Enter` | Add the selected plugin to `config.toml` and sync |
+| `o` | Open the plugin's GitHub page in your default browser |
+| `s` | Cycle sort mode (`stars` / `updated` / `name`) |
+| `R` | Clear the search cache and re-fetch |
+| `q` / `Esc` | Quit |
+
+**Caching:** search results are cached for 24 hours under
+`{cache_root}/store/`; READMEs are cached for 7 days. Press `R` in the TUI
+to force-refresh the search cache (README cache expires on its own TTL).
+
+**Network requirement:** store needs network access to reach
+`api.github.com` and `raw.githubusercontent.com`. Other commands
+(`sync` / `update` / `generate` / `list` / ...) work offline once plugins
+are cloned.
+
+<details>
+<summary><b>More command examples</b></summary>
 
 ```sh
 # ── Sync & generate ──────────────────────────────────────
@@ -447,8 +513,8 @@ rvpm edit lspconfig --before
 rvpm edit
 
 # Jump straight to the global before/after hooks
-rvpm edit --global --before    # ~/.config/rvpm/before.lua (phase 3)
-rvpm edit --global --after     # ~/.config/rvpm/after.lua  (phase 9)
+rvpm edit --global --before    # phase 3
+rvpm edit --global --after     # phase 9
 
 # ── Set plugin options ───────────────────────────────────
 
@@ -464,9 +530,6 @@ rvpm set which-key --on-map '{"lhs":"<leader>?","mode":["n","x"],"desc":"Which K
 
 # Pin to a specific tag
 rvpm set telescope --rev "0.1.8"
-
-# Drop into $EDITOR for manual TOML editing from the set menu
-# → pick a plugin → select [ Open config.toml in $EDITOR ]
 
 # ── Config / init ────────────────────────────────────────
 
@@ -489,15 +552,18 @@ rvpm list --no-tui
 rvpm list --no-tui | grep Missing
 ```
 
+</details>
+
 ## Design highlights
 
-### Loader model
+<details>
+<summary><b>Loader model (9 phases)</b></summary>
 
-```
+```text
 Phase 1: vim.go.loadplugins = false         -- disable Neovim's auto-source
 Phase 2: load_lazy helper                   -- runtime loader for lazy plugins
-Phase 3: global before.lua                  -- ~/.config/rvpm/before.lua (if present)
-Phase 4: all init.lua (dependency order)   -- pre-rtp phase
+Phase 3: global before.lua                  -- ~/.config/rvpm/<appname>/before.lua
+Phase 4: all init.lua (dependency order)    -- pre-rtp phase
 Phase 5: rtp:append(merged_dir)             -- once, if any merge=true plugins
 Phase 6: eager plugins in dependency order:
              if not merge: rtp:append(plugin_path)
@@ -507,25 +573,31 @@ Phase 6: eager plugins in dependency order:
              source after/plugin/**
              after.lua
              User autocmd "rvpm_loaded_<name>"
-Phase 7: lazy trigger registrations (on_cmd / on_ft / on_map / etc)
+Phase 7: lazy trigger registrations         -- on_cmd / on_ft / on_map / etc
 Phase 8: ColorSchemePre handlers            -- auto-registered for lazy plugins
                                               --   whose colors/ dir was detected at
                                               --   generate time (no config needed)
-Phase 9: global after.lua                  -- ~/.config/rvpm/after.lua (if present)
+Phase 9: global after.lua                   -- ~/.config/rvpm/<appname>/after.lua
 ```
 
 Because the file lists are baked in at `rvpm generate` time, the loader does
 zero runtime glob work. `rvpm sync` (or `rvpm generate`) is what pays the I/O
 cost; Neovim startup just sources a fixed list of files.
 
-### Merge optimization
+</details>
+
+<details>
+<summary><b>Merge optimization</b></summary>
 
 When `merge = true`, the plugin directory is linked (junction on Windows,
-symlink elsewhere) into `{cache_root}/plugins/merged/`. All `merge = true` plugins share
-a single `vim.opt.rtp:append(merged_dir)` call, keeping `&runtimepath` lean
-even with many eager plugins.
+symlink elsewhere) into `{cache_root}/plugins/merged/`. All `merge = true`
+plugins share a single `vim.opt.rtp:append(merged_dir)` call, keeping
+`&runtimepath` lean even with many eager plugins.
 
-### Dependency ordering
+</details>
+
+<details>
+<summary><b>Dependency ordering &amp; lazy→eager promotion</b></summary>
 
 `depends` fields are topologically sorted. Cycles and missing dependencies
 emit warnings instead of hard-failing (resilience principle). The sort
@@ -533,35 +605,47 @@ ordering is preserved all the way through to the generated `loader.lua`, so
 `before.lua` / `after.lua` hooks run in the correct order relative to
 dependencies.
 
-Beyond ordering, `depends` now also affects **loading**:
+Beyond ordering, `depends` also affects **loading**:
 
-- **Eager plugin → lazy dep**: a pre-pass during `generate_loader` detects this
-  situation and auto-promotes the lazy dependency to eager, printing a note to
-  stderr. This ensures the dep is unconditionally available before the eager
-  plugin sources its files.
+- **Eager plugin → lazy dep**: a pre-pass during `generate_loader` detects
+  this situation and auto-promotes the lazy dependency to eager, printing a
+  note to stderr. This ensures the dep is unconditionally available before
+  the eager plugin sources its files.
 - **Lazy plugin → lazy dep**: the dependency is loaded on-demand. When the
   trigger fires, the generated callback calls `load_lazy` for each lazy dep
-  (in dependency order) before loading the plugin itself. A double-load guard
-  (`if loaded["<name>"] then return end`) prevents redundant sourcing when
-  multiple plugins share the same dep and their triggers fire close together.
+  (in dependency order) before loading the plugin itself. A double-load
+  guard (`if loaded["<name>"] then return end`) prevents redundant sourcing
+  when multiple plugins share the same dep and their triggers fire close
+  together.
+
+</details>
 
 ## Directory layout (defaults)
 
-| Path | Purpose |
-|---|---|
-| `~/.config/rvpm/config.toml` | Main configuration (fixed location) |
-| `~/.config/rvpm/before.lua` | Global before hook — runs at phase 3, before all plugin `init.lua` |
-| `~/.config/rvpm/after.lua` | Global after hook — runs at phase 9, after all lazy trigger registrations |
-| `~/.config/rvpm/plugins/<host>/<owner>/<repo>/` | Per-plugin `init/before/after.lua` (`options.config_root` to override) |
-| `~/.cache/rvpm/repos/<host>/<owner>/<repo>/` | Plugin clones |
-| `~/.cache/rvpm/merged/` | Linked root for `merge = true` plugins |
-| `~/.cache/rvpm/loader.lua` | Generated loader |
+```text
+~/.config/rvpm/<appname>/                    ← config_root
+├── config.toml                              ← main configuration
+├── before.lua                               ← global before hook (phase 3, auto-detected)
+├── after.lua                                ← global after hook (phase 9, auto-detected)
+└── plugins/
+    └── <host>/<owner>/<repo>/
+        ├── init.lua                         ← per-plugin hooks
+        ├── before.lua
+        └── after.lua
 
-Windows uses the same `.config` / `.cache` paths under `%USERPROFILE%` — no
-`%APPDATA%` — to keep dotfiles portable between Linux/macOS/WSL/Windows.
+~/.cache/rvpm/<appname>/                     ← cache_root
+├── plugins/
+│   ├── repos/<host>/<owner>/<repo>/         ← plugin clones
+│   ├── merged/                              ← linked root for merge=true plugins
+│   └── loader.lua                           ← generated loader
+└── store/                                   ← `rvpm store` cache (search + README)
+```
 
-`options.cache_root = "..."` moves all of `~/.cache/rvpm/<appname>/` to a
-different root (useful for dotfiles-managed caches).
+Windows uses the same `.config` / `.cache` paths under `%USERPROFILE%` —
+no `%APPDATA%` — to keep dotfiles portable between Linux / macOS / WSL /
+Windows.
+
+`<appname>` resolves to `$RVPM_APPNAME` → `$NVIM_APPNAME` → `"nvim"`.
 
 ## Development
 
@@ -571,9 +655,6 @@ cargo build
 
 # Run the full test suite
 cargo test
-
-# Run a single test
-cargo test test_loader_phase_order_init_rtp_before
 
 # Format check / lint
 cargo fmt --all -- --check
