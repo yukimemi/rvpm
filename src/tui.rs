@@ -562,7 +562,8 @@ impl TuiState {
                 let rev = p.rev.as_deref().unwrap_or("-");
 
                 // I B A 列: init/before/after.lua の存在チェック
-                let pcdir = config_root.join(p.canonical_path());
+                // per-plugin hook は <config_root>/plugins/<host>/<owner>/<repo>/
+                let pcdir = config_root.join("plugins").join(p.canonical_path());
                 let hook_i = if pcdir.join("init.lua").exists() {
                     icons.hook_on
                 } else {
