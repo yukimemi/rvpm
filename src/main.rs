@@ -2253,10 +2253,12 @@ fn nvim_init_lua_path() -> PathBuf {
 /// tilde 形式を保持することで dotfiles のマシン間共有を妨げない。
 fn loader_init_snippet(config: &config::Config) -> String {
     let raw_path = if let Some(base) = &config.options.cache_root {
-        format!("{}/plugins/loader.lua", base.trim_end_matches('/'))
+        format!("{}/plugins/loader.lua", base.trim_end_matches(['/', '\\']))
     } else {
         format!("~/.cache/rvpm/{}/plugins/loader.lua", appname())
     };
+    // Windows のバックスラッシュを Lua 文字列リテラルで安全な '/' に正規化。
+    let raw_path = raw_path.replace('\\', "/");
     format!("dofile(vim.fn.expand(\"{}\"))", raw_path)
 }
 
@@ -3027,6 +3029,43 @@ mod tests {
         assert_eq!(
             loader_init_snippet(&cfg),
             "dofile(vim.fn.expand(\"~/dotfiles/rvpm/plugins/loader.lua\"))"
+        );
+    }
+
+    #[test]
+    fn test_loader_init_snippet_normalizes_windows_path_separators() {
+        let cfg = config::Config {
+            vars: None,
+            options: config::Options {
+                cache_root: Some(r"C:\Users\test\.cache\rvpm\nvim".to_string()),
+                ..Default::default()
+            },
+            plugins: vec![],
+        };
+        let snippet = loader_init_snippet(&cfg);
+        assert!(
+            !snippet.contains('\\'),
+            "snippet contains backslash: {snippet}"
+        );
+        assert_eq!(
+            snippet,
+            "dofile(vim.fn.expand(\"C:/Users/test/.cache/rvpm/nvim/plugins/loader.lua\"))"
+        );
+    }
+
+    #[test]
+    fn test_loader_init_snippet_trims_trailing_backslash() {
+        let cfg = config::Config {
+            vars: None,
+            options: config::Options {
+                cache_root: Some(r"C:\cache\rvpm\".to_string()),
+                ..Default::default()
+            },
+            plugins: vec![],
+        };
+        assert_eq!(
+            loader_init_snippet(&cfg),
+            "dofile(vim.fn.expand(\"C:/cache/rvpm/plugins/loader.lua\"))"
         );
     }
 
