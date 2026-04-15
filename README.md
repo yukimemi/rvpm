@@ -113,6 +113,9 @@ nvim_rc = "~/.config/nvim/rc"
 # cache_root = "~/dotfiles/nvim/rvpm"
 # Parallel git operations limit (default: 8)
 concurrency = 10
+# Auto-sync config.toml / global hooks / per-plugin hooks back to chezmoi
+# source state after mutations (default: false). Requires `chezmoi` in PATH.
+# chezmoi = true
 
 [[plugins]]
 name  = "snacks"
@@ -161,6 +164,7 @@ for fully isolated test configs.
 | `config_root` | `string` | `~/.config/rvpm/<appname>` | Root for all rvpm config (`config.toml`, global `before.lua` / `after.lua`, and `plugins/<host>/<owner>/<repo>/` per-plugin hooks). Supports `~` and Tera templates. **Recommended: leave unset** |
 | `cache_root` | `string` | `~/.cache/rvpm/<appname>` | Root for all rvpm cache (`plugins/repos/`, `plugins/merged/`, `plugins/loader.lua`, `store/`). **Recommended: leave unset** |
 | `concurrency` | `integer` | `8` | Max number of parallel git operations during `sync` / `update`. Kept moderate to avoid GitHub rate limits |
+| `chezmoi` | `boolean` | `false` | When `true`, rvpm automatically runs `chezmoi re-add` (or `chezmoi add` for new files whose ancestor is already managed) after mutating `config.toml`, global hooks, or per-plugin hooks. Warns if `chezmoi` is not in `PATH`. See [chezmoi integration](#chezmoi-integration) |
 
 > **Symmetric layout.** `config_root` and `cache_root` are structurally
 > parallel — each owns a `plugins/` subdirectory at the same depth:
@@ -189,6 +193,35 @@ for fully isolated test configs.
 > ```
 > Prefer `~/` over `{{ env.HOME }}` — `~` is portable (Windows too), while
 > `$HOME` is not set on Windows.
+
+### chezmoi integration
+
+If you manage your dotfiles with [chezmoi](https://www.chezmoi.io/) and want
+rvpm's config changes to land in the chezmoi source state automatically, set:
+
+```toml
+[options]
+chezmoi = true
+```
+
+With this enabled, after every mutation (`rvpm add` / `set` / `remove` /
+`edit` / `config`, plus TUI actions `e` / `s` / `d` that edit hooks,
+plugin options, or remove plugins), rvpm:
+
+- runs `chezmoi re-add <path>` when the target file is already chezmoi-managed, and
+- runs `chezmoi add <path>` when the file is newly created by rvpm and its
+  nearest existing ancestor directory is chezmoi-managed (typical for newly
+  created per-plugin hook files under `plugins/<host>/<owner>/<repo>/`).
+
+Files whose ancestors are not managed by chezmoi are left alone, so this is
+safe to enable even if only part of your rvpm tree lives in chezmoi.
+
+If `options.chezmoi = true` but the `chezmoi` binary isn't in `PATH`, rvpm
+prints a warning on every mutation (since you explicitly opted in — the
+loud feedback nudges you to either install chezmoi or set
+`chezmoi = false`). The primary rvpm operation still succeeds.
+
+Detection uses `chezmoi source-path <path>` (exit 0 = managed).
 
 ### Tera templates
 
