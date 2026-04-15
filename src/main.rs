@@ -332,11 +332,11 @@ fn warn_and_disable_merge_if_cond(plugin: &mut crate::config::Plugin) -> Option<
 }
 
 /// プラグインの clone 先パスを解決する。
-fn resolve_plugin_dst(plugin: &crate::config::Plugin, base_dir: &Path) -> PathBuf {
+fn resolve_plugin_dst(plugin: &crate::config::Plugin, cache_root: &Path) -> PathBuf {
     if let Some(d) = &plugin.dst {
         PathBuf::from(d)
     } else {
-        base_dir.join("repos").join(plugin.canonical_path())
+        resolve_repos_dir(cache_root).join(plugin.canonical_path())
     }
 }
 
@@ -346,7 +346,7 @@ async fn execute_build_command(
     plugin: &crate::config::Plugin,
     dst_path: &Path,
     config: &crate::config::Config,
-    base_dir: &Path,
+    cache_root: &Path,
 ) -> Option<String> {
     let build_cmd = plugin.build.as_ref()?;
     let mut rtp_dirs = vec![dst_path.to_path_buf()];
@@ -361,7 +361,7 @@ async fn execute_build_command(
             .iter()
             .find(|p| p.display_name() == dep || p.url == dep)
         {
-            let dep_path = resolve_plugin_dst(dep_plugin, base_dir);
+            let dep_path = resolve_plugin_dst(dep_plugin, cache_root);
             rtp_dirs.push(dep_path);
             if let Some(deeper) = &dep_plugin.depends {
                 stack.extend(deeper.clone());
@@ -411,8 +411,8 @@ async fn run_sync(prune: bool) -> Result<()> {
     }
     let config = Arc::new(config_data);
 
-    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
-    let merged_dir = base_dir.join("merged");
+    let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
+    let merged_dir = resolve_merged_dir(&cache_root);
 
     if merged_dir.exists() {
         let _ = std::fs::remove_dir_all(&merged_dir);
@@ -438,7 +438,7 @@ async fn run_sync(prune: bool) -> Result<()> {
     for plugin in config.plugins.iter() {
         // dev プラグインは sync をスキップ (ローカル開発中のためリセットしない)
         if plugin.dev {
-            let dst_path = resolve_plugin_dst(plugin, &base_dir);
+            let dst_path = resolve_plugin_dst(plugin, &cache_root);
             if !dst_path.exists() {
                 let _ = tx.try_send((
                     plugin.url.clone(),
@@ -453,14 +453,14 @@ async fn run_sync(prune: bool) -> Result<()> {
             continue;
         }
         let plugin = plugin.clone();
-        let base_dir = base_dir.clone();
+        let cache_root = cache_root.clone();
         let tx = tx.clone();
         let sem = semaphore.clone();
 
         let config_for_build = config.clone();
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
-            let dst_path = resolve_plugin_dst(&plugin, &base_dir);
+            let dst_path = resolve_plugin_dst(&plugin, &cache_root);
             let _ = tx
                 .send((
                     plugin.url.clone(),
@@ -483,7 +483,7 @@ async fn run_sync(prune: bool) -> Result<()> {
                             .await;
                     }
                     let build_warn =
-                        execute_build_command(&plugin, &dst_path, &config_for_build, &base_dir)
+                        execute_build_command(&plugin, &dst_path, &config_for_build, &cache_root)
                             .await;
                     if let Some(ref err) = build_warn {
                         let _ = tx
@@ -514,7 +514,7 @@ async fn run_sync(prune: bool) -> Result<()> {
     let mut plugin_scripts = Vec::new();
     let config_root = resolve_config_root(config.options.config_root.as_deref());
     for plugin in config.plugins.iter().filter(|p| p.dev) {
-        let dst_path = resolve_plugin_dst(plugin, &base_dir);
+        let dst_path = resolve_plugin_dst(plugin, &cache_root);
         let plugin_config_dir = config_root.join(plugin.canonical_path());
         if plugin.merge && !plugin.lazy {
             let _ = merge_plugin(&dst_path, &merged_dir);
@@ -628,7 +628,7 @@ async fn run_sync(prune: bool) -> Result<()> {
     }
 
     println!("Generating loader.lua...");
-    let loader_path = resolve_loader_path(config.options.loader_path.as_deref(), &base_dir);
+    let loader_path = resolve_loader_path(&cache_root);
     write_loader_to_path(
         &merged_dir,
         &plugin_scripts,
@@ -638,7 +638,7 @@ async fn run_sync(prune: bool) -> Result<()> {
     println!("Done! -> {}", loader_path.display());
 
     // 未使用 plugin ディレクトリの処理: --prune なら削除、それ以外なら警告表示
-    let repos_dir = base_dir.join("repos");
+    let repos_dir = resolve_repos_dir(&cache_root);
     if repos_dir.exists() {
         let unused = find_unused_repos(&config, &repos_dir).unwrap_or_default();
         if !unused.is_empty() {
@@ -694,18 +694,14 @@ async fn run_generate() -> Result<()> {
             eprintln!("Warning: {}", w);
         }
     }
-    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
-    let merged_dir = base_dir.join("merged");
-    let loader_path = resolve_loader_path(config.options.loader_path.as_deref(), &base_dir);
+    let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
+    let merged_dir = resolve_merged_dir(&cache_root);
+    let loader_path = resolve_loader_path(&cache_root);
 
     let mut plugin_scripts = Vec::new();
     let config_root = resolve_config_root(config.options.config_root.as_deref());
     for plugin in &config.plugins {
-        let dst_path = if let Some(d) = &plugin.dst {
-            PathBuf::from(d)
-        } else {
-            base_dir.join("repos").join(plugin.canonical_path())
-        };
+        let dst_path = resolve_plugin_dst(plugin, &cache_root);
         let plugin_config_dir = config_root.join(plugin.canonical_path());
         plugin_scripts.push(build_plugin_scripts(plugin, &dst_path, &plugin_config_dir));
     }
@@ -741,20 +737,16 @@ async fn run_generate() -> Result<()> {
 /// 全プラグインの git 状態を並列で調べ、url -> PluginStatus のマップを返す。
 async fn fetch_plugin_statuses(
     config: &config::Config,
-    base_dir: &Path,
+    cache_root: &Path,
 ) -> std::collections::HashMap<String, PluginStatus> {
     let (tx, mut rx) = mpsc::channel::<(String, PluginStatus)>(100);
     let mut set = JoinSet::new();
     for plugin in config.plugins.iter() {
         let plugin = plugin.clone();
-        let base_dir = base_dir.to_path_buf();
+        let cache_root = cache_root.to_path_buf();
         let tx = tx.clone();
         set.spawn(async move {
-            let dst_path = if let Some(d) = &plugin.dst {
-                PathBuf::from(d)
-            } else {
-                base_dir.join("repos").join(plugin.canonical_path())
-            };
+            let dst_path = resolve_plugin_dst(&plugin, &cache_root);
             let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
             let git_status = repo.get_status().await;
             let plugin_status = match git_status {
@@ -779,14 +771,14 @@ async fn run_list(no_tui: bool) -> Result<()> {
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)?;
     let mut config = parse_config(&toml_content)?;
-    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
+    let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
     let config_root = resolve_config_root(config.options.config_root.as_deref());
     let mut icons = crate::tui::Icons::from_style(config.options.icons);
 
     if no_tui {
         // 非対話モード: plain text 出力 (旧 status コマンド相当)
         println!("Checking plugin status...");
-        let statuses = fetch_plugin_statuses(&config, &base_dir).await;
+        let statuses = fetch_plugin_statuses(&config, &cache_root).await;
         let mut rows: Vec<(String, PluginStatus)> = statuses.into_iter().collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         for (url, status) in rows {
@@ -818,14 +810,10 @@ async fn run_list(no_tui: bool) -> Result<()> {
     let mut set = JoinSet::new();
     for plugin in config.plugins.iter() {
         let plugin = plugin.clone();
-        let base_dir = base_dir.clone();
+        let cache_root = cache_root.clone();
         let tx = tx.clone();
         set.spawn(async move {
-            let dst_path = if let Some(d) = &plugin.dst {
-                PathBuf::from(d)
-            } else {
-                base_dir.join("repos").join(plugin.canonical_path())
-            };
+            let dst_path = resolve_plugin_dst(&plugin, &cache_root);
             let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
             let git_status = repo.get_status().await;
             let plugin_status = match git_status {
@@ -865,12 +853,12 @@ async fn run_list(no_tui: bool) -> Result<()> {
     // アクション後に config とステータスを再読み込みしてTUIを復帰するヘルパー
     async fn reload_state(
         config_path: &Path,
-        base_dir: &Path,
+        cache_root: &Path,
         terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<(config::Config, TuiState)> {
         let toml_content = std::fs::read_to_string(config_path)?;
         let config = parse_config(&toml_content)?;
-        let statuses = fetch_plugin_statuses(&config, base_dir).await;
+        let statuses = fetch_plugin_statuses(&config, cache_root).await;
         let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
         let mut tui_state = TuiState::new(urls);
         for (url, status) in statuses {
@@ -980,7 +968,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         if run_edit(Some(url), false, false, false, false).await? {
                             let _ = run_sync(false).await;
                         }
-                        let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                        let (c, s) = reload_state(&config_path, &cache_root, &mut terminal).await?;
                         icons = crate::tui::Icons::from_style(c.options.icons);
                         config = c;
                         tui_state = s;
@@ -1007,7 +995,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         {
                             let _ = run_sync(false).await;
                         }
-                        let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                        let (c, s) = reload_state(&config_path, &cache_root, &mut terminal).await?;
                         icons = crate::tui::Icons::from_style(c.options.icons);
                         config = c;
                         tui_state = s;
@@ -1019,7 +1007,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                     terminal.show_cursor()?;
                     let _ = run_sync(false).await;
                     wait_for_keypress("\nPress any key to return to list...")?;
-                    let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                    let (c, s) = reload_state(&config_path, &cache_root, &mut terminal).await?;
                     icons = crate::tui::Icons::from_style(c.options.icons);
                     config = c;
                     tui_state = s;
@@ -1031,7 +1019,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         terminal.show_cursor()?;
                         let _ = run_update(Some(url)).await;
                         wait_for_keypress("\nPress any key to return to list...")?;
-                        let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                        let (c, s) = reload_state(&config_path, &cache_root, &mut terminal).await?;
                         icons = crate::tui::Icons::from_style(c.options.icons);
                         config = c;
                         tui_state = s;
@@ -1043,7 +1031,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                     terminal.show_cursor()?;
                     let _ = run_update(None).await;
                     wait_for_keypress("\nPress any key to return to list...")?;
-                    let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                    let (c, s) = reload_state(&config_path, &cache_root, &mut terminal).await?;
                     icons = crate::tui::Icons::from_style(c.options.icons);
                     config = c;
                     tui_state = s;
@@ -1054,7 +1042,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
                         terminal.show_cursor()?;
                         let _ = run_remove(Some(url)).await;
-                        let (c, s) = reload_state(&config_path, &base_dir, &mut terminal).await?;
+                        let (c, s) = reload_state(&config_path, &cache_root, &mut terminal).await?;
                         icons = crate::tui::Icons::from_style(c.options.icons);
                         config = c;
                         tui_state = s;
@@ -1078,7 +1066,7 @@ async fn run_update(query: Option<String>) -> Result<()> {
     let config_data = parse_config(&toml_content)?;
     let icons = crate::tui::Icons::from_style(config_data.options.icons);
     let config = Arc::new(config_data);
-    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
+    let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
 
     let target_plugins: Vec<_> = config
         .plugins
@@ -1122,17 +1110,13 @@ async fn run_update(query: Option<String>) -> Result<()> {
 
     for plugin in target_plugins.iter() {
         let plugin = plugin.clone();
-        let base_dir = base_dir.clone();
+        let cache_root = cache_root.clone();
         let tx = tx.clone();
         let sem = semaphore.clone();
 
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
-            let dst_path = if let Some(d) = &plugin.dst {
-                PathBuf::from(d)
-            } else {
-                base_dir.join("repos").join(plugin.canonical_path())
-            };
+            let dst_path = resolve_plugin_dst(&plugin, &cache_root);
             let _ = tx
                 .send((
                     plugin.url.clone(),
@@ -1255,14 +1239,14 @@ async fn run_add(
 
     // 追加したプラグインだけ clone + merge し、loader.lua を再生成する
     let config_data = parse_config(&toml_content)?;
-    let base_dir = resolve_base_dir(config_data.options.base_dir.as_deref());
-    let merged_dir = base_dir.join("merged");
+    let cache_root = resolve_cache_root(config_data.options.cache_root.as_deref());
+    let merged_dir = resolve_merged_dir(&cache_root);
 
     if let Some(mut plugin) = config_data.plugins.iter().find(|p| p.url == repo).cloned() {
         if let Some(w) = warn_and_disable_merge_if_cond(&mut plugin) {
             eprintln!("Warning: {}", w);
         }
-        let dst_path = resolve_plugin_dst(&plugin, &base_dir);
+        let dst_path = resolve_plugin_dst(&plugin, &cache_root);
 
         println!("Syncing {}...", plugin.display_name());
         let git_repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
@@ -1270,7 +1254,7 @@ async fn run_add(
             eprintln!("Warning: failed to sync '{}': {}", plugin.display_name(), e);
         } else {
             if let Some(err) =
-                execute_build_command(&plugin, &dst_path, &config_data, &base_dir).await
+                execute_build_command(&plugin, &dst_path, &config_data, &cache_root).await
             {
                 eprintln!("Warning: {}: {}", plugin.display_name(), err);
             }
@@ -1853,17 +1837,13 @@ async fn run_remove(query: Option<String>) -> Result<()> {
     std::fs::write(&config_path, doc.to_string())?;
     println!("Removed '{}' from config.", selected_url);
 
-    let base_dir = resolve_base_dir(config.options.base_dir.as_deref());
+    let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
     let plugin = config
         .plugins
         .iter()
         .find(|p| p.url == selected_url)
         .unwrap();
-    let dst_path = if let Some(d) = &plugin.dst {
-        PathBuf::from(d)
-    } else {
-        base_dir.join("repos").join(plugin.canonical_path())
-    };
+    let dst_path = resolve_plugin_dst(plugin, &cache_root);
 
     if dst_path.exists() {
         std::fs::remove_dir_all(&dst_path)?;
@@ -2088,13 +2068,6 @@ fn update_plugin_config(
     Ok(())
 }
 
-fn resolve_loader_path(config_loader_path: Option<&str>, base_dir: &Path) -> PathBuf {
-    match config_loader_path {
-        Some(raw) => expand_tilde(raw),
-        None => base_dir.join("loader.lua"),
-    }
-}
-
 /// config.toml の隣にある before.lua / after.lua を検出して LoaderOptions を構築する。
 fn build_loader_options() -> crate::loader::LoaderOptions {
     let config_dir = rvpm_config_path()
@@ -2138,18 +2111,47 @@ fn resolve_concurrency(config_value: Option<usize>) -> usize {
 //   - 単一の mental model で済む
 //
 // ユーザー側で別のパスにしたければ TOML の options で上書きできる:
-//   - options.base_dir    → 全データの root (repos / merged / loader まとめて)
-//   - options.loader_path → loader.lua のみ細かく上書き (base_dir より優先)
+//   - options.cache_root  → 全キャッシュの root (plugins/ と store/ が配下)
 //   - options.config_root → per-plugin init/before/after.lua の置き場
 //
-// config.toml 自体の場所は固定 (~/.config/rvpm/config.toml)。これを読まないと
-// options が取れないので chicken-and-egg を避けるため動かさない。
+// $RVPM_APPNAME > $NVIM_APPNAME > "nvim" の順で appname が決まり、
+// デフォルトパスの末尾に appname が入る:
+//   ~/.config/rvpm/<appname>/config.toml
+//   ~/.config/rvpm/<appname>/plugins/
+//   ~/.cache/rvpm/<appname>/plugins/{repos,merged,loader.lua}
+//   ~/.cache/rvpm/<appname>/store/
 // ====================================================================
 
 /// `~/.config/rvpm/config.toml` (固定)
+/// $RVPM_APPNAME → $NVIM_APPNAME → "nvim" の優先順で appname を決定。
+/// 無効な値 (空文字、パス区切り含む、"." / "..") は "nvim" に fallback。
+pub(crate) fn appname() -> String {
+    let raw = std::env::var("RVPM_APPNAME")
+        .or_else(|_| std::env::var("NVIM_APPNAME"))
+        .unwrap_or_default();
+    if is_valid_appname(&raw) {
+        raw
+    } else {
+        "nvim".to_string()
+    }
+}
+
+/// appname が path segment として安全か検証。
+fn is_valid_appname(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
 fn rvpm_config_path() -> PathBuf {
     let home = dirs::home_dir().expect("Could not find home directory");
-    home.join(".config").join("rvpm").join("config.toml")
+    home.join(".config")
+        .join("rvpm")
+        .join(appname())
+        .join("config.toml")
 }
 
 /// config.toml が存在しなければ最小テンプレートで新規作成する。
@@ -2184,30 +2186,49 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// rvpm のデータ置き場 root を決定する。
-/// `options.base_dir` が設定されていればそれを tilde 展開して返す。
-/// 未設定なら `~/.cache/rvpm` (デフォルト)。
-fn resolve_base_dir(config_base_dir: Option<&str>) -> PathBuf {
-    match config_base_dir {
+/// rvpm のキャッシュ root を決定する。
+/// `options.cache_root` が設定されていればそれを tilde 展開して返す。
+/// 未設定なら `~/.cache/rvpm/<appname>` (デフォルト)。
+/// この配下に `plugins/{repos,merged,loader.lua}` が配置される。
+fn resolve_cache_root(config_cache_root: Option<&str>) -> PathBuf {
+    match config_cache_root {
         Some(raw) => expand_tilde(raw),
         None => {
             let home = dirs::home_dir().expect("Could not find home directory");
-            home.join(".cache").join("rvpm")
+            home.join(".cache").join("rvpm").join(appname())
         }
     }
 }
 
 /// per-plugin の init/before/after.lua を置く root を決定する。
 /// `options.config_root` が設定されていればそれを tilde 展開して返す。
-/// 未設定なら `~/.config/rvpm/plugins` (デフォルト)。
+/// 未設定なら `~/.config/rvpm/<appname>/plugins` (デフォルト)。
 fn resolve_config_root(config_root: Option<&str>) -> PathBuf {
     match config_root {
         Some(raw) => expand_tilde(raw),
         None => {
             let home = dirs::home_dir().expect("Could not find home directory");
-            home.join(".config").join("rvpm").join("plugins")
+            home.join(".config")
+                .join("rvpm")
+                .join(appname())
+                .join("plugins")
         }
     }
+}
+
+/// loader.lua のパス。常に `<cache_root>/plugins/loader.lua`。
+fn resolve_loader_path(cache_root: &Path) -> PathBuf {
+    cache_root.join("plugins").join("loader.lua")
+}
+
+/// repos の親ディレクトリ。`<cache_root>/plugins/repos`。
+fn resolve_repos_dir(cache_root: &Path) -> PathBuf {
+    cache_root.join("plugins").join("repos")
+}
+
+/// merged ディレクトリ。`<cache_root>/plugins/merged`。
+fn resolve_merged_dir(cache_root: &Path) -> PathBuf {
+    cache_root.join("plugins").join("merged")
 }
 
 // ====================================================================
@@ -2228,16 +2249,16 @@ fn nvim_init_lua_path() -> PathBuf {
 }
 
 /// loader.lua を参照する `dofile(...)` 行を config から生成する。
-/// 優先順位: `options.loader_path` > `options.base_dir`/loader.lua > `~/.cache/rvpm/loader.lua`
+/// 優先順位: `options.cache_root`/plugins/loader.lua > `~/.cache/rvpm/<appname>/plugins/loader.lua`
 /// tilde 形式を保持することで dotfiles のマシン間共有を妨げない。
 fn loader_init_snippet(config: &config::Config) -> String {
-    let raw_path = if let Some(loader) = &config.options.loader_path {
-        loader.clone()
-    } else if let Some(base) = &config.options.base_dir {
-        format!("{}/loader.lua", base.trim_end_matches('/'))
+    let raw_path = if let Some(base) = &config.options.cache_root {
+        format!("{}/plugins/loader.lua", base.trim_end_matches(['/', '\\']))
     } else {
-        "~/.cache/rvpm/loader.lua".to_string()
+        format!("~/.cache/rvpm/{}/plugins/loader.lua", appname())
     };
+    // Windows のバックスラッシュを Lua 文字列リテラルで安全な '/' に正規化。
+    let raw_path = raw_path.replace('\\', "/");
     format!("dofile(vim.fn.expand(\"{}\"))", raw_path)
 }
 
@@ -2573,10 +2594,21 @@ fn build_plugin_scripts(
 async fn run_store() -> Result<()> {
     use crate::store_tui::StoreTuiState;
 
+    // cache_root を config から解決 (options.cache_root を尊重)
+    let config_path = rvpm_config_path();
+    let cache_root = if config_path.exists() {
+        let toml_content = std::fs::read_to_string(&config_path)?;
+        let config = parse_config(&toml_content)?;
+        resolve_cache_root(config.options.cache_root.as_deref())
+    } else {
+        resolve_cache_root(None)
+    };
+
     let mut state = StoreTuiState::new();
 
     // 初期表示: 人気プラグインをバックグラウンドで取得
-    let popular = tokio::task::spawn_blocking(crate::store::fetch_popular);
+    let cache_root_bg = cache_root.clone();
+    let popular = tokio::task::spawn_blocking(move || crate::store::fetch_popular(&cache_root_bg));
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -2616,8 +2648,9 @@ async fn run_store() -> Result<()> {
                 state.readme_content = None;
                 state.readme_scroll = 0;
                 let tx = readme_tx.clone();
+                let cache_root_bg = cache_root.clone();
                 tokio::task::spawn_blocking(move || {
-                    let content = crate::store::fetch_readme(&repo)
+                    let content = crate::store::fetch_readme(&cache_root_bg, &repo)
                         .unwrap_or_else(|e| format!("Error: {}", e));
                     let _ = tx.blocking_send((repo.full_name.clone(), content));
                 });
@@ -2642,8 +2675,9 @@ async fn run_store() -> Result<()> {
                         let query = state.search_input.clone();
                         state.message = Some(format!("Searching '{}'...", query));
                         terminal.draw(|f| state.draw(f))?;
+                        let cache_root_bg = cache_root.clone();
                         let result = tokio::task::spawn_blocking(move || {
-                            crate::store::search_plugins(&query)
+                            crate::store::search_plugins(&cache_root_bg, &query)
                         })
                         .await;
                         match result {
@@ -2704,10 +2738,14 @@ async fn run_store() -> Result<()> {
                     state.message = Some(format!("Sort: {}", state.sort_mode.label()));
                 }
                 crossterm::event::KeyCode::Char('R') => {
-                    crate::store::clear_search_cache();
+                    crate::store::clear_search_cache(&cache_root);
                     state.message = Some("Cache cleared. Searching...".to_string());
                     terminal.draw(|f| state.draw(f))?;
-                    let result = tokio::task::spawn_blocking(crate::store::fetch_popular).await;
+                    let cache_root_bg = cache_root.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::store::fetch_popular(&cache_root_bg)
+                    })
+                    .await;
                     match result {
                         Ok(Ok(repos)) => {
                             state.message = Some(format!("{} plugins", repos.len()));
@@ -2881,24 +2919,38 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_base_dir_uses_default_when_none() {
-        let home = dirs::home_dir().unwrap();
-        assert_eq!(resolve_base_dir(None), home.join(".cache").join("rvpm"));
+    fn test_is_valid_appname_rejects_unsafe_values() {
+        assert!(is_valid_appname("nvim"));
+        assert!(is_valid_appname("nvim-test"));
+        assert!(!is_valid_appname(""));
+        assert!(!is_valid_appname("."));
+        assert!(!is_valid_appname(".."));
+        assert!(!is_valid_appname("foo/bar"));
+        assert!(!is_valid_appname("foo\\bar"));
+        assert!(!is_valid_appname("foo\0bar"));
     }
 
     #[test]
-    fn test_resolve_base_dir_expands_tilde() {
+    fn test_resolve_cache_root_uses_appname_default() {
+        let home = dirs::home_dir().unwrap();
+        let result = resolve_cache_root(None);
+        // appname は env に依存するので親ディレクトリだけ確認
+        assert!(result.starts_with(home.join(".cache").join("rvpm")));
+    }
+
+    #[test]
+    fn test_resolve_cache_root_expands_tilde() {
         let home = dirs::home_dir().unwrap();
         assert_eq!(
-            resolve_base_dir(Some("~/dotfiles/rvpm")),
+            resolve_cache_root(Some("~/dotfiles/rvpm")),
             home.join("dotfiles").join("rvpm")
         );
     }
 
     #[test]
-    fn test_resolve_base_dir_accepts_absolute_path() {
+    fn test_resolve_cache_root_accepts_absolute_path() {
         assert_eq!(
-            resolve_base_dir(Some("/opt/rvpm")),
+            resolve_cache_root(Some("/opt/rvpm")),
             PathBuf::from("/opt/rvpm")
         );
     }
@@ -2906,10 +2958,10 @@ mod tests {
     #[test]
     fn test_resolve_config_root_uses_default_when_none() {
         let home = dirs::home_dir().unwrap();
-        assert_eq!(
-            resolve_config_root(None),
-            home.join(".config").join("rvpm").join("plugins")
-        );
+        let result = resolve_config_root(None);
+        // appname は env に依存するので親だけ確認
+        assert!(result.starts_with(home.join(".config").join("rvpm")));
+        assert!(result.ends_with("plugins"));
     }
 
     #[test]
@@ -2958,58 +3010,62 @@ mod tests {
             options: config::Options::default(),
             plugins: vec![],
         };
-        assert_eq!(
-            loader_init_snippet(&cfg),
-            "dofile(vim.fn.expand(\"~/.cache/rvpm/loader.lua\"))"
-        );
+        let snippet = loader_init_snippet(&cfg);
+        // appname は env 依存なので partial match
+        assert!(snippet.starts_with("dofile(vim.fn.expand(\"~/.cache/rvpm/"));
+        assert!(snippet.ends_with("/plugins/loader.lua\"))"));
     }
 
     #[test]
-    fn test_loader_init_snippet_uses_loader_path_when_set() {
+    fn test_loader_init_snippet_uses_cache_root_when_set() {
         let cfg = config::Config {
             vars: None,
             options: config::Options {
-                loader_path: Some("~/foo/loader.lua".to_string()),
+                cache_root: Some("~/dotfiles/rvpm".to_string()),
                 ..Default::default()
             },
             plugins: vec![],
         };
         assert_eq!(
             loader_init_snippet(&cfg),
-            "dofile(vim.fn.expand(\"~/foo/loader.lua\"))"
+            "dofile(vim.fn.expand(\"~/dotfiles/rvpm/plugins/loader.lua\"))"
         );
     }
 
     #[test]
-    fn test_loader_init_snippet_uses_base_dir_when_set() {
+    fn test_loader_init_snippet_normalizes_windows_path_separators() {
         let cfg = config::Config {
             vars: None,
             options: config::Options {
-                base_dir: Some("~/dotfiles/rvpm".to_string()),
+                cache_root: Some(r"C:\Users\test\.cache\rvpm\nvim".to_string()),
+                ..Default::default()
+            },
+            plugins: vec![],
+        };
+        let snippet = loader_init_snippet(&cfg);
+        assert!(
+            !snippet.contains('\\'),
+            "snippet contains backslash: {snippet}"
+        );
+        assert_eq!(
+            snippet,
+            "dofile(vim.fn.expand(\"C:/Users/test/.cache/rvpm/nvim/plugins/loader.lua\"))"
+        );
+    }
+
+    #[test]
+    fn test_loader_init_snippet_trims_trailing_backslash() {
+        let cfg = config::Config {
+            vars: None,
+            options: config::Options {
+                cache_root: Some(r"C:\cache\rvpm\".to_string()),
                 ..Default::default()
             },
             plugins: vec![],
         };
         assert_eq!(
             loader_init_snippet(&cfg),
-            "dofile(vim.fn.expand(\"~/dotfiles/rvpm/loader.lua\"))"
-        );
-    }
-
-    #[test]
-    fn test_loader_init_snippet_loader_path_wins_over_base_dir() {
-        let cfg = config::Config {
-            vars: None,
-            options: config::Options {
-                base_dir: Some("~/cache".to_string()),
-                loader_path: Some("~/custom/loader.lua".to_string()),
-                ..Default::default()
-            },
-            plugins: vec![],
-        };
-        assert_eq!(
-            loader_init_snippet(&cfg),
-            "dofile(vim.fn.expand(\"~/custom/loader.lua\"))"
+            "dofile(vim.fn.expand(\"C:/cache/rvpm/plugins/loader.lua\"))"
         );
     }
 
@@ -3096,25 +3152,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_loader_path_uses_default_when_none() {
-        let base = PathBuf::from("/cache/rvpm");
-        let result = resolve_loader_path(None, &base);
-        assert_eq!(result, PathBuf::from("/cache/rvpm/loader.lua"));
-    }
-
-    #[test]
-    fn test_resolve_loader_path_expands_tilde() {
-        let base = PathBuf::from("/cache/rvpm");
-        let result = resolve_loader_path(Some("~/.cache/nvim/loader.lua"), &base);
-        assert!(result.to_str().unwrap().ends_with(".cache/nvim/loader.lua"));
-        assert!(!result.to_str().unwrap().contains('~'));
-    }
-
-    #[test]
-    fn test_resolve_loader_path_uses_absolute_path() {
-        let base = PathBuf::from("/cache/rvpm");
-        let result = resolve_loader_path(Some("/custom/path/loader.lua"), &base);
-        assert_eq!(result, PathBuf::from("/custom/path/loader.lua"));
+    fn test_resolve_loader_path_is_under_plugins() {
+        let base = PathBuf::from("/cache/rvpm/nvim");
+        let result = resolve_loader_path(&base);
+        assert_eq!(result, PathBuf::from("/cache/rvpm/nvim/plugins/loader.lua"));
     }
 
     #[test]

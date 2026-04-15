@@ -25,14 +25,15 @@ pub enum IconStyle {
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone)]
 pub struct Options {
+    /// per-plugin init/before/after.lua の置き場。
+    /// 未指定なら `~/.config/rvpm/<appname>/plugins`。
     pub config_root: Option<String>,
+    /// git 並列実行数 (default: 8)。
     pub concurrency: Option<usize>,
-    pub loader_path: Option<String>,
-    /// rvpm のデータ置き場 root の上書き。
-    /// 未指定なら `~/.cache/rvpm`。ここで指定すると repos / merged / loader.lua
-    /// 全てがこの配下にまとまる。`loader_path` が別途指定されていればそちらが優先。
-    /// `~/...` 形式を受け付ける。
-    pub base_dir: Option<String>,
+    /// rvpm のキャッシュ root。
+    /// 未指定なら `~/.cache/rvpm/<appname>`。
+    /// `repos/`, `merged/`, `loader.lua` がこの配下に配置される。
+    pub cache_root: Option<String>,
     /// TUI アイコンスタイル: "nerd" (default), "unicode", "ascii"
     #[serde(default)]
     pub icons: IconStyle,
@@ -451,23 +452,23 @@ on_cmd = ["Telescope", "Grep"]
     }
 
     #[test]
-    fn test_parse_config_accepts_base_dir_option() {
+    fn test_parse_config_accepts_cache_root_option() {
         let toml = r#"
 [options]
-base_dir = "~/dotfiles/nvim/rvpm"
+cache_root = "~/dotfiles/nvim/rvpm"
 
 [[plugins]]
 url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
         assert_eq!(
-            config.options.base_dir.as_deref(),
+            config.options.cache_root.as_deref(),
             Some("~/dotfiles/nvim/rvpm")
         );
     }
 
     #[test]
-    fn test_parse_config_base_dir_defaults_to_none() {
+    fn test_parse_config_cache_root_defaults_to_none() {
         let toml = r#"
 [options]
 
@@ -475,7 +476,7 @@ url = "owner/repo"
 url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
-        assert_eq!(config.options.base_dir, None);
+        assert_eq!(config.options.cache_root, None);
     }
 
     #[test]

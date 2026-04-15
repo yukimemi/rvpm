@@ -117,10 +117,9 @@ nvim_rc = "~/.config/nvim/rc"
 config_root = "{{ vars.nvim_rc }}/plugins"
 # Parallel git operations limit (default: 8)
 concurrency = 10
-# Optional: move all rvpm data (repos + merged + loader.lua) under a custom root
-# base_dir = "~/dotfiles/nvim/rvpm"
-# Optional: override only loader.lua location (overrides base_dir for loader)
-# loader_path = "~/.cache/nvim/rvpm/loader.lua"
+# Optional: move all rvpm cache (plugins + store) under a custom root.
+# Default: ~/.cache/rvpm/<appname>
+# cache_root = "~/dotfiles/nvim/rvpm"
 
 [[plugins]]
 name  = "snacks"
@@ -153,12 +152,31 @@ on_map = [
 
 ### `[options]` reference
 
+rvpm reads `config.toml` from `~/.config/rvpm/<appname>/config.toml`, where `<appname>` is determined by:
+
+1. `$RVPM_APPNAME` if set, else
+2. `$NVIM_APPNAME` if set, else
+3. `"nvim"` (default)
+
+This mirrors Neovim's `$NVIM_APPNAME` convention, so running `NVIM_APPNAME=nvim-test nvim` pairs with `NVIM_APPNAME=nvim-test rvpm sync` for fully isolated test configs.
+
+> **💡 Recommendation: leave `config_root` and `cache_root` unset.** The defaults
+> are already `<appname>`-aware. Setting a literal path (e.g.
+> `cache_root = "~/dotfiles/rvpm"`) **breaks appname isolation** — every
+> `$NVIM_APPNAME` variant will share the same cache.
+>
+> If you need a custom root *and* appname isolation, use Tera templates:
+> ```toml
+> cache_root = "~/dotfiles/rvpm/{{ env.NVIM_APPNAME }}"
+> ```
+> Prefer `~/` over `{{ env.HOME }}` — `~` is portable (Windows too), while
+> `HOME` is not set on Windows.
+
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `config_root` | `string` | `~/.config/rvpm/plugins` | Root directory for per-plugin `init.lua` / `before.lua` / `after.lua`. Supports `~` and `{{ vars.xxx }}` templates |
+| `config_root` | `string` | `~/.config/rvpm/<appname>/plugins` | Root directory for per-plugin `init.lua` / `before.lua` / `after.lua`. Supports `~` and Tera templates. **Recommended: leave unset** to preserve appname isolation |
 | `concurrency` | `integer` | `8` | Max number of parallel git operations during `sync` / `update`. Kept moderate to avoid GitHub rate limits |
-| `base_dir` | `string` | `~/.cache/rvpm` | Root for all rvpm data (repos, merged, loader.lua). Setting this moves everything together |
-| `loader_path` | `string` | `{base_dir}/loader.lua` | Override only the loader.lua output path. Takes precedence over `base_dir` for the loader file |
+| `cache_root` | `string` | `~/.cache/rvpm/<appname>` | Root for all rvpm cache (`plugins/repos/`, `plugins/merged/`, `plugins/loader.lua`, `store/`). **Recommended: leave unset** to preserve appname isolation |
 
 ### Tera templates
 
@@ -252,9 +270,9 @@ cond = "{{ is_windows }}"  # runtime cond: included in loader but guarded
 |---|---|---|---|
 | `url` | `string` | **(required)** | Plugin repository. `owner/repo` (GitHub shorthand), full URL, or local path |
 | `name` | `string` | repo name from `url` (e.g. `telescope.nvim`) | Friendly name used in `rvpm_loaded_<name>` User autocmd, `on_source` chain, and log messages. Auto-derived by taking the last path component of the URL and stripping `.git` |
-| `dst` | `string` | `{base_dir}/repos/<host>/<owner>/<repo>` | Custom clone destination (overrides the default path layout) |
+| `dst` | `string` | `{cache_root}/plugins/repos/<host>/<owner>/<repo>` | Custom clone destination (overrides the default path layout) |
 | `lazy` | `bool` | auto | **Auto-inferred**: if any `on_*` trigger is set, defaults to `true`; otherwise `false`. Write `lazy = false` explicitly to force eager loading even with triggers |
-| `merge` | `bool` | `true` | If `true`, the plugin directory is linked into `{base_dir}/merged/` and shares a single runtimepath entry |
+| `merge` | `bool` | `true` | If `true`, the plugin directory is linked into `{cache_root}/plugins/merged/` and shares a single runtimepath entry |
 | `rev` | `string` | HEAD | Branch, tag, or commit hash to check out after clone/pull |
 | `depends` | `string[]` | none | Plugins that must be loaded before this one. Accepts `display_name` (e.g. `"snacks.nvim"`) or `url` (e.g. `"folke/snacks.nvim"`). **Eager plugin depending on a lazy plugin:** the lazy dep is auto-promoted to eager (a warning is printed to stderr). **Lazy plugin depending on a lazy plugin:** the dep(s) are loaded first inside the trigger callback via a `load_lazy` chain guarded against double-loading |
 | `cond` | `string` | none | Lua expression. When set, the plugin's loader code is wrapped in `if <cond> then ... end` |
@@ -503,7 +521,7 @@ cost; Neovim startup just sources a fixed list of files.
 ### Merge optimization
 
 When `merge = true`, the plugin directory is linked (junction on Windows,
-symlink elsewhere) into `{base_dir}/merged/`. All `merge = true` plugins share
+symlink elsewhere) into `{cache_root}/plugins/merged/`. All `merge = true` plugins share
 a single `vim.opt.rtp:append(merged_dir)` call, keeping `&runtimepath` lean
 even with many eager plugins.
 
@@ -542,9 +560,8 @@ Beyond ordering, `depends` now also affects **loading**:
 Windows uses the same `.config` / `.cache` paths under `%USERPROFILE%` — no
 `%APPDATA%` — to keep dotfiles portable between Linux/macOS/WSL/Windows.
 
-`options.base_dir = "..."` moves all of `~/.cache/rvpm/` to a different root
-(useful for dotfiles-managed caches). `options.loader_path = "..."` moves only
-`loader.lua`.
+`options.cache_root = "..."` moves all of `~/.cache/rvpm/<appname>/` to a
+different root (useful for dotfiles-managed caches).
 
 ## Development
 

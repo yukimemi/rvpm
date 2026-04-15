@@ -50,28 +50,25 @@ impl GitHubRepo {
     }
 }
 
-/// キャッシュディレクトリ。rvpm の他の cache と同じ ~/.cache/rvpm/ 配下に置く。
-fn store_cache_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cache")
-        .join("rvpm")
-        .join("store")
+/// キャッシュディレクトリ。`<cache_root>/store/` に配置。
+/// 呼び出し元から cache_root を渡すことで `options.cache_root` を尊重する。
+fn store_cache_dir(cache_root: &Path) -> PathBuf {
+    cache_root.join("store")
 }
 
 /// 検索結果のキャッシュパス。
-fn search_cache_path(query: &str) -> PathBuf {
+fn search_cache_path(cache_root: &Path, query: &str) -> PathBuf {
     let safe_name: String = query
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect();
-    store_cache_dir().join(format!("search_{}.json", safe_name))
+    store_cache_dir(cache_root).join(format!("search_{}.json", safe_name))
 }
 
 /// README のキャッシュパス。
-fn readme_cache_path(full_name: &str) -> PathBuf {
+fn readme_cache_path(cache_root: &Path, full_name: &str) -> PathBuf {
     let safe_name = full_name.replace('/', "__");
-    store_cache_dir()
+    store_cache_dir(cache_root)
         .join("readme")
         .join(format!("{}.md", safe_name))
 }
@@ -92,9 +89,9 @@ const SEARCH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(864
 const README_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(604800); // 7 days
 
 /// GitHub Search API でプラグインを検索。キャッシュがあればそれを返す。
-pub fn search_plugins(query: &str) -> Result<Vec<GitHubRepo>> {
+pub fn search_plugins(cache_root: &Path, query: &str) -> Result<Vec<GitHubRepo>> {
     // キャッシュチェック
-    let cache_path = search_cache_path(query);
+    let cache_path = search_cache_path(cache_root, query);
     if is_cache_valid(&cache_path, SEARCH_CACHE_TTL)
         && let Ok(data) = std::fs::read_to_string(&cache_path)
         && let Ok(repos) = serde_json::from_str::<Vec<GitHubRepo>>(&data)
@@ -135,13 +132,13 @@ pub fn search_plugins(query: &str) -> Result<Vec<GitHubRepo>> {
 }
 
 /// 人気プラグインのランキングを取得。
-pub fn fetch_popular() -> Result<Vec<GitHubRepo>> {
-    search_plugins("")
+pub fn fetch_popular(cache_root: &Path) -> Result<Vec<GitHubRepo>> {
+    search_plugins(cache_root, "")
 }
 
 /// README を取得。キャッシュがあればそれを返す。
-pub fn fetch_readme(repo: &GitHubRepo) -> Result<String> {
-    let cache_path = readme_cache_path(&repo.full_name);
+pub fn fetch_readme(cache_root: &Path, repo: &GitHubRepo) -> Result<String> {
+    let cache_path = readme_cache_path(cache_root, &repo.full_name);
     if is_cache_valid(&cache_path, README_CACHE_TTL)
         && let Ok(data) = std::fs::read_to_string(&cache_path)
     {
@@ -177,8 +174,8 @@ pub fn fetch_readme(repo: &GitHubRepo) -> Result<String> {
 }
 
 /// 検索キャッシュをクリア (強制リフレッシュ用)。
-pub fn clear_search_cache() {
-    let dir = store_cache_dir();
+pub fn clear_search_cache(cache_root: &Path) {
+    let dir = store_cache_dir(cache_root);
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -229,10 +226,17 @@ mod tests {
 
     #[test]
     fn test_cache_path_sanitizes_query() {
-        let path = search_cache_path("foo bar:baz");
+        let root = Path::new("/tmp/rvpm/nvim");
+        let path = search_cache_path(root, "foo bar:baz");
         let name = path.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with("search_"));
         assert!(!name.contains(' '));
         assert!(!name.contains(':'));
+    }
+
+    #[test]
+    fn test_store_cache_dir_uses_cache_root() {
+        let root = Path::new("/custom/cache");
+        assert_eq!(store_cache_dir(root), Path::new("/custom/cache/store"));
     }
 }
