@@ -30,7 +30,18 @@ toml = "1.1"
 toml_edit = "0.25"
 
 # HTTP client (for store)
-reqwest = { version = "0.13", features = ["blocking", "json", "query"] }
+# default-features = false to pin TLS backend to `rustls` (avoid native-tls /
+# OpenSSL transitively). Re-add the non-TLS pieces of reqwest's default feature
+# set (`http2`, `charset`, `system-proxy`) so behavior matches 0.12 defaults.
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "json",
+    "query",
+    "rustls",
+    "http2",
+    "charset",
+    "system-proxy",
+] }
 open = "5"
 
 # File System & Path
