@@ -735,11 +735,14 @@ async fn run_generate() -> Result<()> {
 }
 
 /// 全プラグインの git 状態を並列で調べ、url -> PluginStatus のマップを返す。
-async fn fetch_plugin_statuses(
+/// 全プラグインのステータスチェックを並列で spawn し、受信用 channel と
+/// JoinSet を返す。呼び出し側は progressive に受信して描画するか、一括で
+/// await して完了を待つか選べる。
+fn spawn_status_check(
     config: &config::Config,
     cache_root: &Path,
-) -> std::collections::HashMap<String, PluginStatus> {
-    let (tx, mut rx) = mpsc::channel::<(String, PluginStatus)>(100);
+) -> (mpsc::Receiver<(String, PluginStatus)>, JoinSet<()>) {
+    let (tx, rx) = mpsc::channel::<(String, PluginStatus)>(100);
     let mut set = JoinSet::new();
     for plugin in config.plugins.iter() {
         let plugin = plugin.clone();
@@ -759,6 +762,14 @@ async fn fetch_plugin_statuses(
         });
     }
     drop(tx);
+    (rx, set)
+}
+
+async fn fetch_plugin_statuses(
+    config: &config::Config,
+    cache_root: &Path,
+) -> std::collections::HashMap<String, PluginStatus> {
+    let (mut rx, mut set) = spawn_status_check(config, cache_root);
     while set.join_next().await.is_some() {}
     let mut result = std::collections::HashMap::new();
     while let Ok((url, status)) = rx.try_recv() {
@@ -806,27 +817,34 @@ async fn run_list(no_tui: bool) -> Result<()> {
     let mut tui_state = TuiState::new(urls);
 
     // バックグラウンドでステータスチェック開始 (TUI は即表示)
-    let (tx, mut rx) = mpsc::channel::<(String, PluginStatus)>(100);
-    let mut set = JoinSet::new();
-    for plugin in config.plugins.iter() {
-        let plugin = plugin.clone();
-        let cache_root = cache_root.clone();
-        let tx = tx.clone();
-        set.spawn(async move {
-            let dst_path = resolve_plugin_dst(&plugin, &cache_root);
-            let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
-            let git_status = repo.get_status().await;
-            let plugin_status = match git_status {
-                crate::git::RepoStatus::Clean => PluginStatus::Finished,
-                crate::git::RepoStatus::NotInstalled => PluginStatus::Failed("Missing".to_string()),
-                crate::git::RepoStatus::Modified => PluginStatus::Syncing("Modified".to_string()),
-                crate::git::RepoStatus::Error(e) => PluginStatus::Failed(e),
-            };
-            let _ = tx.send((plugin.url.clone(), plugin_status)).await;
-        });
-    }
-    drop(tx);
+    let (mut rx, mut set) = spawn_status_check(&config, &cache_root);
     let mut bg_done = false;
+
+    // サブコマンド実行前の TUI 退避 (raw mode OFF + 通常スクリーン復帰 + カーソル表示)。
+    fn leave_tui(
+        terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        disable_raw_mode()?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        terminal.show_cursor()?;
+        Ok(())
+    }
+
+    // サブコマンド完了後に TUI を復帰して状態一式を差し替えるためのローカル
+    // マクロ。複数の外側変数を同時にムーブ代入するためクロージャにできず、
+    // マクロで反復を畳んでいる。
+    macro_rules! reload {
+        () => {{
+            let (c, s, new_rx, new_set) =
+                reload_state(&config_path, &cache_root, &mut terminal, &icons)?;
+            icons = crate::tui::Icons::from_style(c.options.icons);
+            config = c;
+            tui_state = s;
+            rx = new_rx;
+            set = new_set;
+            bg_done = false;
+        }};
+    }
 
     /// メッセージを表示して任意のキー入力を待つ。
     fn wait_for_keypress(message: &str) -> Result<()> {
@@ -834,14 +852,26 @@ async fn run_list(no_tui: bool) -> Result<()> {
         print!("{}", message);
         std::io::stdout().flush()?;
         crossterm::terminal::enable_raw_mode()?;
+        // run_sync / run_update の TUI 終了直後は crossterm の入力キューに
+        // 残留イベント (Resize / KeyRelease / sync 中のスクロール連打) が
+        // 残りうるので、read の前に一度 drain する。
+        while crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+            let _ = crossterm::event::read();
+        }
+        // blocking read ではなくタイムアウト付き poll で読むことで、
+        // 想定外の環境でも確実に戻ってくるようにする。
         let res = loop {
-            match crossterm::event::read() {
-                Ok(crossterm::event::Event::Key(key))
-                    if key.kind == crossterm::event::KeyEventKind::Press =>
-                {
-                    break Ok(());
-                }
-                Ok(_) => {}
+            match crossterm::event::poll(std::time::Duration::from_millis(100)) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(crossterm::event::Event::Key(key))
+                        if key.kind == crossterm::event::KeyEventKind::Press =>
+                    {
+                        break Ok(());
+                    }
+                    Ok(_) => {}
+                    Err(e) => break Err(e.into()),
+                },
+                Ok(false) => {}
                 Err(e) => break Err(e.into()),
             }
         };
@@ -850,13 +880,26 @@ async fn run_list(no_tui: bool) -> Result<()> {
         res
     }
 
-    // アクション後に config とステータスを再読み込みしてTUIを復帰するヘルパー。
+    // アクション後に config を再読み込みして TUI を復帰し、
+    // ステータスチェックはバックグラウンドで走らせる。
     // 失敗しても TUI 状態は戻せるように、alt screen への復帰を最初に行う。
-    async fn reload_state(
+    //
+    // fetch_plugin_statuses を同期 await にすると、gix を使った status
+    // 取得が Windows で秒単位かかる場合や何らかの理由で詰まった場合に、
+    // TUI が完全に無描画のまま固まって見える。起動時と同じ progressive
+    // 更新パターンに揃え、main loop 側で受信して描画させる。
+    type ReloadState = (
+        config::Config,
+        TuiState,
+        mpsc::Receiver<(String, PluginStatus)>,
+        JoinSet<()>,
+    );
+    fn reload_state(
         config_path: &Path,
         cache_root: &Path,
         terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
-    ) -> Result<(config::Config, TuiState)> {
+        _icons: &crate::tui::Icons,
+    ) -> Result<ReloadState> {
         // ── 1. 先に TUI に復帰 ──
         // show_cursor() を事前に呼んでいるので hide_cursor() で戻す。
         // clear() は ratatui の内部バッファを無効化して全セル再描画を強制する
@@ -867,16 +910,22 @@ async fn run_list(no_tui: bool) -> Result<()> {
         terminal.clear()?;
         terminal.hide_cursor()?;
 
-        // ── 2. 状態を再構築 ──
+        // ── 2. config 再読み込み + status は background で開始 ──
         let toml_content = std::fs::read_to_string(config_path)?;
         let config = parse_config(&toml_content)?;
-        let statuses = fetch_plugin_statuses(&config, cache_root).await;
         let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
-        let mut tui_state = TuiState::new(urls);
-        for (url, status) in statuses {
-            tui_state.update_status(&url, status);
+        let tui_state = TuiState::new(urls);
+        let (rx, set) = spawn_status_check(&config, cache_root);
+
+        // ── 3. 復帰直後に残留イベントを drain ──
+        // wait_for_keypress で押したキーの release や連打分が残ると、main
+        // loop の最初の poll() で拾われて意図しないアクションが起動して
+        // しまうことがあるため、ここで捨てる。
+        while crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+            let _ = crossterm::event::read();
         }
-        Ok((config, tui_state))
+
+        Ok((config, tui_state, rx, set))
     }
 
     loop {
@@ -971,23 +1020,16 @@ async fn run_list(no_tui: bool) -> Result<()> {
                 // ── actions ──
                 crossterm::event::KeyCode::Char('e') => {
                     if let Some(url) = tui_state.selected_url() {
-                        disable_raw_mode()?;
-                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                        terminal.show_cursor()?;
+                        leave_tui(&mut terminal)?;
                         if run_edit(Some(url), false, false, false, false).await? {
                             let _ = run_sync(false).await;
                         }
-                        let (c, s) = reload_state(&config_path, &cache_root, &mut terminal).await?;
-                        icons = crate::tui::Icons::from_style(c.options.icons);
-                        config = c;
-                        tui_state = s;
+                        reload!();
                     }
                 }
                 crossterm::event::KeyCode::Char('s') => {
                     if let Some(url) = tui_state.selected_url() {
-                        disable_raw_mode()?;
-                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                        terminal.show_cursor()?;
+                        leave_tui(&mut terminal)?;
                         if run_set(
                             Some(url),
                             None,
@@ -1004,57 +1046,34 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         {
                             let _ = run_sync(false).await;
                         }
-                        let (c, s) = reload_state(&config_path, &cache_root, &mut terminal).await?;
-                        icons = crate::tui::Icons::from_style(c.options.icons);
-                        config = c;
-                        tui_state = s;
+                        reload!();
                     }
                 }
                 crossterm::event::KeyCode::Char('S') => {
-                    disable_raw_mode()?;
-                    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                    terminal.show_cursor()?;
+                    leave_tui(&mut terminal)?;
                     let _ = run_sync(false).await;
                     wait_for_keypress("\nPress any key to return to list...")?;
-                    let (c, s) = reload_state(&config_path, &cache_root, &mut terminal).await?;
-                    icons = crate::tui::Icons::from_style(c.options.icons);
-                    config = c;
-                    tui_state = s;
+                    reload!();
                 }
                 crossterm::event::KeyCode::Char('u') => {
                     if let Some(url) = tui_state.selected_url() {
-                        disable_raw_mode()?;
-                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                        terminal.show_cursor()?;
+                        leave_tui(&mut terminal)?;
                         let _ = run_update(Some(url)).await;
                         wait_for_keypress("\nPress any key to return to list...")?;
-                        let (c, s) = reload_state(&config_path, &cache_root, &mut terminal).await?;
-                        icons = crate::tui::Icons::from_style(c.options.icons);
-                        config = c;
-                        tui_state = s;
+                        reload!();
                     }
                 }
                 crossterm::event::KeyCode::Char('U') => {
-                    disable_raw_mode()?;
-                    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                    terminal.show_cursor()?;
+                    leave_tui(&mut terminal)?;
                     let _ = run_update(None).await;
                     wait_for_keypress("\nPress any key to return to list...")?;
-                    let (c, s) = reload_state(&config_path, &cache_root, &mut terminal).await?;
-                    icons = crate::tui::Icons::from_style(c.options.icons);
-                    config = c;
-                    tui_state = s;
+                    reload!();
                 }
                 crossterm::event::KeyCode::Char('d') => {
                     if let Some(url) = tui_state.selected_url() {
-                        disable_raw_mode()?;
-                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                        terminal.show_cursor()?;
+                        leave_tui(&mut terminal)?;
                         let _ = run_remove(Some(url)).await;
-                        let (c, s) = reload_state(&config_path, &cache_root, &mut terminal).await?;
-                        icons = crate::tui::Icons::from_style(c.options.icons);
-                        config = c;
-                        tui_state = s;
+                        reload!();
                     }
                 }
                 _ => {}
