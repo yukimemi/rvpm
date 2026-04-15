@@ -105,9 +105,9 @@ rvpm config
 nvim_rc = "~/.config/nvim/rc"
 
 [options]
-# Per-plugin init/before/after.lua directory
-# Default: ~/.config/rvpm/<appname>/plugins
-config_root = "{{ vars.nvim_rc }}/plugins"
+# Root of all rvpm config (config.toml, global hooks, plugins/ subdir)
+# Default: ~/.config/rvpm/<appname>
+# config_root = "{{ vars.nvim_rc }}"
 # Root of all rvpm cache (clones, merged rtp, loader.lua, store cache)
 # Default: ~/.cache/rvpm/<appname>
 # cache_root = "~/dotfiles/nvim/rvpm"
@@ -158,18 +158,26 @@ for fully isolated test configs.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `config_root` | `string` | `~/.config/rvpm/<appname>/plugins` | Root directory for per-plugin `init.lua` / `before.lua` / `after.lua`. Supports `~` and Tera templates. **Recommended: leave unset** |
+| `config_root` | `string` | `~/.config/rvpm/<appname>` | Root for all rvpm config (`config.toml`, global `before.lua` / `after.lua`, and `plugins/<host>/<owner>/<repo>/` per-plugin hooks). Supports `~` and Tera templates. **Recommended: leave unset** |
 | `cache_root` | `string` | `~/.cache/rvpm/<appname>` | Root for all rvpm cache (`plugins/repos/`, `plugins/merged/`, `plugins/loader.lua`, `store/`). **Recommended: leave unset** |
 | `concurrency` | `integer` | `8` | Max number of parallel git operations during `sync` / `update`. Kept moderate to avoid GitHub rate limits |
 
-> **Why both defaults end in `/plugins` is subtle:**
-> `cache_root` is the parent of `plugins/` and `store/`, while `config_root`
-> is the `plugins/` directory itself (i.e. where per-plugin hook dirs live).
-> So on disk the layout lines up symmetrically:
+> **Symmetric layout.** `config_root` and `cache_root` are structurally
+> parallel — each owns a `plugins/` subdirectory at the same depth:
 >
 > ```
-> ~/.config/rvpm/<appname>/plugins/...   ← config_root
-> ~/.cache/rvpm/<appname>/plugins/...    ← cache_root's "plugins/" subdir
+> ~/.config/rvpm/<appname>/                ← config_root
+>     ├── config.toml
+>     ├── before.lua       (global, phase 3)
+>     ├── after.lua        (global, phase 9)
+>     └── plugins/<host>/<owner>/<repo>/   (per-plugin init/before/after.lua)
+>
+> ~/.cache/rvpm/<appname>/                 ← cache_root
+>     ├── plugins/
+>     │   ├── repos/<host>/<owner>/<repo>/  (clones)
+>     │   ├── merged/                       (linked rtp for merge=true)
+>     │   └── loader.lua                    (generated)
+>     └── store/                            (`rvpm store` cache)
 > ```
 
 > **💡 Leave `config_root` and `cache_root` unset** — the defaults are already
@@ -371,18 +379,18 @@ overhead when neither is the initial colorscheme.
 
 ### Hooks
 
-Global hooks (`before.lua` / `after.lua` directly under
-`~/.config/rvpm/<appname>/`) and per-plugin hooks (under
-`{config_root}/<host>/<owner>/<repo>/`) are auto-discovered — no config
-entries needed.
+Global hooks (`before.lua` / `after.lua` directly under `{config_root}/`)
+and per-plugin hooks (under `{config_root}/plugins/<host>/<owner>/<repo>/`)
+are auto-discovered — no config entries needed.
 
 <details>
 <summary><b>Hook file reference</b></summary>
 
 #### Global hooks
 
-Place Lua files directly under `~/.config/rvpm/<appname>/` and rvpm picks
-them up automatically at generate time:
+Place Lua files directly under `{config_root}/` (default:
+`~/.config/rvpm/<appname>/`) and rvpm picks them up automatically at
+generate time:
 
 | File | Phase | When it runs |
 |---|---|---|
@@ -395,8 +403,8 @@ belong to any single plugin.
 
 #### Per-plugin hooks
 
-Drop Lua files under `{config_root}/<host>/<owner>/<repo>/` and rvpm will
-include them in the generated loader:
+Drop Lua files under `{config_root}/plugins/<host>/<owner>/<repo>/` and
+rvpm will include them in the generated loader:
 
 | File | When it runs |
 |---|---|
@@ -615,13 +623,13 @@ Beyond ordering, `depends` also affects **loading**:
 ## Directory layout (defaults)
 
 ```
-~/.config/rvpm/<appname>/
-├── config.toml                              ← main configuration (fixed)
+~/.config/rvpm/<appname>/                    ← config_root
+├── config.toml                              ← main configuration
 ├── before.lua                               ← global before hook (phase 3, auto-detected)
 ├── after.lua                                ← global after hook (phase 9, auto-detected)
-└── plugins/                                 ← config_root
+└── plugins/
     └── <host>/<owner>/<repo>/
-        ├── init.lua
+        ├── init.lua                         ← per-plugin hooks
         ├── before.lua
         └── after.lua
 
