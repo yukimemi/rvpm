@@ -850,12 +850,24 @@ async fn run_list(no_tui: bool) -> Result<()> {
         res
     }
 
-    // アクション後に config とステータスを再読み込みしてTUIを復帰するヘルパー
+    // アクション後に config とステータスを再読み込みしてTUIを復帰するヘルパー。
+    // 失敗しても TUI 状態は戻せるように、alt screen への復帰を最初に行う。
     async fn reload_state(
         config_path: &Path,
         cache_root: &Path,
         terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<(config::Config, TuiState)> {
+        // ── 1. 先に TUI に復帰 ──
+        // show_cursor() を事前に呼んでいるので hide_cursor() で戻す。
+        // clear() は ratatui の内部バッファを無効化して全セル再描画を強制する
+        // (これをしないとサブプロセスが alt screen 外で行った描画のせいで
+        //  差分描画が崩れた画面を残したまま戻る)。
+        enable_raw_mode()?;
+        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        terminal.clear()?;
+        terminal.hide_cursor()?;
+
+        // ── 2. 状態を再構築 ──
         let toml_content = std::fs::read_to_string(config_path)?;
         let config = parse_config(&toml_content)?;
         let statuses = fetch_plugin_statuses(&config, cache_root).await;
@@ -864,9 +876,6 @@ async fn run_list(no_tui: bool) -> Result<()> {
         for (url, status) in statuses {
             tui_state.update_status(&url, status);
         }
-        enable_raw_mode()?;
-        execute!(std::io::stdout(), EnterAlternateScreen)?;
-        terminal.clear()?;
         Ok((config, tui_state))
     }
 
@@ -2796,6 +2805,12 @@ async fn run_store() -> Result<()> {
                         disable_raw_mode()?;
                         execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                         enable_raw_mode()?;
+                        // ratatui の内部バッファは LeaveAlternateScreen 中に
+                        // run_add() 内の sync TUI や println! が行った描画を知らない。
+                        // clear() で全セル再描画を強制し、hide_cursor() で
+                        // 先に show_cursor() した状態を戻す。
+                        terminal.clear()?;
+                        terminal.hide_cursor()?;
                         state.message = Some(format!("Added {}", url));
                     }
                 }
