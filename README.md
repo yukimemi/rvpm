@@ -164,7 +164,7 @@ for fully isolated test configs.
 | `config_root` | `string` | `~/.config/rvpm/<appname>` | Root for all rvpm config (`config.toml`, global `before.lua` / `after.lua`, and `plugins/<host>/<owner>/<repo>/` per-plugin hooks). Supports `~` and Tera templates. **Recommended: leave unset** |
 | `cache_root` | `string` | `~/.cache/rvpm/<appname>` | Root for all rvpm cache (`plugins/repos/`, `plugins/merged/`, `plugins/loader.lua`, `store/`). **Recommended: leave unset** |
 | `concurrency` | `integer` | `8` | Max number of parallel git operations during `sync` / `update`. Kept moderate to avoid GitHub rate limits |
-| `chezmoi` | `boolean` | `false` | When `true`, rvpm automatically runs `chezmoi re-add` (or `chezmoi add` for new files whose ancestor is already managed) after mutating `config.toml`, global hooks, or per-plugin hooks. Silently skipped if `chezmoi` is not in `PATH`. See [chezmoi integration](#chezmoi-integration) |
+| `chezmoi` | `boolean` | `false` | When `true`, rvpm automatically runs `chezmoi re-add` (or `chezmoi add` for new files whose ancestor is already managed) after mutating `config.toml`, global hooks, or per-plugin hooks. Warns if `chezmoi` is not in `PATH`. See [chezmoi integration](#chezmoi-integration) |
 
 > **Symmetric layout.** `config_root` and `cache_root` are structurally
 > parallel — each owns a `plugins/` subdirectory at the same depth:
@@ -214,9 +214,12 @@ config), rvpm:
   created per-plugin hook files under `plugins/<host>/<owner>/<repo>/`).
 
 Files whose ancestors are not managed by chezmoi are left alone, so this is
-safe to enable even if only part of your rvpm tree lives in chezmoi. If
-`chezmoi` isn't installed or the invocation fails, rvpm prints a single
-warning line and continues — your rvpm operation still succeeds.
+safe to enable even if only part of your rvpm tree lives in chezmoi.
+
+If `options.chezmoi = true` but the `chezmoi` binary isn't in `PATH`, rvpm
+prints a warning on every mutation (since you explicitly opted in — the
+loud feedback nudges you to either install chezmoi or set
+`chezmoi = false`). The primary rvpm operation still succeeds.
 
 Detection uses `chezmoi source-path <path>` (exit 0 = managed).
 

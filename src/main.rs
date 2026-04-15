@@ -1265,10 +1265,10 @@ async fn run_add(
     let toml_content = doc.to_string();
     std::fs::write(&config_path, &toml_content)?;
     println!("Added plugin to config: {}", repo);
+    chezmoi::sync(read_chezmoi_flag(&config_path), &config_path);
 
     // 追加したプラグインだけ clone + merge し、loader.lua を再生成する
     let config_data = parse_config(&toml_content)?;
-    chezmoi::sync(config_data.options.chezmoi, &config_path);
     let cache_root = resolve_cache_root(config_data.options.cache_root.as_deref());
     let merged_dir = resolve_merged_dir(&cache_root);
 
@@ -1310,11 +1310,7 @@ async fn run_config() -> Result<bool> {
     ensure_config_exists(&config_path)?;
     println!("Opening {}", config_path.display());
     open_editor_at_line(&config_path, 1)?;
-    if let Ok(toml_content) = std::fs::read_to_string(&config_path)
-        && let Ok(cfg) = parse_config(&toml_content)
-    {
-        chezmoi::sync(cfg.options.chezmoi, &config_path);
-    }
+    chezmoi::sync(read_chezmoi_flag(&config_path), &config_path);
     Ok(true)
 }
 
@@ -1409,12 +1405,7 @@ async fn run_edit(
         println!("\n>> Editing global hook: {}", target.display());
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
         std::process::Command::new(editor).arg(&target).status()?;
-        if config_path.exists()
-            && let Ok(toml_content) = std::fs::read_to_string(&config_path)
-            && let Ok(cfg) = parse_config(&toml_content)
-        {
-            chezmoi::sync(cfg.options.chezmoi, &target);
-        }
+        chezmoi::sync(read_chezmoi_flag(&config_path), &target);
         return Ok(true);
     }
 
@@ -1521,7 +1512,7 @@ async fn run_edit(
     std::process::Command::new(editor)
         .arg(&target_file)
         .status()?;
-    chezmoi::sync(config.options.chezmoi, &target_file);
+    chezmoi::sync(read_chezmoi_flag(&config_path), &target_file);
     Ok(true)
 }
 
@@ -1803,12 +1794,9 @@ async fn run_set(
     }
 
     if modified {
-        let new_toml = doc.to_string();
-        std::fs::write(&config_path, &new_toml)?;
+        std::fs::write(&config_path, doc.to_string())?;
         println!("Updated config for: {}", selected_repo_url);
-        if let Ok(cfg) = parse_config(&new_toml) {
-            chezmoi::sync(cfg.options.chezmoi, &config_path);
-        }
+        chezmoi::sync(read_chezmoi_flag(&config_path), &config_path);
         return Ok(true);
     }
     Ok(false)
@@ -1884,12 +1872,9 @@ async fn run_remove(query: Option<String>) -> Result<()> {
 
     let mut doc = toml_content.parse::<DocumentMut>()?;
     remove_plugin_from_toml(&mut doc, &selected_url)?;
-    let new_toml = doc.to_string();
-    std::fs::write(&config_path, &new_toml)?;
+    std::fs::write(&config_path, doc.to_string())?;
     println!("Removed '{}' from config.", selected_url);
-    if let Ok(cfg) = parse_config(&new_toml) {
-        chezmoi::sync(cfg.options.chezmoi, &config_path);
-    }
+    chezmoi::sync(read_chezmoi_flag(&config_path), &config_path);
 
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
     let plugin = config
@@ -2208,6 +2193,24 @@ fn rvpm_config_path() -> PathBuf {
         .join("rvpm")
         .join(appname())
         .join("config.toml")
+}
+
+/// `config.toml` から `options.chezmoi` フラグだけを軽量に読み出す。
+/// `parse_config` は Tera 展開 + topological sort を行う重量級処理なので、
+/// mutate 系コマンドがフラグ 1 つを見るためだけに呼ぶのは無駄。
+/// toml_edit で該当キーだけ直接参照する。
+/// ファイルが存在しない / パースできない / キーが無い場合は `false`。
+fn read_chezmoi_flag(config_path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    let Ok(doc) = content.parse::<DocumentMut>() else {
+        return false;
+    };
+    doc.get("options")
+        .and_then(|o| o.get("chezmoi"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// config.toml が存在しなければ最小テンプレートで新規作成する。

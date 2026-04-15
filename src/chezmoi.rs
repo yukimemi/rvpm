@@ -68,7 +68,6 @@ pub fn first_existing_ancestor(path: &Path) -> Option<PathBuf> {
 }
 
 /// `chezmoi source-path <p>` を実行して exit 0 なら managed。
-/// `chezmoi` が見つからない場合も false を返す。
 fn is_managed_via_chezmoi(p: &Path) -> bool {
     Command::new("chezmoi")
         .arg("source-path")
@@ -78,11 +77,36 @@ fn is_managed_via_chezmoi(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// `chezmoi` 実行可能ファイルが PATH に存在するか。`--version` で軽く叩いて判定。
+fn is_chezmoi_available() -> bool {
+    Command::new("chezmoi")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// `options.chezmoi = true` のときに rvpm の mutate 系コマンドから呼ばれる
 /// エントリポイント。`path` に対する必要な chezmoi 操作を判定し実行する。
 /// 失敗しても rvpm 本体の処理は止めない (stderr に warn 1 行だけ出して継続)。
+///
+/// `enabled = true` なのに `chezmoi` バイナリが PATH に無い場合は、ユーザーが
+/// 明示的に ON にしている以上不整合なので毎回 warn を出す (設定ミスを放置
+/// しない方が親切)。鬱陶しければ `options.chezmoi = false` に戻すか、
+/// `chezmoi` を入れるかを選んでもらう。
 pub fn sync(enabled: bool, path: &Path) {
-    let action = decide_action(enabled, path, is_managed_via_chezmoi);
+    if !enabled {
+        return;
+    }
+    if !is_chezmoi_available() {
+        eprintln!(
+            "\u{26a0} options.chezmoi = true but `chezmoi` is not in PATH. \
+             Skipping sync for {} (install chezmoi or set chezmoi = false).",
+            path.display(),
+        );
+        return;
+    }
+    let action = decide_action(true, path, is_managed_via_chezmoi);
     match action {
         SyncAction::Noop => {}
         SyncAction::ReAdd(p) => run_chezmoi(&["re-add"], &p),
