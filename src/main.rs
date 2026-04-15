@@ -735,11 +735,14 @@ async fn run_generate() -> Result<()> {
 }
 
 /// 全プラグインの git 状態を並列で調べ、url -> PluginStatus のマップを返す。
-async fn fetch_plugin_statuses(
+/// 全プラグインのステータスチェックを並列で spawn し、受信用 channel と
+/// JoinSet を返す。呼び出し側は progressive に受信して描画するか、一括で
+/// await して完了を待つか選べる。
+fn spawn_status_check(
     config: &config::Config,
     cache_root: &Path,
-) -> std::collections::HashMap<String, PluginStatus> {
-    let (tx, mut rx) = mpsc::channel::<(String, PluginStatus)>(100);
+) -> (mpsc::Receiver<(String, PluginStatus)>, JoinSet<()>) {
+    let (tx, rx) = mpsc::channel::<(String, PluginStatus)>(100);
     let mut set = JoinSet::new();
     for plugin in config.plugins.iter() {
         let plugin = plugin.clone();
@@ -759,6 +762,14 @@ async fn fetch_plugin_statuses(
         });
     }
     drop(tx);
+    (rx, set)
+}
+
+async fn fetch_plugin_statuses(
+    config: &config::Config,
+    cache_root: &Path,
+) -> std::collections::HashMap<String, PluginStatus> {
+    let (mut rx, mut set) = spawn_status_check(config, cache_root);
     while set.join_next().await.is_some() {}
     let mut result = std::collections::HashMap::new();
     while let Ok((url, status)) = rx.try_recv() {
@@ -805,42 +816,35 @@ async fn run_list(no_tui: bool) -> Result<()> {
     let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
     let mut tui_state = TuiState::new(urls);
 
-    /// 全プラグインのステータスチェックを並列で spawn し、
-    /// (rx, set) を返す。main loop は progressive に受信して描画する。
-    fn spawn_status_check(
-        config: &config::Config,
-        cache_root: &Path,
-    ) -> (mpsc::Receiver<(String, PluginStatus)>, JoinSet<()>) {
-        let (tx, rx) = mpsc::channel::<(String, PluginStatus)>(100);
-        let mut set = JoinSet::new();
-        for plugin in config.plugins.iter() {
-            let plugin = plugin.clone();
-            let cache_root = cache_root.to_path_buf();
-            let tx = tx.clone();
-            set.spawn(async move {
-                let dst_path = resolve_plugin_dst(&plugin, &cache_root);
-                let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
-                let git_status = repo.get_status().await;
-                let plugin_status = match git_status {
-                    crate::git::RepoStatus::Clean => PluginStatus::Finished,
-                    crate::git::RepoStatus::NotInstalled => {
-                        PluginStatus::Failed("Missing".to_string())
-                    }
-                    crate::git::RepoStatus::Modified => {
-                        PluginStatus::Syncing("Modified".to_string())
-                    }
-                    crate::git::RepoStatus::Error(e) => PluginStatus::Failed(e),
-                };
-                let _ = tx.send((plugin.url.clone(), plugin_status)).await;
-            });
-        }
-        drop(tx);
-        (rx, set)
-    }
-
     // バックグラウンドでステータスチェック開始 (TUI は即表示)
     let (mut rx, mut set) = spawn_status_check(&config, &cache_root);
     let mut bg_done = false;
+
+    // サブコマンド実行前の TUI 退避 (raw mode OFF + 通常スクリーン復帰 + カーソル表示)。
+    fn leave_tui(
+        terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        disable_raw_mode()?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        terminal.show_cursor()?;
+        Ok(())
+    }
+
+    // サブコマンド完了後に TUI を復帰して状態一式を差し替えるためのローカル
+    // マクロ。複数の外側変数を同時にムーブ代入するためクロージャにできず、
+    // マクロで反復を畳んでいる。
+    macro_rules! reload {
+        () => {{
+            let (c, s, new_rx, new_set) =
+                reload_state(&config_path, &cache_root, &mut terminal, &icons)?;
+            icons = crate::tui::Icons::from_style(c.options.icons);
+            config = c;
+            tui_state = s;
+            rx = new_rx;
+            set = new_set;
+            bg_done = false;
+        }};
+    }
 
     /// メッセージを表示して任意のキー入力を待つ。
     fn wait_for_keypress(message: &str) -> Result<()> {
@@ -1016,27 +1020,16 @@ async fn run_list(no_tui: bool) -> Result<()> {
                 // ── actions ──
                 crossterm::event::KeyCode::Char('e') => {
                     if let Some(url) = tui_state.selected_url() {
-                        disable_raw_mode()?;
-                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                        terminal.show_cursor()?;
+                        leave_tui(&mut terminal)?;
                         if run_edit(Some(url), false, false, false, false).await? {
                             let _ = run_sync(false).await;
                         }
-                        let (c, s, new_rx, new_set) =
-                            reload_state(&config_path, &cache_root, &mut terminal, &icons)?;
-                        icons = crate::tui::Icons::from_style(c.options.icons);
-                        config = c;
-                        tui_state = s;
-                        rx = new_rx;
-                        set = new_set;
-                        bg_done = false;
+                        reload!();
                     }
                 }
                 crossterm::event::KeyCode::Char('s') => {
                     if let Some(url) = tui_state.selected_url() {
-                        disable_raw_mode()?;
-                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                        terminal.show_cursor()?;
+                        leave_tui(&mut terminal)?;
                         if run_set(
                             Some(url),
                             None,
@@ -1053,77 +1046,34 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         {
                             let _ = run_sync(false).await;
                         }
-                        let (c, s, new_rx, new_set) =
-                            reload_state(&config_path, &cache_root, &mut terminal, &icons)?;
-                        icons = crate::tui::Icons::from_style(c.options.icons);
-                        config = c;
-                        tui_state = s;
-                        rx = new_rx;
-                        set = new_set;
-                        bg_done = false;
+                        reload!();
                     }
                 }
                 crossterm::event::KeyCode::Char('S') => {
-                    disable_raw_mode()?;
-                    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                    terminal.show_cursor()?;
+                    leave_tui(&mut terminal)?;
                     let _ = run_sync(false).await;
                     wait_for_keypress("\nPress any key to return to list...")?;
-                    let (c, s, new_rx, new_set) =
-                        reload_state(&config_path, &cache_root, &mut terminal, &icons)?;
-                    icons = crate::tui::Icons::from_style(c.options.icons);
-                    config = c;
-                    tui_state = s;
-                    rx = new_rx;
-                    set = new_set;
-                    bg_done = false;
+                    reload!();
                 }
                 crossterm::event::KeyCode::Char('u') => {
                     if let Some(url) = tui_state.selected_url() {
-                        disable_raw_mode()?;
-                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                        terminal.show_cursor()?;
+                        leave_tui(&mut terminal)?;
                         let _ = run_update(Some(url)).await;
                         wait_for_keypress("\nPress any key to return to list...")?;
-                        let (c, s, new_rx, new_set) =
-                            reload_state(&config_path, &cache_root, &mut terminal, &icons)?;
-                        icons = crate::tui::Icons::from_style(c.options.icons);
-                        config = c;
-                        tui_state = s;
-                        rx = new_rx;
-                        set = new_set;
-                        bg_done = false;
+                        reload!();
                     }
                 }
                 crossterm::event::KeyCode::Char('U') => {
-                    disable_raw_mode()?;
-                    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                    terminal.show_cursor()?;
+                    leave_tui(&mut terminal)?;
                     let _ = run_update(None).await;
                     wait_for_keypress("\nPress any key to return to list...")?;
-                    let (c, s, new_rx, new_set) =
-                        reload_state(&config_path, &cache_root, &mut terminal, &icons)?;
-                    icons = crate::tui::Icons::from_style(c.options.icons);
-                    config = c;
-                    tui_state = s;
-                    rx = new_rx;
-                    set = new_set;
-                    bg_done = false;
+                    reload!();
                 }
                 crossterm::event::KeyCode::Char('d') => {
                     if let Some(url) = tui_state.selected_url() {
-                        disable_raw_mode()?;
-                        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-                        terminal.show_cursor()?;
+                        leave_tui(&mut terminal)?;
                         let _ = run_remove(Some(url)).await;
-                        let (c, s, new_rx, new_set) =
-                            reload_state(&config_path, &cache_root, &mut terminal, &icons)?;
-                        icons = crate::tui::Icons::from_style(c.options.icons);
-                        config = c;
-                        tui_state = s;
-                        rx = new_rx;
-                        set = new_set;
-                        bg_done = false;
+                        reload!();
                     }
                 }
                 _ => {}
