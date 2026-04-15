@@ -2124,10 +2124,26 @@ fn resolve_concurrency(config_value: Option<usize>) -> usize {
 
 /// `~/.config/rvpm/config.toml` (固定)
 /// $RVPM_APPNAME → $NVIM_APPNAME → "nvim" の優先順で appname を決定。
+/// 無効な値 (空文字、パス区切り含む、"." / "..") は "nvim" に fallback。
 pub(crate) fn appname() -> String {
-    std::env::var("RVPM_APPNAME")
+    let raw = std::env::var("RVPM_APPNAME")
         .or_else(|_| std::env::var("NVIM_APPNAME"))
-        .unwrap_or_else(|_| "nvim".to_string())
+        .unwrap_or_default();
+    if is_valid_appname(&raw) {
+        raw
+    } else {
+        "nvim".to_string()
+    }
+}
+
+/// appname が path segment として安全か検証。
+fn is_valid_appname(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
 }
 
 fn rvpm_config_path() -> PathBuf {
@@ -2898,6 +2914,18 @@ mod tests {
             expand_tilde("relative/path"),
             PathBuf::from("relative/path")
         );
+    }
+
+    #[test]
+    fn test_is_valid_appname_rejects_unsafe_values() {
+        assert!(is_valid_appname("nvim"));
+        assert!(is_valid_appname("nvim-test"));
+        assert!(!is_valid_appname(""));
+        assert!(!is_valid_appname("."));
+        assert!(!is_valid_appname(".."));
+        assert!(!is_valid_appname("foo/bar"));
+        assert!(!is_valid_appname("foo\\bar"));
+        assert!(!is_valid_appname("foo\0bar"));
     }
 
     #[test]
