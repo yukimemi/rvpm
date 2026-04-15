@@ -701,11 +701,7 @@ async fn run_generate() -> Result<()> {
     let mut plugin_scripts = Vec::new();
     let config_root = resolve_config_root(config.options.config_root.as_deref());
     for plugin in &config.plugins {
-        let dst_path = if let Some(d) = &plugin.dst {
-            PathBuf::from(d)
-        } else {
-            resolve_repos_dir(&cache_root).join(plugin.canonical_path())
-        };
+        let dst_path = resolve_plugin_dst(plugin, &cache_root);
         let plugin_config_dir = config_root.join(plugin.canonical_path());
         plugin_scripts.push(build_plugin_scripts(plugin, &dst_path, &plugin_config_dir));
     }
@@ -750,11 +746,7 @@ async fn fetch_plugin_statuses(
         let cache_root = cache_root.to_path_buf();
         let tx = tx.clone();
         set.spawn(async move {
-            let dst_path = if let Some(d) = &plugin.dst {
-                PathBuf::from(d)
-            } else {
-                resolve_repos_dir(&cache_root).join(plugin.canonical_path())
-            };
+            let dst_path = resolve_plugin_dst(&plugin, &cache_root);
             let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
             let git_status = repo.get_status().await;
             let plugin_status = match git_status {
@@ -821,11 +813,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
         let cache_root = cache_root.clone();
         let tx = tx.clone();
         set.spawn(async move {
-            let dst_path = if let Some(d) = &plugin.dst {
-                PathBuf::from(d)
-            } else {
-                resolve_repos_dir(&cache_root).join(plugin.canonical_path())
-            };
+            let dst_path = resolve_plugin_dst(&plugin, &cache_root);
             let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
             let git_status = repo.get_status().await;
             let plugin_status = match git_status {
@@ -1128,11 +1116,7 @@ async fn run_update(query: Option<String>) -> Result<()> {
 
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
-            let dst_path = if let Some(d) = &plugin.dst {
-                PathBuf::from(d)
-            } else {
-                resolve_repos_dir(&cache_root).join(plugin.canonical_path())
-            };
+            let dst_path = resolve_plugin_dst(&plugin, &cache_root);
             let _ = tx
                 .send((
                     plugin.url.clone(),
@@ -1859,11 +1843,7 @@ async fn run_remove(query: Option<String>) -> Result<()> {
         .iter()
         .find(|p| p.url == selected_url)
         .unwrap();
-    let dst_path = if let Some(d) = &plugin.dst {
-        PathBuf::from(d)
-    } else {
-        resolve_repos_dir(&cache_root).join(plugin.canonical_path())
-    };
+    let dst_path = resolve_plugin_dst(plugin, &cache_root);
 
     if dst_path.exists() {
         std::fs::remove_dir_all(&dst_path)?;
@@ -2144,7 +2124,7 @@ fn resolve_concurrency(config_value: Option<usize>) -> usize {
 
 /// `~/.config/rvpm/config.toml` (固定)
 /// $RVPM_APPNAME → $NVIM_APPNAME → "nvim" の優先順で appname を決定。
-fn appname() -> String {
+pub(crate) fn appname() -> String {
     std::env::var("RVPM_APPNAME")
         .or_else(|_| std::env::var("NVIM_APPNAME"))
         .unwrap_or_else(|_| "nvim".to_string())
@@ -2596,10 +2576,21 @@ fn build_plugin_scripts(
 async fn run_store() -> Result<()> {
     use crate::store_tui::StoreTuiState;
 
+    // cache_root を config から解決 (options.cache_root を尊重)
+    let config_path = rvpm_config_path();
+    let cache_root = if config_path.exists() {
+        let toml_content = std::fs::read_to_string(&config_path)?;
+        let config = parse_config(&toml_content)?;
+        resolve_cache_root(config.options.cache_root.as_deref())
+    } else {
+        resolve_cache_root(None)
+    };
+
     let mut state = StoreTuiState::new();
 
     // 初期表示: 人気プラグインをバックグラウンドで取得
-    let popular = tokio::task::spawn_blocking(crate::store::fetch_popular);
+    let cache_root_bg = cache_root.clone();
+    let popular = tokio::task::spawn_blocking(move || crate::store::fetch_popular(&cache_root_bg));
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -2639,8 +2630,9 @@ async fn run_store() -> Result<()> {
                 state.readme_content = None;
                 state.readme_scroll = 0;
                 let tx = readme_tx.clone();
+                let cache_root_bg = cache_root.clone();
                 tokio::task::spawn_blocking(move || {
-                    let content = crate::store::fetch_readme(&repo)
+                    let content = crate::store::fetch_readme(&cache_root_bg, &repo)
                         .unwrap_or_else(|e| format!("Error: {}", e));
                     let _ = tx.blocking_send((repo.full_name.clone(), content));
                 });
@@ -2665,8 +2657,9 @@ async fn run_store() -> Result<()> {
                         let query = state.search_input.clone();
                         state.message = Some(format!("Searching '{}'...", query));
                         terminal.draw(|f| state.draw(f))?;
+                        let cache_root_bg = cache_root.clone();
                         let result = tokio::task::spawn_blocking(move || {
-                            crate::store::search_plugins(&query)
+                            crate::store::search_plugins(&cache_root_bg, &query)
                         })
                         .await;
                         match result {
@@ -2727,10 +2720,14 @@ async fn run_store() -> Result<()> {
                     state.message = Some(format!("Sort: {}", state.sort_mode.label()));
                 }
                 crossterm::event::KeyCode::Char('R') => {
-                    crate::store::clear_search_cache();
+                    crate::store::clear_search_cache(&cache_root);
                     state.message = Some("Cache cleared. Searching...".to_string());
                     terminal.draw(|f| state.draw(f))?;
-                    let result = tokio::task::spawn_blocking(crate::store::fetch_popular).await;
+                    let cache_root_bg = cache_root.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::store::fetch_popular(&cache_root_bg)
+                    })
+                    .await;
                     match result {
                         Ok(Ok(repos)) => {
                             state.message = Some(format!("{} plugins", repos.len()));
