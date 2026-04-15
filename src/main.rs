@@ -863,7 +863,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
         // (これをしないとサブプロセスが alt screen 外で行った描画のせいで
         //  差分描画が崩れた画面を残したまま戻る)。
         enable_raw_mode()?;
-        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
         terminal.clear()?;
         terminal.hide_cursor()?;
 
