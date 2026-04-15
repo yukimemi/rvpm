@@ -205,8 +205,8 @@ chezmoi = true
 ```
 
 With this enabled, after every mutation (`rvpm add` / `set` / `remove` /
-`edit` / `config`, plus TUI `S`/`u`/`U`/`e`/`s`/`d` actions that touch
-config), rvpm:
+`edit` / `config`, plus TUI actions `e` / `s` / `d` that edit hooks,
+plugin options, or remove plugins), rvpm:
 
 - runs `chezmoi re-add <path>` when the target file is already chezmoi-managed, and
 - runs `chezmoi add <path>` when the file is newly created by rvpm and its

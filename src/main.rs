@@ -1215,6 +1215,7 @@ async fn run_add(
     rev: Option<String>,
 ) -> Result<()> {
     let config_path = rvpm_config_path();
+    let config_existed_before = config_path.exists();
     ensure_config_exists(&config_path)?;
     let toml_content = std::fs::read_to_string(&config_path)?;
     let mut doc = toml_content.parse::<DocumentMut>()?;
@@ -1265,7 +1266,11 @@ async fn run_add(
     let toml_content = doc.to_string();
     std::fs::write(&config_path, &toml_content)?;
     println!("Added plugin to config: {}", repo);
-    chezmoi::sync(read_chezmoi_flag(&config_path), &config_path);
+    chezmoi::sync(
+        read_chezmoi_flag(&config_path),
+        config_existed_before,
+        &config_path,
+    );
 
     // 追加したプラグインだけ clone + merge し、loader.lua を再生成する
     let config_data = parse_config(&toml_content)?;
@@ -1307,10 +1312,15 @@ use dialoguer::{FuzzySelect, Select};
 /// 常に `Ok(true)` を返すので呼び出し側で sync を走らせる前提。
 async fn run_config() -> Result<bool> {
     let config_path = rvpm_config_path();
+    let existed_before = config_path.exists();
     ensure_config_exists(&config_path)?;
     println!("Opening {}", config_path.display());
     open_editor_at_line(&config_path, 1)?;
-    chezmoi::sync(read_chezmoi_flag(&config_path), &config_path);
+    chezmoi::sync(
+        read_chezmoi_flag(&config_path),
+        existed_before,
+        &config_path,
+    );
     Ok(true)
 }
 
@@ -1402,10 +1412,11 @@ async fn run_edit(
         };
 
         let target = config_dir.join(file_name);
+        let existed_before = target.exists();
         println!("\n>> Editing global hook: {}", target.display());
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
         std::process::Command::new(editor).arg(&target).status()?;
-        chezmoi::sync(read_chezmoi_flag(&config_path), &target);
+        chezmoi::sync(read_chezmoi_flag(&config_path), existed_before, &target);
         return Ok(true);
     }
 
@@ -1508,11 +1519,16 @@ async fn run_edit(
     };
     std::fs::create_dir_all(&plugin_config_dir)?;
     let target_file = plugin_config_dir.join(file_name);
+    let existed_before = target_file.exists();
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
     std::process::Command::new(editor)
         .arg(&target_file)
         .status()?;
-    chezmoi::sync(read_chezmoi_flag(&config_path), &target_file);
+    chezmoi::sync(
+        read_chezmoi_flag(&config_path),
+        existed_before,
+        &target_file,
+    );
     Ok(true)
 }
 
@@ -1649,6 +1665,7 @@ async fn run_set(
                         // 対応 editor なら plugin の url 行にジャンプ
                         let line = find_plugin_line_in_toml(&toml_content, &selected_repo_url);
                         open_editor_at_line(&config_path, line)?;
+                        chezmoi::sync(read_chezmoi_flag(&config_path), true, &config_path);
                         // ユーザーが何を編集したか分からないので常に変更ありと見なす
                         return Ok(true);
                     }
@@ -1737,6 +1754,7 @@ async fn run_set(
                                 let line =
                                     find_plugin_line_in_toml(&toml_content, &selected_repo_url);
                                 open_editor_at_line(&config_path, line)?;
+                                chezmoi::sync(read_chezmoi_flag(&config_path), true, &config_path);
                                 return Ok(true);
                             }
                             _ => return Ok(false),
@@ -1796,7 +1814,7 @@ async fn run_set(
     if modified {
         std::fs::write(&config_path, doc.to_string())?;
         println!("Updated config for: {}", selected_repo_url);
-        chezmoi::sync(read_chezmoi_flag(&config_path), &config_path);
+        chezmoi::sync(read_chezmoi_flag(&config_path), true, &config_path);
         return Ok(true);
     }
     Ok(false)
@@ -1874,7 +1892,7 @@ async fn run_remove(query: Option<String>) -> Result<()> {
     remove_plugin_from_toml(&mut doc, &selected_url)?;
     std::fs::write(&config_path, doc.to_string())?;
     println!("Removed '{}' from config.", selected_url);
-    chezmoi::sync(read_chezmoi_flag(&config_path), &config_path);
+    chezmoi::sync(read_chezmoi_flag(&config_path), true, &config_path);
 
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
     let plugin = config
