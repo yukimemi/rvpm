@@ -1,3 +1,4 @@
+mod chezmoi;
 mod config;
 mod git;
 mod link;
@@ -1267,6 +1268,7 @@ async fn run_add(
 
     // 追加したプラグインだけ clone + merge し、loader.lua を再生成する
     let config_data = parse_config(&toml_content)?;
+    chezmoi::sync(config_data.options.chezmoi, &config_path);
     let cache_root = resolve_cache_root(config_data.options.cache_root.as_deref());
     let merged_dir = resolve_merged_dir(&cache_root);
 
@@ -1308,6 +1310,11 @@ async fn run_config() -> Result<bool> {
     ensure_config_exists(&config_path)?;
     println!("Opening {}", config_path.display());
     open_editor_at_line(&config_path, 1)?;
+    if let Ok(toml_content) = std::fs::read_to_string(&config_path)
+        && let Ok(cfg) = parse_config(&toml_content)
+    {
+        chezmoi::sync(cfg.options.chezmoi, &config_path);
+    }
     Ok(true)
 }
 
@@ -1402,6 +1409,12 @@ async fn run_edit(
         println!("\n>> Editing global hook: {}", target.display());
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
         std::process::Command::new(editor).arg(&target).status()?;
+        if config_path.exists()
+            && let Ok(toml_content) = std::fs::read_to_string(&config_path)
+            && let Ok(cfg) = parse_config(&toml_content)
+        {
+            chezmoi::sync(cfg.options.chezmoi, &target);
+        }
         return Ok(true);
     }
 
@@ -1506,8 +1519,9 @@ async fn run_edit(
     let target_file = plugin_config_dir.join(file_name);
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
     std::process::Command::new(editor)
-        .arg(target_file)
+        .arg(&target_file)
         .status()?;
+    chezmoi::sync(config.options.chezmoi, &target_file);
     Ok(true)
 }
 
@@ -1789,8 +1803,12 @@ async fn run_set(
     }
 
     if modified {
-        std::fs::write(&config_path, doc.to_string())?;
+        let new_toml = doc.to_string();
+        std::fs::write(&config_path, &new_toml)?;
         println!("Updated config for: {}", selected_repo_url);
+        if let Ok(cfg) = parse_config(&new_toml) {
+            chezmoi::sync(cfg.options.chezmoi, &config_path);
+        }
         return Ok(true);
     }
     Ok(false)
@@ -1866,8 +1884,12 @@ async fn run_remove(query: Option<String>) -> Result<()> {
 
     let mut doc = toml_content.parse::<DocumentMut>()?;
     remove_plugin_from_toml(&mut doc, &selected_url)?;
-    std::fs::write(&config_path, doc.to_string())?;
+    let new_toml = doc.to_string();
+    std::fs::write(&config_path, &new_toml)?;
     println!("Removed '{}' from config.", selected_url);
+    if let Ok(cfg) = parse_config(&new_toml) {
+        chezmoi::sync(cfg.options.chezmoi, &config_path);
+    }
 
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
     let plugin = config

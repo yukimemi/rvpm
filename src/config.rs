@@ -37,6 +37,12 @@ pub struct Options {
     /// TUI アイコンスタイル: "nerd" (default), "unicode", "ascii"
     #[serde(default)]
     pub icons: IconStyle,
+    /// chezmoi 連携を有効にするか。`true` なら rvpm が `config.toml` や
+    /// per-plugin hook を書き換えた後に `chezmoi re-add` / `chezmoi add` を
+    /// 自動実行して source 側へ同期する。`chezmoi` コマンドが無い環境では
+    /// 静かにスキップ。デフォルト `false`。
+    #[serde(default)]
+    pub chezmoi: bool,
 }
 
 /// Keymap 仕様. TOML では文字列 (`"<leader>f"`) またはテーブル
@@ -477,6 +483,31 @@ url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
         assert_eq!(config.options.cache_root, None);
+    }
+
+    #[test]
+    fn test_parse_config_chezmoi_defaults_to_false() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(!config.options.chezmoi);
+    }
+
+    #[test]
+    fn test_parse_config_accepts_chezmoi_true() {
+        let toml = r#"
+[options]
+chezmoi = true
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(config.options.chezmoi);
     }
 
     #[test]
