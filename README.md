@@ -32,8 +32,8 @@ sources everything without any runtime glob cost.
 
 - **Fast startup** — 9-phase loader model with `vim.go.loadplugins = false`
   and pre-globbed `plugin/` / `ftdetect/` / `after/plugin/` file lists
-- **Global hooks** — `before.lua` / `after.lua` directly under the config
-  root are auto-detected at generate time; no config entry needed
+- **Global hooks** — `before.lua` / `after.lua` alongside `config.toml`
+  are auto-detected at generate time; no config entry needed
 - **Lazy trigger fidelity** — `User Xxx` pattern shorthand, bang/range/count/
   complete-aware commands, keymaps with mode + desc, and `<Ignore>`-prefixed
   replay for safety; operator-pending mode preserves `v:operator` /
@@ -165,7 +165,7 @@ for fully isolated test configs.
 > **Symmetric layout.** `config_root` and `cache_root` are structurally
 > parallel — each owns a `plugins/` subdirectory at the same depth:
 >
-> ```
+> ```text
 > ~/.config/rvpm/<appname>/                ← config_root
 >     ├── config.toml
 >     ├── before.lua       (global, phase 3)
@@ -179,7 +179,7 @@ for fully isolated test configs.
 >     │   └── loader.lua                    (generated)
 >     └── store/                            (`rvpm store` cache)
 > ```
-
+>
 > **💡 Leave `config_root` and `cache_root` unset** — the defaults are already
 > `<appname>`-aware. Setting a literal path (e.g. `cache_root = "~/dotfiles/rvpm"`)
 > **breaks appname isolation**: every `$NVIM_APPNAME` variant will share the same
@@ -412,7 +412,7 @@ rvpm will include them in the generated loader:
 | `before.lua` | Right after the plugin's rtp is added, before `plugin/*` is sourced |
 | `after.lua`  | After `plugin/*` is sourced (safe to call plugin APIs) |
 
-Example: `~/.config/rvpm/nvim/plugins/github.com/nvim-telescope/telescope.nvim/after.lua`
+Example: `~/.config/rvpm/<appname>/plugins/github.com/nvim-telescope/telescope.nvim/after.lua`
 
 ```lua
 require("telescope").setup({
@@ -463,7 +463,7 @@ plugin's `README.md` on demand for preview.
 
 **Caching:** search results are cached for 24 hours under
 `{cache_root}/store/`; READMEs are cached for 7 days. Press `R` in the TUI
-to force-refresh.
+to force-refresh the search cache (README cache expires on its own TTL).
 
 **Network requirement:** store needs network access to reach
 `api.github.com` and `raw.githubusercontent.com`. Other commands
@@ -559,7 +559,7 @@ rvpm list --no-tui | grep Missing
 <details>
 <summary><b>Loader model (9 phases)</b></summary>
 
-```
+```text
 Phase 1: vim.go.loadplugins = false         -- disable Neovim's auto-source
 Phase 2: load_lazy helper                   -- runtime loader for lazy plugins
 Phase 3: global before.lua                  -- ~/.config/rvpm/<appname>/before.lua
@@ -622,7 +622,7 @@ Beyond ordering, `depends` also affects **loading**:
 
 ## Directory layout (defaults)
 
-```
+```text
 ~/.config/rvpm/<appname>/                    ← config_root
 ├── config.toml                              ← main configuration
 ├── before.lua                               ← global before hook (phase 3, auto-detected)
