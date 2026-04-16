@@ -262,7 +262,7 @@ async fn main() -> Result<()> {
             global,
         } => {
             if run_edit(query, init, before, after, global).await? {
-                let _ = run_sync(false).await;
+                let _ = run_generate().await;
             }
         }
         Commands::Set {
@@ -282,7 +282,7 @@ async fn main() -> Result<()> {
             )
             .await?
             {
-                let _ = run_sync(false).await;
+                let _ = run_generate().await;
             }
         }
         Commands::Update { query } => {
@@ -296,7 +296,7 @@ async fn main() -> Result<()> {
         }
         Commands::Config => {
             if run_config().await? {
-                let _ = run_sync(false).await;
+                let _ = run_generate().await;
             }
         }
         Commands::Init { write } => {
@@ -318,17 +318,12 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
-/// cond + merge=true の組み合わせを検出し、merge を無効化する。
-/// 警告メッセージを返す (呼び出し元でまとめて表示)。
-fn warn_and_disable_merge_if_cond(plugin: &mut crate::config::Plugin) -> Option<String> {
+/// cond + merge=true の組み合わせを検出し、silent に merge を無効化する。
+/// (cond が false のとき merged rtp に中身が残ると矛盾するため。警告は
+/// 出さない — 自明に整合させているだけで、ユーザーアクションは不要。)
+fn disable_merge_if_cond(plugin: &mut crate::config::Plugin) {
     if plugin.cond.is_some() && plugin.merge {
         plugin.merge = false;
-        Some(format!(
-            "{}: cond + merge=true -> merge disabled",
-            plugin.display_name()
-        ))
-    } else {
-        None
     }
 }
 
@@ -403,12 +398,8 @@ async fn run_sync(prune: bool) -> Result<()> {
 
     let mut config_data = parse_config(&toml_content)?;
     crate::config::sort_plugins(&mut config_data.plugins)?;
-    // TUI 開始前に cond+merge を処理 (警告は後でまとめて出す)
-    let mut cond_warnings: Vec<String> = Vec::new();
     for plugin in config_data.plugins.iter_mut() {
-        if let Some(w) = warn_and_disable_merge_if_cond(plugin) {
-            cond_warnings.push(w);
-        }
+        disable_merge_if_cond(plugin);
     }
     let config = Arc::new(config_data);
 
@@ -621,13 +612,6 @@ async fn run_sync(prune: bool) -> Result<()> {
             eprintln!("  -> {}", name);
         }
     }
-    if !cond_warnings.is_empty() {
-        eprintln!("\n{} cond/merge warning(s):", cond_warnings.len());
-        for w in &cond_warnings {
-            eprintln!("  \u{26a0} {}", w);
-        }
-    }
-
     println!("Generating loader.lua...");
     let loader_path = resolve_loader_path(&cache_root);
     write_loader_to_path(
@@ -689,11 +673,8 @@ async fn run_generate() -> Result<()> {
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
     let mut config = parse_config(&toml_content)?;
     crate::config::sort_plugins(&mut config.plugins)?;
-    // cond + merge=true を正規化 (run_sync と同じ)
     for plugin in config.plugins.iter_mut() {
-        if let Some(w) = warn_and_disable_merge_if_cond(plugin) {
-            eprintln!("Warning: {}", w);
-        }
+        disable_merge_if_cond(plugin);
     }
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
     let merged_dir = resolve_merged_dir(&cache_root);
@@ -1023,7 +1004,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                     if let Some(url) = tui_state.selected_url() {
                         leave_tui(&mut terminal)?;
                         if run_edit(Some(url), false, false, false, false).await? {
-                            let _ = run_sync(false).await;
+                            let _ = run_generate().await;
                         }
                         reload!();
                     }
@@ -1045,7 +1026,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         )
                         .await?
                         {
-                            let _ = run_sync(false).await;
+                            let _ = run_generate().await;
                         }
                         reload!();
                     }
@@ -1278,9 +1259,7 @@ async fn run_add(
     let merged_dir = resolve_merged_dir(&cache_root);
 
     if let Some(mut plugin) = config_data.plugins.iter().find(|p| p.url == repo).cloned() {
-        if let Some(w) = warn_and_disable_merge_if_cond(&mut plugin) {
-            eprintln!("Warning: {}", w);
-        }
+        disable_merge_if_cond(&mut plugin);
         let dst_path = resolve_plugin_dst(&plugin, &cache_root);
 
         println!("Syncing {}...", plugin.display_name());

@@ -259,12 +259,12 @@ let _permit = sem.acquire_owned().await.unwrap();
 |---------|------|------|
 | `sync [--prune]` | `run_sync()` | clone/pull + merged + loader.lua 生成。`--prune` で未使用プラグインディレクトリも削除。無指定でも未使用があれば末尾で警告表示 |
 | `generate` | `run_generate()` | loader.lua のみ再生成 |
-| `add <repo>` | `run_add()` | TOML 追加 + sync |
+| `add <repo>` | `run_add()` | TOML 追加 + 当該プラグインだけ clone + generate |
 | `update [query]` | `run_update()` | 既存プラグインの pull (clone しない) |
 | `remove [query]` | `run_remove()` | TOML + ディレクトリ削除 + generate |
 | `edit [query] [--init\|--before\|--after] [--global]` | `run_edit()` | per-plugin init/before/after.lua をエディタで編集。フラグ指定でファイル選択をスキップ。`--global` で global hooks (`~/.config/rvpm/before.lua` / `after.lua`) を編集。インタラクティブ選択時は `[ Global hooks ]` sentinel でも同じ動作 |
 | `set [query] [flags]` | `run_set()` | lazy/merge/on_* などを対話式 or 引数で変更。`on_cmd` 等は comma-separated / JSON array 両対応、`--on-map` は JSON object/array で table 形式もサポート。`[ Open config.toml in $EDITOR ]` sentinel で TOML 直接編集に逃げられる |
-| `config` | `run_config()` | `config.toml` を `$EDITOR` で直接開く (終了後に sync 実行) |
+| `config` | `run_config()` | `config.toml` を `$EDITOR` で直接開く (終了後に generate のみ実行。新規プラグイン追加した場合は `rvpm sync` 明示実行) |
 | `init [--write]` | `run_init()` | Neovim `init.lua` に loader.lua を繋ぐ `dofile(...)` スニペットを案内。`--write` で自動追記 (init.lua がなければ新規作成)。`$NVIM_APPNAME` を尊重 |
 | `list [--no-tui]` | `run_list()` | プラグイン一覧表示。デフォルトは TUI で `[S] sync / [u/U] update / [g] generate / [d] remove / [e] edit / [s] set` のアクションキー対応。`--no-tui` で pipe-friendly な plain text 出力 (旧 `status` 相当) |
 
