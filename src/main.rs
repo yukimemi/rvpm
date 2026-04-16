@@ -2771,31 +2771,85 @@ async fn run_store() -> Result<()> {
 
             match key.code {
                 crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => break,
+                crossterm::event::KeyCode::Tab => {
+                    state.toggle_focus();
+                }
+                crossterm::event::KeyCode::Char('?') => {
+                    state.show_help = !state.show_help;
+                }
                 crossterm::event::KeyCode::Char('/') => {
                     state.search_mode = true;
                     state.search_input.clear();
                     state.message = None;
                 }
+
+                // ── Navigation: focus-aware ──
                 crossterm::event::KeyCode::Char('j') | crossterm::event::KeyCode::Down => {
-                    state.next();
+                    match state.focus {
+                        store_tui::Focus::List => state.next(),
+                        store_tui::Focus::Readme => state.scroll_readme_down(1),
+                    }
                 }
                 crossterm::event::KeyCode::Char('k') | crossterm::event::KeyCode::Up => {
-                    state.previous();
+                    match state.focus {
+                        store_tui::Focus::List => state.previous(),
+                        store_tui::Focus::Readme => state.scroll_readme_up(1),
+                    }
+                }
+                crossterm::event::KeyCode::Char('g') | crossterm::event::KeyCode::Home => {
+                    match state.focus {
+                        store_tui::Focus::List => state.go_top(),
+                        store_tui::Focus::Readme => state.readme_scroll = 0,
+                    }
+                }
+                crossterm::event::KeyCode::Char('G') | crossterm::event::KeyCode::End => {
+                    match state.focus {
+                        store_tui::Focus::List => state.go_bottom(),
+                        store_tui::Focus::Readme => state.scroll_readme_down(u16::MAX / 2),
+                    }
                 }
                 crossterm::event::KeyCode::Char('d')
                     if key
                         .modifiers
                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
-                    state.scroll_readme_down(10);
+                    match state.focus {
+                        store_tui::Focus::List => state.move_down(10),
+                        store_tui::Focus::Readme => state.scroll_readme_down(10),
+                    }
                 }
                 crossterm::event::KeyCode::Char('u')
                     if key
                         .modifiers
                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
-                    state.scroll_readme_up(10);
+                    match state.focus {
+                        store_tui::Focus::List => state.move_up(10),
+                        store_tui::Focus::Readme => state.scroll_readme_up(10),
+                    }
                 }
+                crossterm::event::KeyCode::Char('f')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    match state.focus {
+                        store_tui::Focus::List => state.move_down(20),
+                        store_tui::Focus::Readme => state.scroll_readme_down(20),
+                    }
+                }
+                crossterm::event::KeyCode::Char('b')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    match state.focus {
+                        store_tui::Focus::List => state.move_up(20),
+                        store_tui::Focus::Readme => state.scroll_readme_up(20),
+                    }
+                }
+
+                // ── Actions ──
                 crossterm::event::KeyCode::Char('s') => {
                     state.sort_mode = state.sort_mode.next();
                     state.sort_plugins();
