@@ -122,7 +122,7 @@ pub fn apply(wrote_to: &Path, target: &Path) {
         return;
     }
     let mut cmd = Command::new("chezmoi");
-    cmd.arg("apply").arg(target);
+    cmd.arg("apply").arg("--force").arg(target);
     match cmd.status() {
         Ok(s) if s.success() => {}
         Ok(s) => eprintln!(

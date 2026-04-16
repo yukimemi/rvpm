@@ -1310,28 +1310,28 @@ async fn run_init(write: bool) -> Result<()> {
     let init_lua_path = nvim_init_lua_path();
 
     if write {
-        match write_init_lua_snippet(&init_lua_path, &snippet)? {
+        let chezmoi_enabled = read_chezmoi_flag(&config_path);
+        let wp = chezmoi::write_path(chezmoi_enabled, &init_lua_path);
+        if let Some(parent) = wp.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match write_init_lua_snippet(&wp, &snippet)? {
             WriteInitResult::Created => {
-                println!(
-                    "\u{2714} Created {} with rvpm loader.",
-                    init_lua_path.display()
-                );
+                println!("\u{2714} Created {} with rvpm loader.", wp.display());
                 println!("  Snippet: {}", snippet);
             }
             WriteInitResult::Appended => {
-                println!(
-                    "\u{2714} Appended rvpm loader to {}.",
-                    init_lua_path.display()
-                );
+                println!("\u{2714} Appended rvpm loader to {}.", wp.display());
                 println!("  Snippet: {}", snippet);
             }
             WriteInitResult::AlreadyConfigured => {
                 println!(
                     "\u{2714} {} already references rvpm loader. No changes.",
-                    init_lua_path.display()
+                    wp.display()
                 );
             }
         }
+        chezmoi::apply(&wp, &init_lua_path);
     } else {
         println!("-- Add this to your Neovim init.lua:");
         println!("{}", snippet);
