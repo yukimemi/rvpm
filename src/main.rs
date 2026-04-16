@@ -2480,12 +2480,10 @@ fn read_input_with_esc(prompt: &str, initial: &str) -> Result<Option<String>> {
                     print!("{}", c);
                     std::io::stdout().flush()?;
                 }
-                KeyCode::Backspace => {
-                    if !input.is_empty() {
-                        input.pop();
-                        print!("\x08 \x08");
-                        std::io::stdout().flush()?;
-                    }
+                KeyCode::Backspace if !input.is_empty() => {
+                    input.pop();
+                    print!("\x08 \x08");
+                    std::io::stdout().flush()?;
                 }
                 _ => {}
             },

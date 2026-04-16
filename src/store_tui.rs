@@ -73,7 +73,7 @@ impl StoreTuiState {
         match self.sort_mode {
             SortMode::Stars => self
                 .plugins
-                .sort_by(|a, b| b.stargazers_count.cmp(&a.stargazers_count)),
+                .sort_by_key(|p| std::cmp::Reverse(p.stargazers_count)),
             SortMode::Updated => self.plugins.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)),
             SortMode::Name => self.plugins.sort_by(|a, b| {
                 a.plugin_name()
