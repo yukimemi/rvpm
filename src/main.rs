@@ -1247,7 +1247,7 @@ async fn run_add(
     let chezmoi_enabled = read_chezmoi_flag(&config_path);
     let wp = chezmoi::write_path(chezmoi_enabled, &config_path);
     std::fs::write(&wp, &toml_content)?;
-    chezmoi::apply(chezmoi_enabled, &config_path);
+    chezmoi::apply(&wp, &config_path);
     println!("Added plugin to config: {}", repo);
 
     // 追加したプラグインだけ clone + merge し、loader.lua を再生成する
@@ -1293,7 +1293,7 @@ async fn run_config() -> Result<bool> {
     let edit_target = chezmoi::write_path(chezmoi_enabled, &config_path);
     println!("Opening {}", edit_target.display());
     open_editor_at_line(&edit_target, 1)?;
-    chezmoi::apply(chezmoi_enabled, &config_path);
+    chezmoi::apply(&edit_target, &config_path);
     Ok(true)
 }
 
@@ -1388,14 +1388,14 @@ async fn run_edit(
         let chezmoi_enabled = read_chezmoi_flag(&config_path);
         let edit_target = chezmoi::write_path(chezmoi_enabled, &target);
         if let Some(parent) = edit_target.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent)?;
         }
         println!("\n>> Editing global hook: {}", edit_target.display());
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
         std::process::Command::new(editor)
             .arg(&edit_target)
             .status()?;
-        chezmoi::apply(chezmoi_enabled, &target);
+        chezmoi::apply(&edit_target, &target);
         return Ok(true);
     }
 
@@ -1506,7 +1506,7 @@ async fn run_edit(
     std::process::Command::new(editor)
         .arg(&edit_target)
         .status()?;
-    chezmoi::apply(chezmoi_enabled, &target_file);
+    chezmoi::apply(&edit_target, &target_file);
     Ok(true)
 }
 
@@ -1645,7 +1645,7 @@ async fn run_set(
                         let cz = read_chezmoi_flag(&config_path);
                         let ep = chezmoi::write_path(cz, &config_path);
                         open_editor_at_line(&ep, line)?;
-                        chezmoi::apply(cz, &config_path);
+                        chezmoi::apply(&ep, &config_path);
                         // ユーザーが何を編集したか分からないので常に変更ありと見なす
                         return Ok(true);
                     }
@@ -1736,7 +1736,7 @@ async fn run_set(
                                 let cz = read_chezmoi_flag(&config_path);
                                 let ep = chezmoi::write_path(cz, &config_path);
                                 open_editor_at_line(&ep, line)?;
-                                chezmoi::apply(cz, &config_path);
+                                chezmoi::apply(&ep, &config_path);
                                 return Ok(true);
                             }
                             _ => return Ok(false),
@@ -1797,7 +1797,7 @@ async fn run_set(
         let chezmoi_enabled = read_chezmoi_flag(&config_path);
         let wp = chezmoi::write_path(chezmoi_enabled, &config_path);
         std::fs::write(&wp, doc.to_string())?;
-        chezmoi::apply(chezmoi_enabled, &config_path);
+        chezmoi::apply(&wp, &config_path);
         println!("Updated config for: {}", selected_repo_url);
         return Ok(true);
     }
@@ -1877,7 +1877,7 @@ async fn run_remove(query: Option<String>) -> Result<()> {
     let chezmoi_enabled = read_chezmoi_flag(&config_path);
     let wp = chezmoi::write_path(chezmoi_enabled, &config_path);
     std::fs::write(&wp, doc.to_string())?;
-    chezmoi::apply(chezmoi_enabled, &config_path);
+    chezmoi::apply(&wp, &config_path);
     println!("Removed '{}' from config.", selected_url);
 
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());

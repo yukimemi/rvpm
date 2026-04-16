@@ -41,6 +41,11 @@ where
     while let Some(a) = ancestor {
         if let Some(source_ancestor) = source_path_probe(a) {
             if is_tmpl(&source_ancestor) {
+                eprintln!(
+                    "\u{26a0} ancestor {} resolves to a chezmoi template (.tmpl). \
+                     chezmoi=true requires plain files — use rvpm's Tera templates instead.",
+                    a.display(),
+                );
                 return None;
             }
             let relative = target.strip_prefix(a).ok()?;
@@ -93,7 +98,8 @@ fn is_chezmoi_available() -> bool {
 }
 
 /// rvpm が書き込むべきパスを返す。chezmoi 有効かつ managed なら source 側、
-/// そうでなければ target そのまま。
+/// そうでなければ target そのまま。返り値が target と異なれば source に書いた
+/// ことを意味するので、呼び出し側は `apply()` を呼んで target へ反映する。
 pub fn write_path(enabled: bool, target: &Path) -> PathBuf {
     if !enabled {
         return target.to_path_buf();
@@ -109,23 +115,11 @@ pub fn write_path(enabled: bool, target: &Path) -> PathBuf {
 }
 
 /// source に書いた後、`chezmoi apply <target>` で target へ反映する。
-pub fn apply(enabled: bool, target: &Path) {
-    if !enabled {
+/// `wrote_to` は実際に書き込んだパス (`write_path` の返り値)。target と
+/// 異なる場合のみ apply が必要 (同一なら直接 target に書いたので不要)。
+pub fn apply(wrote_to: &Path, target: &Path) {
+    if wrote_to == target {
         return;
-    }
-    if !is_chezmoi_available() {
-        return;
-    }
-    // target が managed じゃなければ apply は不要 (write_path が target を返した場合)
-    if chezmoi_source_path(target).is_none() {
-        // 祖先が managed なら新規ファイルとして apply が必要
-        let has_managed_ancestor = target
-            .ancestors()
-            .skip(1)
-            .any(|a| chezmoi_source_path(a).is_some());
-        if !has_managed_ancestor {
-            return;
-        }
     }
     let mut cmd = Command::new("chezmoi");
     cmd.arg("apply").arg(target);
