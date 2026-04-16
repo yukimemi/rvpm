@@ -2805,7 +2805,7 @@ async fn run_store() -> Result<()> {
                 crossterm::event::KeyCode::Char('G') | crossterm::event::KeyCode::End => {
                     match state.focus {
                         store_tui::Focus::List => state.go_bottom(),
-                        store_tui::Focus::Readme => state.scroll_readme_down(u16::MAX / 2),
+                        store_tui::Focus::Readme => state.scroll_readme_down(u16::MAX),
                     }
                 }
                 crossterm::event::KeyCode::Char('d')

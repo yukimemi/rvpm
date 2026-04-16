@@ -554,10 +554,17 @@ mod tests {
         state.next();
         state.next();
         assert_eq!(state.table_state.selected(), Some(2));
+        // seed readme state to verify it resets
+        state.readme_content = Some("old".to_string());
+        state.readme_scroll = 42;
         state.go_top();
         assert_eq!(state.table_state.selected(), Some(0));
+        assert!(state.readme_content.is_none());
+        assert_eq!(state.readme_scroll, 0);
         state.go_bottom();
         assert_eq!(state.table_state.selected(), Some(2));
+        assert!(state.readme_content.is_none());
+        assert_eq!(state.readme_scroll, 0);
     }
 
     #[test]
@@ -570,8 +577,12 @@ mod tests {
             make_repo("d", 70),
             make_repo("e", 60),
         ]);
+        state.readme_content = Some("test".to_string());
+        state.readme_scroll = 10;
         state.move_down(3);
         assert_eq!(state.table_state.selected(), Some(3));
+        assert!(state.readme_content.is_none());
+        assert_eq!(state.readme_scroll, 0);
         state.move_up(2);
         assert_eq!(state.table_state.selected(), Some(1));
         state.move_down(100);
