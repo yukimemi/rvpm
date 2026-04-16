@@ -7,6 +7,12 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Row, Table, TableState, Wrap},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    List,
+    Readme,
+}
+
 pub struct StoreTuiState {
     pub plugins: Vec<GitHubRepo>,
     pub table_state: TableState,
@@ -17,6 +23,8 @@ pub struct StoreTuiState {
     pub readme_scroll: u16,
     pub sort_mode: SortMode,
     pub message: Option<String>,
+    pub focus: Focus,
+    pub show_help: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,6 +64,8 @@ impl StoreTuiState {
             readme_scroll: 0,
             sort_mode: SortMode::Stars,
             message: None,
+            focus: Focus::List,
+            show_help: false,
         }
     }
 
@@ -127,6 +137,52 @@ impl StoreTuiState {
         self.table_state.select(Some(i));
         self.readme_content = None;
         self.readme_scroll = 0;
+    }
+
+    pub fn go_top(&mut self) {
+        if !self.plugins.is_empty() {
+            self.table_state.select(Some(0));
+            self.readme_content = None;
+            self.readme_scroll = 0;
+        }
+    }
+
+    pub fn go_bottom(&mut self) {
+        if !self.plugins.is_empty() {
+            self.table_state.select(Some(self.plugins.len() - 1));
+            self.readme_content = None;
+            self.readme_scroll = 0;
+        }
+    }
+
+    pub fn move_down(&mut self, n: usize) {
+        if self.plugins.is_empty() {
+            return;
+        }
+        let current = self.table_state.selected().unwrap_or(0);
+        let target = (current + n).min(self.plugins.len() - 1);
+        if target != current {
+            self.table_state.select(Some(target));
+            self.readme_content = None;
+            self.readme_scroll = 0;
+        }
+    }
+
+    pub fn move_up(&mut self, n: usize) {
+        let current = self.table_state.selected().unwrap_or(0);
+        let target = current.saturating_sub(n);
+        if target != current {
+            self.table_state.select(Some(target));
+            self.readme_content = None;
+            self.readme_scroll = 0;
+        }
+    }
+
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::List => Focus::Readme,
+            Focus::Readme => Focus::List,
+        };
     }
 
     pub fn scroll_readme_down(&mut self, n: u16) {
@@ -235,7 +291,11 @@ impl StoreTuiState {
             Block::default()
                 .title(" Plugins ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(Style::default().fg(if self.focus == Focus::List {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                })),
         )
         .row_highlight_style(
             Style::default()
@@ -268,7 +328,11 @@ impl StoreTuiState {
                 Block::default()
                     .title(readme_title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(if self.focus == Focus::Readme {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    })),
             )
             .wrap(Wrap { trim: false })
             .scroll((self.readme_scroll, 0));
@@ -283,21 +347,24 @@ impl StoreTuiState {
                 Span::styled(":cancel", Style::default().fg(Color::DarkGray)),
             ]))
         } else {
+            let focus_label = match self.focus {
+                Focus::List => "readme",
+                Focus::Readme => "list",
+            };
             Paragraph::new(Line::from(vec![
                 Span::styled(" /", Style::default().fg(Color::Yellow)),
                 Span::styled(":search ", Style::default().fg(Color::DarkGray)),
-                Span::styled("j/k", Style::default().fg(Color::Yellow)),
-                Span::styled(":move ", Style::default().fg(Color::DarkGray)),
-                Span::styled("C-d/C-u", Style::default().fg(Color::Yellow)),
-                Span::styled(":scroll ", Style::default().fg(Color::DarkGray)),
-                Span::styled("s", Style::default().fg(Color::Yellow)),
-                Span::styled(":sort ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Tab", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!(":{} ", focus_label),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::styled("Enter", Style::default().fg(Color::Yellow)),
                 Span::styled(":add ", Style::default().fg(Color::DarkGray)),
-                Span::styled("o", Style::default().fg(Color::Yellow)),
-                Span::styled(":open ", Style::default().fg(Color::DarkGray)),
-                Span::styled("R", Style::default().fg(Color::Yellow)),
-                Span::styled(":refresh ", Style::default().fg(Color::DarkGray)),
+                Span::styled("s", Style::default().fg(Color::Yellow)),
+                Span::styled(":sort ", Style::default().fg(Color::DarkGray)),
+                Span::styled("?", Style::default().fg(Color::Yellow)),
+                Span::styled(":help ", Style::default().fg(Color::DarkGray)),
                 Span::styled("q", Style::default().fg(Color::Yellow)),
                 Span::styled(":quit", Style::default().fg(Color::DarkGray)),
             ]))
@@ -306,6 +373,95 @@ impl StoreTuiState {
             footer.block(Block::default().borders(Borders::ALL)),
             chunks[2],
         );
+
+        // ── Help popup overlay ──
+        if self.show_help {
+            use ratatui::layout::Rect;
+            use ratatui::widgets::Clear;
+            let area = f.area();
+            let popup_w = 50u16.min(area.width.saturating_sub(4));
+            let popup_h = 18u16.min(area.height.saturating_sub(4));
+            let popup = Rect::new(
+                (area.width.saturating_sub(popup_w)) / 2,
+                (area.height.saturating_sub(popup_h)) / 2,
+                popup_w,
+                popup_h,
+            );
+            let help_lines = vec![
+                Line::from(vec![Span::styled(
+                    "  Navigation",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  j / k       ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Move / scroll down / up", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  g / G       ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Go to top / bottom", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  C-d / C-u   ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Half page down / up", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  C-f / C-b   ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Full page down / up", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Tab         ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        "Switch focus: list / readme",
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  /           ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Search plugins", Style::default().fg(Color::White)),
+                ]),
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "  Actions",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Enter       ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Add plugin to config", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  o           ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Open in browser", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  s           ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Cycle sort mode", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  R           ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Refresh (clear cache)", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  q / Esc     ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Quit", Style::default().fg(Color::White)),
+                ]),
+            ];
+            f.render_widget(Clear, popup);
+            f.render_widget(
+                Paragraph::new(help_lines).block(
+                    Block::default()
+                        .title(" Help [?] ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow)),
+                ),
+                popup,
+            );
+        }
     }
 }
 
@@ -375,5 +531,63 @@ mod tests {
         assert_eq!(state.readme_scroll, 7);
         state.scroll_readme_up(100);
         assert_eq!(state.readme_scroll, 0);
+    }
+
+    #[test]
+    fn test_toggle_focus() {
+        let mut state = StoreTuiState::new();
+        assert_eq!(state.focus, Focus::List);
+        state.toggle_focus();
+        assert_eq!(state.focus, Focus::Readme);
+        state.toggle_focus();
+        assert_eq!(state.focus, Focus::List);
+    }
+
+    #[test]
+    fn test_go_top_and_bottom() {
+        let mut state = StoreTuiState::new();
+        state.set_plugins(vec![
+            make_repo("a", 100),
+            make_repo("b", 50),
+            make_repo("c", 10),
+        ]);
+        state.next();
+        state.next();
+        assert_eq!(state.table_state.selected(), Some(2));
+        // seed readme state to verify it resets
+        state.readme_content = Some("old".to_string());
+        state.readme_scroll = 42;
+        state.go_top();
+        assert_eq!(state.table_state.selected(), Some(0));
+        assert!(state.readme_content.is_none());
+        assert_eq!(state.readme_scroll, 0);
+        state.go_bottom();
+        assert_eq!(state.table_state.selected(), Some(2));
+        assert!(state.readme_content.is_none());
+        assert_eq!(state.readme_scroll, 0);
+    }
+
+    #[test]
+    fn test_move_down_up() {
+        let mut state = StoreTuiState::new();
+        state.set_plugins(vec![
+            make_repo("a", 100),
+            make_repo("b", 90),
+            make_repo("c", 80),
+            make_repo("d", 70),
+            make_repo("e", 60),
+        ]);
+        state.readme_content = Some("test".to_string());
+        state.readme_scroll = 10;
+        state.move_down(3);
+        assert_eq!(state.table_state.selected(), Some(3));
+        assert!(state.readme_content.is_none());
+        assert_eq!(state.readme_scroll, 0);
+        state.move_up(2);
+        assert_eq!(state.table_state.selected(), Some(1));
+        state.move_down(100);
+        assert_eq!(state.table_state.selected(), Some(4));
+        state.move_up(100);
+        assert_eq!(state.table_state.selected(), Some(0));
     }
 }

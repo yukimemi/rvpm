@@ -23,7 +23,7 @@ sources everything without any runtime glob cost.
   `on_source`, auto-detected `ColorSchemePre`, and `depends`-aware loading
 - **Merge optimization** — `merge = true` plugins share a single rtp entry
 - **Plugin discovery TUI** — `rvpm store` browses the GitHub `neovim-plugin`
-  topic with live README preview and one-keystroke install
+  topic with live README preview; `Tab` switches focus between panes
 - **Resilient** — cyclic dependencies, missing plugins, and config errors
   produce warnings, not crashes
 
@@ -474,6 +474,31 @@ vim.keymap.set("n", "<leader>ff", "<cmd>Telescope find_files<cr>")
 
 Run `rvpm <command> --help` for flag-level details.
 
+### `rvpm list` — plugin manager TUI
+
+<details>
+<summary><b>Key bindings</b></summary>
+
+| Key | Action |
+|---|---|
+| `j` / `k` / `↓` / `↑` | Move selection |
+| `g` / `Home` | Go to top |
+| `G` / `End` | Go to bottom |
+| `Ctrl-d` / `Ctrl-u` | Half page down / up |
+| `Ctrl-f` / `Ctrl-b` | Full page down / up |
+| `/` | Incremental search |
+| `n` / `N` | Next / previous search result |
+| `e` | Edit per-plugin hooks (init / before / after.lua) |
+| `s` | Set plugin options (lazy, merge, on_cmd, …) |
+| `S` | Sync all plugins |
+| `u` | Update selected plugin |
+| `U` | Update all plugins |
+| `d` | Remove selected plugin |
+| `?` | Toggle help popup |
+| `q` / `Esc` | Quit |
+
+</details>
+
 ### `rvpm store` — plugin discovery TUI
 
 Browse, search, and install plugins from GitHub without leaving the terminal.
@@ -481,18 +506,32 @@ Browse, search, and install plugins from GitHub without leaving the terminal.
 `neovim-plugin` topic, displays them in a split-pane TUI, and fetches each
 plugin's `README.md` on demand for preview.
 
-**Key bindings:**
+<details>
+<summary><b>Key bindings</b></summary>
+
+Navigation keys are **focus-aware**: press `Tab` to switch between the
+plugin list and the README preview pane.
+
+| Key | List focused | README focused |
+|---|---|---|
+| `j` / `k` / `↓` / `↑` | Move selection | Scroll line |
+| `g` / `Home` | Go to top | Scroll to top |
+| `G` / `End` | Go to bottom | Scroll to bottom |
+| `Ctrl-d` / `Ctrl-u` | Half page down / up | Half page scroll |
+| `Ctrl-f` / `Ctrl-b` | Full page down / up | Full page scroll |
 
 | Key | Action |
 |---|---|
-| `j` / `k` / `↓` / `↑` | Move selection |
-| `Ctrl-d` / `Ctrl-u` | Scroll README pane |
+| `Tab` | Switch focus between list and README |
 | `/` | Search (`topic:neovim-plugin <query>` against GitHub Search API) |
-| `Enter` | Add the selected plugin to `config.toml` and sync |
+| `Enter` | Add the selected plugin to `config.toml` |
 | `o` | Open the plugin's GitHub page in your default browser |
 | `s` | Cycle sort mode (`stars` / `updated` / `name`) |
 | `R` | Clear the search cache and re-fetch |
+| `?` | Toggle help popup |
 | `q` / `Esc` | Quit |
+
+</details>
 
 **Caching:** search results are cached for 24 hours under
 `{cache_root}/store/`; READMEs are cached for 7 days. Press `R` in the TUI
@@ -577,7 +616,7 @@ rvpm config
 
 # ── List / status ────────────────────────────────────────
 
-# TUI with interactive actions ([S] sync, [u] update, [d] remove, …)
+# TUI with interactive actions ([S] sync, [u] update, [d] remove, [?] help)
 rvpm list
 
 # Plain text for scripting / piping
