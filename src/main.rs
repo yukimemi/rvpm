@@ -262,7 +262,7 @@ async fn main() -> Result<()> {
             global,
         } => {
             if run_edit(query, init, before, after, global).await? {
-                let _ = run_generate().await;
+                run_generate().await?;
             }
         }
         Commands::Set {
@@ -282,7 +282,7 @@ async fn main() -> Result<()> {
             )
             .await?
             {
-                let _ = run_generate().await;
+                run_generate().await?;
             }
         }
         Commands::Update { query } => {
@@ -296,7 +296,7 @@ async fn main() -> Result<()> {
         }
         Commands::Config => {
             if run_config().await? {
-                let _ = run_generate().await;
+                run_generate().await?;
             }
         }
         Commands::Init { write } => {
@@ -1004,7 +1004,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                     if let Some(url) = tui_state.selected_url() {
                         leave_tui(&mut terminal)?;
                         if run_edit(Some(url), false, false, false, false).await? {
-                            let _ = run_generate().await;
+                            run_generate().await?;
                         }
                         reload!();
                     }
@@ -1026,7 +1026,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                         )
                         .await?
                         {
-                            let _ = run_generate().await;
+                            run_generate().await?;
                         }
                         reload!();
                     }
