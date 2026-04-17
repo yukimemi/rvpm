@@ -502,9 +502,13 @@ Run `rvpm <command> --help` for flag-level details.
 ### `rvpm store` — plugin discovery TUI
 
 Browse, search, and install plugins from GitHub without leaving the terminal.
-`rvpm store` queries the GitHub Search API for repositories tagged with the
-`neovim-plugin` topic, displays them in a split-pane TUI, and fetches each
-plugin's `README.md` on demand for preview.
+`rvpm store` fetches up to ~300 repositories tagged with the `neovim-plugin`
+topic, displays them in a split-pane TUI with a GitHub-flavored markdown
+preview, and installs the selected plugin into your `config.toml` on `Enter`.
+
+Plugins already listed in `config.toml` are marked with a green `✓` at the
+start of the row; pressing `Enter` on an installed plugin shows a warning
+instead of adding a duplicate.
 
 <details>
 <summary><b>Key bindings</b></summary>
@@ -523,13 +527,18 @@ plugin list and the README preview pane.
 | Key | Action |
 |---|---|
 | `Tab` | Switch focus between list and README |
-| `/` | Search (`topic:neovim-plugin <query>` against GitHub Search API) |
-| `Enter` | Add the selected plugin to `config.toml` |
+| `/` | Local incremental search over `name + description + topics` |
+| `n` / `N` | Jump to next / previous search match |
+| `S` | GitHub API search (`topic:neovim-plugin <query>`, replaces list) |
+| `Enter` | Add the selected plugin to `config.toml` (warns if already installed) |
 | `o` | Open the plugin's GitHub page in your default browser |
 | `s` | Cycle sort mode (`stars` / `updated` / `name`) |
 | `R` | Clear the search cache and re-fetch |
 | `?` | Toggle help popup |
 | `q` / `Esc` | Quit |
+
+**Legend:** `✓` in the leftmost column means the plugin is already in your
+`config.toml`. Topics are shown in the rightmost column (`#lua #ui ...`).
 
 </details>
 

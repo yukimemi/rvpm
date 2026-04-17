@@ -2659,20 +2659,68 @@ fn build_plugin_scripts(
 }
 
 /// `rvpm store` — GitHub からプラグインを検索して追加する TUI。
+/// Plugin URL を GitHub の `owner/repo` 形式 (小文字) に正規化する。
+/// GitHub の `full_name` は大文字小文字非依存なので lowercase で揃える。
+/// - `"owner/repo"` → `Some("owner/repo")`
+/// - `"https://github.com/Owner/Repo(.git)?"` → `Some("owner/repo")`
+/// - `"git@github.com:Owner/Repo.git"` → `Some("owner/repo")`
+/// - GitHub 以外 (gitlab 等) → None
+fn installed_full_name(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches(".git");
+    // SSH 形式: git@github.com:owner/repo
+    if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() >= 2 {
+            return Some(format!("{}/{}", parts[0], parts[1]).to_lowercase());
+        }
+        return None;
+    }
+    // HTTPS/HTTP
+    for prefix in ["https://github.com/", "http://github.com/"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let parts: Vec<&str> = rest.split('/').collect();
+            if parts.len() >= 2 {
+                return Some(format!("{}/{}", parts[0], parts[1]).to_lowercase());
+            }
+            return None;
+        }
+    }
+    // 別ホストの URL は GitHub ではないので None
+    if trimmed.contains("://") {
+        return None;
+    }
+    // `owner/repo` 形式 (スキーム無し)
+    if trimmed.contains('/') && !trimmed.contains(' ') {
+        let parts: Vec<&str> = trimmed.split('/').collect();
+        if parts.len() == 2 {
+            return Some(format!("{}/{}", parts[0], parts[1]).to_lowercase());
+        }
+    }
+    None
+}
+
 async fn run_store() -> Result<()> {
     use crate::store_tui::StoreTuiState;
 
-    // cache_root を config から解決 (options.cache_root を尊重)
+    // cache_root を config から解決 (options.cache_root を尊重)。
+    // 同時に config.plugins から installed 集合を構築する。
     let config_path = rvpm_config_path();
-    let cache_root = if config_path.exists() {
+    let (cache_root, installed) = if config_path.exists() {
         let toml_content = std::fs::read_to_string(&config_path)?;
         let config = parse_config(&toml_content)?;
-        resolve_cache_root(config.options.cache_root.as_deref())
+        let cache = resolve_cache_root(config.options.cache_root.as_deref());
+        let set: std::collections::HashSet<String> = config
+            .plugins
+            .iter()
+            .filter_map(|p| installed_full_name(&p.url))
+            .collect();
+        (cache, set)
     } else {
-        resolve_cache_root(None)
+        (resolve_cache_root(None), std::collections::HashSet::new())
     };
 
     let mut state = StoreTuiState::new();
+    state.installed = installed;
 
     // 初期表示: 人気プラグインをバックグラウンドで取得
     let cache_root_bg = cache_root.clone();
@@ -2733,14 +2781,26 @@ async fn run_store() -> Result<()> {
                 continue;
             }
 
+            // `/` ローカルインクリメンタル検索モード
             if state.search_mode {
                 match key.code {
-                    crossterm::event::KeyCode::Esc => {
-                        state.search_mode = false;
-                    }
+                    crossterm::event::KeyCode::Esc => state.search_cancel(),
+                    crossterm::event::KeyCode::Enter => state.search_confirm(),
+                    crossterm::event::KeyCode::Backspace => state.search_backspace(),
+                    crossterm::event::KeyCode::Char(c) => state.search_type(c),
+                    _ => {}
+                }
+                continue;
+            }
+
+            // `S` GitHub API 検索モード (旧 `/` の挙動)
+            if state.api_search_mode {
+                match key.code {
+                    crossterm::event::KeyCode::Esc => state.search_cancel(),
                     crossterm::event::KeyCode::Enter => {
-                        state.search_mode = false;
+                        state.api_search_mode = false;
                         let query = state.search_input.clone();
+                        state.search_input.clear();
                         state.message = Some(format!("Searching '{}'...", query));
                         terminal.draw(|f| state.draw(f))?;
                         let cache_root_bg = cache_root.clone();
@@ -2782,9 +2842,16 @@ async fn run_store() -> Result<()> {
                     state.show_help = !state.show_help;
                 }
                 crossterm::event::KeyCode::Char('/') => {
-                    state.search_mode = true;
-                    state.search_input.clear();
-                    state.message = None;
+                    state.start_search();
+                }
+                crossterm::event::KeyCode::Char('S') => {
+                    state.start_api_search();
+                }
+                crossterm::event::KeyCode::Char('n') => {
+                    state.search_next();
+                }
+                crossterm::event::KeyCode::Char('N') => {
+                    state.search_prev();
                 }
 
                 // ── Navigation: focus-aware ──
@@ -2887,8 +2954,12 @@ async fn run_store() -> Result<()> {
                     }
                 }
                 crossterm::event::KeyCode::Enter => {
-                    // config.toml に追加
-                    if let Some(repo) = state.selected_repo() {
+                    // config.toml に追加 (installed なら警告のみ)
+                    if let Some(repo) = state.selected_repo().cloned() {
+                        if state.is_installed(&repo) {
+                            state.message = Some(format!("already installed: {}", repo.full_name));
+                            continue;
+                        }
                         let url = repo.full_name.clone();
                         let _ = disable_raw_mode();
                         let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
@@ -2898,6 +2969,7 @@ async fn run_store() -> Result<()> {
                         // run_add の最小版: config.toml に追記して sync
                         let result =
                             run_add(url.clone(), None, None, None, None, None, None, None).await;
+                        let added = result.is_ok();
                         match result {
                             Ok(_) => println!("Added {} successfully!", url),
                             Err(e) => eprintln!("Failed to add {}: {}", url, e),
@@ -2924,7 +2996,12 @@ async fn run_store() -> Result<()> {
                         // 先に show_cursor() した状態を戻す。
                         terminal.clear()?;
                         terminal.hide_cursor()?;
-                        state.message = Some(format!("Added {}", url));
+                        if added {
+                            state.mark_installed(&repo);
+                            state.message = Some(format!("Added {}", url));
+                        } else {
+                            state.message = Some(format!("Failed: {}", url));
+                        }
                     }
                 }
                 _ => {}
@@ -2945,6 +3022,51 @@ mod tests {
     use crate::loader::PluginScripts;
     use tempfile::tempdir;
     use toml_edit::DocumentMut;
+
+    #[test]
+    fn test_installed_full_name_owner_repo() {
+        assert_eq!(
+            installed_full_name("folke/snacks.nvim"),
+            Some("folke/snacks.nvim".to_string())
+        );
+    }
+
+    #[test]
+    fn test_installed_full_name_https_url_with_git_suffix() {
+        assert_eq!(
+            installed_full_name("https://github.com/Owner/Repo.git"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_installed_full_name_https_url_without_git_suffix() {
+        assert_eq!(
+            installed_full_name("https://github.com/nvim-lua/plenary.nvim"),
+            Some("nvim-lua/plenary.nvim".to_string())
+        );
+    }
+
+    #[test]
+    fn test_installed_full_name_ssh_url() {
+        assert_eq!(
+            installed_full_name("git@github.com:Owner/Repo.git"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_installed_full_name_non_github_returns_none() {
+        assert_eq!(installed_full_name("https://gitlab.com/owner/repo"), None);
+    }
+
+    #[test]
+    fn test_installed_full_name_case_normalized() {
+        assert_eq!(
+            installed_full_name("Folke/Snacks.NVIM"),
+            Some("folke/snacks.nvim".to_string())
+        );
+    }
 
     #[test]
     fn test_update_filters_by_query() {
