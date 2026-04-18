@@ -275,6 +275,12 @@ const MAX_VARS_RESOLVE_ITERATIONS: usize = 10;
 /// の Tera レンダリング時に自己射影 (value = `{{ name }}` リテラル) させ、
 /// 実行時の `external_render::substitute` が展開するまで生き残らせる。
 /// `src/external_render.rs` の `expand_args` と同期。
+///
+/// 注意: これらは **config.toml 全体の Tera context** に差し込まれるので、
+/// `readme_command` 以外の文字列値 (例: `dst = "/tmp/{{ width }}"`) でも同じ
+/// リテラルとして保持される。つまりここで挙げた名前については、未定義変数
+/// エラーが出ない代わりに意図しない場所でリテラルとして残る可能性がある。
+/// 実運用では `readme_command` 内以外で同じトークンを使う動機は薄いので妥協。
 const README_COMMAND_PLACEHOLDERS: &[&str] = &[
     "width",
     "height",
@@ -393,10 +399,10 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     // 7. 全体を Tera でレンダリング ({% if %} 等が動く)
     let rendered = Tera::one_off(toml_str, &context, false)?;
 
-    // 6. TOML パース
+    // 8. TOML パース
     let mut config: Config = toml::from_str(&rendered)?;
 
-    // 5. lazy 自動解決: on_* トリガーがあれば lazy = true にする (明示 false は尊重)
+    // 9. lazy 自動解決: on_* トリガーがあれば lazy = true にする (明示 false は尊重)
     for plugin in config.plugins.iter_mut() {
         let has_trigger = plugin.on_cmd.is_some()
             || plugin.on_ft.is_some()
