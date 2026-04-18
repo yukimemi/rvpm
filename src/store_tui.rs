@@ -159,6 +159,99 @@ fn parse_tag_name(tag: &str) -> String {
         .collect()
 }
 
+/// Markdown の pipe テーブルを検出し、列幅を揃えた上で fenced code block として
+/// 囲む。tui-markdown 0.3 はテーブルの TableRow/Cell イベントを 1 Text::Line に
+/// 詰めてしまうため、ヘッダー・separator・本体行が 1 表示行に折り重なって崩れる。
+/// code fence で囲めば tui-markdown は逐行 preserve するので、最低限の
+/// プレーンテキスト表として読めるようになる (外部 renderer 無しで済む)。
+///
+/// 列幅は `unicode-width` ベースで最大幅を取り、各セルを空白で右 padding する。
+/// pane 幅を超えるテーブルは wrap されるが、その場合も「少なくとも改行で切れる」
+/// 動作は保たれる。
+fn wrap_tables_as_code_blocks(input: &str) -> String {
+    use unicode_width::UnicodeWidthStr;
+
+    let lines: Vec<&str> = input.lines().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if is_table_row(line) && i + 1 < lines.len() && is_table_separator(lines[i + 1]) {
+            // 連続する table 行を末尾まで収集
+            let mut end = i + 2;
+            while end < lines.len() && is_table_row(lines[end]) {
+                end += 1;
+            }
+            let rows = &lines[i..end];
+            let parsed: Vec<Vec<&str>> = rows
+                .iter()
+                .map(|l| {
+                    let t = l.trim();
+                    let inner = t.strip_prefix('|').unwrap_or(t);
+                    let inner = inner.strip_suffix('|').unwrap_or(inner);
+                    inner.split('|').map(|c| c.trim()).collect()
+                })
+                .collect();
+            let ncols = parsed.iter().map(|r| r.len()).max().unwrap_or(0);
+            let mut widths = vec![0usize; ncols];
+            for (row_idx, row) in parsed.iter().enumerate() {
+                if row_idx == 1 {
+                    continue;
+                }
+                for (ci, cell) in row.iter().enumerate() {
+                    widths[ci] = widths[ci].max(UnicodeWidthStr::width(*cell));
+                }
+            }
+            // 全体を code fence で囲む。言語は "text" にして syntect の
+            // 言語推定を抑止する。
+            out.push_str("\n```text\n");
+            for (row_idx, row) in parsed.iter().enumerate() {
+                out.push('|');
+                for (ci, width) in widths.iter().enumerate() {
+                    out.push(' ');
+                    let cell = row.get(ci).copied().unwrap_or("");
+                    if row_idx == 1 {
+                        out.push_str(&"-".repeat((*width).max(3)));
+                    } else {
+                        out.push_str(cell);
+                        let pad = width.saturating_sub(UnicodeWidthStr::width(cell));
+                        for _ in 0..pad {
+                            out.push(' ');
+                        }
+                    }
+                    out.push(' ');
+                    out.push('|');
+                }
+                out.push('\n');
+            }
+            out.push_str("```\n");
+            i = end;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
+fn is_table_row(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.len() >= 2 && t.contains('|')
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    if !t.starts_with('|') || !t.ends_with('|') || t.len() < 3 {
+        return false;
+    }
+    let inner = &t[1..t.len() - 1];
+    inner.split('|').all(|cell| {
+        let c = cell.trim();
+        !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':' | ' '))
+    })
+}
+
 /// Paragraph が `Wrap { trim: false }` で描画したときの実行数を推定する。
 /// - 幅が 0 (draw 前) なら Text の Line 数をそのまま返す
 /// - 各 Line の spans 合計 display 幅を `pane_width` で割り切り上げ (空 Line は 1 行)
@@ -570,7 +663,11 @@ impl StoreTuiState {
         // `unicode-width` は幅 1 と答えるが terminal は 2 セルで描画するため
         // tui-markdown の Line 折返しが壊れる。リスト側と同じく PUA / VS を除去する。
         let sanitized = sanitize_cell_text(&cleaned);
-        self.readme_prepared = format!("{}{}", topics_prefix, sanitized);
+        // tui-markdown 0.3 はテーブルの全セルを 1 Line に詰めてしまい、ヘッダーと
+        // 本体行が重なって読めなくなる。pipe テーブルを検出したら列幅を揃えつつ
+        // code fence でラップして、逐行描画される経路に逃がす。
+        let tabled = wrap_tables_as_code_blocks(&sanitized);
+        self.readme_prepared = format!("{}{}", topics_prefix, tabled);
         // ratatui の Paragraph({ wrap: trim=false }) が pane 幅で折り返した後の
         // 実行数を推定する。各 Line の表示幅を unicode-width で測り、
         // pane の内側幅で割って切り上げて合計する近似 (空 Line は 1 行分)。
@@ -1434,6 +1531,69 @@ mod tests {
     fn test_sanitize_keeps_ascii() {
         let input = "A collection of small qol plugins for Neovim";
         assert_eq!(sanitize_cell_text(input), input);
+    }
+
+    // ───── wrap_tables_as_code_blocks ─────
+
+    #[test]
+    fn test_wrap_tables_puts_fence_around_pipe_table() {
+        let input = "\
+intro
+
+| col | other |
+| --- | --- |
+| a | b |
+
+outro
+";
+        let out = wrap_tables_as_code_blocks(input);
+        assert!(out.contains("```text\n"));
+        assert!(out.contains("\n```\n"));
+        assert!(out.contains("intro"));
+        assert!(out.contains("outro"));
+    }
+
+    #[test]
+    fn test_wrap_tables_aligns_columns_inside_fence() {
+        let input = "\
+| short | name |
+| --- | --- |
+| VeryLongCell | desc |
+";
+        let out = wrap_tables_as_code_blocks(input);
+        // すべての table 行で `|` 位置が揃う
+        let table_lines: Vec<&str> = out.lines().filter(|l| l.starts_with('|')).collect();
+        assert_eq!(table_lines.len(), 3);
+        let first_pipes: Vec<usize> = table_lines[0]
+            .char_indices()
+            .filter(|(_, c)| *c == '|')
+            .map(|(i, _)| i)
+            .collect();
+        for l in &table_lines[1..] {
+            let pipes: Vec<usize> = l
+                .char_indices()
+                .filter(|(_, c)| *c == '|')
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(pipes, first_pipes, "pipe positions differ on `{}`", l);
+        }
+    }
+
+    #[test]
+    fn test_wrap_tables_preserves_non_table_lines() {
+        let input = "Hello\n\nWorld\n";
+        let out = wrap_tables_as_code_blocks(input);
+        assert!(!out.contains("```"));
+        assert!(out.contains("Hello"));
+        assert!(out.contains("World"));
+    }
+
+    #[test]
+    fn test_wrap_tables_without_separator_is_noop() {
+        // separator なし → table ではない → ラップしない
+        let input = "| not | a table |\nbut a line";
+        let out = wrap_tables_as_code_blocks(input);
+        assert!(!out.contains("```"));
     }
 
     #[test]
