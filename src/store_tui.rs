@@ -570,11 +570,22 @@ impl StoreTuiState {
         );
         f.render_widget(title, chunks[0]);
 
-        // ── Main: left (list) + right (readme) ──
-        let main_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .split(chunks[1]);
+        // ── Main: list + readme ──
+        // 横幅が狭い terminal では side-by-side だと plugin 名が潰れるので、
+        // 一定幅未満のときは縦積み (list: 上 / readme: 下) に切り替える。
+        let total_width = f.area().width;
+        let side_by_side = total_width >= 160;
+        let main_chunks = if side_by_side {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .split(chunks[1])
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(chunks[1])
+        };
 
         // Left: plugin list
         let rows: Vec<Row> = self
@@ -612,14 +623,24 @@ impl StoreTuiState {
             })
             .collect();
 
+        // plugin name を最優先にするため、name と desc は Min 制約で伸縮、
+        // topics は終端で Length、stars/installed は固定。side_by_side のときは
+        // 横幅が限られるため topics を短めに (18)、vertical 積みのときは余裕あるので広めに (30)。
+        let name_col = Constraint::Min(15);
+        let desc_col = Constraint::Min(20);
+        let topics_col = if side_by_side {
+            Constraint::Length(18)
+        } else {
+            Constraint::Length(30)
+        };
         let table = Table::new(
             rows,
             [
                 Constraint::Length(2),
                 Constraint::Length(8),
-                Constraint::Length(30),
-                Constraint::Min(20),
-                Constraint::Length(24),
+                name_col,
+                desc_col,
+                topics_col,
             ],
         )
         .block(
