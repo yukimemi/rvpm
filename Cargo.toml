@@ -30,8 +30,10 @@ toml = "1.1"
 toml_edit = "0.25"
 
 # Markdown rendering (for store TUI README preview).
-# default-features = false to avoid pulling syntect/ansi-to-tui (heavy, MB-scale).
-tui-markdown = { version = "0.3", default-features = false }
+# `highlight-code` brings in syntect + ansi-to-tui (~4 MB of syntax / theme
+# data) but is the only way to make fenced code blocks readable — without it
+# they render as plain prose indistinguishable from text paragraphs.
+tui-markdown = { version = "0.3", features = ["highlight-code"] }
 
 # HTTP client (for store)
 # default-features = false to pin TLS backend to `rustls` (avoid native-tls /
