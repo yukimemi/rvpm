@@ -35,6 +35,12 @@ pub struct StoreTuiState {
     pub readme_content: Option<String>,
     pub readme_loading: bool,
     pub readme_scroll: u16,
+    /// draw() ごとに strip+format し直さないための前処理済み markdown キャッシュ。
+    /// `readme_prepared_key` に紐付き、キーが変わったときだけ作り直す。
+    pub readme_prepared: String,
+    /// `readme_prepared` の cache key: (selected full_name, readme_content の長さ, loading)
+    /// 内容そのものを保持せず長さだけで比較 (同一内容の読み直しは想定しない)。
+    readme_prepared_key: Option<(String, usize, bool)>,
     pub sort_mode: SortMode,
     pub message: Option<String>,
     pub focus: Focus,
@@ -69,108 +75,94 @@ impl SortMode {
 /// GitHub README によくある `<img src="...badge">`, `<a>`, `<p align="center">`,
 /// `<br>`, `<div>` 等の HTML タグを除去して markdown として読みやすくする。
 ///
-/// 完全な HTML パーサではなく、行単位の **存在感が大きい** タグだけを対象にする最小限の処理:
-/// - `<img .../>` や `<img ...>` を alt text で置き換え (alt があれば) or 空文字
-/// - `<a ...>` / `</a>` / `<br ?/?>` / `<div ...>` / `</div>` / `<p ...>` / `</p>` / `<picture>` 類を削除
-/// - `<!-- ... -->` コメントを削除
+/// 単一パスで UTF-8 安全 (ASCII の `<` / `>` 境界でしか切らない)。
+/// - HTML コメント `<!-- ... -->` を削除
+/// - `<img ...>` は `alt` 属性の値に置換、無ければ除去
+/// - `REMOVE_TAGS` に含まれる既知の装飾タグは開き/閉じ両方除去
+/// - それ以外の未知タグは markdown として意味を持ちうるので保持
 fn strip_common_html(input: &str) -> String {
-    let mut s = input.to_string();
+    const REMOVE_TAGS: &[&str] = &[
+        "a", "br", "div", "p", "picture", "source", "sub", "sup", "kbd", "details", "summary",
+        "center", "span", "table", "tr", "td", "th", "tbody", "thead", "ul", "li", "ol",
+    ];
 
-    // HTML コメントを削除
-    while let Some(start) = s.find("<!--") {
-        if let Some(rel_end) = s[start..].find("-->") {
-            s.replace_range(start..start + rel_end + 3, "");
-        } else {
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        // 次の '<' までをそのままコピー ('<' は ASCII なので byte 境界 = char 境界)
+        let Some(lt_rel) = input[i..].find('<') else {
+            out.push_str(&input[i..]);
+            break;
+        };
+        let lt = i + lt_rel;
+        out.push_str(&input[i..lt]);
+
+        // HTML コメント
+        if input[lt..].starts_with("<!--") {
+            if let Some(end_rel) = input[lt + 4..].find("-->") {
+                i = lt + 4 + end_rel + 3;
+                continue;
+            }
+            // 閉じコメント無し → 残りそのまま
+            out.push_str(&input[lt..]);
             break;
         }
-    }
 
-    // <img ...> を alt text or 空文字に置換
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'<'
-            && i + 4 <= bytes.len()
-            && &s[i..i + 4].to_lowercase() == "<img"
-            && let Some(rel_end) = s[i..].find('>')
-        {
-            let tag = &s[i..=i + rel_end];
-            let alt = extract_attr(tag, "alt").unwrap_or_default();
-            if !alt.is_empty() {
+        // 対応する '>' を探す (属性値に入った '>' を厳密に扱わない小さな手抜き)
+        let Some(gt_rel) = input[lt..].find('>') else {
+            out.push_str(&input[lt..]);
+            break;
+        };
+        let gt = lt + gt_rel;
+        let tag = &input[lt..=gt];
+
+        // タグ名を抽出 (先頭 '<' / '</' を飛ばし、ASCII alphabetic の連続)
+        let name = parse_tag_name(tag);
+        let lname = name.to_ascii_lowercase();
+
+        if lname == "img" {
+            if let Some(alt) = extract_alt(tag)
+                && !alt.is_empty()
+            {
                 out.push_str(&alt);
             }
-            i += rel_end + 1;
-            continue;
+        } else if REMOVE_TAGS.iter().any(|t| *t == lname) {
+            // 開き/閉じ/self-closing どれでも丸ごと除去
+        } else {
+            // 未知タグは保持
+            out.push_str(tag);
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        i = gt + 1;
     }
-
-    // 既知の **開き/閉じ両方** のタグ名だけを、`<tag ...>` or `</tag>` or `<tag ... />` 形式で削除
-    let tags = [
-        "a", "br", "div", "p", "picture", "source", "sub", "sup", "kbd", "details", "summary",
-        "center", "span", "table", "tr", "td", "th", "tbody", "thead", "ul", "li",
-    ];
-    for tag in tags {
-        let open = format!("<{}", tag);
-        let close = format!("</{}>", tag);
-        out = remove_tag_instances(&out, &open, &close);
-    }
-
     out
 }
 
-/// `<img alt="Hello world" src="...">` から `alt` の値を取り出す。
-/// 非常に緩いパース (属性はクォート必須、エスケープ非対応)。見つからなければ None。
-fn extract_attr(tag: &str, attr: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
-    let pat = format!("{}=", attr);
-    let pos = lower.find(&pat)?;
-    let rest = &tag[pos + pat.len()..];
-    let (delim, start_off) = if let Some(stripped) = rest.strip_prefix('"') {
-        ('"', stripped.as_ptr() as usize - rest.as_ptr() as usize)
-    } else if let Some(stripped) = rest.strip_prefix('\'') {
-        ('\'', stripped.as_ptr() as usize - rest.as_ptr() as usize)
-    } else {
-        return None;
-    };
-    let body = &rest[start_off..];
-    let end = body.find(delim)?;
-    Some(body[..end].to_string())
+/// `<tagname ...>` / `</tagname>` / `<tagname/>` からタグ名を抜き出す。
+/// 見つからなければ空文字列。
+fn parse_tag_name(tag: &str) -> String {
+    let inner = tag
+        .trim_start_matches('<')
+        .trim_start_matches('/')
+        .trim_start_matches('!');
+    inner
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect()
 }
 
-/// `<tag ...>` および `</tag>` をすべて削除。
-/// `input.to_lowercase()` で case-insensitive 比較するが、削除は元文字列に対して行う。
-fn remove_tag_instances(input: &str, open_prefix: &str, close: &str) -> String {
-    let mut s = input.to_string();
-    let lower_open = open_prefix.to_lowercase();
-    let lower_close = close.to_lowercase();
-
-    loop {
-        let lower = s.to_lowercase();
-        if let Some(start) = lower.find(&lower_open) {
-            // 次が ' ' / '>' / '/' のいずれかでないと別タグ (e.g., <abbr>)
-            let after = s[start + open_prefix.len()..].chars().next().unwrap_or('>');
-            if !matches!(after, ' ' | '>' | '/' | '\t' | '\n') {
-                // false positive, skip this instance by slicing past it
-                let remainder = &s[start + open_prefix.len()..];
-                // just break to avoid infinite loop; accept leftover
-                let _ = remainder;
-                break;
-            }
-            if let Some(rel_end) = s[start..].find('>') {
-                s.replace_range(start..start + rel_end + 1, "");
-                continue;
-            }
-        }
-        break;
+/// `<img ... alt="..." ...>` から `alt` 属性の値を取り出す。
+/// クォート必須、エスケープ非対応。UTF-8 安全 (`=` / クォートは ASCII)。
+fn extract_alt(tag: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let pos = lower.find("alt=")?;
+    let rest = &tag[pos + 4..];
+    let delim = rest.chars().next()?;
+    if delim != '"' && delim != '\'' {
+        return None;
     }
-
-    while let Some(start) = s.to_lowercase().find(&lower_close) {
-        s.replace_range(start..start + close.len(), "");
-    }
-    s
+    let after = &rest[delim.len_utf8()..];
+    let end = after.find(delim)?;
+    Some(after[..end].to_string())
 }
 
 impl StoreTuiState {
@@ -188,6 +180,8 @@ impl StoreTuiState {
             readme_content: None,
             readme_loading: false,
             readme_scroll: 0,
+            readme_prepared: String::new(),
+            readme_prepared_key: None,
             sort_mode: SortMode::Stars,
             message: None,
             focus: Focus::List,
@@ -445,6 +439,54 @@ impl StoreTuiState {
         self.installed.insert(repo.full_name.to_lowercase());
     }
 
+    /// README 描画用の前処理済み markdown を必要なら再計算する。
+    /// `selected_repo` / `readme_content` / `readme_loading` が変わったときだけ
+    /// HTML strip + topics prefix の組み立てを行い、結果を `readme_prepared` に保持する。
+    fn ensure_readme_prepared(&mut self) {
+        let selected_name = self
+            .selected_repo()
+            .map(|r| r.full_name.clone())
+            .unwrap_or_default();
+        let content_len = self.readme_content.as_ref().map(|c| c.len()).unwrap_or(0);
+        let key = (selected_name, content_len, self.readme_loading);
+        if self.readme_prepared_key.as_ref() == Some(&key) {
+            return;
+        }
+
+        let body = if self.readme_loading {
+            "_Loading README..._".to_string()
+        } else {
+            self.readme_content.clone().unwrap_or_else(|| {
+                if self.plugins.is_empty() {
+                    "_Press / to search or S to fetch more._".to_string()
+                } else {
+                    "_Loading..._".to_string()
+                }
+            })
+        };
+
+        let topics_prefix = self
+            .selected_repo()
+            .map(|r| {
+                if r.topics.is_empty() {
+                    String::new()
+                } else {
+                    let joined = r
+                        .topics
+                        .iter()
+                        .map(|t| format!("`{}`", t))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!("**Topics:** {}\n\n---\n\n", joined)
+                }
+            })
+            .unwrap_or_default();
+
+        let cleaned = strip_common_html(&body);
+        self.readme_prepared = format!("{}{}", topics_prefix, cleaned);
+        self.readme_prepared_key = Some(key);
+    }
+
     pub fn draw(&mut self, f: &mut Frame) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -599,42 +641,10 @@ impl StoreTuiState {
         f.render_stateful_widget(table, main_chunks[0], &mut self.table_state);
 
         // Right: README preview (tui-markdown rendered GFM)
-        let readme_body = if self.readme_loading {
-            "_Loading README..._".to_string()
-        } else {
-            self.readme_content.clone().unwrap_or_else(|| {
-                if self.plugins.is_empty() {
-                    "_Press / to search or S to fetch more._".to_string()
-                } else {
-                    "_Loading..._".to_string()
-                }
-            })
-        };
-
-        // 選択中 repo の topics を README 先頭に prepend (DarkGray、区切り線付き)
-        let topics_prefix = self
-            .selected_repo()
-            .map(|r| {
-                if r.topics.is_empty() {
-                    String::new()
-                } else {
-                    let joined = r
-                        .topics
-                        .iter()
-                        .map(|t| format!("`{}`", t))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    format!("**Topics:** {}\n\n---\n\n", joined)
-                }
-            })
-            .unwrap_or_default();
-
-        // バッジや `<div>` 等の HTML タグは pulldown-cmark が HTML block として扱うので
-        // 生テキストが残る。最低限、行頭の `<img ...>` / `<a ...>` / `</a>` / `<br>` 等を
-        // 除去して見た目を整える。
-        let cleaned_body = strip_common_html(&readme_body);
-        let combined = format!("{}{}", topics_prefix, cleaned_body);
-        let rendered = tui_markdown::from_str(&combined);
+        // HTML strip + topics 結合はキャッシュ (`readme_prepared`) されるので、
+        // draw() ごとのコストは tui_markdown::from_str のパースだけ。
+        self.ensure_readme_prepared();
+        let rendered = tui_markdown::from_str(&self.readme_prepared);
 
         let readme_title = self
             .selected_repo()
@@ -1164,5 +1174,76 @@ mod tests {
         assert!(!state.is_installed(&repo));
         state.mark_installed(&repo);
         assert!(state.is_installed(&repo));
+    }
+
+    // ───── strip_common_html UTF-8 safety ─────
+
+    #[test]
+    fn test_strip_html_preserves_japanese_text() {
+        let input = "これは README です。\n<a href=\"...\">リンク</a> の後。";
+        let out = strip_common_html(input);
+        assert!(out.contains("これは README です。"));
+        assert!(out.contains("リンク"));
+        assert!(!out.contains("<a"));
+        assert!(!out.contains("</a>"));
+    }
+
+    #[test]
+    fn test_strip_html_preserves_emoji_around_img() {
+        // <img> のすぐ前後に絵文字・日本語を置いてもバイト位置破綻しない
+        let input = "🎉 hi <img alt=\"X\" src=\"y\"/> あ い";
+        let out = strip_common_html(input);
+        assert!(out.contains("🎉"));
+        assert!(out.contains("X"));
+        assert!(out.contains("あ い"));
+        assert!(!out.contains("<img"));
+    }
+
+    #[test]
+    fn test_strip_html_img_alt_extracted() {
+        let out = strip_common_html("<img src=\"x.png\" alt=\"Build Status\">");
+        assert_eq!(out, "Build Status");
+    }
+
+    #[test]
+    fn test_strip_html_img_no_alt_dropped() {
+        let out = strip_common_html("<img src=\"x.png\">");
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn test_strip_html_abbr_not_false_matched_as_a() {
+        // 以前の実装では <abbr> を <a> として扱って残り全削除していた
+        let input = "<abbr title=\"x\">TLA</abbr> followed by <a>link</a>";
+        let out = strip_common_html(input);
+        assert!(out.contains("<abbr"));
+        assert!(out.contains("TLA"));
+        assert!(out.contains("link"));
+        assert!(!out.contains("<a>"));
+        assert!(!out.contains("</a>"));
+    }
+
+    #[test]
+    fn test_strip_html_comment_removed() {
+        let out = strip_common_html("before <!-- skip me --> after");
+        assert!(out.contains("before"));
+        assert!(out.contains("after"));
+        assert!(!out.contains("skip me"));
+    }
+
+    #[test]
+    fn test_strip_html_unknown_tag_preserved() {
+        // markdown のインラインコード/カスタム要素は残す
+        let out = strip_common_html("<mark>note</mark>");
+        assert!(out.contains("<mark>"));
+    }
+
+    #[test]
+    fn test_strip_html_multibyte_inside_tag() {
+        // 属性値に日本語が入っていても切り損なわない
+        let input = "<img alt=\"ロゴ\" src=\"logo.png\"/> 本文";
+        let out = strip_common_html(input);
+        assert!(out.contains("ロゴ"));
+        assert!(out.contains("本文"));
     }
 }

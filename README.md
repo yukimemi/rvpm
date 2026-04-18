@@ -535,7 +535,8 @@ plugin list and the README preview pane.
 | `s` | Cycle sort mode (`stars` / `updated` / `name`) |
 | `R` | Clear the search cache and re-fetch |
 | `?` | Toggle help popup |
-| `q` / `Esc` | Quit |
+| `q` | Quit |
+| `Esc` | Cancel active input (`/` or `S`) when in a search mode; quit otherwise |
 
 **Legend:** `✓` in the leftmost column means the plugin is already in your
 `config.toml`. Topics are shown in the rightmost column (`#lua #ui ...`).

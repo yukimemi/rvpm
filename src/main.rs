@@ -2666,7 +2666,12 @@ fn build_plugin_scripts(
 /// - `"git@github.com:Owner/Repo.git"` → `Some("owner/repo")`
 /// - GitHub 以外 (gitlab 等) → None
 fn installed_full_name(url: &str) -> Option<String> {
-    let trimmed = url.trim().trim_end_matches(".git");
+    // `.git` と末尾 `/` の順序が揺れるケースを両方受け付ける
+    let trimmed = url
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/');
     // SSH 形式: git@github.com:owner/repo
     if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
         let parts: Vec<&str> = rest.split('/').collect();
@@ -2704,19 +2709,38 @@ async fn run_store() -> Result<()> {
 
     // cache_root を config から解決 (options.cache_root を尊重)。
     // 同時に config.plugins から installed 集合を構築する。
+    // resilience 原則: config.toml が壊れていても store TUI は defaults で開く。
     let config_path = rvpm_config_path();
-    let (cache_root, installed) = if config_path.exists() {
-        let toml_content = std::fs::read_to_string(&config_path)?;
-        let config = parse_config(&toml_content)?;
-        let cache = resolve_cache_root(config.options.cache_root.as_deref());
-        let set: std::collections::HashSet<String> = config
-            .plugins
-            .iter()
-            .filter_map(|p| installed_full_name(&p.url))
-            .collect();
-        (cache, set)
-    } else {
-        (resolve_cache_root(None), std::collections::HashSet::new())
+    let (cache_root, installed) = 'resolve: {
+        if !config_path.exists() {
+            break 'resolve (resolve_cache_root(None), std::collections::HashSet::new());
+        }
+        let toml_content = match std::fs::read_to_string(&config_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("\u{26a0} failed to read {}: {}", config_path.display(), e);
+                break 'resolve (resolve_cache_root(None), std::collections::HashSet::new());
+            }
+        };
+        match parse_config(&toml_content) {
+            Ok(config) => {
+                let cache = resolve_cache_root(config.options.cache_root.as_deref());
+                let set: std::collections::HashSet<String> = config
+                    .plugins
+                    .iter()
+                    .filter_map(|p| installed_full_name(&p.url))
+                    .collect();
+                (cache, set)
+            }
+            Err(e) => {
+                eprintln!(
+                    "\u{26a0} failed to parse {}: {}. Opening store with defaults.",
+                    config_path.display(),
+                    e
+                );
+                (resolve_cache_root(None), std::collections::HashSet::new())
+            }
+        }
     };
 
     let mut state = StoreTuiState::new();
@@ -3065,6 +3089,23 @@ mod tests {
         assert_eq!(
             installed_full_name("Folke/Snacks.NVIM"),
             Some("folke/snacks.nvim".to_string())
+        );
+    }
+
+    #[test]
+    fn test_installed_full_name_trailing_slash() {
+        // `owner/repo/`, `.../repo.git/`, `.../repo/` をすべて許容する
+        assert_eq!(
+            installed_full_name("folke/snacks.nvim/"),
+            Some("folke/snacks.nvim".to_string())
+        );
+        assert_eq!(
+            installed_full_name("https://github.com/Owner/Repo/"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            installed_full_name("https://github.com/Owner/Repo.git/"),
+            Some("owner/repo".to_string())
         );
     }
 

@@ -115,9 +115,11 @@ pub fn search_plugins(cache_root: &Path, query: &str) -> Result<Vec<GitHubRepo>>
         .build()?;
 
     let mut all_items: Vec<GitHubRepo> = Vec::new();
+    // ページ境界で失敗した場合、取得済みの部分結果は呼び出し元に返すが、
+    // 不完全なデータは 24h キャッシュに書かない (次回 TUI 復帰時に再試行させる)。
+    let mut cache_complete = true;
     for page in 1..=MAX_PAGES {
         let page_str = page.to_string();
-        // resilience: ページ途中で失敗しても、既に取得済みの結果は返す
         let resp = match client
             .get("https://api.github.com/search/repositories")
             .query(&[
@@ -134,7 +136,8 @@ pub fn search_plugins(cache_root: &Path, query: &str) -> Result<Vec<GitHubRepo>>
                 if all_items.is_empty() {
                     return Err(e.into());
                 }
-                eprintln!("\u{26a0} GitHub search page {} failed: {}", page, e);
+                // TUI が active かもしれないので eprintln! はしない。
+                cache_complete = false;
                 break;
             }
         };
@@ -145,12 +148,13 @@ pub fn search_plugins(cache_root: &Path, query: &str) -> Result<Vec<GitHubRepo>>
                 if all_items.is_empty() {
                     return Err(e.into());
                 }
-                eprintln!("\u{26a0} GitHub search page {} parse failed: {}", page, e);
+                cache_complete = false;
                 break;
             }
         };
 
         if parsed.items.is_empty() {
+            // 正常終了 (ページ尽き)
             break;
         }
         let got_full_page = parsed.items.len() >= 100;
@@ -160,12 +164,15 @@ pub fn search_plugins(cache_root: &Path, query: &str) -> Result<Vec<GitHubRepo>>
         }
     }
 
-    // キャッシュに保存
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent).ok();
+    // 完全取得できたときだけキャッシュに保存
+    if cache_complete && !all_items.is_empty() {
+        if let Some(parent) = cache_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        if let Ok(json) = serde_json::to_string(&all_items) {
+            std::fs::write(&cache_path, json).ok();
+        }
     }
-    let json = serde_json::to_string(&all_items)?;
-    std::fs::write(&cache_path, json).ok();
 
     Ok(all_items)
 }
