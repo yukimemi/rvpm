@@ -71,6 +71,16 @@ Sleep 3s
 Type "?"
 Sleep 500ms
 
+# Trigger a full sync (S) from the list TUI to show the animated sync UI:
+# spinner frames, gradient gauge (red → yellow → cyan → green), elapsed
+# timer, rounded borders. Plugins were just cloned so pulls are fast, but
+# the animation still renders and the final 100%-green state is visible.
+Type "S"
+Sleep 5s
+# "Press any key to return to list..." prompt
+Enter
+Sleep 1500ms
+
 # Quit list
 Type "q"
 Sleep 1s
