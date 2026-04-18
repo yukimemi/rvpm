@@ -32,6 +32,9 @@ pub struct StoreTuiState {
     /// インストール済みプラグインの full_name (小文字) 集合。`Enter` 時の
     /// 重複 add 警告と、リスト行の ✓ マーク表示に使う。
     pub installed: HashSet<String>,
+    /// `[options.store.readme_command]` で設定された README 整形コマンド。
+    /// 未設定/空なら内蔵 tui-markdown パイプラインだけを使う。
+    pub readme_command: Option<Vec<String>>,
     pub readme_content: Option<String>,
     pub readme_loading: bool,
     pub readme_scroll: u16,
@@ -47,6 +50,13 @@ pub struct StoreTuiState {
     /// `readme_prepared_key` が変わらない限り再パースしないので、draw() ごとの
     /// コストは clone の string alloc だけ (再 parse + syntect ハイライトを回避)。
     pub readme_rendered: Option<ratatui::text::Text<'static>>,
+    /// 外部 renderer (`readme_command`) の結果。`run_store` の background task
+    /// が完了したときに書き込まれる。描画時は `readme_rendered` より優先される。
+    /// 対応する `(full_name, content_len, visible_width)` が変わったら無効化する。
+    pub readme_external_rendered: Option<ratatui::text::Text<'static>>,
+    /// `readme_external_rendered` の鮮度を判定する cache key。
+    /// `(full_name, content_len, visible_width)`。
+    pub readme_external_key: Option<(String, usize, u16)>,
     /// README の post-wrap 推定行数。pane 内側幅 (`readme_visible_width`) で
     /// 文字幅換算して割った近似値。G / scroll 下限の clamp に使う。
     pub readme_line_count: u16,
@@ -375,12 +385,15 @@ impl StoreTuiState {
             search_matches: Vec::new(),
             search_cursor: 0,
             installed: HashSet::new(),
+            readme_command: None,
             readme_content: None,
             readme_loading: false,
             readme_scroll: 0,
             readme_prepared: String::new(),
             readme_prepared_key: None,
             readme_rendered: None,
+            readme_external_rendered: None,
+            readme_external_key: None,
             readme_line_count: 0,
             readme_visible_height: 0,
             readme_visible_width: 0,
@@ -661,6 +674,37 @@ impl StoreTuiState {
         self.installed.insert(repo.full_name.to_lowercase());
     }
 
+    /// 現在の選択 repo / readme_content / pane 幅の組が `key` と一致するか。
+    /// 外部 renderer の結果を流用してよいかの判定に使う。
+    pub fn external_key_matches(&self, key: &(String, usize, u16)) -> bool {
+        let name_ok = self
+            .selected_repo()
+            .map(|r| r.full_name == key.0)
+            .unwrap_or(false);
+        let len_ok = self.readme_content.as_ref().map(|c| c.len()).unwrap_or(0) == key.1;
+        let width_ok = self.readme_visible_width == key.2;
+        name_ok && len_ok && width_ok
+    }
+
+    /// 現在の選択 repo / readme_content / pane 幅から外部 renderer 用の
+    /// cache key を作る。`run_store` から spawn タイミング判定にも使う。
+    pub fn external_key_current(&self) -> Option<(String, usize, u16)> {
+        let full_name = self.selected_repo()?.full_name.clone();
+        let content_len = self.readme_content.as_ref().map(|c| c.len()).unwrap_or(0);
+        Some((full_name, content_len, self.readme_visible_width))
+    }
+
+    /// 外部 renderer に渡す markdown source を返す。
+    /// 契約として **raw README markdown を無加工で渡す** (README / config
+    /// ドキュメントの "raw markdown goes to the command's stdin" に従う)。
+    /// topics prefix / HTML strip / sanitize / table wrap はいずれも built-in
+    /// 側の responsibility で、ここでは適用しない。mdcat / glow / bat は
+    /// 自前で HTML / テーブル / 幅計算を扱うことを期待している。
+    /// README content が未取得なら `None`。
+    pub fn build_external_source(&self) -> Option<String> {
+        self.readme_content.clone()
+    }
+
     /// README 描画用の前処理済み markdown を必要なら再計算する。
     /// `selected_repo` / `readme_content` / `readme_loading` / pane 幅 のいずれかが
     /// 変わったときだけ HTML strip + topics prefix の組み立てと post-wrap 行数の
@@ -715,6 +759,15 @@ impl StoreTuiState {
         // `unicode-width` は幅 1 と答えるが terminal は 2 セルで描画するため
         // tui-markdown の Line 折返しが壊れる。リスト側と同じく PUA / VS を除去する。
         let sanitized = sanitize_cell_text(&cleaned);
+
+        // 外部 renderer (`options.store.readme_command`) は `draw()` 経由で
+        // 同期実行すると 3 秒 timeout 間 TUI がフリーズするので、ここでは
+        // 呼ばない。代わりに `run_store` 側が README content 到着時に
+        // background task として spawn し、結果は `readme_external_rendered`
+        // に格納する (下の draw() が優先的にそっちを使う)。このメソッドは
+        // 常に built-in tui-markdown の結果を用意しておき、外部結果が来る
+        // までの fallback として機能する。
+
         // tui-markdown 0.3 はテーブルの全セルを 1 Line に詰めてしまい、ヘッダーと
         // 本体行が重なって読めなくなる。pipe テーブルを検出したら列幅を揃えつつ
         // code fence でラップして、逐行描画される経路に逃がす。
@@ -936,7 +989,28 @@ impl StoreTuiState {
         // bg strip / post-wrap 行数 — すべて ensure_readme_prepared でキャッシュ済み。
         // draw() ごとのコストは cached Text<'static> の clone (String alloc) のみ。
         self.ensure_readme_prepared();
-        let rendered = self.readme_rendered.clone().unwrap_or_default();
+        // 外部 renderer の結果が現在の (full_name, content_len, visible_width) に
+        // 対応して届いていれば、そちらを優先する。未設定 / 未完了 / 古い key なら
+        // built-in tui-markdown の結果にフォールバック。
+        let external_is_fresh = self
+            .readme_external_key
+            .as_ref()
+            .map(|k| self.external_key_matches(k))
+            .unwrap_or(false);
+        let rendered = if external_is_fresh {
+            // 外部結果を使う場合、wrap 行数も外部のもので更新しておく
+            if let Some(ext) = self.readme_external_rendered.as_ref() {
+                self.readme_line_count = estimate_wrapped_rows(ext, self.readme_visible_width);
+                ext.clone()
+            } else {
+                self.readme_rendered.clone().unwrap_or_default()
+            }
+        } else {
+            self.readme_rendered.clone().unwrap_or_default()
+        };
+        // built-in → 外部の swap で wrap 後行数が変わった場合、以前のスクロール位置が
+        // 新しい max を超えていると README pane が空白だけに見える。ここで clamp する。
+        self.readme_scroll = self.readme_scroll.min(self.readme_max_scroll());
 
         let readme_title = self
             .selected_repo()
@@ -1504,6 +1578,29 @@ mod tests {
         assert!(!state.is_installed(&repo));
         state.mark_installed(&repo);
         assert!(state.is_installed(&repo));
+    }
+
+    // ───── build_external_source — raw markdown passthrough ─────
+
+    #[test]
+    fn test_build_external_source_returns_raw_content_unchanged() {
+        // 契約: 外部 renderer には加工せず raw README を渡す
+        let mut state = StoreTuiState::new();
+        state.set_plugins(vec![make_repo_full(
+            "x.nvim",
+            0,
+            Some("desc"),
+            vec!["lua", "ui"], // topics があっても prefix しない
+        )]);
+        let raw = "# Title\n\n<div>html here</div>\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n";
+        state.readme_content = Some(raw.to_string());
+        assert_eq!(state.build_external_source().as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn test_build_external_source_none_when_no_content() {
+        let state = StoreTuiState::new();
+        assert!(state.build_external_source().is_none());
     }
 
     // ───── strip_common_html UTF-8 safety ─────

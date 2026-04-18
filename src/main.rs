@@ -1,5 +1,6 @@
 mod chezmoi;
 mod config;
+mod external_render;
 mod git;
 mod link;
 mod loader;
@@ -2707,19 +2708,25 @@ fn installed_full_name(url: &str) -> Option<String> {
 async fn run_store() -> Result<()> {
     use crate::store_tui::StoreTuiState;
 
-    // cache_root を config から解決 (options.cache_root を尊重)。
-    // 同時に config.plugins から installed 集合を構築する。
+    // cache_root / installed set / readme_command を config から解決。
     // resilience 原則: config.toml が壊れていても store TUI は defaults で開く。
     let config_path = rvpm_config_path();
-    let (cache_root, installed) = 'resolve: {
+    let defaults = || {
+        (
+            resolve_cache_root(None),
+            std::collections::HashSet::<String>::new(),
+            None::<Vec<String>>,
+        )
+    };
+    let (cache_root, installed, readme_command) = 'resolve: {
         if !config_path.exists() {
-            break 'resolve (resolve_cache_root(None), std::collections::HashSet::new());
+            break 'resolve defaults();
         }
         let toml_content = match std::fs::read_to_string(&config_path) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("\u{26a0} failed to read {}: {}", config_path.display(), e);
-                break 'resolve (resolve_cache_root(None), std::collections::HashSet::new());
+                break 'resolve defaults();
             }
         };
         match parse_config(&toml_content) {
@@ -2730,7 +2737,12 @@ async fn run_store() -> Result<()> {
                     .iter()
                     .filter_map(|p| installed_full_name(&p.url))
                     .collect();
-                (cache, set)
+                let cmd = config
+                    .options
+                    .store
+                    .readme_command
+                    .filter(|v| !v.is_empty());
+                (cache, set, cmd)
             }
             Err(e) => {
                 eprintln!(
@@ -2738,13 +2750,14 @@ async fn run_store() -> Result<()> {
                     config_path.display(),
                     e
                 );
-                (resolve_cache_root(None), std::collections::HashSet::new())
+                defaults()
             }
         }
     };
 
     let mut state = StoreTuiState::new();
     state.installed = installed;
+    state.readme_command = readme_command;
 
     // 初期表示: 人気プラグインをバックグラウンドで取得
     let cache_root_bg = cache_root.clone();
@@ -2763,10 +2776,22 @@ async fn run_store() -> Result<()> {
 
     // README を非同期で取得するためのチャネル
     let (readme_tx, mut readme_rx) = tokio::sync::mpsc::channel::<(String, String)>(1);
+    // 外部 renderer (`options.store.readme_command`) の結果用チャネル。
+    // 成功時は `Rendered(key, text)`、失敗時は `Warning(message)` をユーザーに
+    // 見せる (title bar の message)。capacity 2 は resize 連打時の drop 防止。
+    enum RenderMsg {
+        Rendered((String, usize, u16), ratatui::text::Text<'static>),
+        Warning(String),
+    }
+    let (render_tx, mut render_rx) = tokio::sync::mpsc::channel::<RenderMsg>(2);
     let mut last_selected: Option<String> = None;
     // README pane の scroll が変化したら terminal.clear() して diff を無効化する。
     // highlight-code の styled span が zellij 等で残骸を残す問題への belt-and-suspenders。
     let mut last_readme_scroll: u16 = state.readme_scroll;
+    // 外部 renderer task の重複 spawn 防止用。`(full_name, content_len, width)`
+    // がこれと同じなら再スポーンしない。selection / content / resize いずれかの
+    // 変化で key が動けば次のループで spawn される。
+    let mut last_render_spawned: Option<(String, usize, u16)> = None;
 
     loop {
         if state.readme_scroll != last_readme_scroll {
@@ -2784,9 +2809,29 @@ async fn run_store() -> Result<()> {
         {
             state.readme_content = Some(content);
             state.readme_loading = false;
+            // 新 content で external_key_current が変わるので、下の統一 spawn 判定に任せる。
         }
 
-        // 選択変更時に README を非同期取得
+        // 外部 renderer の結果 or 警告を受信。
+        if let Ok(msg) = render_rx.try_recv() {
+            match msg {
+                RenderMsg::Rendered(key, text) => {
+                    if state.external_key_matches(&key) {
+                        state.readme_external_rendered = Some(text);
+                        state.readme_external_key = Some(key);
+                    }
+                }
+                RenderMsg::Warning(text) => {
+                    state.message = Some(text);
+                }
+            }
+        }
+
+        // 選択変更時に README を非同期取得。
+        // 注意: 外部 render spawn より **先に** やる。そうしないと新 repo が
+        // selected、readme_content はまだ旧 repo の内容、という状況で
+        // external_key_current() が (新 full_name, 旧 content_len) の混成 key を
+        // 吐いて、そのまま spawn されると stale な render が混入する恐れがある。
         let current_selected = state.selected_repo().map(|r| r.full_name.clone());
         if current_selected != last_selected {
             last_selected = current_selected.clone();
@@ -2794,6 +2839,12 @@ async fn run_store() -> Result<()> {
                 state.readme_loading = true;
                 state.readme_content = None;
                 state.readme_scroll = 0;
+                // 新 repo 用に外部 render state もクリアし、spawn debounce key もリセット。
+                // こうしないと新 repo + 旧 content_len が偶然一致したケースで
+                // last_render_spawned が spawn を抑制してしまう。
+                state.readme_external_rendered = None;
+                state.readme_external_key = None;
+                last_render_spawned = None;
                 // Clear widget だけでは ansi-to-tui の styled span の残骸が
                 // 一部ホスト (zellij 等) で残ることがあるため、選択変更時は
                 // ratatui の内部バッファを明示的に無効化して全セル再描画を強制する。
@@ -2806,6 +2857,40 @@ async fn run_store() -> Result<()> {
                     let _ = tx.blocking_send((repo.full_name.clone(), content));
                 });
             }
+        }
+
+        // 選択変更 / content 受信 / resize いずれかで key が動いたら、
+        // 未 spawn の key なら外部 renderer task を spawn する。
+        // `last_render_spawned` が実際に飛ばしたキーの記憶役。
+        if let Some(cmd) = state.readme_command.as_ref()
+            && state.readme_content.is_some()
+            && let Some(key) = state.external_key_current()
+            && last_render_spawned.as_ref() != Some(&key)
+            && let Some(source) = state.build_external_source()
+        {
+            last_render_spawned = Some(key.clone());
+            let cmd = cmd.clone();
+            let w = state.readme_visible_width;
+            let h = state.readme_visible_height;
+            let tx = render_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                match crate::external_render::render(&cmd, &source, w, h) {
+                    Ok(Some(text)) => {
+                        let _ = tx.blocking_send(RenderMsg::Rendered(key, text));
+                    }
+                    Ok(None) => {
+                        let _ = tx.blocking_send(RenderMsg::Warning(
+                            "readme_command produced no output (fell back to built-in)".to_string(),
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = tx.blocking_send(RenderMsg::Warning(format!(
+                            "readme_command failed: {} (fell back to built-in)",
+                            e
+                        )));
+                    }
+                }
+            });
         }
 
         // キー入力処理

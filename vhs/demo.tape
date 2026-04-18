@@ -1,5 +1,5 @@
 # rvpm demo — README GIF
-# Usage: vhs demo.tape
+# Usage: (cd vhs && vhs demo.tape)   # output lands next to this tape
 # Note: On Windows, run from WSL (vhs hangs on Set Theme in native Windows)
 # Note: FontFamily must be installed in the system. Adjust if tofu appears.
 

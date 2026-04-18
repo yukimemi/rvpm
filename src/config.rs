@@ -43,6 +43,45 @@ pub struct Options {
     /// 静かにスキップ。デフォルト `false`。
     #[serde(default)]
     pub chezmoi: bool,
+    /// `rvpm store` の README preview 用オプション。
+    #[serde(default)]
+    pub store: StoreOptions,
+}
+
+/// `[options.store]` 以下に置く、`rvpm store` TUI 固有の設定。
+#[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone)]
+pub struct StoreOptions {
+    /// README 表示を整形する外部コマンド。未設定/空なら内蔵 `tui-markdown`
+    /// パイプラインを使う (offline fallback)。
+    ///
+    /// 受け渡し規約:
+    /// - 生 README markdown は **stdin** に渡る。
+    /// - コマンドの **stdout** を取り込んで、ANSI エスケープを
+    ///   `ansi-to-tui` 経由で解釈して描画する。ANSI 対応の renderer
+    ///   (`mdcat`, `glow -s dark`, `bat --language=markdown --color=always`
+    ///   等) を想定。
+    /// - 実行タイムアウトは 3 秒。超過した場合は fallback。
+    /// - 各引数内で **Tera 風の `{{ name }}` 記法** の placeholder が展開される
+    ///   (rvpm 他箇所の `[vars]` / テンプレートと統一、空白有無は任意):
+    ///   - `{{ width }}` — README pane の内側幅 (列数)
+    ///   - `{{ height }}` — 内側高さ
+    ///   - `{{ file_path }}` — 生 markdown を書き出した tempfile 絶対パス
+    ///     (使った場合 stdin 経由では渡さない)
+    ///   - `{{ file_dir }}` — `{{ file_path }}` の親ディレクトリ
+    ///   - `{{ file_name }}` — `{{ file_path }}` のファイル名部分
+    ///   - `{{ file_stem }}` — `{{ file_name }}` から拡張子を除いた部分
+    ///   - `{{ file_ext }}` — 拡張子 (dot 無し、例: `md`)
+    ///
+    /// 例:
+    /// ```toml
+    /// [options.store]
+    /// readme_command = ["mdcat"]
+    /// # readme_command = ["mdcat", "--columns", "{{ width }}"]
+    /// # readme_command = ["glow", "-s", "dark", "-w", "{{ width }}", "{{ file_path }}"]
+    /// # readme_command = ["bat", "--language=markdown", "--color=always"]
+    /// ```
+    #[serde(default)]
+    pub readme_command: Option<Vec<String>>,
 }
 
 /// Keymap 仕様. TOML では文字列 (`"<leader>f"`) またはテーブル
@@ -232,6 +271,26 @@ impl Plugin {
 /// vars 内の相互参照を解決する最大反復回数。
 const MAX_VARS_RESOLVE_ITERATIONS: usize = 10;
 
+/// `options.store.readme_command` 内で使える placeholder 名。`parse_config`
+/// の Tera レンダリング時に自己射影 (value = `{{ name }}` リテラル) させ、
+/// 実行時の `external_render::substitute` が展開するまで生き残らせる。
+/// `src/external_render.rs` の `expand_args` と同期。
+///
+/// 注意: これらは **config.toml 全体の Tera context** に差し込まれるので、
+/// `readme_command` 以外の文字列値 (例: `dst = "/tmp/{{ width }}"`) でも同じ
+/// リテラルとして保持される。つまりここで挙げた名前については、未定義変数
+/// エラーが出ない代わりに意図しない場所でリテラルとして残る可能性がある。
+/// 実運用では `readme_command` 内以外で同じトークンを使う動機は薄いので妥協。
+const README_COMMAND_PLACEHOLDERS: &[&str] = &[
+    "width",
+    "height",
+    "file_path",
+    "file_dir",
+    "file_name",
+    "file_stem",
+    "file_ext",
+];
+
 /// [vars] セクションを TOML 全体パースなしでテキストから抽出する。
 /// `{% if %}` 等の Tera 構文が含まれていても安全。
 /// `[vars.sub]` のようなサブテーブルも正しく含める。
@@ -327,13 +386,23 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     context.insert("is_windows", &cfg!(windows));
     context.insert("env", &env_map);
 
-    // 6. 全体を Tera でレンダリング ({% if %} 等が動く)
+    // 6. `options.store.readme_command` 用 placeholder (`{{ width }}` 等) を
+    //    自己参照の literal 値として context に登録する。こうしないと Tera が
+    //    未定義変数扱いで空文字列に置換してしまい、外部 renderer に
+    //    `--columns ""` のような壊れた引数を渡してしまう。`{{ width }}` を
+    //    評価した結果が `{{ width }}` になるように、リテラル値を自己射影する。
+    for key in README_COMMAND_PLACEHOLDERS {
+        let literal = format!("{{{{ {} }}}}", key);
+        context.insert(*key, &literal);
+    }
+
+    // 7. 全体を Tera でレンダリング ({% if %} 等が動く)
     let rendered = Tera::one_off(toml_str, &context, false)?;
 
-    // 6. TOML パース
+    // 8. TOML パース
     let mut config: Config = toml::from_str(&rendered)?;
 
-    // 5. lazy 自動解決: on_* トリガーがあれば lazy = true にする (明示 false は尊重)
+    // 9. lazy 自動解決: on_* トリガーがあれば lazy = true にする (明示 false は尊重)
     for plugin in config.plugins.iter_mut() {
         let has_trigger = plugin.on_cmd.is_some()
             || plugin.on_ft.is_some()
@@ -508,6 +577,53 @@ url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
         assert!(config.options.chezmoi);
+    }
+
+    #[test]
+    fn test_parse_config_preserves_readme_command_placeholders() {
+        // `{{ width }}` 等は Tera パスで壊れず、リテラルのまま readme_command に残ること
+        let toml = r#"
+[options.store]
+readme_command = ["mdcat", "--columns", "{{ width }}", "{{ file_path }}"]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(
+            config.options.store.readme_command,
+            Some(vec![
+                "mdcat".to_string(),
+                "--columns".to_string(),
+                "{{ width }}".to_string(),
+                "{{ file_path }}".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_config_preserves_all_readme_command_placeholders() {
+        let toml = r#"
+[options.store]
+readme_command = [
+  "r",
+  "{{ width }}", "{{ height }}",
+  "{{ file_path }}", "{{ file_dir }}",
+  "{{ file_name }}", "{{ file_stem }}", "{{ file_ext }}",
+]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        let cmd = config.options.store.readme_command.unwrap();
+        assert!(cmd.contains(&"{{ width }}".to_string()));
+        assert!(cmd.contains(&"{{ height }}".to_string()));
+        assert!(cmd.contains(&"{{ file_path }}".to_string()));
+        assert!(cmd.contains(&"{{ file_dir }}".to_string()));
+        assert!(cmd.contains(&"{{ file_name }}".to_string()));
+        assert!(cmd.contains(&"{{ file_stem }}".to_string()));
+        assert!(cmd.contains(&"{{ file_ext }}".to_string()));
     }
 
     #[test]
