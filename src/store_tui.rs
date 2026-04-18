@@ -566,7 +566,11 @@ impl StoreTuiState {
             .unwrap_or_default();
 
         let cleaned = strip_common_html(&body);
-        self.readme_prepared = format!("{}{}", topics_prefix, cleaned);
+        // README 本文にも nerd font の Private Use Area 文字が混じることがあり、
+        // `unicode-width` は幅 1 と答えるが terminal は 2 セルで描画するため
+        // tui-markdown の Line 折返しが壊れる。リスト側と同じく PUA / VS を除去する。
+        let sanitized = sanitize_cell_text(&cleaned);
+        self.readme_prepared = format!("{}{}", topics_prefix, sanitized);
         // ratatui の Paragraph({ wrap: trim=false }) が pane 幅で折り返した後の
         // 実行数を推定する。各 Line の表示幅を unicode-width で測り、
         // pane の内側幅で割って切り上げて合計する近似 (空 Line は 1 行分)。
