@@ -38,15 +38,18 @@ pub struct StoreTuiState {
     /// draw() ごとに strip+format し直さないための前処理済み markdown キャッシュ。
     /// `readme_prepared_key` に紐付き、キーが変わったときだけ作り直す。
     pub readme_prepared: String,
-    /// `readme_prepared` の cache key: (selected full_name, readme_content の長さ, loading)
-    /// 内容そのものを保持せず長さだけで比較 (同一内容の読み直しは想定しない)。
-    readme_prepared_key: Option<(String, usize, bool)>,
-    /// `readme_prepared` の行数 (改行で区切った pre-wrap の行数)。`G` / `j` で
-    /// スクロールオーバーしないよう clamp に使う。wrap 後はこれより増えうるが
-    /// 下限として十分機能する。
+    /// `readme_prepared` の cache key:
+    /// (selected full_name, readme_content 長, loading, visible_width)
+    /// 内容そのものを保持せず長さだけで比較。幅が変わると wrap 後行数が変わるので
+    /// key に含め、resize 時にも再計算する。
+    readme_prepared_key: Option<(String, usize, bool, u16)>,
+    /// README の post-wrap 推定行数。pane 内側幅 (`readme_visible_width`) で
+    /// 文字幅換算して割った近似値。G / scroll 下限の clamp に使う。
     pub readme_line_count: u16,
     /// README pane の表示行数 (`draw()` で毎フレーム更新)。clamp 計算に使う。
     pub readme_visible_height: u16,
+    /// README pane の表示幅 (`draw()` で毎フレーム更新)。post-wrap 計算に使う。
+    pub readme_visible_width: u16,
     pub sort_mode: SortMode,
     pub message: Option<String>,
     pub focus: Focus,
@@ -156,6 +159,33 @@ fn parse_tag_name(tag: &str) -> String {
         .collect()
 }
 
+/// Paragraph が `Wrap { trim: false }` で描画したときの実行数を推定する。
+/// - 幅が 0 (draw 前) なら Text の Line 数をそのまま返す
+/// - 各 Line の spans 合計 display 幅を `pane_width` で割り切り上げ (空 Line は 1 行)
+/// - 合計を u16 にクランプ
+///
+/// word-wrap の影響は無視しているので ±数行の誤差はあるが、`G` の clamp 用途には十分。
+fn estimate_wrapped_rows(text: &ratatui::text::Text<'_>, pane_width: u16) -> u16 {
+    use unicode_width::UnicodeWidthStr;
+    if pane_width == 0 {
+        return text.lines.len().try_into().unwrap_or(u16::MAX);
+    }
+    let w = pane_width as usize;
+    let total: usize = text
+        .lines
+        .iter()
+        .map(|line| {
+            let display: usize = line
+                .spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            display.max(1).div_ceil(w)
+        })
+        .sum();
+    total.try_into().unwrap_or(u16::MAX)
+}
+
 /// リスト行のセル表示用に問題のある Unicode スカラを落とす。
 ///
 /// nerd font の Private Use Area (U+E000-F8FF 等) は `unicode-width` が幅 1 と
@@ -213,6 +243,7 @@ impl StoreTuiState {
             readme_prepared_key: None,
             readme_line_count: 0,
             readme_visible_height: 0,
+            readme_visible_width: 0,
             sort_mode: SortMode::Stars,
             message: None,
             focus: Focus::List,
@@ -486,15 +517,21 @@ impl StoreTuiState {
     }
 
     /// README 描画用の前処理済み markdown を必要なら再計算する。
-    /// `selected_repo` / `readme_content` / `readme_loading` が変わったときだけ
-    /// HTML strip + topics prefix の組み立てを行い、結果を `readme_prepared` に保持する。
+    /// `selected_repo` / `readme_content` / `readme_loading` / pane 幅 のいずれかが
+    /// 変わったときだけ HTML strip + topics prefix の組み立てと post-wrap 行数の
+    /// 見積もりを行い、結果を `readme_prepared` / `readme_line_count` に保持する。
     fn ensure_readme_prepared(&mut self) {
         let selected_name = self
             .selected_repo()
             .map(|r| r.full_name.clone())
             .unwrap_or_default();
         let content_len = self.readme_content.as_ref().map(|c| c.len()).unwrap_or(0);
-        let key = (selected_name, content_len, self.readme_loading);
+        let key = (
+            selected_name,
+            content_len,
+            self.readme_loading,
+            self.readme_visible_width,
+        );
         if self.readme_prepared_key.as_ref() == Some(&key) {
             return;
         }
@@ -530,16 +567,24 @@ impl StoreTuiState {
 
         let cleaned = strip_common_html(&body);
         self.readme_prepared = format!("{}{}", topics_prefix, cleaned);
-        // tui-markdown が実際に生成する Line 数で clamp する。`\n` を数えると
-        // paragraph 内のソフトラップ (改行はあるがブロック境界ではない) まで
-        // カウントしてしまい、G が実内容より遥かに下へ飛ぶ原因になる。
-        // pulldown-cmark + tui-markdown の block 整形を通した後の行数が正確。
+        // ratatui の Paragraph({ wrap: trim=false }) が pane 幅で折り返した後の
+        // 実行数を推定する。各 Line の表示幅を unicode-width で測り、
+        // pane の内側幅で割って切り上げて合計する近似 (空 Line は 1 行分)。
+        // word-wrap と完全一致はしないが、G のオーバー/アンダーを実用レベルまで
+        // 抑えられる。`\n` カウントは paragraph 内の soft break まで数えすぎ、
+        // tui-markdown Line 数は wrap を無視するため、いずれも単独だとズレる。
         let rendered = tui_markdown::from_str(&self.readme_prepared);
-        self.readme_line_count = rendered.lines.len().try_into().unwrap_or(u16::MAX);
+        self.readme_line_count = estimate_wrapped_rows(&rendered, self.readme_visible_width);
         self.readme_prepared_key = Some(key);
     }
 
     pub fn draw(&mut self, f: &mut Frame) {
+        // 毎フレームまず全セルを空白 + 既定スタイルに戻してから widget を重ねる。
+        // 個別 pane 単位の Clear だと highlight-code (ansi-to-tui) の styled span が
+        // scroll 位置変更時に残骸を残すケースがあるため、フレーム丸ごと洗う。
+        // ratatui の diff 機構により実際の端末出力は変化したセルのみ。
+        f.render_widget(ratatui::widgets::Clear, f.area());
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -718,7 +763,11 @@ impl StoreTuiState {
         f.render_stateful_widget(table, main_chunks[0], &mut self.table_state);
 
         // Right: README preview (tui-markdown rendered GFM)
-        // HTML strip + topics 結合はキャッシュ (`readme_prepared`) されるので、
+        // scroll 系のメソッドが使う pane 内側サイズ。borders 分を差し引く。
+        // ensure_readme_prepared は visible_width を cache key に使うのでその前に更新する。
+        self.readme_visible_height = main_chunks[1].height.saturating_sub(2);
+        self.readme_visible_width = main_chunks[1].width.saturating_sub(2);
+        // HTML strip + topics 結合 + post-wrap 行数はキャッシュされるので、
         // draw() ごとのコストは tui_markdown::from_str のパースだけ。
         self.ensure_readme_prepared();
         let rendered = tui_markdown::from_str(&self.readme_prepared);
@@ -741,9 +790,6 @@ impl StoreTuiState {
             )
             .wrap(Wrap { trim: false })
             .scroll((self.readme_scroll, 0));
-        // scroll_readme_to_bottom() / scroll_readme_down() が使う pane 内側高さ。
-        // Borders 2 行を差し引く。
-        self.readme_visible_height = main_chunks[1].height.saturating_sub(2);
         // Paragraph は inner area の未使用セルを空白で埋めないため、前フレームの
         // 長い README の残骸が残ることがある (特に zellij のようにターミナルが
         // セル状態を厳密に保持するホストで顕在化する)。Clear でペイン全体を空白に
