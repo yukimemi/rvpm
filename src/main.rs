@@ -1310,12 +1310,11 @@ async fn run_init(write: bool) -> Result<()> {
     let init_lua_path = nvim_init_lua_path();
 
     if write {
-        let chezmoi_enabled = read_chezmoi_flag(&config_path);
-        let wp = chezmoi::write_path(chezmoi_enabled, &init_lua_path);
-        if let Some(parent) = wp.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        match write_init_lua_snippet(&wp, &snippet)? {
+        // `config` は既にパース済みなので再読込せずそのまま使う。
+        // 親ディレクトリ作成は write_init_lua_snippet が新規作成時に行うので不要。
+        let wp = chezmoi::write_path(config.options.chezmoi, &init_lua_path);
+        let result = write_init_lua_snippet(&wp, &snippet)?;
+        match result {
             WriteInitResult::Created => {
                 println!("\u{2714} Created {} with rvpm loader.", wp.display());
                 println!("  Snippet: {}", snippet);
@@ -1331,7 +1330,12 @@ async fn run_init(write: bool) -> Result<()> {
                 );
             }
         }
-        chezmoi::apply(&wp, &init_lua_path);
+        // 実際に source 側を書き換えたときだけ chezmoi apply する。変更なしの
+        // AlreadyConfigured で apply すると、target 側でユーザーが手で編集した
+        // 差分を上書きしてしまう恐れがある。
+        if result != WriteInitResult::AlreadyConfigured {
+            chezmoi::apply(&wp, &init_lua_path);
+        }
     } else {
         println!("-- Add this to your Neovim init.lua:");
         println!("{}", snippet);
