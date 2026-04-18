@@ -1228,20 +1228,45 @@ async fn run_add(
     ensure_config_exists(&config_path)?;
     let toml_content = std::fs::read_to_string(&config_path)?;
     let mut doc = toml_content.parse::<DocumentMut>()?;
+    // url_style は DocumentMut から直接読む (parse_config 経由だと Tera 展開と
+    // 全フィールドのデシリアライズが走って無駄。ここでは add に必要な
+    // option だけ拾えればよい)。値が無効 / 読めないなら default (Short)。
+    let url_style = doc
+        .get("options")
+        .and_then(|o| o.get("url_style"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| match s {
+            "short" => Some(crate::config::UrlStyle::Short),
+            "full" => Some(crate::config::UrlStyle::Full),
+            _ => None,
+        })
+        .unwrap_or_default();
     if doc.get("plugins").is_none() {
         doc["plugins"] = toml_edit::ArrayOfTables::new().into();
     }
     let plugins = doc["plugins"]
         .as_array_of_tables_mut()
         .context("plugins is not an array of tables")?;
+    // 重複検出: store TUI と同じ `installed_full_name` で両辺を正規化して比較。
+    // https / short / ssh / 大文字小文字 / `.git` / 末尾 `/` の揺れを吸収。
+    // どちらかが GitHub URL と認識できない (gitlab 等) なら生文字列一致に fallback。
+    let incoming_normalized = installed_full_name(&repo);
     for p in plugins.iter() {
-        if p.get("url").and_then(|v| v.as_str()) == Some(&repo) {
-            println!("Plugin already exists: {}", repo);
+        let existing_url = p.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        let existing_normalized = installed_full_name(existing_url);
+        let matches = match (&incoming_normalized, &existing_normalized) {
+            (Some(a), Some(b)) => a == b,
+            _ => existing_url == repo,
+        };
+        if matches {
+            println!("Plugin already exists: {}", existing_url);
             return Ok(());
         }
     }
+    // 書き込み URL は options.url_style に従って整形 (GitHub 以外はそのまま)。
+    let stored_url = format_plugin_url(&repo, url_style);
     let mut new_plugin = table();
-    new_plugin["url"] = value(&repo);
+    new_plugin["url"] = value(&stored_url);
     if let Some(n) = name {
         new_plugin["name"] = value(n);
     }
@@ -2756,7 +2781,89 @@ fn build_plugin_scripts(
     }
 }
 
-/// `rvpm store` — GitHub からプラグインを検索して追加する TUI。
+/// 入力 URL を GitHub の `owner/repo` 形式 (大文字小文字保持) に正規化する。
+///
+/// - `owner/repo` → `Some("owner/repo")`
+/// - `https://github.com/Owner/Repo(.git)?(/)?` → `Some("Owner/Repo")`
+/// - `git@github.com:Owner/Repo.git` → `Some("Owner/Repo")`
+/// - `https://gitlab.com/...` 等の非 GitHub URL → `None`
+///
+/// 重複検出用 (`installed_full_name`) と config.toml 書き出し
+/// (`format_plugin_url`) の両方で再利用する。大文字小文字は保持するので、
+/// 比較目的では呼び出し側で `.to_lowercase()` すること。
+fn github_owner_repo(url: &str) -> Option<String> {
+    let trimmed = url
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/');
+    if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() >= 2 {
+            return Some(format!("{}/{}", parts[0], parts[1]));
+        }
+        return None;
+    }
+    for prefix in ["https://github.com/", "http://github.com/"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let parts: Vec<&str> = rest.split('/').collect();
+            if parts.len() >= 2 {
+                return Some(format!("{}/{}", parts[0], parts[1]));
+            }
+            return None;
+        }
+    }
+    if trimmed.contains("://") {
+        return None;
+    }
+    // スキーム無しの 2 セグメント形式は **owner/repo** のみを受理し、ローカル
+    // パスは除外する。`./foo`, `../foo`, `~/foo`, `/foo`, `\foo`,
+    // `C:/foo` (Windows drive letter) 等を GitHub shorthand と誤認しない
+    // ようガードする。
+    if looks_like_local_path(trimmed) {
+        return None;
+    }
+    if trimmed.contains('/') && !trimmed.contains(' ') {
+        let parts: Vec<&str> = trimmed.split('/').collect();
+        if parts.len() == 2 && is_valid_github_owner(parts[0]) && is_valid_github_repo(parts[1]) {
+            return Some(format!("{}/{}", parts[0], parts[1]));
+        }
+    }
+    None
+}
+
+/// ローカルパスっぽい文字列を判定する (GitHub shorthand と区別するため)。
+/// - 先頭が `./` / `../` / `~` / `/` / `\`
+/// - Windows のドライブレター (`C:`, `D:` 等) で始まる
+fn looks_like_local_path(s: &str) -> bool {
+    if s.starts_with("./") || s.starts_with("../") {
+        return true;
+    }
+    if s.starts_with('~') || s.starts_with('/') || s.starts_with('\\') {
+        return true;
+    }
+    // Windows drive letter: `C:`, `d:` 等
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return true;
+    }
+    false
+}
+
+/// GitHub owner 名の許容文字集合 (alphanumeric と hyphen)。
+/// 先頭 `-` は GitHub 側が拒否するので弾く。
+fn is_valid_github_owner(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with('-') && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// GitHub repo 名の許容文字集合 (alphanumeric と `- _ .`)。
+/// owner よりやや緩く、`.` や `_` を受ける。
+fn is_valid_github_repo(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// Plugin URL を GitHub の `owner/repo` 形式 (小文字) に正規化する。
 /// GitHub の `full_name` は大文字小文字非依存なので lowercase で揃える。
 /// - `"owner/repo"` → `Some("owner/repo")`
@@ -2764,42 +2871,21 @@ fn build_plugin_scripts(
 /// - `"git@github.com:Owner/Repo.git"` → `Some("owner/repo")`
 /// - GitHub 以外 (gitlab 等) → None
 fn installed_full_name(url: &str) -> Option<String> {
-    // `.git` と末尾 `/` の順序が揺れるケースを両方受け付ける
-    let trimmed = url
-        .trim()
-        .trim_end_matches('/')
-        .trim_end_matches(".git")
-        .trim_end_matches('/');
-    // SSH 形式: git@github.com:owner/repo
-    if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
-        let parts: Vec<&str> = rest.split('/').collect();
-        if parts.len() >= 2 {
-            return Some(format!("{}/{}", parts[0], parts[1]).to_lowercase());
-        }
-        return None;
+    github_owner_repo(url).map(|s| s.to_lowercase())
+}
+
+/// `rvpm add` が `config.toml` に書き込む URL を `options.url_style` に従って整形する。
+/// GitHub リポジトリと認識できる入力は `Short` / `Full` で書き換え、
+/// 認識できないもの (gitlab など) は入力をそのまま返す。
+fn format_plugin_url(input: &str, style: crate::config::UrlStyle) -> String {
+    use crate::config::UrlStyle;
+    match github_owner_repo(input) {
+        Some(owner_repo) => match style {
+            UrlStyle::Short => owner_repo,
+            UrlStyle::Full => format!("https://github.com/{}", owner_repo),
+        },
+        None => input.to_string(),
     }
-    // HTTPS/HTTP
-    for prefix in ["https://github.com/", "http://github.com/"] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            let parts: Vec<&str> = rest.split('/').collect();
-            if parts.len() >= 2 {
-                return Some(format!("{}/{}", parts[0], parts[1]).to_lowercase());
-            }
-            return None;
-        }
-    }
-    // 別ホストの URL は GitHub ではないので None
-    if trimmed.contains("://") {
-        return None;
-    }
-    // `owner/repo` 形式 (スキーム無し)
-    if trimmed.contains('/') && !trimmed.contains(' ') {
-        let parts: Vec<&str> = trimmed.split('/').collect();
-        if parts.len() == 2 {
-            return Some(format!("{}/{}", parts[0], parts[1]).to_lowercase());
-        }
-    }
-    None
 }
 
 async fn run_store() -> Result<()> {
@@ -3305,6 +3391,139 @@ mod tests {
             installed_full_name("https://github.com/Owner/Repo.git/"),
             Some("owner/repo".to_string())
         );
+    }
+
+    #[test]
+    fn test_github_owner_repo_preserves_case() {
+        // installed_full_name と違い case は保持する (config.toml 書き込み用途)
+        assert_eq!(
+            github_owner_repo("Folke/Snacks.NVIM"),
+            Some("Folke/Snacks.NVIM".to_string())
+        );
+        assert_eq!(
+            github_owner_repo("https://github.com/Owner/Repo.git"),
+            Some("Owner/Repo".to_string())
+        );
+        assert_eq!(
+            github_owner_repo("git@github.com:Owner/Repo.git"),
+            Some("Owner/Repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_github_owner_repo_non_github_returns_none() {
+        assert_eq!(github_owner_repo("https://gitlab.com/a/b"), None);
+        assert_eq!(github_owner_repo("https://git.example/a/b"), None);
+    }
+
+    #[test]
+    fn test_format_plugin_url_short_form() {
+        use crate::config::UrlStyle;
+        // 入力がどの形式でも owner/repo に統一
+        assert_eq!(
+            format_plugin_url("folke/snacks.nvim", UrlStyle::Short),
+            "folke/snacks.nvim"
+        );
+        assert_eq!(
+            format_plugin_url("https://github.com/folke/snacks.nvim", UrlStyle::Short),
+            "folke/snacks.nvim"
+        );
+        assert_eq!(
+            format_plugin_url("https://github.com/folke/snacks.nvim.git", UrlStyle::Short),
+            "folke/snacks.nvim"
+        );
+    }
+
+    #[test]
+    fn test_format_plugin_url_full_form() {
+        use crate::config::UrlStyle;
+        // 入力がどの形式でも https://github.com/owner/repo に統一
+        assert_eq!(
+            format_plugin_url("folke/snacks.nvim", UrlStyle::Full),
+            "https://github.com/folke/snacks.nvim"
+        );
+        assert_eq!(
+            format_plugin_url("https://github.com/folke/snacks.nvim.git", UrlStyle::Full),
+            "https://github.com/folke/snacks.nvim"
+        );
+        assert_eq!(
+            format_plugin_url("git@github.com:folke/snacks.nvim.git", UrlStyle::Full),
+            "https://github.com/folke/snacks.nvim"
+        );
+    }
+
+    #[test]
+    fn test_format_plugin_url_non_github_passthrough() {
+        use crate::config::UrlStyle;
+        // GitHub 以外は入力そのまま保存 (style 無視)
+        assert_eq!(
+            format_plugin_url("https://gitlab.com/g/h", UrlStyle::Short),
+            "https://gitlab.com/g/h"
+        );
+        assert_eq!(
+            format_plugin_url("https://gitlab.com/g/h", UrlStyle::Full),
+            "https://gitlab.com/g/h"
+        );
+    }
+
+    #[test]
+    fn test_github_owner_repo_rejects_local_paths() {
+        // `./foo`, `../foo`, `~/foo`, `/foo`, `\foo`, `C:/foo` を GitHub shorthand
+        // と誤認しないこと (CodeRabbit major fix)。
+        assert_eq!(github_owner_repo("./foo"), None);
+        assert_eq!(github_owner_repo("../foo"), None);
+        assert_eq!(github_owner_repo("~/foo"), None);
+        assert_eq!(github_owner_repo("/tmp/foo"), None);
+        assert_eq!(github_owner_repo("\\foo\\bar"), None);
+        assert_eq!(github_owner_repo("C:/foo"), None);
+        assert_eq!(github_owner_repo("d:/bar/baz"), None);
+    }
+
+    #[test]
+    fn test_github_owner_repo_rejects_invalid_chars() {
+        // owner / repo の文字集合を超えるものは GitHub shorthand と認めない。
+        // owner は alphanumeric + `-`、repo は + `. _` まで許容。
+        assert_eq!(github_owner_repo("foo bar/baz"), None);
+        assert_eq!(github_owner_repo("-foo/bar"), None); // owner 先頭 `-`
+        assert_eq!(github_owner_repo("foo!/bar"), None); // owner に `!`
+    }
+
+    #[test]
+    fn test_github_owner_repo_accepts_normal_shorthand() {
+        // 正常な owner/repo は従来どおり受理される
+        assert_eq!(
+            github_owner_repo("folke/snacks.nvim"),
+            Some("folke/snacks.nvim".to_string())
+        );
+        assert_eq!(
+            github_owner_repo("nvim-lua/plenary.nvim"),
+            Some("nvim-lua/plenary.nvim".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_config_url_style_defaults_to_short() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = crate::config::parse_config(toml).unwrap();
+        assert_eq!(config.options.url_style, crate::config::UrlStyle::Short);
+    }
+
+    #[test]
+    fn test_parse_config_accepts_url_style_full() {
+        let toml = r#"
+[options]
+url_style = "full"
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = crate::config::parse_config(toml).unwrap();
+        assert_eq!(config.options.url_style, crate::config::UrlStyle::Full);
     }
 
     #[test]

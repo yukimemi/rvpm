@@ -61,6 +61,9 @@ concurrency = 10
 # config.toml から外したプラグインディレクトリを sync / generate 完了時に
 # 自動削除 (デフォルト false)。毎回 `sync --prune` を指定する代わり。
 # auto_clean = true
+# `rvpm add` の URL 書き込み形式: "short" (owner/repo, デフォルト) か
+# "full" (https://github.com/owner/repo)。重複検出は両形式を正規化して比較。
+# url_style = "full"
 # rvpm のデータ置き場 root を上書き (未指定なら ~/.cache/rvpm)
 # repos / merged / loader.lua 全部ここ配下にまとまる
 # base_dir = "~/.cache/nvim/rvpm"
@@ -274,7 +277,7 @@ let _permit = sem.acquire_owned().await.unwrap();
 | `sync [--prune]` | `run_sync()` | clone/pull + merged + loader.lua 生成。`--prune` で未使用プラグインディレクトリも削除。無指定でも未使用があれば末尾で警告表示 |
 | `generate` | `run_generate()` | loader.lua のみ再生成 |
 | `clean` | `run_clean()` | config.toml から外したプラグインの `{cache_root}/plugins/repos/<host>/<owner>/<repo>/` を削除。git 操作なしで `sync --prune` より高速 (200+ プラグインでの所要時間対策)。共有ヘルパー `prune_unused_repos()` を `sync --prune` と共用 |
-| `add <repo>` | `run_add()` | TOML 追加 + 当該プラグインだけ clone + generate |
+| `add <repo>` | `run_add()` | TOML 追加 + 当該プラグインだけ clone + generate。重複検出は `installed_full_name` で正規化 (https / owner/repo / ssh / 大文字小文字 / `.git` / 末尾 `/` の揺れを吸収し、`rvpm store` の installed マークと同じロジックを共用)。書き込み URL 形式は `options.url_style` (`short` / `full`) に従う |
 | `update [query]` | `run_update()` | 既存プラグインの pull (clone しない) |
 | `remove [query]` | `run_remove()` | TOML + ディレクトリ削除 + generate |
 | `edit [query] [--init\|--before\|--after] [--global]` | `run_edit()` | per-plugin init/before/after.lua をエディタで編集。フラグ指定でファイル選択をスキップ。`--global` で global hooks (`~/.config/rvpm/before.lua` / `after.lua`) を編集。インタラクティブ選択時は `[ Global hooks ]` sentinel でも同じ動作 |
