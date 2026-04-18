@@ -770,7 +770,16 @@ impl StoreTuiState {
         // HTML strip + topics 結合 + post-wrap 行数はキャッシュされるので、
         // draw() ごとのコストは tui_markdown::from_str のパースだけ。
         self.ensure_readme_prepared();
-        let rendered = tui_markdown::from_str(&self.readme_prepared);
+        let mut rendered = tui_markdown::from_str(&self.readme_prepared);
+        // highlight-code 由来の背景色付き Span が scroll 時に一部ホストで
+        // 残骸を残すので、前景色だけ残して背景は既定に戻す。fg による
+        // syntax highlighting は維持されるので可読性は保たれる。
+        for line in &mut rendered.lines {
+            for span in &mut line.spans {
+                span.style.bg = None;
+            }
+            line.style.bg = None;
+        }
 
         let readme_title = self
             .selected_repo()
