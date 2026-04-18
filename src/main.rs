@@ -1,5 +1,6 @@
 mod chezmoi;
 mod config;
+mod external_render;
 mod git;
 mod link;
 mod loader;
@@ -2707,19 +2708,25 @@ fn installed_full_name(url: &str) -> Option<String> {
 async fn run_store() -> Result<()> {
     use crate::store_tui::StoreTuiState;
 
-    // cache_root を config から解決 (options.cache_root を尊重)。
-    // 同時に config.plugins から installed 集合を構築する。
+    // cache_root / installed set / readme_command を config から解決。
     // resilience 原則: config.toml が壊れていても store TUI は defaults で開く。
     let config_path = rvpm_config_path();
-    let (cache_root, installed) = 'resolve: {
+    let defaults = || {
+        (
+            resolve_cache_root(None),
+            std::collections::HashSet::<String>::new(),
+            None::<Vec<String>>,
+        )
+    };
+    let (cache_root, installed, readme_command) = 'resolve: {
         if !config_path.exists() {
-            break 'resolve (resolve_cache_root(None), std::collections::HashSet::new());
+            break 'resolve defaults();
         }
         let toml_content = match std::fs::read_to_string(&config_path) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("\u{26a0} failed to read {}: {}", config_path.display(), e);
-                break 'resolve (resolve_cache_root(None), std::collections::HashSet::new());
+                break 'resolve defaults();
             }
         };
         match parse_config(&toml_content) {
@@ -2730,7 +2737,12 @@ async fn run_store() -> Result<()> {
                     .iter()
                     .filter_map(|p| installed_full_name(&p.url))
                     .collect();
-                (cache, set)
+                let cmd = config
+                    .options
+                    .store
+                    .readme_command
+                    .filter(|v| !v.is_empty());
+                (cache, set, cmd)
             }
             Err(e) => {
                 eprintln!(
@@ -2738,13 +2750,14 @@ async fn run_store() -> Result<()> {
                     config_path.display(),
                     e
                 );
-                (resolve_cache_root(None), std::collections::HashSet::new())
+                defaults()
             }
         }
     };
 
     let mut state = StoreTuiState::new();
     state.installed = installed;
+    state.readme_command = readme_command;
 
     // 初期表示: 人気プラグインをバックグラウンドで取得
     let cache_root_bg = cache_root.clone();

@@ -36,6 +36,14 @@ toml_edit = "0.25"
 tui-markdown = { version = "0.3", features = ["highlight-code"] }
 # post-wrap row count の計算用 (store TUI の README scroll clamp)。
 unicode-width = "0.2"
+# 外部 renderer (mdcat / glow 等) の stdout ANSI を ratatui Text に変換するため。
+# tui-markdown[highlight-code] 経由で transitively 入っているが、直接依存として
+# 明示しておくと将来 tui-markdown を差し替えても壊れない。
+ansi-to-tui = "8"
+# `[options.store.readme_command]` で spawn する外部プロセスのタイムアウト。
+wait-timeout = "0.2"
+# 外部 renderer に `{file_path}` を渡す場合の一時ファイル作成。
+tempfile = "3"
 
 # HTTP client (for store)
 # default-features = false to pin TLS backend to `rustls` (avoid native-tls /

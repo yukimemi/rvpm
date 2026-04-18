@@ -32,6 +32,9 @@ pub struct StoreTuiState {
     /// インストール済みプラグインの full_name (小文字) 集合。`Enter` 時の
     /// 重複 add 警告と、リスト行の ✓ マーク表示に使う。
     pub installed: HashSet<String>,
+    /// `[options.store.readme_command]` で設定された README 整形コマンド。
+    /// 未設定/空なら内蔵 tui-markdown パイプラインだけを使う。
+    pub readme_command: Option<Vec<String>>,
     pub readme_content: Option<String>,
     pub readme_loading: bool,
     pub readme_scroll: u16,
@@ -375,6 +378,7 @@ impl StoreTuiState {
             search_matches: Vec::new(),
             search_cursor: 0,
             installed: HashSet::new(),
+            readme_command: None,
             readme_content: None,
             readme_loading: false,
             readme_scroll: 0,
@@ -715,6 +719,39 @@ impl StoreTuiState {
         // `unicode-width` は幅 1 と答えるが terminal は 2 セルで描画するため
         // tui-markdown の Line 折返しが壊れる。リスト側と同じく PUA / VS を除去する。
         let sanitized = sanitize_cell_text(&cleaned);
+
+        // 外部 renderer (`options.store.readme_command`) が設定されているなら
+        // まずそっちを試す。成功すればその結果を採用 (コードフェンス変換は不要
+        // — mdcat / glow は自前でテーブルも扱える)。失敗時は下の tui-markdown
+        // 経路に fallback。
+        if let Some(cmd) = self.readme_command.as_ref().filter(|c| !c.is_empty()) {
+            // 外部 renderer には preprocess 後 + topics prefix を渡す (pipe table も生形式で)
+            let source = format!("{}{}", topics_prefix, sanitized);
+            match crate::external_render::render(
+                cmd,
+                &source,
+                self.readme_visible_width,
+                self.readme_visible_height,
+            ) {
+                Ok(Some(text)) => {
+                    self.readme_prepared = source;
+                    self.readme_line_count =
+                        estimate_wrapped_rows(&text, self.readme_visible_width);
+                    self.readme_rendered = Some(text);
+                    self.readme_prepared_key = Some(key);
+                    return;
+                }
+                Ok(None) => { /* 未設定扱い or 空出力 → fallback */ }
+                Err(e) => {
+                    // TUI 中なので stderr に出さず、title bar 用の message に載せる。
+                    self.message = Some(format!(
+                        "readme_command error: {} (fell back to built-in)",
+                        e
+                    ));
+                }
+            }
+        }
+
         // tui-markdown 0.3 はテーブルの全セルを 1 Line に詰めてしまい、ヘッダーと
         // 本体行が重なって読めなくなる。pipe テーブルを検出したら列幅を揃えつつ
         // code fence でラップして、逐行描画される経路に逃がす。

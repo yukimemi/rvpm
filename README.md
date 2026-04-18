@@ -117,6 +117,11 @@ concurrency = 10
 # source state after mutations (default: false). Requires `chezmoi` in PATH.
 # chezmoi = true
 
+# [options.store]
+# Optional: run READMEs in the store TUI through an external renderer.
+# See "rvpm store — plugin discovery TUI > External README renderer".
+# readme_command = ["mdcat"]
+
 [[plugins]]
 name  = "snacks"
 url   = "folke/snacks.nvim"
@@ -551,6 +556,47 @@ to force-refresh the search cache (README cache expires on its own TTL).
 `api.github.com` and `raw.githubusercontent.com`. Other commands
 (`sync` / `update` / `generate` / `list` / ...) work offline once plugins
 are cloned.
+
+#### External README renderer
+
+The built-in `tui-markdown` pipeline handles most READMEs reasonably well,
+but it can't match dedicated renderers like `mdcat` or `glow` for tables,
+task lists, or themed output. Configure an external command and rvpm will
+pipe the raw README through it and render its ANSI output instead:
+
+```toml
+[options.store]
+# Most common: mdcat reads from stdin by default
+readme_command = ["mdcat"]
+
+# Pass the terminal width explicitly
+# readme_command = ["mdcat", "--columns", "{width}"]
+
+# glow wants a file path and supports theme flags
+# readme_command = ["glow", "-s", "dark", "-w", "{width}", "{file_path}"]
+
+# bat can also pretty-print markdown
+# readme_command = ["bat", "--language=markdown", "--color=always"]
+```
+
+**Placeholders** are expanded in every argument before spawning:
+
+- `{width}` / `{height}` — inner size of the README pane in cells
+- `{file_path}` — absolute path to a temp file containing the raw README
+  (the command receives an empty stdin when this is used)
+- `{file_dir}` — parent directory of `{file_path}`
+
+**Contract and safeguards:**
+
+- raw markdown goes to the command's **stdin** (unless `{file_path}` is used)
+- the command's **stdout** is read and its ANSI escapes are parsed via
+  `ansi-to-tui`, so any ANSI-aware renderer works
+- hard timeout of 3 seconds per render; exceeding it falls back to the
+  built-in path silently
+- exit code ≠ 0, empty output, or spawn failure also falls back, with a
+  one-line warning in the title bar
+- leave `readme_command` unset to keep the offline built-in renderer as
+  the default
 
 <details>
 <summary><b>More command examples</b></summary>
