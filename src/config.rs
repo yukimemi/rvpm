@@ -61,19 +61,23 @@ pub struct StoreOptions {
     ///   (`mdcat`, `glow -s dark`, `bat --language=markdown --color=always`
     ///   等) を想定。
     /// - 実行タイムアウトは 3 秒。超過した場合は fallback。
-    /// - 各引数内で以下の placeholder が展開される (いずれも optional):
-    ///   - `{width}` — README pane の内側幅 (列数)
-    ///   - `{height}` — 内側高さ
-    ///   - `{file_path}` — 生 markdown を書き出した tempfile 絶対パス
-    ///     (指定した場合 stdin 経由では渡さない)
-    ///   - `{file_dir}` — `{file_path}` の親ディレクトリ
+    /// - 各引数内で **Tera 風の `{{ name }}` 記法** の placeholder が展開される
+    ///   (rvpm 他箇所の `[vars]` / テンプレートと統一、空白有無は任意):
+    ///   - `{{ width }}` — README pane の内側幅 (列数)
+    ///   - `{{ height }}` — 内側高さ
+    ///   - `{{ file_path }}` — 生 markdown を書き出した tempfile 絶対パス
+    ///     (使った場合 stdin 経由では渡さない)
+    ///   - `{{ file_dir }}` — `{{ file_path }}` の親ディレクトリ
+    ///   - `{{ file_name }}` — `{{ file_path }}` のファイル名部分
+    ///   - `{{ file_stem }}` — `{{ file_name }}` から拡張子を除いた部分
+    ///   - `{{ file_ext }}` — 拡張子 (dot 無し、例: `md`)
     ///
     /// 例:
     /// ```toml
     /// [options.store]
     /// readme_command = ["mdcat"]
-    /// # readme_command = ["mdcat", "--columns", "{width}"]
-    /// # readme_command = ["glow", "-s", "dark", "-w", "{width}", "{file_path}"]
+    /// # readme_command = ["mdcat", "--columns", "{{ width }}"]
+    /// # readme_command = ["glow", "-s", "dark", "-w", "{{ width }}", "{{ file_path }}"]
     /// # readme_command = ["bat", "--language=markdown", "--color=always"]
     /// ```
     #[serde(default)]

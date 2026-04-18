@@ -569,22 +569,28 @@ pipe the raw README through it and render its ANSI output instead:
 # Most common: mdcat reads from stdin by default
 readme_command = ["mdcat"]
 
-# Pass the terminal width explicitly
-# readme_command = ["mdcat", "--columns", "{width}"]
+# Pass the terminal width explicitly (Tera-style `{{ name }}` placeholders)
+# readme_command = ["mdcat", "--columns", "{{ width }}"]
 
 # glow wants a file path and supports theme flags
-# readme_command = ["glow", "-s", "dark", "-w", "{width}", "{file_path}"]
+# readme_command = ["glow", "-s", "dark", "-w", "{{ width }}", "{{ file_path }}"]
 
 # bat can also pretty-print markdown
 # readme_command = ["bat", "--language=markdown", "--color=always"]
 ```
 
-**Placeholders** are expanded in every argument before spawning:
+**Placeholders** follow the same `{{ name }}` syntax rvpm uses elsewhere
+(`[vars]`, Tera templates). Whitespace inside the braces is optional, so
+`{{width}}` and `{{ width }}` are equivalent. Unknown names are left
+literal. Supported names:
 
-- `{width}` / `{height}` — inner size of the README pane in cells
-- `{file_path}` — absolute path to a temp file containing the raw README
-  (the command receives an empty stdin when this is used)
-- `{file_dir}` — parent directory of `{file_path}`
+- `{{ width }}` / `{{ height }}` — inner size of the README pane in cells
+- `{{ file_path }}` — absolute path to a temp file containing the raw README
+  (the command receives an empty stdin when any `{{ file_* }}` is used)
+- `{{ file_dir }}` — parent directory of `{{ file_path }}`
+- `{{ file_name }}` — basename (e.g. `rvpm-store-readme-xxxx.md`)
+- `{{ file_stem }}` — basename without extension
+- `{{ file_ext }}` — extension without the leading dot (e.g. `md`)
 
 **Contract and safeguards:**
 

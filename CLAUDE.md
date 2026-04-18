@@ -68,9 +68,11 @@ loader_path = "~/.cache/nvim/rvpm/loader.lua"
 # README 表示を外部コマンドに委譲する (store TUI 専用)。
 # stdin に raw markdown、stdout の ANSI エスケープを ansi-to-tui 経由で
 # ratatui Text に変換。失敗/タイムアウト時は tui-markdown 内蔵パスに fallback。
-# placeholder: {width} / {height} / {file_path} / {file_dir}
+# placeholder は Tera 風の `{{ name }}` 記法 (rvpm 他箇所と統一):
+#   {{ width }} / {{ height }} / {{ file_path }} / {{ file_dir }}
+#   {{ file_name }} / {{ file_stem }} / {{ file_ext }}
 # readme_command = ["mdcat"]
-# readme_command = ["glow", "-s", "dark", "-w", "{width}", "{file_path}"]
+# readme_command = ["glow", "-s", "dark", "-w", "{{ width }}", "{{ file_path }}"]
 
 [[plugins]]
 name  = "snacks"

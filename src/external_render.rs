@@ -7,14 +7,18 @@
 //! 失敗 / timeout / 空出力のときは `Ok(None)` を返し、呼び出し側は
 //! 内蔵 tui-markdown パイプラインに fallback する。
 //!
-//! コマンド引数内で使える placeholder (すべて optional):
-//! - `{width}` — pane 内側幅 (列)
-//! - `{height}` — pane 内側高さ (行)
-//! - `{file_path}` — raw markdown を書き出した temp ファイル絶対パス
-//! - `{file_dir}` — `{file_path}` の親ディレクトリ
+//! コマンド引数内で使える placeholder は **Tera 風の `{{ name }}` 記法** で
+//! 書く (rvpm 他箇所の `[vars]` / template と統一)。空白有無は任意:
+//! - `{{ width }}` — pane 内側幅 (列)
+//! - `{{ height }}` — pane 内側高さ (行)
+//! - `{{ file_path }}` — raw markdown を書き出した temp ファイル絶対パス
+//! - `{{ file_dir }}` — `{{ file_path }}` の親ディレクトリ
+//! - `{{ file_name }}` — `{{ file_path }}` のファイル名部分
+//! - `{{ file_stem }}` — `{{ file_name }}` から拡張子を除いた部分
+//! - `{{ file_ext }}` — 拡張子 (dot 無し、例: `md`)
 //!
-//! `{file_path}` が使われた場合は stdin を close して (空 stdin として) 渡す。
-//! そうでない場合は raw markdown を stdin に pipe する。
+//! `{{ file_* }}` のいずれかが使われた場合は stdin を close して (空 stdin
+//! として) 渡す。そうでない場合は raw markdown を stdin に pipe する。
 
 use anyhow::Result;
 use ratatui::text::Text;
@@ -41,11 +45,8 @@ pub fn render(
         return Ok(None);
     }
 
-    // `{file_path}` / `{file_dir}` を使う場合は tempfile を用意する。
-    // 一度展開してみて placeholder が含まれているかどうか判定。
-    let needs_file = command
-        .iter()
-        .any(|a| a.contains("{file_path}") || a.contains("{file_dir}"));
+    // `{{ file_* }}` のいずれかを使う場合は tempfile を用意する。
+    let needs_file = command.iter().any(|a| uses_file_placeholder(a));
     let tempfile_holder = if needs_file {
         let mut f = tempfile::Builder::new()
             .prefix("rvpm-store-readme-")
@@ -110,37 +111,122 @@ pub fn render(
     Ok(Some(text_to_owned(text)))
 }
 
-/// 引数列の placeholder を展開し、stdin が必要かどうかのフラグを返す。
+/// 引数列の `{{ name }}` placeholder を展開し、stdin が必要かどうかのフラグを返す。
 fn expand_args(
     command: &[String],
     width: u16,
     height: u16,
     tempfile: Option<&tempfile::NamedTempFile>,
 ) -> (Vec<String>, bool) {
-    let (file_path, file_dir) = match tempfile {
+    use std::path::Path;
+
+    let (file_path, file_dir, file_name, file_stem, file_ext) = match tempfile {
         Some(f) => {
-            let p = f.path().to_string_lossy().to_string();
-            let dir = f
-                .path()
-                .parent()
-                .map(|d| d.to_string_lossy().to_string())
-                .unwrap_or_default();
-            (p, dir)
+            let p: &Path = f.path();
+            let s = |o: Option<&std::ffi::OsStr>| {
+                o.map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            };
+            let sp = |o: Option<&Path>| {
+                o.map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            };
+            (
+                p.to_string_lossy().to_string(),
+                sp(p.parent()),
+                s(p.file_name()),
+                s(p.file_stem()),
+                s(p.extension()),
+            )
         }
-        None => (String::new(), String::new()),
+        None => (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ),
     };
     let use_stdin = tempfile.is_none();
 
-    let expanded: Vec<String> = command
-        .iter()
-        .map(|a| {
-            a.replace("{width}", &width.to_string())
-                .replace("{height}", &height.to_string())
-                .replace("{file_path}", &file_path)
-                .replace("{file_dir}", &file_dir)
-        })
-        .collect();
+    let vars: [(&str, &str); 7] = [
+        ("width", &width_str(width)),
+        ("height", &height_str(height)),
+        ("file_path", &file_path),
+        ("file_dir", &file_dir),
+        ("file_name", &file_name),
+        ("file_stem", &file_stem),
+        ("file_ext", &file_ext),
+    ];
+    let expanded: Vec<String> = command.iter().map(|a| substitute(a, &vars)).collect();
     (expanded, use_stdin)
+}
+
+// 一時 String を借用するためのヘルパー (配列リテラル内で直接 `&value.to_string()` と書けない)
+fn width_str(w: u16) -> String {
+    w.to_string()
+}
+fn height_str(h: u16) -> String {
+    h.to_string()
+}
+
+/// 文字列内の `{{ name }}` (空白有無は任意) を `vars` で置換する。
+/// 未知の名前は置換せずそのまま残す。`{{` と `}}` は ASCII なので byte index
+/// で slicing しても UTF-8 境界は壊れない。
+fn substitute(s: &str, vars: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'{'
+            && bytes[i + 1] == b'{'
+            && let Some(end_rel) = s[i + 2..].find("}}")
+        {
+            let inner_start = i + 2;
+            let inner_end = inner_start + end_rel;
+            let key = s[inner_start..inner_end].trim();
+            if let Some((_, val)) = vars.iter().find(|(k, _)| *k == key) {
+                out.push_str(&s[last..i]);
+                out.push_str(val);
+                i = inner_end + 2;
+                last = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
+/// 引数に `{{ file_path }}` / `{{ file_dir }}` / `{{ file_name }}` / ... の
+/// いずれかが含まれるかを判定する (空白無視)。1 つでもあれば tempfile が必要。
+fn uses_file_placeholder(arg: &str) -> bool {
+    const FILE_KEYS: &[&str] = &[
+        "file_path",
+        "file_dir",
+        "file_name",
+        "file_stem",
+        "file_ext",
+    ];
+    let bytes = arg.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'{'
+            && bytes[i + 1] == b'{'
+            && let Some(end_rel) = arg[i + 2..].find("}}")
+        {
+            let key = arg[i + 2..i + 2 + end_rel].trim();
+            if FILE_KEYS.contains(&key) {
+                return true;
+            }
+            i = i + 2 + end_rel + 2;
+            continue;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// ansi-to-tui が返す `Text<'_>` を所有権付き `Text<'static>` に変換する。
@@ -182,8 +268,8 @@ mod tests {
     fn test_expand_args_substitutes_width_height() {
         let cmd = vec![
             "x".to_string(),
-            "--cols={width}".to_string(),
-            "--rows={height}".to_string(),
+            "--cols={{ width }}".to_string(),
+            "--rows={{height}}".to_string(), // 空白無しも許容
         ];
         let (expanded, use_stdin) = expand_args(&cmd, 120, 40, None);
         assert_eq!(
@@ -199,12 +285,77 @@ mod tests {
 
     #[test]
     fn test_expand_args_file_path_uses_tempfile_and_no_stdin() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let cmd = vec!["x".to_string(), "{file_path}".to_string()];
+        let tmp = tempfile::Builder::new()
+            .prefix("test-")
+            .suffix(".md")
+            .tempfile()
+            .unwrap();
+        let cmd = vec!["x".to_string(), "{{ file_path }}".to_string()];
         let (expanded, use_stdin) = expand_args(&cmd, 80, 24, Some(&tmp));
         assert_eq!(expanded[0], "x");
         assert_eq!(expanded[1], tmp.path().to_string_lossy());
         assert!(!use_stdin);
+    }
+
+    #[test]
+    fn test_expand_args_all_file_placeholders() {
+        let tmp = tempfile::Builder::new()
+            .prefix("readme-")
+            .suffix(".md")
+            .tempfile()
+            .unwrap();
+        let cmd = vec![
+            "--path={{ file_path }}".to_string(),
+            "--dir={{ file_dir }}".to_string(),
+            "--name={{ file_name }}".to_string(),
+            "--stem={{ file_stem }}".to_string(),
+            "--ext={{ file_ext }}".to_string(),
+        ];
+        let (expanded, use_stdin) = expand_args(&cmd, 80, 24, Some(&tmp));
+        let name = tmp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let stem = tmp
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(expanded[0], format!("--path={}", tmp.path().display()));
+        assert!(expanded[1].starts_with("--dir="));
+        assert_eq!(expanded[2], format!("--name={}", name));
+        assert_eq!(expanded[3], format!("--stem={}", stem));
+        assert_eq!(expanded[4], "--ext=md");
+        assert!(!use_stdin);
+    }
+
+    #[test]
+    fn test_expand_args_unknown_placeholder_left_as_is() {
+        let cmd = vec!["{{ nonexistent }}".to_string(), "{{ width }}".to_string()];
+        let (expanded, _) = expand_args(&cmd, 100, 20, None);
+        assert_eq!(expanded[0], "{{ nonexistent }}");
+        assert_eq!(expanded[1], "100");
+    }
+
+    #[test]
+    fn test_substitute_multiple_occurrences_in_one_arg() {
+        let vars = [("a", "foo"), ("b", "bar")];
+        assert_eq!(substitute("{{a}}/{{b}}/{{a}}", &vars), "foo/bar/foo");
+        assert_eq!(substitute("{{ a }} and {{ b }}", &vars), "foo and bar");
+    }
+
+    #[test]
+    fn test_uses_file_placeholder_detects_any_variant() {
+        assert!(uses_file_placeholder("--in={{ file_path }}"));
+        assert!(uses_file_placeholder("{{file_dir}}"));
+        assert!(uses_file_placeholder("--out={{file_name}}"));
+        assert!(uses_file_placeholder("{{ file_stem }}"));
+        assert!(uses_file_placeholder("{{ file_ext }}"));
+        assert!(!uses_file_placeholder("{{ width }}"));
+        assert!(!uses_file_placeholder("no placeholders here"));
     }
 
     /// 実コマンド: `echo` で ANSI 出力 1 行を吐かせて取り込む smoke test。
