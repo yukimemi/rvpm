@@ -569,12 +569,10 @@ impl TuiState {
                     .add_modifier(Modifier::BOLD),
             )
             .label(Span::styled(
-                format!(
-                    "{:>3}%   {}/{}",
-                    percent,
-                    finished_count,
-                    self.plugins.len()
-                ),
+                // percent と揃えるため done_count (finished + failed) を使う。
+                // finished だけだと failed がある時に `100%   8/9` のような
+                // 矛盾した表示になる。
+                format!("{:>3}%   {}/{}", percent, done_count, self.plugins.len()),
                 Style::default()
                     .fg(Color::Black)
                     .add_modifier(Modifier::BOLD),
