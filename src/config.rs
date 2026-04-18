@@ -271,6 +271,20 @@ impl Plugin {
 /// vars 内の相互参照を解決する最大反復回数。
 const MAX_VARS_RESOLVE_ITERATIONS: usize = 10;
 
+/// `options.store.readme_command` 内で使える placeholder 名。`parse_config`
+/// の Tera レンダリング時に自己射影 (value = `{{ name }}` リテラル) させ、
+/// 実行時の `external_render::substitute` が展開するまで生き残らせる。
+/// `src/external_render.rs` の `expand_args` と同期。
+const README_COMMAND_PLACEHOLDERS: &[&str] = &[
+    "width",
+    "height",
+    "file_path",
+    "file_dir",
+    "file_name",
+    "file_stem",
+    "file_ext",
+];
+
 /// [vars] セクションを TOML 全体パースなしでテキストから抽出する。
 /// `{% if %}` 等の Tera 構文が含まれていても安全。
 /// `[vars.sub]` のようなサブテーブルも正しく含める。
@@ -366,7 +380,17 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     context.insert("is_windows", &cfg!(windows));
     context.insert("env", &env_map);
 
-    // 6. 全体を Tera でレンダリング ({% if %} 等が動く)
+    // 6. `options.store.readme_command` 用 placeholder (`{{ width }}` 等) を
+    //    自己参照の literal 値として context に登録する。こうしないと Tera が
+    //    未定義変数扱いで空文字列に置換してしまい、外部 renderer に
+    //    `--columns ""` のような壊れた引数を渡してしまう。`{{ width }}` を
+    //    評価した結果が `{{ width }}` になるように、リテラル値を自己射影する。
+    for key in README_COMMAND_PLACEHOLDERS {
+        let literal = format!("{{{{ {} }}}}", key);
+        context.insert(*key, &literal);
+    }
+
+    // 7. 全体を Tera でレンダリング ({% if %} 等が動く)
     let rendered = Tera::one_off(toml_str, &context, false)?;
 
     // 6. TOML パース
@@ -547,6 +571,53 @@ url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
         assert!(config.options.chezmoi);
+    }
+
+    #[test]
+    fn test_parse_config_preserves_readme_command_placeholders() {
+        // `{{ width }}` 等は Tera パスで壊れず、リテラルのまま readme_command に残ること
+        let toml = r#"
+[options.store]
+readme_command = ["mdcat", "--columns", "{{ width }}", "{{ file_path }}"]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(
+            config.options.store.readme_command,
+            Some(vec![
+                "mdcat".to_string(),
+                "--columns".to_string(),
+                "{{ width }}".to_string(),
+                "{{ file_path }}".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_config_preserves_all_readme_command_placeholders() {
+        let toml = r#"
+[options.store]
+readme_command = [
+  "r",
+  "{{ width }}", "{{ height }}",
+  "{{ file_path }}", "{{ file_dir }}",
+  "{{ file_name }}", "{{ file_stem }}", "{{ file_ext }}",
+]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        let cmd = config.options.store.readme_command.unwrap();
+        assert!(cmd.contains(&"{{ width }}".to_string()));
+        assert!(cmd.contains(&"{{ height }}".to_string()));
+        assert!(cmd.contains(&"{{ file_path }}".to_string()));
+        assert!(cmd.contains(&"{{ file_dir }}".to_string()));
+        assert!(cmd.contains(&"{{ file_name }}".to_string()));
+        assert!(cmd.contains(&"{{ file_stem }}".to_string()));
+        assert!(cmd.contains(&"{{ file_ext }}".to_string()));
     }
 
     #[test]

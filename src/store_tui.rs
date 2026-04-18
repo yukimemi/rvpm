@@ -694,32 +694,15 @@ impl StoreTuiState {
         Some((full_name, content_len, self.readme_visible_width))
     }
 
-    /// 外部 renderer に渡す markdown source を組み立てる。
-    /// topics prefix + HTML strip + PUA/VS sanitize を適用済み。
-    /// `wrap_tables_as_code_blocks` は**かけない** (mdcat / glow は自前で
-    /// テーブル描画できるので code fence ラップは不要、というより邪魔)。
+    /// 外部 renderer に渡す markdown source を返す。
+    /// 契約として **raw README markdown を無加工で渡す** (README / config
+    /// ドキュメントの "raw markdown goes to the command's stdin" に従う)。
+    /// topics prefix / HTML strip / sanitize / table wrap はいずれも built-in
+    /// 側の responsibility で、ここでは適用しない。mdcat / glow / bat は
+    /// 自前で HTML / テーブル / 幅計算を扱うことを期待している。
     /// README content が未取得なら `None`。
     pub fn build_external_source(&self) -> Option<String> {
-        let body = self.readme_content.as_deref()?;
-        let topics_prefix = self
-            .selected_repo()
-            .map(|r| {
-                if r.topics.is_empty() {
-                    String::new()
-                } else {
-                    let joined = r
-                        .topics
-                        .iter()
-                        .map(|t| format!("`{}`", t))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    format!("**Topics:** {}\n\n---\n\n", joined)
-                }
-            })
-            .unwrap_or_default();
-        let cleaned = strip_common_html(body);
-        let sanitized = sanitize_cell_text(&cleaned);
-        Some(format!("{}{}", topics_prefix, sanitized))
+        self.readme_content.clone()
     }
 
     /// README 描画用の前処理済み markdown を必要なら再計算する。
@@ -1025,6 +1008,9 @@ impl StoreTuiState {
         } else {
             self.readme_rendered.clone().unwrap_or_default()
         };
+        // built-in → 外部の swap で wrap 後行数が変わった場合、以前のスクロール位置が
+        // 新しい max を超えていると README pane が空白だけに見える。ここで clamp する。
+        self.readme_scroll = self.readme_scroll.min(self.readme_max_scroll());
 
         let readme_title = self
             .selected_repo()
@@ -1592,6 +1578,29 @@ mod tests {
         assert!(!state.is_installed(&repo));
         state.mark_installed(&repo);
         assert!(state.is_installed(&repo));
+    }
+
+    // ───── build_external_source — raw markdown passthrough ─────
+
+    #[test]
+    fn test_build_external_source_returns_raw_content_unchanged() {
+        // 契約: 外部 renderer には加工せず raw README を渡す
+        let mut state = StoreTuiState::new();
+        state.set_plugins(vec![make_repo_full(
+            "x.nvim",
+            0,
+            Some("desc"),
+            vec!["lua", "ui"], // topics があっても prefix しない
+        )]);
+        let raw = "# Title\n\n<div>html here</div>\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n";
+        state.readme_content = Some(raw.to_string());
+        assert_eq!(state.build_external_source().as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn test_build_external_source_none_when_no_content() {
+        let state = StoreTuiState::new();
+        assert!(state.build_external_source().is_none());
     }
 
     // ───── strip_common_html UTF-8 safety ─────

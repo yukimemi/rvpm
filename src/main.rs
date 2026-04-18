@@ -2777,11 +2777,13 @@ async fn run_store() -> Result<()> {
     // README を非同期で取得するためのチャネル
     let (readme_tx, mut readme_rx) = tokio::sync::mpsc::channel::<(String, String)>(1);
     // 外部 renderer (`options.store.readme_command`) の結果用チャネル。
-    // 送信は `(key, rendered_text)` で、key は `(full_name, content_len, visible_width)`。
-    // capacity 2 にしているのは、readme_content arrive の spawn と resize 時 spawn が
-    // 連続したときに drop されないように少し余裕を持たせるため。
-    let (render_tx, mut render_rx) =
-        tokio::sync::mpsc::channel::<((String, usize, u16), ratatui::text::Text<'static>)>(2);
+    // 成功時は `Rendered(key, text)`、失敗時は `Warning(message)` をユーザーに
+    // 見せる (title bar の message)。capacity 2 は resize 連打時の drop 防止。
+    enum RenderMsg {
+        Rendered((String, usize, u16), ratatui::text::Text<'static>),
+        Warning(String),
+    }
+    let (render_tx, mut render_rx) = tokio::sync::mpsc::channel::<RenderMsg>(2);
     let mut last_selected: Option<String> = None;
     // README pane の scroll が変化したら terminal.clear() して diff を無効化する。
     // highlight-code の styled span が zellij 等で残骸を残す問題への belt-and-suspenders。
@@ -2810,12 +2812,51 @@ async fn run_store() -> Result<()> {
             // 新 content で external_key_current が変わるので、下の統一 spawn 判定に任せる。
         }
 
-        // 外部 renderer の結果を受信 (まだ有効な key なら採用)。
-        if let Ok((key, text)) = render_rx.try_recv()
-            && state.external_key_matches(&key)
-        {
-            state.readme_external_rendered = Some(text);
-            state.readme_external_key = Some(key);
+        // 外部 renderer の結果 or 警告を受信。
+        if let Ok(msg) = render_rx.try_recv() {
+            match msg {
+                RenderMsg::Rendered(key, text) => {
+                    if state.external_key_matches(&key) {
+                        state.readme_external_rendered = Some(text);
+                        state.readme_external_key = Some(key);
+                    }
+                }
+                RenderMsg::Warning(text) => {
+                    state.message = Some(text);
+                }
+            }
+        }
+
+        // 選択変更時に README を非同期取得。
+        // 注意: 外部 render spawn より **先に** やる。そうしないと新 repo が
+        // selected、readme_content はまだ旧 repo の内容、という状況で
+        // external_key_current() が (新 full_name, 旧 content_len) の混成 key を
+        // 吐いて、そのまま spawn されると stale な render が混入する恐れがある。
+        let current_selected = state.selected_repo().map(|r| r.full_name.clone());
+        if current_selected != last_selected {
+            last_selected = current_selected.clone();
+            if let Some(repo) = state.selected_repo().cloned() {
+                state.readme_loading = true;
+                state.readme_content = None;
+                state.readme_scroll = 0;
+                // 新 repo 用に外部 render state もクリアし、spawn debounce key もリセット。
+                // こうしないと新 repo + 旧 content_len が偶然一致したケースで
+                // last_render_spawned が spawn を抑制してしまう。
+                state.readme_external_rendered = None;
+                state.readme_external_key = None;
+                last_render_spawned = None;
+                // Clear widget だけでは ansi-to-tui の styled span の残骸が
+                // 一部ホスト (zellij 等) で残ることがあるため、選択変更時は
+                // ratatui の内部バッファを明示的に無効化して全セル再描画を強制する。
+                terminal.clear()?;
+                let tx = readme_tx.clone();
+                let cache_root_bg = cache_root.clone();
+                tokio::task::spawn_blocking(move || {
+                    let content = crate::store::fetch_readme(&cache_root_bg, &repo)
+                        .unwrap_or_else(|e| format!("Error: {}", e));
+                    let _ = tx.blocking_send((repo.full_name.clone(), content));
+                });
+            }
         }
 
         // 選択変更 / content 受信 / resize いずれかで key が動いたら、
@@ -2835,37 +2876,21 @@ async fn run_store() -> Result<()> {
             tokio::task::spawn_blocking(move || {
                 match crate::external_render::render(&cmd, &source, w, h) {
                     Ok(Some(text)) => {
-                        let _ = tx.blocking_send((key, text));
+                        let _ = tx.blocking_send(RenderMsg::Rendered(key, text));
                     }
-                    // None = no output / empty / not configured → built-in fallback は既に出ている
-                    Ok(None) => {}
-                    // spawn 失敗などは message に出したいが、state をこの場から触れないので stderr 相当の
-                    // 扱いとして捨てる (次回 content 変更で再試行される)。
-                    Err(_) => {}
+                    Ok(None) => {
+                        let _ = tx.blocking_send(RenderMsg::Warning(
+                            "readme_command produced no output (fell back to built-in)".to_string(),
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = tx.blocking_send(RenderMsg::Warning(format!(
+                            "readme_command failed: {} (fell back to built-in)",
+                            e
+                        )));
+                    }
                 }
             });
-        }
-
-        // 選択変更時に README を非同期取得
-        let current_selected = state.selected_repo().map(|r| r.full_name.clone());
-        if current_selected != last_selected {
-            last_selected = current_selected.clone();
-            if let Some(repo) = state.selected_repo().cloned() {
-                state.readme_loading = true;
-                state.readme_content = None;
-                state.readme_scroll = 0;
-                // Clear widget だけでは ansi-to-tui の styled span の残骸が
-                // 一部ホスト (zellij 等) で残ることがあるため、選択変更時は
-                // ratatui の内部バッファを明示的に無効化して全セル再描画を強制する。
-                terminal.clear()?;
-                let tx = readme_tx.clone();
-                let cache_root_bg = cache_root.clone();
-                tokio::task::spawn_blocking(move || {
-                    let content = crate::store::fetch_readme(&cache_root_bg, &repo)
-                        .unwrap_or_else(|e| format!("Error: {}", e));
-                    let _ = tx.blocking_send((repo.full_name.clone(), content));
-                });
-            }
         }
 
         // キー入力処理
