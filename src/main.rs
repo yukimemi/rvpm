@@ -1855,7 +1855,7 @@ fn maybe_prune_unused_repos(
     if !repos_dir.exists() {
         return (0, Vec::new());
     }
-    let unused = find_unused_repos(config, &repos_dir).unwrap_or_default();
+    let unused = find_unused_repos(config, cache_root, &repos_dir).unwrap_or_default();
     if unused.is_empty() {
         return (0, Vec::new());
     }
@@ -1885,11 +1885,30 @@ fn prune_unused_repos(unused: &[PathBuf]) {
     }
 }
 
-fn find_unused_repos(config: &config::Config, repos_dir: &Path) -> Result<Vec<PathBuf>> {
+/// `{cache_root}/plugins/repos/` 配下で、config.toml に載っていないプラグイン
+/// ディレクトリを列挙する (削除候補)。
+///
+/// 判定ルール:
+/// - 使用中セットには `resolve_plugin_dst()` の結果 (= `plugin.dst` があれば
+///   それ、無ければ canonical_path ベースの既定) のうち `repos_dir` 配下の
+///   ものだけを入れる。`dst` を別ツリーに逃がしてる plugin は対象外になる。
+/// - `.git` を持つ候補ディレクトリを検出し、**使用中パス自身またはその
+///   子孫であれば保護する** (= プラグイン本体の clone の中に置かれた
+///   submodule の `.git` を誤削除しない)。
+fn find_unused_repos(
+    config: &config::Config,
+    cache_root: &Path,
+    repos_dir: &Path,
+) -> Result<Vec<PathBuf>> {
     let mut unused = Vec::new();
-    let mut used_paths = std::collections::HashSet::new();
+    let mut used_paths: Vec<PathBuf> = Vec::new();
     for plugin in &config.plugins {
-        used_paths.insert(repos_dir.join(plugin.canonical_path()));
+        let dst = resolve_plugin_dst(plugin, cache_root);
+        // custom dst がツリー外 (`~/dev/...` 等) の場合は repos_dir のスキャン
+        // 対象外なので used 判定にも不要。
+        if dst.starts_with(repos_dir) {
+            used_paths.push(dst);
+        }
     }
     for entry in walkdir::WalkDir::new(repos_dir)
         .into_iter()
@@ -1898,7 +1917,9 @@ fn find_unused_repos(config: &config::Config, repos_dir: &Path) -> Result<Vec<Pa
     {
         let git_dir = entry.path();
         if let Some(repo_root) = git_dir.parent()
-            && !used_paths.contains(repo_root)
+            && !used_paths
+                .iter()
+                .any(|used| repo_root == used || repo_root.starts_with(used))
         {
             unused.push(repo_root.to_path_buf());
         }
@@ -4075,7 +4096,8 @@ lazy = false"#;
     #[test]
     fn test_find_unused_repos() {
         let root = tempdir().unwrap();
-        let repos_dir = root.path().join("repos");
+        // `cache_root` を root にして、標準の {cache_root}/plugins/repos/ 下に配置する
+        let repos_dir = root.path().join("plugins/repos");
         std::fs::create_dir_all(&repos_dir).unwrap();
         let used_dir = repos_dir.join("github.com/used/plugin");
         let unused_dir = repos_dir.join("github.com/unused/plugin");
@@ -4089,9 +4111,63 @@ lazy = false"#;
                 ..Default::default()
             }],
         };
-        let unused = find_unused_repos(&config, &repos_dir).unwrap();
+        let unused = find_unused_repos(&config, root.path(), &repos_dir).unwrap();
         assert_eq!(unused.len(), 1);
         assert!(unused[0].to_string_lossy().contains("unused"));
+    }
+
+    #[test]
+    fn test_find_unused_repos_respects_custom_dst_inside_repos_dir() {
+        // `plugin.dst` で canonical_path と違う場所に clone してる場合でも、
+        // その場所は "used" として保護されること。
+        let root = tempdir().unwrap();
+        let repos_dir = root.path().join("plugins/repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let custom = repos_dir.join("custom-slot/my-plugin");
+        std::fs::create_dir_all(custom.join(".git")).unwrap();
+        let config = Config {
+            vars: None,
+            options: Options::default(),
+            plugins: vec![Plugin {
+                url: "owner/my-plugin".to_string(),
+                dst: Some(custom.to_string_lossy().to_string()),
+                ..Default::default()
+            }],
+        };
+        let unused = find_unused_repos(&config, root.path(), &repos_dir).unwrap();
+        assert!(
+            unused.is_empty(),
+            "custom dst must be protected, got {:?}",
+            unused
+        );
+    }
+
+    #[test]
+    fn test_find_unused_repos_preserves_nested_git_inside_used_plugin() {
+        // 設定済みプラグインのクローン配下にある submodule 等の `.git` は
+        // 削除候補にしないこと (repo_root が used プラグインの子孫なら保護)。
+        let root = tempdir().unwrap();
+        let repos_dir = root.path().join("plugins/repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let plugin_dir = repos_dir.join("github.com/used/plugin");
+        std::fs::create_dir_all(plugin_dir.join(".git")).unwrap();
+        // submodule
+        let submodule = plugin_dir.join("deps/sub");
+        std::fs::create_dir_all(submodule.join(".git")).unwrap();
+        let config = Config {
+            vars: None,
+            options: Options::default(),
+            plugins: vec![Plugin {
+                url: "used/plugin".to_string(),
+                ..Default::default()
+            }],
+        };
+        let unused = find_unused_repos(&config, root.path(), &repos_dir).unwrap();
+        assert!(
+            unused.is_empty(),
+            "submodule .git must not be considered unused, got {:?}",
+            unused
+        );
     }
 
     #[test]
