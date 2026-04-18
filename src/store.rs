@@ -87,8 +87,12 @@ fn is_cache_valid(path: &Path, max_age: std::time::Duration) -> bool {
 
 const SEARCH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(86400); // 24h
 const README_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(604800); // 7 days
+/// 取得する最大ページ数 (100 件/ページ)。unauth rate limit (60 req/h) を食い潰さない
+/// 範囲に抑える。3 ページ = 300 件で体感上十分。
+const MAX_PAGES: u32 = 3;
 
 /// GitHub Search API でプラグインを検索。キャッシュがあればそれを返す。
+/// 複数ページ取得 (最大 `MAX_PAGES` * 100 件) し、合算結果をキャッシュする。
 pub fn search_plugins(cache_root: &Path, query: &str) -> Result<Vec<GitHubRepo>> {
     // キャッシュチェック
     let cache_path = search_cache_path(cache_root, query);
@@ -110,25 +114,67 @@ pub fn search_plugins(cache_root: &Path, query: &str) -> Result<Vec<GitHubRepo>>
         .user_agent("rvpm")
         .build()?;
 
-    let resp: SearchResponse = client
-        .get("https://api.github.com/search/repositories")
-        .query(&[
-            ("q", search_query.as_str()),
-            ("sort", "stars"),
-            ("order", "desc"),
-            ("per_page", "100"),
-        ])
-        .send()?
-        .json()?;
+    let mut all_items: Vec<GitHubRepo> = Vec::new();
+    // ページ境界で失敗した場合、取得済みの部分結果は呼び出し元に返すが、
+    // 不完全なデータは 24h キャッシュに書かない (次回 TUI 復帰時に再試行させる)。
+    let mut cache_complete = true;
+    for page in 1..=MAX_PAGES {
+        let page_str = page.to_string();
+        let resp = match client
+            .get("https://api.github.com/search/repositories")
+            .query(&[
+                ("q", search_query.as_str()),
+                ("sort", "stars"),
+                ("order", "desc"),
+                ("per_page", "100"),
+                ("page", page_str.as_str()),
+            ])
+            .send()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                if all_items.is_empty() {
+                    return Err(e.into());
+                }
+                // TUI が active かもしれないので eprintln! はしない。
+                cache_complete = false;
+                break;
+            }
+        };
 
-    // キャッシュに保存
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        let parsed: SearchResponse = match resp.json() {
+            Ok(p) => p,
+            Err(e) => {
+                if all_items.is_empty() {
+                    return Err(e.into());
+                }
+                cache_complete = false;
+                break;
+            }
+        };
+
+        if parsed.items.is_empty() {
+            // 正常終了 (ページ尽き)
+            break;
+        }
+        let got_full_page = parsed.items.len() >= 100;
+        all_items.extend(parsed.items);
+        if !got_full_page {
+            break;
+        }
     }
-    let json = serde_json::to_string(&resp.items)?;
-    std::fs::write(&cache_path, json).ok();
 
-    Ok(resp.items)
+    // 完全取得できたときだけキャッシュに保存
+    if cache_complete && !all_items.is_empty() {
+        if let Some(parent) = cache_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        if let Ok(json) = serde_json::to_string(&all_items) {
+            std::fs::write(&cache_path, json).ok();
+        }
+    }
+
+    Ok(all_items)
 }
 
 /// 人気プラグインのランキングを取得。

@@ -2659,20 +2659,92 @@ fn build_plugin_scripts(
 }
 
 /// `rvpm store` — GitHub からプラグインを検索して追加する TUI。
+/// Plugin URL を GitHub の `owner/repo` 形式 (小文字) に正規化する。
+/// GitHub の `full_name` は大文字小文字非依存なので lowercase で揃える。
+/// - `"owner/repo"` → `Some("owner/repo")`
+/// - `"https://github.com/Owner/Repo(.git)?"` → `Some("owner/repo")`
+/// - `"git@github.com:Owner/Repo.git"` → `Some("owner/repo")`
+/// - GitHub 以外 (gitlab 等) → None
+fn installed_full_name(url: &str) -> Option<String> {
+    // `.git` と末尾 `/` の順序が揺れるケースを両方受け付ける
+    let trimmed = url
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/');
+    // SSH 形式: git@github.com:owner/repo
+    if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() >= 2 {
+            return Some(format!("{}/{}", parts[0], parts[1]).to_lowercase());
+        }
+        return None;
+    }
+    // HTTPS/HTTP
+    for prefix in ["https://github.com/", "http://github.com/"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let parts: Vec<&str> = rest.split('/').collect();
+            if parts.len() >= 2 {
+                return Some(format!("{}/{}", parts[0], parts[1]).to_lowercase());
+            }
+            return None;
+        }
+    }
+    // 別ホストの URL は GitHub ではないので None
+    if trimmed.contains("://") {
+        return None;
+    }
+    // `owner/repo` 形式 (スキーム無し)
+    if trimmed.contains('/') && !trimmed.contains(' ') {
+        let parts: Vec<&str> = trimmed.split('/').collect();
+        if parts.len() == 2 {
+            return Some(format!("{}/{}", parts[0], parts[1]).to_lowercase());
+        }
+    }
+    None
+}
+
 async fn run_store() -> Result<()> {
     use crate::store_tui::StoreTuiState;
 
-    // cache_root を config から解決 (options.cache_root を尊重)
+    // cache_root を config から解決 (options.cache_root を尊重)。
+    // 同時に config.plugins から installed 集合を構築する。
+    // resilience 原則: config.toml が壊れていても store TUI は defaults で開く。
     let config_path = rvpm_config_path();
-    let cache_root = if config_path.exists() {
-        let toml_content = std::fs::read_to_string(&config_path)?;
-        let config = parse_config(&toml_content)?;
-        resolve_cache_root(config.options.cache_root.as_deref())
-    } else {
-        resolve_cache_root(None)
+    let (cache_root, installed) = 'resolve: {
+        if !config_path.exists() {
+            break 'resolve (resolve_cache_root(None), std::collections::HashSet::new());
+        }
+        let toml_content = match std::fs::read_to_string(&config_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("\u{26a0} failed to read {}: {}", config_path.display(), e);
+                break 'resolve (resolve_cache_root(None), std::collections::HashSet::new());
+            }
+        };
+        match parse_config(&toml_content) {
+            Ok(config) => {
+                let cache = resolve_cache_root(config.options.cache_root.as_deref());
+                let set: std::collections::HashSet<String> = config
+                    .plugins
+                    .iter()
+                    .filter_map(|p| installed_full_name(&p.url))
+                    .collect();
+                (cache, set)
+            }
+            Err(e) => {
+                eprintln!(
+                    "\u{26a0} failed to parse {}: {}. Opening store with defaults.",
+                    config_path.display(),
+                    e
+                );
+                (resolve_cache_root(None), std::collections::HashSet::new())
+            }
+        }
     };
 
     let mut state = StoreTuiState::new();
+    state.installed = installed;
 
     // 初期表示: 人気プラグインをバックグラウンドで取得
     let cache_root_bg = cache_root.clone();
@@ -2692,8 +2764,15 @@ async fn run_store() -> Result<()> {
     // README を非同期で取得するためのチャネル
     let (readme_tx, mut readme_rx) = tokio::sync::mpsc::channel::<(String, String)>(1);
     let mut last_selected: Option<String> = None;
+    // README pane の scroll が変化したら terminal.clear() して diff を無効化する。
+    // highlight-code の styled span が zellij 等で残骸を残す問題への belt-and-suspenders。
+    let mut last_readme_scroll: u16 = state.readme_scroll;
 
     loop {
+        if state.readme_scroll != last_readme_scroll {
+            terminal.clear()?;
+            last_readme_scroll = state.readme_scroll;
+        }
         terminal.draw(|f| state.draw(f))?;
 
         // README 非同期受信
@@ -2715,6 +2794,10 @@ async fn run_store() -> Result<()> {
                 state.readme_loading = true;
                 state.readme_content = None;
                 state.readme_scroll = 0;
+                // Clear widget だけでは ansi-to-tui の styled span の残骸が
+                // 一部ホスト (zellij 等) で残ることがあるため、選択変更時は
+                // ratatui の内部バッファを明示的に無効化して全セル再描画を強制する。
+                terminal.clear()?;
                 let tx = readme_tx.clone();
                 let cache_root_bg = cache_root.clone();
                 tokio::task::spawn_blocking(move || {
@@ -2733,14 +2816,31 @@ async fn run_store() -> Result<()> {
                 continue;
             }
 
+            // `/` ローカルインクリメンタル検索モード
             if state.search_mode {
                 match key.code {
+                    crossterm::event::KeyCode::Esc => state.search_cancel(),
+                    crossterm::event::KeyCode::Enter => state.search_confirm(),
+                    crossterm::event::KeyCode::Backspace => state.search_backspace(),
+                    crossterm::event::KeyCode::Char(c) => state.search_type(c),
+                    _ => {}
+                }
+                continue;
+            }
+
+            // `S` GitHub API 検索モード (旧 `/` の挙動)
+            if state.api_search_mode {
+                match key.code {
                     crossterm::event::KeyCode::Esc => {
-                        state.search_mode = false;
+                        // API 入力だけキャンセル。既存の local `/` 検索の
+                        // pattern / matches は保持して n/N を引き続き使えるようにする。
+                        state.api_search_mode = false;
+                        state.search_input.clear();
                     }
                     crossterm::event::KeyCode::Enter => {
-                        state.search_mode = false;
+                        state.api_search_mode = false;
                         let query = state.search_input.clone();
+                        state.search_input.clear();
                         state.message = Some(format!("Searching '{}'...", query));
                         terminal.draw(|f| state.draw(f))?;
                         let cache_root_bg = cache_root.clone();
@@ -2782,9 +2882,16 @@ async fn run_store() -> Result<()> {
                     state.show_help = !state.show_help;
                 }
                 crossterm::event::KeyCode::Char('/') => {
-                    state.search_mode = true;
-                    state.search_input.clear();
-                    state.message = None;
+                    state.start_search();
+                }
+                crossterm::event::KeyCode::Char('S') => {
+                    state.start_api_search();
+                }
+                crossterm::event::KeyCode::Char('n') => {
+                    state.search_next();
+                }
+                crossterm::event::KeyCode::Char('N') => {
+                    state.search_prev();
                 }
 
                 // ── Navigation: focus-aware ──
@@ -2809,7 +2916,7 @@ async fn run_store() -> Result<()> {
                 crossterm::event::KeyCode::Char('G') | crossterm::event::KeyCode::End => {
                     match state.focus {
                         store_tui::Focus::List => state.go_bottom(),
-                        store_tui::Focus::Readme => state.scroll_readme_down(u16::MAX),
+                        store_tui::Focus::Readme => state.scroll_readme_to_bottom(),
                     }
                 }
                 crossterm::event::KeyCode::Char('d')
@@ -2887,8 +2994,12 @@ async fn run_store() -> Result<()> {
                     }
                 }
                 crossterm::event::KeyCode::Enter => {
-                    // config.toml に追加
-                    if let Some(repo) = state.selected_repo() {
+                    // config.toml に追加 (installed なら警告のみ)
+                    if let Some(repo) = state.selected_repo().cloned() {
+                        if state.is_installed(&repo) {
+                            state.message = Some(format!("already installed: {}", repo.full_name));
+                            continue;
+                        }
                         let url = repo.full_name.clone();
                         let _ = disable_raw_mode();
                         let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
@@ -2898,6 +3009,7 @@ async fn run_store() -> Result<()> {
                         // run_add の最小版: config.toml に追記して sync
                         let result =
                             run_add(url.clone(), None, None, None, None, None, None, None).await;
+                        let added = result.is_ok();
                         match result {
                             Ok(_) => println!("Added {} successfully!", url),
                             Err(e) => eprintln!("Failed to add {}: {}", url, e),
@@ -2924,7 +3036,12 @@ async fn run_store() -> Result<()> {
                         // 先に show_cursor() した状態を戻す。
                         terminal.clear()?;
                         terminal.hide_cursor()?;
-                        state.message = Some(format!("Added {}", url));
+                        if added {
+                            state.mark_installed(&repo);
+                            state.message = Some(format!("Added {}", url));
+                        } else {
+                            state.message = Some(format!("Failed: {}", url));
+                        }
                     }
                 }
                 _ => {}
@@ -2945,6 +3062,68 @@ mod tests {
     use crate::loader::PluginScripts;
     use tempfile::tempdir;
     use toml_edit::DocumentMut;
+
+    #[test]
+    fn test_installed_full_name_owner_repo() {
+        assert_eq!(
+            installed_full_name("folke/snacks.nvim"),
+            Some("folke/snacks.nvim".to_string())
+        );
+    }
+
+    #[test]
+    fn test_installed_full_name_https_url_with_git_suffix() {
+        assert_eq!(
+            installed_full_name("https://github.com/Owner/Repo.git"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_installed_full_name_https_url_without_git_suffix() {
+        assert_eq!(
+            installed_full_name("https://github.com/nvim-lua/plenary.nvim"),
+            Some("nvim-lua/plenary.nvim".to_string())
+        );
+    }
+
+    #[test]
+    fn test_installed_full_name_ssh_url() {
+        assert_eq!(
+            installed_full_name("git@github.com:Owner/Repo.git"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_installed_full_name_non_github_returns_none() {
+        assert_eq!(installed_full_name("https://gitlab.com/owner/repo"), None);
+    }
+
+    #[test]
+    fn test_installed_full_name_case_normalized() {
+        assert_eq!(
+            installed_full_name("Folke/Snacks.NVIM"),
+            Some("folke/snacks.nvim".to_string())
+        );
+    }
+
+    #[test]
+    fn test_installed_full_name_trailing_slash() {
+        // `owner/repo/`, `.../repo.git/`, `.../repo/` をすべて許容する
+        assert_eq!(
+            installed_full_name("folke/snacks.nvim/"),
+            Some("folke/snacks.nvim".to_string())
+        );
+        assert_eq!(
+            installed_full_name("https://github.com/Owner/Repo/"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            installed_full_name("https://github.com/Owner/Repo.git/"),
+            Some("owner/repo".to_string())
+        );
+    }
 
     #[test]
     fn test_update_filters_by_query() {

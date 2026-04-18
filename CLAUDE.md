@@ -268,7 +268,7 @@ let _permit = sem.acquire_owned().await.unwrap();
 | `config` | `run_config()` | `config.toml` を `$EDITOR` で直接開く (終了後に generate のみ実行。新規プラグイン追加した場合は `rvpm sync` 明示実行) |
 | `init [--write]` | `run_init()` | Neovim `init.lua` に loader.lua を繋ぐ `dofile(...)` スニペットを案内。`--write` で自動追記 (init.lua がなければ新規作成)。`$NVIM_APPNAME` を尊重 |
 | `list [--no-tui]` | `run_list()` | プラグイン一覧表示。デフォルトは TUI で `[S] sync / [u/U] update / [d] remove / [e] edit / [s] set / [?] help` のアクションキー対応。ナビ: `j/k/g/G/Ctrl-d/u/f/b`、検索: `/n/N`。`--no-tui` で pipe-friendly な plain text 出力 |
-| `store` | `run_store()` | GitHub `neovim-plugin` トピックのプラグインブラウザ TUI。`Tab` でリスト/README フォーカス切替。ナビキーはフォーカスに応じてリスト操作 or README スクロール。`Enter` で追加、`o` でブラウザ、`s` でソート切替、`?` でヘルプ |
+| `store` | `run_store()` | GitHub `neovim-plugin` トピックのプラグインブラウザ TUI (最大 300 件、3 ページ取得)。README は tui-markdown で GFM レンダ。行頭の `✓` でインストール済みを表示し、`Enter` で installed plugin は警告して add をスキップ。`/` ローカルインクリメンタル検索 (name + description + topics) + `n`/`N` でマッチジャンプ。`S` で GitHub API 検索。`Tab` でリスト/README フォーカス切替。`o` でブラウザ、`s` でソート切替、`R` でキャッシュクリア+再取得、`?` でヘルプ |
 
 **廃止コマンド:**
 - `status` → `list --no-tui` に統合 (plain text 出力で機能同等)
