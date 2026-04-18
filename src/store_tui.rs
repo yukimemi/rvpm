@@ -43,6 +43,10 @@ pub struct StoreTuiState {
     /// 内容そのものを保持せず長さだけで比較。幅が変わると wrap 後行数が変わるので
     /// key に含め、resize 時にも再計算する。
     readme_prepared_key: Option<(String, usize, bool, u16)>,
+    /// tui-markdown でパースし、bg 色を剥がし終えた済みの描画用 Text。
+    /// `readme_prepared_key` が変わらない限り再パースしないので、draw() ごとの
+    /// コストは clone の string alloc だけ (再 parse + syntect ハイライトを回避)。
+    pub readme_rendered: Option<ratatui::text::Text<'static>>,
     /// README の post-wrap 推定行数。pane 内側幅 (`readme_visible_width`) で
     /// 文字幅換算して割った近似値。G / scroll 下限の clamp に使う。
     pub readme_line_count: u16,
@@ -252,6 +256,32 @@ fn is_table_separator(line: &str) -> bool {
     })
 }
 
+/// `Text<'_>` を所有権つき Text<'static> に変換する。tui-markdown の結果を
+/// State にキャッシュして再パースを避けるために必要。各 Span の Cow を
+/// Owned (String) 化するので 1 回だけの allocation コストで済む。
+fn text_to_owned(text: ratatui::text::Text<'_>) -> ratatui::text::Text<'static> {
+    use ratatui::text::{Line, Span, Text};
+    let lines: Vec<Line<'static>> = text
+        .lines
+        .into_iter()
+        .map(|line| {
+            let spans: Vec<Span<'static>> = line
+                .spans
+                .into_iter()
+                .map(|span| Span::styled(span.content.into_owned(), span.style))
+                .collect();
+            let mut l = Line::from(spans);
+            l.style = line.style;
+            l.alignment = line.alignment;
+            l
+        })
+        .collect();
+    let mut out = Text::from(lines);
+    out.style = text.style;
+    out.alignment = text.alignment;
+    out
+}
+
 /// Paragraph が `Wrap { trim: false }` で描画したときの実行数を推定する。
 /// - 幅が 0 (draw 前) なら Text の Line 数をそのまま返す
 /// - 各 Line の spans 合計 display 幅を `pane_width` で割り切り上げ (空 Line は 1 行)
@@ -334,6 +364,7 @@ impl StoreTuiState {
             readme_scroll: 0,
             readme_prepared: String::new(),
             readme_prepared_key: None,
+            readme_rendered: None,
             readme_line_count: 0,
             readme_visible_height: 0,
             readme_visible_width: 0,
@@ -668,14 +699,26 @@ impl StoreTuiState {
         // code fence でラップして、逐行描画される経路に逃がす。
         let tabled = wrap_tables_as_code_blocks(&sanitized);
         self.readme_prepared = format!("{}{}", topics_prefix, tabled);
+        // tui-markdown パース + syntect ハイライト + bg strip をここで 1 回だけ
+        // 実行し、結果を Text<'static> にして `readme_rendered` にキャッシュする。
+        // draw() ごとに clone するだけになるので、再パース & 毎フレームの span
+        // 反復コストを回避できる。
+        let mut rendered = tui_markdown::from_str(&self.readme_prepared);
+        // highlight-code 由来の背景色付き Span が scroll 時に一部ホストで
+        // 残骸を残すので、前景色だけ残して背景は既定に戻す。
+        for line in &mut rendered.lines {
+            for span in &mut line.spans {
+                span.style.bg = None;
+            }
+            line.style.bg = None;
+        }
         // ratatui の Paragraph({ wrap: trim=false }) が pane 幅で折り返した後の
         // 実行数を推定する。各 Line の表示幅を unicode-width で測り、
         // pane の内側幅で割って切り上げて合計する近似 (空 Line は 1 行分)。
         // word-wrap と完全一致はしないが、G のオーバー/アンダーを実用レベルまで
-        // 抑えられる。`\n` カウントは paragraph 内の soft break まで数えすぎ、
-        // tui-markdown Line 数は wrap を無視するため、いずれも単独だとズレる。
-        let rendered = tui_markdown::from_str(&self.readme_prepared);
+        // 抑えられる。
         self.readme_line_count = estimate_wrapped_rows(&rendered, self.readme_visible_width);
+        self.readme_rendered = Some(text_to_owned(rendered));
         self.readme_prepared_key = Some(key);
     }
 
@@ -868,19 +911,11 @@ impl StoreTuiState {
         // ensure_readme_prepared は visible_width を cache key に使うのでその前に更新する。
         self.readme_visible_height = main_chunks[1].height.saturating_sub(2);
         self.readme_visible_width = main_chunks[1].width.saturating_sub(2);
-        // HTML strip + topics 結合 + post-wrap 行数はキャッシュされるので、
-        // draw() ごとのコストは tui_markdown::from_str のパースだけ。
+        // HTML strip / topics 結合 / tui-markdown parse / syntect ハイライト /
+        // bg strip / post-wrap 行数 — すべて ensure_readme_prepared でキャッシュ済み。
+        // draw() ごとのコストは cached Text<'static> の clone (String alloc) のみ。
         self.ensure_readme_prepared();
-        let mut rendered = tui_markdown::from_str(&self.readme_prepared);
-        // highlight-code 由来の背景色付き Span が scroll 時に一部ホストで
-        // 残骸を残すので、前景色だけ残して背景は既定に戻す。fg による
-        // syntax highlighting は維持されるので可読性は保たれる。
-        for line in &mut rendered.lines {
-            for span in &mut line.spans {
-                span.style.bg = None;
-            }
-            line.style.bg = None;
-        }
+        let rendered = self.readme_rendered.clone().unwrap_or_default();
 
         let readme_title = self
             .selected_repo()
