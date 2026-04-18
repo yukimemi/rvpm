@@ -252,7 +252,7 @@ async fn main() -> Result<()> {
             run_generate().await?;
         }
         Commands::Clean => {
-            run_clean().await?;
+            run_clean()?;
         }
         Commands::Add {
             repo,
@@ -637,28 +637,22 @@ async fn run_sync(prune: bool) -> Result<()> {
     // 未使用 plugin ディレクトリの処理:
     //  - `--prune` フラグまたは `options.auto_clean = true` で自動削除
     //  - それ以外なら警告のみ (rvpm clean で後処理できる旨を案内)
-    let repos_dir = resolve_repos_dir(&cache_root);
-    if repos_dir.exists() {
-        let unused = find_unused_repos(&config, &repos_dir).unwrap_or_default();
-        if !unused.is_empty() {
-            if prune || config.options.auto_clean {
-                prune_unused_repos(&unused);
-            } else {
-                println!();
-                println!(
-                    "\u{26a0} Found {} unused plugin {}:",
-                    unused.len(),
-                    plural("directory", "directories", unused.len()),
-                );
-                for path in &unused {
-                    println!("    {}", path.display());
-                }
-                println!(
-                    "  Run `rvpm clean` (fast, no git) or `rvpm sync --prune` to delete them,\n  \
-                     or set `auto_clean = true` under `[options]` to do it automatically."
-                );
-            }
+    let force = prune || config.options.auto_clean;
+    let (count, unused) = maybe_prune_unused_repos(&config, &cache_root, force);
+    if !force && count > 0 {
+        println!();
+        println!(
+            "\u{26a0} Found {} unused plugin {}:",
+            count,
+            plural("directory", "directories", count),
+        );
+        for path in &unused {
+            println!("    {}", path.display());
         }
+        println!(
+            "  Run `rvpm clean` (fast, no git) or `rvpm sync --prune` to delete them,\n  \
+             or set `auto_clean = true` under `[options]` to do it automatically."
+        );
     }
 
     print_init_lua_hint_if_missing(&config);
@@ -667,7 +661,8 @@ async fn run_sync(prune: bool) -> Result<()> {
 
 /// `rvpm clean` — git 操作なしで、config.toml に無いプラグインディレクトリだけを削除する。
 /// プラグイン数が多い環境で `sync --prune` が重いケースの受け皿。
-async fn run_clean() -> Result<()> {
+/// 非同期処理は無いので `async` は付けない (clippy::unused_async 回避)。
+fn run_clean() -> Result<()> {
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
@@ -683,16 +678,14 @@ async fn run_clean() -> Result<()> {
         return Ok(());
     }
 
-    let unused = find_unused_repos(&config, &repos_dir).unwrap_or_default();
-    if unused.is_empty() {
+    // force=true で即削除。空なら helper は (0, []) を返すので別メッセージを出す。
+    let (count, _leftover) = maybe_prune_unused_repos(&config, &cache_root, true);
+    if count == 0 {
         println!(
             "No unused plugin directories under {}.",
             repos_dir.display()
         );
-        return Ok(());
     }
-
-    prune_unused_repos(&unused);
     Ok(())
 }
 
@@ -745,13 +738,7 @@ async fn run_generate() -> Result<()> {
     // `options.auto_clean = true` なら config から外されたプラグインディレクトリも
     // 自動削除 (git 操作は行わないので generate 自体のコストは増えない)。
     if config.options.auto_clean {
-        let repos_dir = resolve_repos_dir(&cache_root);
-        if repos_dir.exists() {
-            let unused = find_unused_repos(&config, &repos_dir).unwrap_or_default();
-            if !unused.is_empty() {
-                prune_unused_repos(&unused);
-            }
-        }
+        let _ = maybe_prune_unused_repos(&config, &cache_root, true);
     }
 
     print_init_lua_hint_if_missing(&config);
@@ -1853,6 +1840,32 @@ async fn run_set(
 /// 英語の単数/複数形切替。表示メッセージで使う小さなヘルパー。
 fn plural<'a>(singular: &'a str, plural: &'a str, n: usize) -> &'a str {
     if n == 1 { singular } else { plural }
+}
+
+/// `sync --prune` / `generate` (auto_clean) / 両方の末尾で使う共通の「後片付け」。
+/// 未使用 repo を検出し、`force` が true なら `prune_unused_repos` で削除する。
+/// 戻り値は検出された未使用の件数。0 以外なら呼び出し側で警告メッセージを
+/// 出せるよう、発見はしたが削除していないケースを区別できるようにする。
+fn maybe_prune_unused_repos(
+    config: &config::Config,
+    cache_root: &Path,
+    force: bool,
+) -> (usize, Vec<PathBuf>) {
+    let repos_dir = resolve_repos_dir(cache_root);
+    if !repos_dir.exists() {
+        return (0, Vec::new());
+    }
+    let unused = find_unused_repos(config, &repos_dir).unwrap_or_default();
+    if unused.is_empty() {
+        return (0, Vec::new());
+    }
+    let count = unused.len();
+    if force {
+        prune_unused_repos(&unused);
+        (count, Vec::new()) // 削除済みなのでパスは返さない
+    } else {
+        (count, unused)
+    }
 }
 
 /// 未使用 repo ディレクトリを削除する共通処理。`sync --prune` と `clean` 両方から呼ばれる。
