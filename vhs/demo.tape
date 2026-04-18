@@ -2,6 +2,9 @@
 # Usage: (cd vhs && vhs demo.tape)   # output lands next to this tape
 # Note: On Windows, run from WSL (vhs hangs on Set Theme in native Windows).
 # Note: FontFamily must be installed in the system. Adjust if tofu appears.
+# Note: The tape runs in an isolated NVIM_APPNAME/RVPM_APPNAME sandbox
+#       (`rvpm-demo`) and only ever touches paths under that appname. It
+#       will NOT modify your real `~/.config/nvim/` or `~/.config/rvpm/`.
 #
 # Flow (single gif covering both list and browse TUIs):
 #   1. init --write
@@ -28,8 +31,13 @@ Set TypingSpeed 50ms
 Set Theme "Catppuccin Mocha"
 
 # ── clean slate ──
+# NVIM_APPNAME / RVPM_APPNAME で完全に sandbox 化し、ユーザーの実 nvim /
+# rvpm 設定 (`~/.config/nvim/`, `~/.config/rvpm/nvim/`) には触れないようにする。
 Hide
-Type "rm -rf ~/.config/rvpm ~/.cache/rvpm ~/.config/nvim/init.lua 2>/dev/null; clear"
+Type "export NVIM_APPNAME=rvpm-demo RVPM_APPNAME=rvpm-demo"
+Enter
+Sleep 200ms
+Type "rm -rf ~/.config/rvpm/rvpm-demo ~/.cache/rvpm/rvpm-demo ~/.config/rvpm-demo 2>/dev/null; clear"
 Enter
 Sleep 500ms
 Show
@@ -51,7 +59,7 @@ Sleep 2500ms
 #    `S` sync fires actual clones. Plus, `browse`'s `✓` marker works
 #    because snacks.nvim is already in config. ──
 Hide
-Type `printf '\n[[plugins]]\nurl = "%s"\n' nvim-lua/plenary.nvim stevearc/oil.nvim MunifTanjim/nui.nvim lewis6991/gitsigns.nvim >> ~/.config/rvpm/nvim/config.toml`
+Type `printf '\n[[plugins]]\nurl = "%s"\n' nvim-lua/plenary.nvim stevearc/oil.nvim MunifTanjim/nui.nvim lewis6991/gitsigns.nvim >> ~/.config/rvpm/$RVPM_APPNAME/config.toml`
 Enter
 Sleep 300ms
 # Pre-warm the GitHub search cache so the later `rvpm list → b` jump into
