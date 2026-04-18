@@ -90,7 +90,7 @@ Sleep 500ms
 # running long enough to see the spinner rotate and the gauge walk
 # through all four colour buckets.
 Type "S"
-Sleep 16s
+Sleep 8s
 # "Press any key to return to list..." prompt
 Enter
 Sleep 1500ms
