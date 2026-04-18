@@ -2764,8 +2764,15 @@ async fn run_store() -> Result<()> {
     // README を非同期で取得するためのチャネル
     let (readme_tx, mut readme_rx) = tokio::sync::mpsc::channel::<(String, String)>(1);
     let mut last_selected: Option<String> = None;
+    // README pane の scroll が変化したら terminal.clear() して diff を無効化する。
+    // highlight-code の styled span が zellij 等で残骸を残す問題への belt-and-suspenders。
+    let mut last_readme_scroll: u16 = state.readme_scroll;
 
     loop {
+        if state.readme_scroll != last_readme_scroll {
+            terminal.clear()?;
+            last_readme_scroll = state.readme_scroll;
+        }
         terminal.draw(|f| state.draw(f))?;
 
         // README 非同期受信
