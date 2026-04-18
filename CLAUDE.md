@@ -13,6 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Git ワークフロー
 
 - **main ブランチに直接 push しない。** 変更は必ずフィーチャーブランチを切り、Pull Request を作成する。
+- 例外: `chore: bump version to ...` や `chore: release vX.Y.Z` のようなリリース関連 chore commit、および `git tag vX.Y.Z` の push は直接 main に push してよい (既存履歴もそのパターン)。
 - ブランチ名は変更内容を端的に表す (例: `feat/add-only-sync-new-plugin`)。
 - **PR のタイトル・本文は英語で書く。** コミットメッセージも英語。
 
