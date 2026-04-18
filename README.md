@@ -136,6 +136,11 @@ concurrency = 10
 # `sync --prune`. Standalone `rvpm clean` remains available.
 # auto_clean = true
 
+# How `rvpm add` records GitHub plugin URLs in config.toml.
+# "short" (default) → owner/repo ; "full" → https://github.com/owner/repo.
+# Duplicate detection normalises between styles either way.
+# url_style = "full"
+
 # Optional: run READMEs in the store TUI through an external renderer
 # (mdcat / glow / bat). See "External README renderer" below.
 # [options.store]
@@ -184,6 +189,7 @@ for where files land).
 | `concurrency` | `integer` | `8` | Max number of parallel git operations during `sync` / `update`. Kept moderate to avoid GitHub rate limits |
 | `chezmoi` | `boolean` | `false` | When `true`, rvpm writes mutations (`config.toml`, global hooks, per-plugin hooks) directly to the chezmoi **source** file (resolved via `chezmoi source-path`) and then runs `chezmoi apply --force` to materialise the change in the target. Falls back to writing the target directly if `chezmoi` is missing. Plain files only — `.tmpl` sources are rejected (rvpm has its own Tera engine). See [chezmoi integration](#chezmoi-integration) |
 | `auto_clean` | `boolean` | `false` | When `true`, `rvpm sync` and `rvpm generate` automatically delete plugin directories under `plugins/repos/` that are no longer referenced by `config.toml`. Equivalent to always passing `--prune` to `sync`. The standalone `rvpm clean` command is still available for one-off cleanups |
+| `url_style` | `"short"` \| `"full"` | `"short"` | How `rvpm add` writes GitHub plugin URLs to `config.toml`. `"short"` → `owner/repo`, `"full"` → `https://github.com/owner/repo`. Non-GitHub URLs (gitlab etc.) are saved verbatim regardless. Duplicate detection normalizes between styles, so the two forms never produce double entries |
 
 > **💡 Leave `config_root` / `cache_root` unset.** The defaults are already
 > `<appname>`-aware. Setting a literal path (e.g. `cache_root =

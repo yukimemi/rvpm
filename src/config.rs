@@ -23,6 +23,17 @@ pub enum IconStyle {
     Ascii,
 }
 
+/// `rvpm add` が `config.toml` に書き込む URL の表記スタイル。
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UrlStyle {
+    /// `owner/repo` (GitHub 省略形、デフォルト)
+    #[default]
+    Short,
+    /// `https://github.com/owner/repo` (full URL)
+    Full,
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone)]
 pub struct Options {
     /// per-plugin init/before/after.lua の置き場。
@@ -48,6 +59,13 @@ pub struct Options {
     /// `sync --prune` を毎回明示しなくてよくなる。デフォルト `false`。
     #[serde(default)]
     pub auto_clean: bool,
+    /// `rvpm add` が `config.toml` に書き込む URL の形式。
+    /// - `"short"` (デフォルト): `owner/repo`
+    /// - `"full"`: `https://github.com/owner/repo`
+    ///
+    /// GitHub 以外の URL (gitlab 等) はこの設定に関わらずそのまま保存される。
+    #[serde(default)]
+    pub url_style: UrlStyle,
     /// `rvpm store` の README preview 用オプション。
     #[serde(default)]
     pub store: StoreOptions,
