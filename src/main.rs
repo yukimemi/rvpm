@@ -2820,7 +2820,12 @@ async fn run_store() -> Result<()> {
             // `S` GitHub API 検索モード (旧 `/` の挙動)
             if state.api_search_mode {
                 match key.code {
-                    crossterm::event::KeyCode::Esc => state.search_cancel(),
+                    crossterm::event::KeyCode::Esc => {
+                        // API 入力だけキャンセル。既存の local `/` 検索の
+                        // pattern / matches は保持して n/N を引き続き使えるようにする。
+                        state.api_search_mode = false;
+                        state.search_input.clear();
+                    }
                     crossterm::event::KeyCode::Enter => {
                         state.api_search_mode = false;
                         let query = state.search_input.clone();
