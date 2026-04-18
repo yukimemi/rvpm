@@ -27,17 +27,27 @@ Sleep 2s
 Type "rvpm add nvim-telescope/telescope.nvim >/dev/null 2>&1"
 Enter
 Sleep 2s
+
+# Pre-warm the GitHub search cache so the recorded launch is instant.
+# `rvpm store` awaits the initial fetch before it enters the main loop,
+# so by the time we send `q` the 24h cache under
+# ~/.cache/rvpm/<appname>/store/ is already populated.
+Type "rvpm store"
+Enter
+Sleep 8s
+Type "q"
+Sleep 500ms
 Type "clear"
 Enter
 Sleep 200ms
 Show
 
-# Launch the store TUI.
+# Launch the store TUI — reads from cache, opens immediately.
 Sleep 500ms
 Type "rvpm store"
 Sleep 500ms
 Enter
-Sleep 5s
+Sleep 1500ms
 
 # Navigate the plugin list.
 Type "j"
