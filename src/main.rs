@@ -70,6 +70,14 @@ enum Commands {
     /// TOML triggers — skips the clone/pull phase entirely.
     Generate,
 
+    /// Delete plugin directories no longer referenced by config.toml
+    ///
+    /// Walks `{cache_root}/plugins/repos/` and removes every clone whose
+    /// plugin is no longer in `config.toml`. Does not run git operations,
+    /// so it is much faster than `sync --prune` on large configs
+    /// (hundreds of plugins).
+    Clean,
+
     /// Add a plugin and sync
     ///
     /// Accepts the same trigger flags as `set` to configure the plugin
@@ -242,6 +250,9 @@ async fn main() -> Result<()> {
         }
         Commands::Generate => {
             run_generate().await?;
+        }
+        Commands::Clean => {
+            run_clean().await?;
         }
         Commands::Add {
             repo,
@@ -623,48 +634,65 @@ async fn run_sync(prune: bool) -> Result<()> {
     )?;
     println!("Done! -> {}", loader_path.display());
 
-    // 未使用 plugin ディレクトリの処理: --prune なら削除、それ以外なら警告表示
+    // 未使用 plugin ディレクトリの処理:
+    //  - `--prune` フラグまたは `options.auto_clean = true` で自動削除
+    //  - それ以外なら警告のみ (rvpm clean で後処理できる旨を案内)
     let repos_dir = resolve_repos_dir(&cache_root);
     if repos_dir.exists() {
         let unused = find_unused_repos(&config, &repos_dir).unwrap_or_default();
         if !unused.is_empty() {
-            if prune {
-                println!();
-                println!(
-                    "Pruning {} unused plugin {}:",
-                    unused.len(),
-                    if unused.len() == 1 {
-                        "directory"
-                    } else {
-                        "directories"
-                    }
-                );
-                for path in &unused {
-                    println!("  - {}", path.display());
-                    if let Err(e) = std::fs::remove_dir_all(path) {
-                        eprintln!("    \u{26a0} failed: {}", e);
-                    }
-                }
+            if prune || config.options.auto_clean {
+                prune_unused_repos(&unused);
             } else {
                 println!();
                 println!(
                     "\u{26a0} Found {} unused plugin {}:",
                     unused.len(),
-                    if unused.len() == 1 {
-                        "directory"
-                    } else {
-                        "directories"
-                    }
+                    plural("directory", "directories", unused.len()),
                 );
                 for path in &unused {
                     println!("    {}", path.display());
                 }
-                println!("  Run `rvpm sync --prune` to delete them.");
+                println!(
+                    "  Run `rvpm clean` (fast, no git) or `rvpm sync --prune` to delete them,\n  \
+                     or set `auto_clean = true` under `[options]` to do it automatically."
+                );
             }
         }
     }
 
     print_init_lua_hint_if_missing(&config);
+    Ok(())
+}
+
+/// `rvpm clean` — git 操作なしで、config.toml に無いプラグインディレクトリだけを削除する。
+/// プラグイン数が多い環境で `sync --prune` が重いケースの受け皿。
+async fn run_clean() -> Result<()> {
+    let config_path = rvpm_config_path();
+    let toml_content = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+    let config = parse_config(&toml_content)?;
+
+    let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
+    let repos_dir = resolve_repos_dir(&cache_root);
+    if !repos_dir.exists() {
+        println!(
+            "No repos directory at {} — nothing to clean.",
+            repos_dir.display()
+        );
+        return Ok(());
+    }
+
+    let unused = find_unused_repos(&config, &repos_dir).unwrap_or_default();
+    if unused.is_empty() {
+        println!(
+            "No unused plugin directories under {}.",
+            repos_dir.display()
+        );
+        return Ok(());
+    }
+
+    prune_unused_repos(&unused);
     Ok(())
 }
 
@@ -713,6 +741,19 @@ async fn run_generate() -> Result<()> {
         &build_loader_options(&config_root),
     )?;
     println!("Done! -> {}", loader_path.display());
+
+    // `options.auto_clean = true` なら config から外されたプラグインディレクトリも
+    // 自動削除 (git 操作は行わないので generate 自体のコストは増えない)。
+    if config.options.auto_clean {
+        let repos_dir = resolve_repos_dir(&cache_root);
+        if repos_dir.exists() {
+            let unused = find_unused_repos(&config, &repos_dir).unwrap_or_default();
+            if !unused.is_empty() {
+                prune_unused_repos(&unused);
+            }
+        }
+    }
+
     print_init_lua_hint_if_missing(&config);
     Ok(())
 }
@@ -1807,6 +1848,28 @@ async fn run_set(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// 英語の単数/複数形切替。表示メッセージで使う小さなヘルパー。
+fn plural<'a>(singular: &'a str, plural: &'a str, n: usize) -> &'a str {
+    if n == 1 { singular } else { plural }
+}
+
+/// 未使用 repo ディレクトリを削除する共通処理。`sync --prune` と `clean` 両方から呼ばれる。
+/// 削除失敗は eprintln で警告のみ出し、処理を続ける (resilience 原則)。
+fn prune_unused_repos(unused: &[PathBuf]) {
+    println!();
+    println!(
+        "Pruning {} unused plugin {}:",
+        unused.len(),
+        plural("directory", "directories", unused.len()),
+    );
+    for path in unused {
+        println!("  - {}", path.display());
+        if let Err(e) = std::fs::remove_dir_all(path) {
+            eprintln!("    \u{26a0} failed: {}", e);
+        }
+    }
 }
 
 fn find_unused_repos(config: &config::Config, repos_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -4016,5 +4079,59 @@ lazy = false"#;
         let unused = find_unused_repos(&config, &repos_dir).unwrap();
         assert_eq!(unused.len(), 1);
         assert!(unused[0].to_string_lossy().contains("unused"));
+    }
+
+    #[test]
+    fn test_prune_unused_repos_removes_listed_dirs() {
+        let root = tempdir().unwrap();
+        let a = root.path().join("a/.git");
+        let b = root.path().join("b/.git");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let targets = vec![
+            a.parent().unwrap().to_path_buf(),
+            b.parent().unwrap().to_path_buf(),
+        ];
+        prune_unused_repos(&targets);
+        assert!(!targets[0].exists());
+        assert!(!targets[1].exists());
+    }
+
+    #[test]
+    fn test_prune_unused_repos_empty_slice_noop() {
+        // 空でもクラッシュしないこと
+        prune_unused_repos(&[]);
+    }
+
+    #[test]
+    fn test_plural_helper() {
+        assert_eq!(plural("dir", "dirs", 0), "dirs");
+        assert_eq!(plural("dir", "dirs", 1), "dir");
+        assert_eq!(plural("dir", "dirs", 2), "dirs");
+    }
+
+    #[test]
+    fn test_parse_config_auto_clean_defaults_to_false() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = crate::config::parse_config(toml).unwrap();
+        assert!(!config.options.auto_clean);
+    }
+
+    #[test]
+    fn test_parse_config_accepts_auto_clean_true() {
+        let toml = r#"
+[options]
+auto_clean = true
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = crate::config::parse_config(toml).unwrap();
+        assert!(config.options.auto_clean);
     }
 }

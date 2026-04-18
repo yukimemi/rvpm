@@ -58,6 +58,9 @@ nvim_rc = "~/.config/nvim/rc"
 config_root = "{{ vars.nvim_rc }}/plugins"
 # 並列数上限 (デフォルト 8、GitHub rate limit 回避のため控えめ)
 concurrency = 10
+# config.toml から外したプラグインディレクトリを sync / generate 完了時に
+# 自動削除 (デフォルト false)。毎回 `sync --prune` を指定する代わり。
+# auto_clean = true
 # rvpm のデータ置き場 root を上書き (未指定なら ~/.cache/rvpm)
 # repos / merged / loader.lua 全部ここ配下にまとまる
 # base_dir = "~/.cache/nvim/rvpm"
@@ -270,6 +273,7 @@ let _permit = sem.acquire_owned().await.unwrap();
 |---------|------|------|
 | `sync [--prune]` | `run_sync()` | clone/pull + merged + loader.lua 生成。`--prune` で未使用プラグインディレクトリも削除。無指定でも未使用があれば末尾で警告表示 |
 | `generate` | `run_generate()` | loader.lua のみ再生成 |
+| `clean` | `run_clean()` | config.toml から外したプラグインの `{cache_root}/plugins/repos/<host>/<owner>/<repo>/` を削除。git 操作なしで `sync --prune` より高速 (200+ プラグインでの所要時間対策)。共有ヘルパー `prune_unused_repos()` を `sync --prune` と共用 |
 | `add <repo>` | `run_add()` | TOML 追加 + 当該プラグインだけ clone + generate |
 | `update [query]` | `run_update()` | 既存プラグインの pull (clone しない) |
 | `remove [query]` | `run_remove()` | TOML + ディレクトリ削除 + generate |
@@ -282,7 +286,6 @@ let _permit = sem.acquire_owned().await.unwrap();
 
 **廃止コマンド:**
 - `status` → `list --no-tui` に統合 (plain text 出力で機能同等)
-- `clean` → `sync --prune` に統合。未使用 dir がある状態で `sync` を走らせると末尾に警告が出るので発見しやすい
 
 ### ディレクトリレイアウト (デフォルト)
 
