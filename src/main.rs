@@ -3269,11 +3269,33 @@ async fn run_browse() -> Result<bool> {
                     let changed = run_config().await.unwrap_or(false);
                     if changed {
                         let _ = run_generate().await;
+                        // installed マーク (`✓`) と readme_command を再読込した
+                        // config に追従させる。失敗しても TUI は継続 (resilience)。
+                        if let Ok(toml) = std::fs::read_to_string(&config_path)
+                            && let Ok(new_config) = parse_config(&toml)
+                        {
+                            state.installed = new_config
+                                .plugins
+                                .iter()
+                                .filter_map(|p| installed_full_name(&p.url))
+                                .collect();
+                            state.readme_command = new_config
+                                .options
+                                .browse
+                                .readme_command
+                                .filter(|v| !v.is_empty());
+                        }
                     }
                     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                     enable_raw_mode()?;
                     terminal.clear()?;
                     terminal.hide_cursor()?;
+                    // エディタ退出時に残った KeyRelease / Resize イベントが
+                    // そのまま次の match に流れると誤発火する (例: 編集中の
+                    // 大文字 `S` が API search トリガーになる等) ので drain。
+                    while crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+                        let _ = crossterm::event::read();
+                    }
                     state.message = Some(if changed {
                         "Config saved; loader regenerated".to_string()
                     } else {
