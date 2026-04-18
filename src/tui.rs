@@ -376,8 +376,11 @@ impl TuiState {
             .values()
             .filter(|s| matches!(s, PluginStatus::Syncing(_)))
             .count();
+        // Finished と Failed は両方「処理済み」として ratio に含める。
+        // Failed のみ残るパターンで永遠に 100% に届かない状態を防ぐ。
+        let done_count = finished_count + failed_count;
         let ratio = if !self.plugins.is_empty() {
-            finished_count as f64 / self.plugins.len() as f64
+            done_count as f64 / self.plugins.len() as f64
         } else {
             1.0
         };
@@ -504,14 +507,19 @@ impl TuiState {
             })
             .collect();
 
-        // Plugins テーブル: 1 プラグインでもエラーが出たら赤枠、アクティブな sync が
-        // あれば gauge_color と同じ進行色 (ダイナミックに変わる)、完了したら Green。
+        // Plugins テーブル枠:
+        //  - 失敗あり: 赤
+        //  - 1 つでも sync 中: gauge_color (進行度に応じて赤→黄→シアン→緑)
+        //  - 全 Waiting (ジョブまだ始まってない): DarkGray
+        //  - 全 Finished: 緑
         let table_border_color = if failed_count > 0 {
             Color::Red
         } else if syncing_count > 0 {
             gauge_color
-        } else {
+        } else if done_count == self.plugins.len() && !self.plugins.is_empty() {
             Color::Green
+        } else {
+            Color::DarkGray
         };
         let table = Table::new(
             rows,
