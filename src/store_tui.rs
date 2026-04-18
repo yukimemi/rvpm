@@ -41,6 +41,12 @@ pub struct StoreTuiState {
     /// `readme_prepared` の cache key: (selected full_name, readme_content の長さ, loading)
     /// 内容そのものを保持せず長さだけで比較 (同一内容の読み直しは想定しない)。
     readme_prepared_key: Option<(String, usize, bool)>,
+    /// `readme_prepared` の行数 (改行で区切った pre-wrap の行数)。`G` / `j` で
+    /// スクロールオーバーしないよう clamp に使う。wrap 後はこれより増えうるが
+    /// 下限として十分機能する。
+    pub readme_line_count: u16,
+    /// README pane の表示行数 (`draw()` で毎フレーム更新)。clamp 計算に使う。
+    pub readme_visible_height: u16,
     pub sort_mode: SortMode,
     pub message: Option<String>,
     pub focus: Focus,
@@ -205,6 +211,8 @@ impl StoreTuiState {
             readme_scroll: 0,
             readme_prepared: String::new(),
             readme_prepared_key: None,
+            readme_line_count: 0,
+            readme_visible_height: 0,
             sort_mode: SortMode::Stars,
             message: None,
             focus: Focus::List,
@@ -333,11 +341,26 @@ impl StoreTuiState {
     }
 
     pub fn scroll_readme_down(&mut self, n: u16) {
-        self.readme_scroll = self.readme_scroll.saturating_add(n);
+        let max = self.readme_max_scroll();
+        self.readme_scroll = self.readme_scroll.saturating_add(n).min(max);
     }
 
     pub fn scroll_readme_up(&mut self, n: u16) {
         self.readme_scroll = self.readme_scroll.saturating_sub(n);
+    }
+
+    /// README を最下部までスクロール (`G` / `End` 用)。pre-wrap の行数を基準に
+    /// 最終行あたりが pane 下端に来る位置を設定する。wrap で行数が増えた場合は
+    /// 若干上方に見えるが、空白のみ見える `u16::MAX` 飛びより実用的。
+    pub fn scroll_readme_to_bottom(&mut self) {
+        self.readme_scroll = self.readme_max_scroll();
+    }
+
+    /// 現在の readme 行数と pane 高さから、これ以上下に行くと空白しか見えない
+    /// 限界スクロール位置を返す。行数 ≤ 表示高さなら 0。
+    fn readme_max_scroll(&self) -> u16 {
+        self.readme_line_count
+            .saturating_sub(self.readme_visible_height)
     }
 
     // ───────── ローカル検索 (`/` + n/N) ─────────
@@ -507,6 +530,13 @@ impl StoreTuiState {
 
         let cleaned = strip_common_html(&body);
         self.readme_prepared = format!("{}{}", topics_prefix, cleaned);
+        // pre-wrap の改行数で近似。wrap 後は増えるが scroll 上限としては十分。
+        self.readme_line_count = self
+            .readme_prepared
+            .lines()
+            .count()
+            .try_into()
+            .unwrap_or(u16::MAX);
         self.readme_prepared_key = Some(key);
     }
 
@@ -712,6 +742,9 @@ impl StoreTuiState {
             )
             .wrap(Wrap { trim: false })
             .scroll((self.readme_scroll, 0));
+        // scroll_readme_to_bottom() / scroll_readme_down() が使う pane 内側高さ。
+        // Borders 2 行を差し引く。
+        self.readme_visible_height = main_chunks[1].height.saturating_sub(2);
         // Paragraph は inner area の未使用セルを空白で埋めないため、前フレームの
         // 長い README の残骸が残ることがある (特に zellij のようにターミナルが
         // セル状態を厳密に保持するホストで顕在化する)。Clear でペイン全体を空白に
@@ -950,11 +983,44 @@ mod tests {
     #[test]
     fn test_readme_scroll() {
         let mut state = StoreTuiState::new();
+        // clamp を効かせるために表示範囲を設定 (100 行 README を高さ 20 の pane で)
+        state.readme_line_count = 100;
+        state.readme_visible_height = 20;
         state.scroll_readme_down(10);
         assert_eq!(state.readme_scroll, 10);
         state.scroll_readme_up(3);
         assert_eq!(state.readme_scroll, 7);
         state.scroll_readme_up(100);
+        assert_eq!(state.readme_scroll, 0);
+    }
+
+    #[test]
+    fn test_scroll_readme_down_clamps_to_max() {
+        let mut state = StoreTuiState::new();
+        state.readme_line_count = 50;
+        state.readme_visible_height = 20;
+        // max = 50 - 20 = 30
+        state.scroll_readme_down(u16::MAX);
+        assert_eq!(state.readme_scroll, 30);
+    }
+
+    #[test]
+    fn test_scroll_readme_to_bottom_lands_at_max() {
+        let mut state = StoreTuiState::new();
+        state.readme_line_count = 80;
+        state.readme_visible_height = 25;
+        state.scroll_readme_to_bottom();
+        // max = 80 - 25 = 55
+        assert_eq!(state.readme_scroll, 55);
+    }
+
+    #[test]
+    fn test_scroll_readme_to_bottom_on_short_content_stays_at_top() {
+        let mut state = StoreTuiState::new();
+        // 内容が pane より短いならスクロール不要
+        state.readme_line_count = 10;
+        state.readme_visible_height = 25;
+        state.scroll_readme_to_bottom();
         assert_eq!(state.readme_scroll, 0);
     }
 
