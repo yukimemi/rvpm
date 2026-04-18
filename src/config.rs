@@ -422,7 +422,22 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     // 7. 全体を Tera でレンダリング ({% if %} 等が動く)
     let rendered = Tera::one_off(toml_str, &context, false)?;
 
-    // 8. TOML パース
+    // 8. 旧 `[options.store]` は v3.10 で `[options.browse]` に改名された。
+    //    serde は未知のフィールドを黙って無視するので、そのままだと
+    //    `readme_command` が無効になっていることに気付けない。明示的に
+    //    warning を出してユーザーに migration を促す。
+    if rendered.lines().any(|line| {
+        line.split('#')
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<String>()
+            == "[options.store]"
+    }) {
+        eprintln!("\u{26a0} [options.store] is no longer supported; rename it to [options.browse]");
+    }
+
+    // 9. TOML パース
     let mut config: Config = toml::from_str(&rendered)?;
 
     // 9. lazy 自動解決: on_* トリガーがあれば lazy = true にする (明示 false は尊重)

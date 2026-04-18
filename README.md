@@ -691,7 +691,7 @@ rvpm init --write
 # Print the snippet without writing (dry run)
 rvpm init
 
-# Open config.toml in $EDITOR (auto-creates if missing; runs sync on close)
+# Open config.toml in $EDITOR (auto-creates if missing; regenerates loader.lua on close)
 rvpm config
 
 # ── List / status ────────────────────────────────────────

@@ -805,8 +805,12 @@ async fn run_list(no_tui: bool) -> Result<bool> {
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)?;
     let mut config = parse_config(&toml_content)?;
+    // `cache_root` は起動時の spawn_status_check / no_tui 用。以降は
+    // reload_state 内で再 resolve されるので外側では不変で良い。
+    // `config_root` は描画 (per-plugin hook アイコン) で毎フレーム使うので
+    // `let mut` で保持し、reload! マクロで `c` 編集後の新しい値に差し替える。
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
-    let config_root = resolve_config_root(config.options.config_root.as_deref());
+    let mut config_root = resolve_config_root(config.options.config_root.as_deref());
     let mut icons = crate::tui::Icons::from_style(config.options.icons);
 
     if no_tui {
@@ -861,13 +865,14 @@ async fn run_list(no_tui: bool) -> Result<bool> {
     // マクロで反復を畳んでいる。
     macro_rules! reload {
         () => {{
-            let (c, s, new_rx, new_set) =
-                reload_state(&config_path, &cache_root, &mut terminal, &icons)?;
+            let (c, s, new_rx, new_set, new_config_root) =
+                reload_state(&config_path, &mut terminal, &icons)?;
             icons = crate::tui::Icons::from_style(c.options.icons);
             config = c;
             tui_state = s;
             rx = new_rx;
             set = new_set;
+            config_root = new_config_root;
             bg_done = false;
         }};
     }
@@ -919,10 +924,10 @@ async fn run_list(no_tui: bool) -> Result<bool> {
         TuiState,
         mpsc::Receiver<(String, PluginStatus)>,
         JoinSet<()>,
+        PathBuf,
     );
     fn reload_state(
         config_path: &Path,
-        cache_root: &Path,
         terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
         _icons: &crate::tui::Icons,
     ) -> Result<ReloadState> {
@@ -937,11 +942,15 @@ async fn run_list(no_tui: bool) -> Result<bool> {
         terminal.hide_cursor()?;
 
         // ── 2. config 再読み込み + status は background で開始 ──
+        // `c` ハンドラで options.cache_root / options.config_root が変わった
+        // 場合にも追従できるよう、ここで毎回 resolve し直して返す。
         let toml_content = std::fs::read_to_string(config_path)?;
         let config = parse_config(&toml_content)?;
+        let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
+        let config_root = resolve_config_root(config.options.config_root.as_deref());
         let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
         let tui_state = TuiState::new(urls);
-        let (rx, set) = spawn_status_check(&config, cache_root);
+        let (rx, set) = spawn_status_check(&config, &cache_root);
 
         // ── 3. 復帰直後に残留イベントを drain ──
         // wait_for_keypress で押したキーの release や連打分が残ると、main
@@ -951,7 +960,7 @@ async fn run_list(no_tui: bool) -> Result<bool> {
             let _ = crossterm::event::read();
         }
 
-        Ok((config, tui_state, rx, set))
+        Ok((config, tui_state, rx, set, config_root))
     }
 
     loop {
@@ -2927,7 +2936,8 @@ async fn run_browse() -> Result<bool> {
             None::<Vec<String>>,
         )
     };
-    let (cache_root, installed, readme_command) = 'resolve: {
+    // `c` ハンドラで options.cache_root が変わった場合も追従できるよう `let mut`。
+    let (mut cache_root, installed, readme_command) = 'resolve: {
         if !config_path.exists() {
             break 'resolve defaults();
         }
@@ -3266,14 +3276,20 @@ async fn run_browse() -> Result<bool> {
                     let _ = disable_raw_mode();
                     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
                     let _ = terminal.show_cursor();
-                    let changed = run_config().await.unwrap_or(false);
+                    // エラーを握り潰さず、message に出して TUI で確認できるようにする。
+                    let config_result = run_config().await;
+                    let changed = matches!(&config_result, Ok(true));
+                    let mut gen_err: Option<String> = None;
                     if changed {
-                        let _ = run_generate().await;
-                        // installed マーク (`✓`) と readme_command を再読込した
-                        // config に追従させる。失敗しても TUI は継続 (resilience)。
-                        if let Ok(toml) = std::fs::read_to_string(&config_path)
+                        if let Err(e) = run_generate().await {
+                            gen_err = Some(e.to_string());
+                        } else if let Ok(toml) = std::fs::read_to_string(&config_path)
                             && let Ok(new_config) = parse_config(&toml)
                         {
+                            // options.cache_root が書き換わった可能性があるので
+                            // 再 resolve。installed (`✓`) と readme_command も更新。
+                            cache_root =
+                                resolve_cache_root(new_config.options.cache_root.as_deref());
                             state.installed = new_config
                                 .plugins
                                 .iter()
@@ -3296,10 +3312,11 @@ async fn run_browse() -> Result<bool> {
                     while crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
                         let _ = crossterm::event::read();
                     }
-                    state.message = Some(if changed {
-                        "Config saved; loader regenerated".to_string()
-                    } else {
-                        "Config unchanged".to_string()
+                    state.message = Some(match (&config_result, &gen_err) {
+                        (Err(e), _) => format!("Config edit failed: {}", e),
+                        (Ok(true), Some(e)) => format!("Config saved; regenerate failed: {}", e),
+                        (Ok(true), None) => "Config saved; loader regenerated".to_string(),
+                        (Ok(false), _) => "Config unchanged".to_string(),
                     });
                 }
                 crossterm::event::KeyCode::Char('s') => {

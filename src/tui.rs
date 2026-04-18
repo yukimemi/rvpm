@@ -871,16 +871,6 @@ impl TuiState {
 
         // ── Help popup overlay ──
         if self.show_help {
-            let area = f.area();
-            let popup_w = 48u16.min(area.width.saturating_sub(4));
-            let popup_h = 18u16.min(area.height.saturating_sub(4));
-            let popup = Rect::new(
-                (area.width.saturating_sub(popup_w)) / 2,
-                (area.height.saturating_sub(popup_h)) / 2,
-                popup_w,
-                popup_h,
-            );
-
             let help_lines = vec![
                 Line::from(vec![Span::styled(
                     "  Navigation",
@@ -950,6 +940,17 @@ impl TuiState {
                     Span::styled("Quit", Style::default().fg(Color::White)),
                 ]),
             ];
+
+            // 高さは help_lines 数 + 上下 border 2 行。外枠が area を超えないようにクランプ。
+            let area = f.area();
+            let popup_w = 48u16.min(area.width.saturating_sub(4));
+            let popup_h = (help_lines.len() as u16 + 2).min(area.height.saturating_sub(4));
+            let popup = Rect::new(
+                (area.width.saturating_sub(popup_w)) / 2,
+                (area.height.saturating_sub(popup_h)) / 2,
+                popup_w,
+                popup_h,
+            );
 
             f.render_widget(Clear, popup);
             f.render_widget(
