@@ -178,9 +178,25 @@ fn wrap_tables_as_code_blocks(input: &str) -> String {
     let lines: Vec<&str> = input.lines().collect();
     let mut out = String::new();
     let mut i = 0;
+    // fenced code block の中では table 検出しない (README のコードサンプルが
+    // `| a | b |` を含んでいた場合、二重 wrap で原 fence を壊してしまうため)。
+    // ``` / ~~~ 行を見たら状態を反転させる。
+    let mut in_fence = false;
     while i < lines.len() {
         let line = lines[i];
-        if is_table_row(line) && i + 1 < lines.len() && is_table_separator(lines[i + 1]) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            out.push('\n');
+            i += 1;
+            continue;
+        }
+        if !in_fence
+            && is_table_row(line)
+            && i + 1 < lines.len()
+            && is_table_separator(lines[i + 1])
+        {
             // 連続する table 行を末尾まで収集
             let mut end = i + 2;
             while end < lines.len() && is_table_row(lines[end]) {
@@ -400,6 +416,11 @@ impl StoreTuiState {
                     .cmp(b.plugin_name())
                     .then_with(|| a.full_name.cmp(&b.full_name))
             }),
+        }
+        // sort で plugins の順序が変わると search_matches のインデックスが無効化されるので、
+        // アクティブな local `/` 検索があれば走り直して n/N が破綻しないようにする。
+        if let Some(pat) = self.search_pattern.clone() {
+            self.run_local_search(&pat);
         }
     }
 
@@ -1621,6 +1642,73 @@ outro
         assert!(!out.contains("```"));
         assert!(out.contains("Hello"));
         assert!(out.contains("World"));
+    }
+
+    #[test]
+    fn test_wrap_tables_skips_inside_fenced_code_block() {
+        // README のコードサンプル内に pipe table があっても二重 wrap しない
+        let input = "\
+intro
+
+```markdown
+| col | other |
+| --- | --- |
+| a | b |
+```
+
+outro
+";
+        let out = wrap_tables_as_code_blocks(input);
+        // ``` の数は元と同じ 2 (開始 + 終了) で、新たな fence は足されていない
+        assert_eq!(out.matches("```").count(), 2);
+        assert!(out.contains("```markdown"));
+    }
+
+    #[test]
+    fn test_wrap_tables_still_wraps_tables_outside_fences() {
+        let input = "\
+```lua
+print(1)
+```
+
+| a | b |
+| --- | --- |
+| 1 | 2 |
+";
+        let out = wrap_tables_as_code_blocks(input);
+        // 内側 (lua コード) の ``` と新たに足された ```text / ``` で計 4 個
+        assert_eq!(out.matches("```").count(), 4);
+        assert!(out.contains("```text"));
+    }
+
+    #[test]
+    fn test_sort_rebuilds_search_matches() {
+        // sort 後も search が追従して n/N の飛び先が正しいこと
+        let mut state = StoreTuiState::new();
+        state.set_plugins(vec![
+            make_repo_full("aaa-nvim", 10, None, vec![]),
+            make_repo_full("zzz", 100, None, vec![]),
+            make_repo_full("bbb-nvim", 50, None, vec![]),
+        ]);
+        state.start_search();
+        state.search_type('n');
+        state.search_type('v');
+        state.search_type('i');
+        state.search_type('m');
+        // stars 降順 (デフォルト) で zzz(100), bbb-nvim(50), aaa-nvim(10)
+        // nvim マッチは bbb-nvim(idx 1) と aaa-nvim(idx 2)
+        assert_eq!(state.search_matches, vec![1, 2]);
+        // sort を Name に切り替え → aaa-nvim(0), bbb-nvim(1), zzz(2)
+        state.sort_mode = SortMode::Name;
+        state.sort_plugins();
+        // 再計算後: aaa-nvim(0), bbb-nvim(1)
+        assert_eq!(state.search_matches, vec![0, 1]);
+        // n で次のマッチ (bbb-nvim) に飛ぶ
+        state.search_next();
+        assert_eq!(
+            state.selected_repo().map(|r| r.plugin_name().to_string()),
+            Some("bbb-nvim".to_string())
+        );
     }
 
     #[test]
