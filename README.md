@@ -10,15 +10,11 @@ rvpm clones plugins in parallel, links `merge = true` plugins into a single
 runtime-path entry, and ahead-of-time compiles a static `loader.lua` that
 sources everything without any runtime glob cost.
 
-## Demos
+## Demo
 
-**`rvpm init --write` → `add` → `list` → `S` (sync)**
+**`init` → `add` → `list` → `b` browse → `Enter` add → `l` back → `S` sync**
 
-![list](vhs/demo.gif)
-
-**`rvpm browse` — plugin browser**
-
-![browse](vhs/browse.gif)
+![rvpm](vhs/demo.gif)
 
 ## Why rvpm?
 

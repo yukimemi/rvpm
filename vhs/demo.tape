@@ -1,7 +1,24 @@
 # rvpm demo — README GIF
 # Usage: (cd vhs && vhs demo.tape)   # output lands next to this tape
-# Note: On Windows, run from WSL (vhs hangs on Set Theme in native Windows)
+# Note: On Windows, run from WSL (vhs hangs on Set Theme in native Windows).
 # Note: FontFamily must be installed in the system. Adjust if tofu appears.
+# Note: The tape runs in an isolated NVIM_APPNAME/RVPM_APPNAME sandbox
+#       (`rvpm-demo`) and only ever touches paths under that appname. It
+#       will NOT modify your real `~/.config/nvim/` or `~/.config/rvpm/`.
+#
+# Flow (single gif covering both list and browse TUIs):
+#   1. init --write
+#   2. rvpm add folke/snacks.nvim                  (CLI add)
+#   3. silently seed extra plugins for a lively sync UI later
+#   4. rvpm list                                   (list TUI tour)
+#      - j/k navigation, / search
+#      - b → browse TUI
+#   5. browse TUI tour
+#      - j/k navigation, / incremental search, Tab → README pane, scroll
+#      - Enter to add the highlighted plugin (browse's one-shot add)
+#      - l → back to list TUI
+#   6. S to trigger an animated sync
+#   7. q
 
 Output demo.gif
 Set Shell "bash"
@@ -13,55 +30,58 @@ Set Padding 20
 Set TypingSpeed 50ms
 Set Theme "Catppuccin Mocha"
 
-# Clean slate
+# ── clean slate ──
+# NVIM_APPNAME / RVPM_APPNAME で完全に sandbox 化し、ユーザーの実 nvim /
+# rvpm 設定 (`~/.config/nvim/`, `~/.config/rvpm/nvim/`) には触れないようにする。
 Hide
-Type "rm -rf ~/.config/rvpm ~/.cache/rvpm ~/.config/nvim/init.lua 2>/dev/null; clear"
+Type "export NVIM_APPNAME=rvpm-demo RVPM_APPNAME=rvpm-demo"
+Enter
+Sleep 200ms
+Type "rm -rf ~/.config/rvpm/rvpm-demo ~/.cache/rvpm/rvpm-demo ~/.config/rvpm-demo 2>/dev/null; clear"
 Enter
 Sleep 500ms
 Show
 
-# 1. One-time setup
+# ── 1. init ──
 Sleep 500ms
 Type "rvpm init --write"
 Sleep 500ms
 Enter
-Sleep 3s
+Sleep 2500ms
 
-# 2. Add plugins (one eager, one lazy+on_cmd, one lazy colorscheme)
+# ── 2. CLI add ──
 Type "rvpm add folke/snacks.nvim"
 Sleep 500ms
 Enter
-Sleep 3s
+Sleep 2500ms
 
-Type "rvpm add nvim-telescope/telescope.nvim --on-cmd Telescope"
-Sleep 500ms
-Enter
-Sleep 3s
-
-Type "rvpm add catppuccin/nvim --lazy true"
-Sleep 500ms
-Enter
-Sleep 3s
-
-# Silently seed more plugins by appending to config.toml without cloning.
-# This way the sync demo below (S from the list TUI) has enough fresh
-# rows to actually show the spinner + gradient gauge for a few seconds.
+# ── 3. silent seed: append raw entries so `list` has rows and the later
+#    `S` sync fires actual clones. Plus, `browse`'s `✓` marker works
+#    because snacks.nvim is already in config. ──
 Hide
-Type `printf '\n[[plugins]]\nurl = "%s"\n' nvim-lua/plenary.nvim stevearc/oil.nvim MunifTanjim/nui.nvim lewis6991/gitsigns.nvim nvim-tree/nvim-tree.lua echasnovski/mini.nvim >> ~/.config/rvpm/nvim/config.toml`
+Type `printf '\n[[plugins]]\nurl = "%s"\n' nvim-lua/plenary.nvim stevearc/oil.nvim MunifTanjim/nui.nvim lewis6991/gitsigns.nvim >> ~/.config/rvpm/$RVPM_APPNAME/config.toml`
 Enter
 Sleep 300ms
+# Pre-warm the GitHub search cache so the later `rvpm list → b` jump into
+# browse doesn't sit on a blank screen waiting for the API round-trip.
+Type "rvpm browse"
+Enter
+Sleep 7s
+Type "q"
+Sleep 500ms
 Type "clear"
 Enter
 Sleep 200ms
 Show
 
-# 3. List TUI
+# ── 4. list TUI tour ──
+Sleep 500ms
 Type "rvpm list"
 Sleep 500ms
 Enter
 Sleep 2s
 
-# Navigate
+# navigate
 Type "j"
 Sleep 400ms
 Type "j"
@@ -69,32 +89,69 @@ Sleep 400ms
 Type "k"
 Sleep 600ms
 
-# Search
+# search
 Type "/"
-Sleep 500ms
-Type "tele"
-Sleep 1500ms
+Sleep 400ms
+Type "snacks"
+Sleep 1200ms
 Enter
 Sleep 800ms
 
-# Help popup
-Type "?"
-Sleep 3s
-Type "?"
+# ── 5. jump into browse TUI ──
+Type "b"
+Sleep 2s
+
+# browse navigation
+Type "j"
+Sleep 400ms
+Type "j"
+Sleep 400ms
+Type "j"
+Sleep 400ms
+Type "k"
 Sleep 500ms
 
-# Trigger a full sync (S) from the list TUI to show the animated sync UI:
-# spinner frames, gradient gauge (red → yellow → cyan → green), elapsed
-# timer, rounded borders. 6 of the 9 plugins are not cloned yet (config
-# was seeded via raw append), so the fresh clones keep the animation
-# running long enough to see the spinner rotate and the gauge walk
-# through all four colour buckets.
+# browse incremental search
+Type "/"
+Sleep 300ms
+Type "tele"
+Sleep 1500ms
+Enter
+Sleep 600ms
+
+# Tab to README pane, scroll a bit
+Tab
+Sleep 400ms
+Type "j"
+Sleep 250ms
+Type "j"
+Sleep 250ms
+Ctrl+d
+Sleep 800ms
+Type "G"
+Sleep 600ms
+Type "g"
+Sleep 500ms
+Tab
+Sleep 400ms
+
+# Add highlighted plugin from browse TUI
+Enter
+Sleep 5s
+# "Press any key to return to browse..."
+Space
+Sleep 1500ms
+
+# ── 6. back to list, then full sync ──
+Type "l"
+Sleep 2s
+
 Type "S"
-Sleep 8s
+Sleep 10s
 # "Press any key to return to list..." prompt
 Enter
 Sleep 1500ms
 
-# Quit list
+# ── 7. quit ──
 Type "q"
 Sleep 1s
