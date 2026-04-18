@@ -1,11 +1,11 @@
+mod browse;
+mod browse_tui;
 mod chezmoi;
 mod config;
 mod external_render;
 mod git;
 mod link;
 mod loader;
-mod store;
-mod store_tui;
 mod tui;
 
 use crate::config::parse_config;
@@ -237,7 +237,7 @@ enum Commands {
         write: bool,
     },
     /// Browse and install Neovim plugins from GitHub
-    Store,
+    Browse,
 }
 
 #[tokio::main]
@@ -304,7 +304,16 @@ async fn main() -> Result<()> {
             run_remove(query).await?;
         }
         Commands::List { no_tui } => {
-            run_list(no_tui).await?;
+            // list / browse 間を相互に `b` / `l` キーで行き来できるように、
+            // フラグが立っている限りループで切り替える。`--no-tui` は常に false を返すので即抜ける。
+            let mut nt = no_tui;
+            loop {
+                if run_list(nt).await? && run_browse().await? {
+                    nt = false;
+                    continue;
+                }
+                break;
+            }
         }
         Commands::Config => {
             if run_config().await? {
@@ -314,9 +323,12 @@ async fn main() -> Result<()> {
         Commands::Init { write } => {
             run_init(write).await?;
         }
-        Commands::Store => {
-            run_store().await?;
-        }
+        Commands::Browse => loop {
+            if run_browse().await? && run_list(false).await? {
+                continue;
+            }
+            break;
+        },
     }
 
     Ok(())
@@ -789,12 +801,16 @@ async fn fetch_plugin_statuses(
     result
 }
 
-async fn run_list(no_tui: bool) -> Result<()> {
+async fn run_list(no_tui: bool) -> Result<bool> {
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)?;
     let mut config = parse_config(&toml_content)?;
+    // `cache_root` は起動時の spawn_status_check / no_tui 用。以降は
+    // reload_state 内で再 resolve されるので外側では不変で良い。
+    // `config_root` は描画 (per-plugin hook アイコン) で毎フレーム使うので
+    // `let mut` で保持し、reload! マクロで `c` 編集後の新しい値に差し替える。
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
-    let config_root = resolve_config_root(config.options.config_root.as_deref());
+    let mut config_root = resolve_config_root(config.options.config_root.as_deref());
     let mut icons = crate::tui::Icons::from_style(config.options.icons);
 
     if no_tui {
@@ -815,7 +831,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
                 PluginStatus::Waiting => println!("  [Waiting]   {}", url),
             }
         }
-        return Ok(());
+        return Ok(false);
     }
 
     enable_raw_mode()?;
@@ -830,6 +846,9 @@ async fn run_list(no_tui: bool) -> Result<()> {
     // バックグラウンドでステータスチェック開始 (TUI は即表示)
     let (mut rx, mut set) = spawn_status_check(&config, &cache_root);
     let mut bg_done = false;
+
+    // `b` キーで browse TUI に遷移したいフラグ。ループ終了後 main.rs 側に返す。
+    let mut goto_browse = false;
 
     // サブコマンド実行前の TUI 退避 (raw mode OFF + 通常スクリーン復帰 + カーソル表示)。
     fn leave_tui(
@@ -846,13 +865,14 @@ async fn run_list(no_tui: bool) -> Result<()> {
     // マクロで反復を畳んでいる。
     macro_rules! reload {
         () => {{
-            let (c, s, new_rx, new_set) =
-                reload_state(&config_path, &cache_root, &mut terminal, &icons)?;
+            let (c, s, new_rx, new_set, new_config_root) =
+                reload_state(&config_path, &mut terminal, &icons)?;
             icons = crate::tui::Icons::from_style(c.options.icons);
             config = c;
             tui_state = s;
             rx = new_rx;
             set = new_set;
+            config_root = new_config_root;
             bg_done = false;
         }};
     }
@@ -904,10 +924,10 @@ async fn run_list(no_tui: bool) -> Result<()> {
         TuiState,
         mpsc::Receiver<(String, PluginStatus)>,
         JoinSet<()>,
+        PathBuf,
     );
     fn reload_state(
         config_path: &Path,
-        cache_root: &Path,
         terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
         _icons: &crate::tui::Icons,
     ) -> Result<ReloadState> {
@@ -922,11 +942,15 @@ async fn run_list(no_tui: bool) -> Result<()> {
         terminal.hide_cursor()?;
 
         // ── 2. config 再読み込み + status は background で開始 ──
+        // `c` ハンドラで options.cache_root / options.config_root が変わった
+        // 場合にも追従できるよう、ここで毎回 resolve し直して返す。
         let toml_content = std::fs::read_to_string(config_path)?;
         let config = parse_config(&toml_content)?;
+        let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
+        let config_root = resolve_config_root(config.options.config_root.as_deref());
         let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
         let tui_state = TuiState::new(urls);
-        let (rx, set) = spawn_status_check(&config, cache_root);
+        let (rx, set) = spawn_status_check(&config, &cache_root);
 
         // ── 3. 復帰直後に残留イベントを drain ──
         // wait_for_keypress で押したキーの release や連打分が残ると、main
@@ -936,7 +960,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
             let _ = crossterm::event::read();
         }
 
-        Ok((config, tui_state, rx, set))
+        Ok((config, tui_state, rx, set, config_root))
     }
 
     loop {
@@ -1029,6 +1053,17 @@ async fn run_list(no_tui: bool) -> Result<()> {
                 crossterm::event::KeyCode::Char('N') => tui_state.search_prev(),
 
                 // ── actions ──
+                crossterm::event::KeyCode::Char('b') => {
+                    goto_browse = true;
+                    break;
+                }
+                crossterm::event::KeyCode::Char('c') => {
+                    leave_tui(&mut terminal)?;
+                    if run_config().await? {
+                        run_generate().await?;
+                    }
+                    reload!();
+                }
                 crossterm::event::KeyCode::Char('e') => {
                     if let Some(url) = tui_state.selected_url() {
                         leave_tui(&mut terminal)?;
@@ -1095,7 +1130,7 @@ async fn run_list(no_tui: bool) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-    Ok(())
+    Ok(goto_browse)
 }
 
 async fn run_update(query: Option<String>) -> Result<()> {
@@ -1247,7 +1282,7 @@ async fn run_add(
     let plugins = doc["plugins"]
         .as_array_of_tables_mut()
         .context("plugins is not an array of tables")?;
-    // 重複検出: store TUI と同じ `installed_full_name` で両辺を正規化して比較。
+    // 重複検出: browse TUI と同じ `installed_full_name` で両辺を正規化して比較。
     // https / short / ssh / 大文字小文字 / `.git` / 末尾 `/` の揺れを吸収。
     // どちらかが GitHub URL と認識できない (gitlab 等) なら生文字列一致に fallback。
     let incoming_normalized = installed_full_name(&repo);
@@ -2277,7 +2312,7 @@ fn resolve_concurrency(config_value: Option<usize>) -> usize {
 //   - 単一の mental model で済む
 //
 // ユーザー側で別のパスにしたければ TOML の options で上書きできる:
-//   - options.cache_root  → 全キャッシュの root (plugins/ と store/ が配下)
+//   - options.cache_root  → 全キャッシュの root (plugins/ と browse/ が配下)
 //   - options.config_root → 全コンフィグの root (config.toml / 全 global hook /
 //                           plugins/ が配下)
 //
@@ -2286,7 +2321,7 @@ fn resolve_concurrency(config_value: Option<usize>) -> usize {
 //   <config_root>/before.lua / after.lua             (global hooks)
 //   <config_root>/plugins/<host>/<owner>/<repo>/     (per-plugin hooks)
 //   <cache_root>/plugins/{repos,merged,loader.lua}   (plugins 本体)
-//   <cache_root>/store/                              (store キャッシュ)
+//   <cache_root>/browse/                             (browse キャッシュ)
 //
 // $RVPM_APPNAME > $NVIM_APPNAME > "nvim" の順で appname が決まり、
 // デフォルトパスの末尾に appname が入る:
@@ -2888,11 +2923,11 @@ fn format_plugin_url(input: &str, style: crate::config::UrlStyle) -> String {
     }
 }
 
-async fn run_store() -> Result<()> {
-    use crate::store_tui::StoreTuiState;
+async fn run_browse() -> Result<bool> {
+    use crate::browse_tui::BrowseTuiState;
 
     // cache_root / installed set / readme_command を config から解決。
-    // resilience 原則: config.toml が壊れていても store TUI は defaults で開く。
+    // resilience 原則: config.toml が壊れていても browse TUI は defaults で開く。
     let config_path = rvpm_config_path();
     let defaults = || {
         (
@@ -2901,7 +2936,8 @@ async fn run_store() -> Result<()> {
             None::<Vec<String>>,
         )
     };
-    let (cache_root, installed, readme_command) = 'resolve: {
+    // `c` ハンドラで options.cache_root が変わった場合も追従できるよう `let mut`。
+    let (mut cache_root, installed, readme_command) = 'resolve: {
         if !config_path.exists() {
             break 'resolve defaults();
         }
@@ -2922,14 +2958,14 @@ async fn run_store() -> Result<()> {
                     .collect();
                 let cmd = config
                     .options
-                    .store
+                    .browse
                     .readme_command
                     .filter(|v| !v.is_empty());
                 (cache, set, cmd)
             }
             Err(e) => {
                 eprintln!(
-                    "\u{26a0} failed to parse {}: {}. Opening store with defaults.",
+                    "\u{26a0} failed to parse {}: {}. Opening browse with defaults.",
                     config_path.display(),
                     e
                 );
@@ -2938,13 +2974,13 @@ async fn run_store() -> Result<()> {
         }
     };
 
-    let mut state = StoreTuiState::new();
+    let mut state = BrowseTuiState::new();
     state.installed = installed;
     state.readme_command = readme_command;
 
     // 初期表示: 人気プラグインをバックグラウンドで取得
     let cache_root_bg = cache_root.clone();
-    let popular = tokio::task::spawn_blocking(move || crate::store::fetch_popular(&cache_root_bg));
+    let popular = tokio::task::spawn_blocking(move || crate::browse::fetch_popular(&cache_root_bg));
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -2959,7 +2995,7 @@ async fn run_store() -> Result<()> {
 
     // README を非同期で取得するためのチャネル
     let (readme_tx, mut readme_rx) = tokio::sync::mpsc::channel::<(String, String)>(1);
-    // 外部 renderer (`options.store.readme_command`) の結果用チャネル。
+    // 外部 renderer (`options.browse.readme_command`) の結果用チャネル。
     // 成功時は `Rendered(key, text)`、失敗時は `Warning(message)` をユーザーに
     // 見せる (title bar の message)。capacity 2 は resize 連打時の drop 防止。
     enum RenderMsg {
@@ -2975,6 +3011,9 @@ async fn run_store() -> Result<()> {
     // がこれと同じなら再スポーンしない。selection / content / resize いずれかの
     // 変化で key が動けば次のループで spawn される。
     let mut last_render_spawned: Option<(String, usize, u16)> = None;
+
+    // `l` キーで list TUI に遷移したいフラグ。ループ終了後 main.rs 側に返す。
+    let mut goto_list = false;
 
     loop {
         if state.readme_scroll != last_readme_scroll {
@@ -3035,7 +3074,7 @@ async fn run_store() -> Result<()> {
                 let tx = readme_tx.clone();
                 let cache_root_bg = cache_root.clone();
                 tokio::task::spawn_blocking(move || {
-                    let content = crate::store::fetch_readme(&cache_root_bg, &repo)
+                    let content = crate::browse::fetch_readme(&cache_root_bg, &repo)
                         .unwrap_or_else(|e| format!("Error: {}", e));
                     let _ = tx.blocking_send((repo.full_name.clone(), content));
                 });
@@ -3113,7 +3152,7 @@ async fn run_store() -> Result<()> {
                         terminal.draw(|f| state.draw(f))?;
                         let cache_root_bg = cache_root.clone();
                         let result = tokio::task::spawn_blocking(move || {
-                            crate::store::search_plugins(&cache_root_bg, &query)
+                            crate::browse::search_plugins(&cache_root_bg, &query)
                         })
                         .await;
                         match result {
@@ -3165,26 +3204,26 @@ async fn run_store() -> Result<()> {
                 // ── Navigation: focus-aware ──
                 crossterm::event::KeyCode::Char('j') | crossterm::event::KeyCode::Down => {
                     match state.focus {
-                        store_tui::Focus::List => state.next(),
-                        store_tui::Focus::Readme => state.scroll_readme_down(1),
+                        browse_tui::Focus::List => state.next(),
+                        browse_tui::Focus::Readme => state.scroll_readme_down(1),
                     }
                 }
                 crossterm::event::KeyCode::Char('k') | crossterm::event::KeyCode::Up => {
                     match state.focus {
-                        store_tui::Focus::List => state.previous(),
-                        store_tui::Focus::Readme => state.scroll_readme_up(1),
+                        browse_tui::Focus::List => state.previous(),
+                        browse_tui::Focus::Readme => state.scroll_readme_up(1),
                     }
                 }
                 crossterm::event::KeyCode::Char('g') | crossterm::event::KeyCode::Home => {
                     match state.focus {
-                        store_tui::Focus::List => state.go_top(),
-                        store_tui::Focus::Readme => state.readme_scroll = 0,
+                        browse_tui::Focus::List => state.go_top(),
+                        browse_tui::Focus::Readme => state.readme_scroll = 0,
                     }
                 }
                 crossterm::event::KeyCode::Char('G') | crossterm::event::KeyCode::End => {
                     match state.focus {
-                        store_tui::Focus::List => state.go_bottom(),
-                        store_tui::Focus::Readme => state.scroll_readme_to_bottom(),
+                        browse_tui::Focus::List => state.go_bottom(),
+                        browse_tui::Focus::Readme => state.scroll_readme_to_bottom(),
                     }
                 }
                 crossterm::event::KeyCode::Char('d')
@@ -3193,8 +3232,8 @@ async fn run_store() -> Result<()> {
                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
                     match state.focus {
-                        store_tui::Focus::List => state.move_down(10),
-                        store_tui::Focus::Readme => state.scroll_readme_down(10),
+                        browse_tui::Focus::List => state.move_down(10),
+                        browse_tui::Focus::Readme => state.scroll_readme_down(10),
                     }
                 }
                 crossterm::event::KeyCode::Char('u')
@@ -3203,8 +3242,8 @@ async fn run_store() -> Result<()> {
                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
                     match state.focus {
-                        store_tui::Focus::List => state.move_up(10),
-                        store_tui::Focus::Readme => state.scroll_readme_up(10),
+                        browse_tui::Focus::List => state.move_up(10),
+                        browse_tui::Focus::Readme => state.scroll_readme_up(10),
                     }
                 }
                 crossterm::event::KeyCode::Char('f')
@@ -3213,8 +3252,8 @@ async fn run_store() -> Result<()> {
                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
                     match state.focus {
-                        store_tui::Focus::List => state.move_down(20),
-                        store_tui::Focus::Readme => state.scroll_readme_down(20),
+                        browse_tui::Focus::List => state.move_down(20),
+                        browse_tui::Focus::Readme => state.scroll_readme_down(20),
                     }
                 }
                 crossterm::event::KeyCode::Char('b')
@@ -3223,24 +3262,75 @@ async fn run_store() -> Result<()> {
                         .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
                     match state.focus {
-                        store_tui::Focus::List => state.move_up(20),
-                        store_tui::Focus::Readme => state.scroll_readme_up(20),
+                        browse_tui::Focus::List => state.move_up(20),
+                        browse_tui::Focus::Readme => state.scroll_readme_up(20),
                     }
                 }
 
                 // ── Actions ──
+                crossterm::event::KeyCode::Char('l') => {
+                    goto_list = true;
+                    break;
+                }
+                crossterm::event::KeyCode::Char('c') => {
+                    let _ = disable_raw_mode();
+                    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+                    let _ = terminal.show_cursor();
+                    // エラーを握り潰さず、message に出して TUI で確認できるようにする。
+                    let config_result = run_config().await;
+                    let changed = matches!(&config_result, Ok(true));
+                    let mut gen_err: Option<String> = None;
+                    if changed {
+                        if let Err(e) = run_generate().await {
+                            gen_err = Some(e.to_string());
+                        } else if let Ok(toml) = std::fs::read_to_string(&config_path)
+                            && let Ok(new_config) = parse_config(&toml)
+                        {
+                            // options.cache_root が書き換わった可能性があるので
+                            // 再 resolve。installed (`✓`) と readme_command も更新。
+                            cache_root =
+                                resolve_cache_root(new_config.options.cache_root.as_deref());
+                            state.installed = new_config
+                                .plugins
+                                .iter()
+                                .filter_map(|p| installed_full_name(&p.url))
+                                .collect();
+                            state.readme_command = new_config
+                                .options
+                                .browse
+                                .readme_command
+                                .filter(|v| !v.is_empty());
+                        }
+                    }
+                    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                    enable_raw_mode()?;
+                    terminal.clear()?;
+                    terminal.hide_cursor()?;
+                    // エディタ退出時に残った KeyRelease / Resize イベントが
+                    // そのまま次の match に流れると誤発火する (例: 編集中の
+                    // 大文字 `S` が API search トリガーになる等) ので drain。
+                    while crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+                        let _ = crossterm::event::read();
+                    }
+                    state.message = Some(match (&config_result, &gen_err) {
+                        (Err(e), _) => format!("Config edit failed: {}", e),
+                        (Ok(true), Some(e)) => format!("Config saved; regenerate failed: {}", e),
+                        (Ok(true), None) => "Config saved; loader regenerated".to_string(),
+                        (Ok(false), _) => "Config unchanged".to_string(),
+                    });
+                }
                 crossterm::event::KeyCode::Char('s') => {
                     state.sort_mode = state.sort_mode.next();
                     state.sort_plugins();
                     state.message = Some(format!("Sort: {}", state.sort_mode.label()));
                 }
                 crossterm::event::KeyCode::Char('R') => {
-                    crate::store::clear_search_cache(&cache_root);
+                    crate::browse::clear_search_cache(&cache_root);
                     state.message = Some("Cache cleared. Searching...".to_string());
                     terminal.draw(|f| state.draw(f))?;
                     let cache_root_bg = cache_root.clone();
                     let result = tokio::task::spawn_blocking(move || {
-                        crate::store::fetch_popular(&cache_root_bg)
+                        crate::browse::fetch_popular(&cache_root_bg)
                     })
                     .await;
                     match result {
@@ -3284,7 +3374,7 @@ async fn run_store() -> Result<()> {
                         }
 
                         // TUI に戻る
-                        print!("\nPress any key to return to store...");
+                        print!("\nPress any key to return to browse...");
                         use std::io::Write;
                         std::io::stdout().flush().ok();
                         enable_raw_mode()?;
@@ -3320,7 +3410,7 @@ async fn run_store() -> Result<()> {
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
-    Ok(())
+    Ok(goto_list)
 }
 
 #[cfg(test)]

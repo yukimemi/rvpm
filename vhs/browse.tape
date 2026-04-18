@@ -1,9 +1,9 @@
-# rvpm store TUI demo — README GIF
-# Usage: (cd vhs && vhs store.tape)   # output lands next to this tape
+# rvpm browse TUI demo — README GIF
+# Usage: (cd vhs && vhs browse.tape)   # output lands next to this tape
 # Note: On Windows, run from WSL (vhs hangs on Set Theme in native Windows).
 # Note: FontFamily must be installed in the system. Adjust if tofu appears.
 
-Output store.gif
+Output browse.gif
 Set Shell "bash"
 Set FontSize 14
 Set FontFamily "PlemolJP Console NF"
@@ -29,10 +29,10 @@ Enter
 Sleep 2s
 
 # Pre-warm the GitHub search cache so the recorded launch is instant.
-# `rvpm store` awaits the initial fetch before it enters the main loop,
+# `rvpm browse` awaits the initial fetch before it enters the main loop,
 # so by the time we send `q` the 24h cache under
-# ~/.cache/rvpm/<appname>/store/ is already populated.
-Type "rvpm store"
+# ~/.cache/rvpm/<appname>/browse/ is already populated.
+Type "rvpm browse"
 Enter
 Sleep 8s
 Type "q"
@@ -42,9 +42,9 @@ Enter
 Sleep 200ms
 Show
 
-# Launch the store TUI — reads from cache, opens immediately.
+# Launch the browse TUI — reads from cache, opens immediately.
 Sleep 500ms
-Type "rvpm store"
+Type "rvpm browse"
 Sleep 500ms
 Enter
 Sleep 1500ms

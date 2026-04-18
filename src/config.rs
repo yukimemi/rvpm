@@ -66,14 +66,14 @@ pub struct Options {
     /// GitHub 以外の URL (gitlab 等) はこの設定に関わらずそのまま保存される。
     #[serde(default)]
     pub url_style: UrlStyle,
-    /// `rvpm store` の README preview 用オプション。
+    /// `rvpm browse` の README preview 用オプション。
     #[serde(default)]
-    pub store: StoreOptions,
+    pub browse: BrowseOptions,
 }
 
-/// `[options.store]` 以下に置く、`rvpm store` TUI 固有の設定。
+/// `[options.browse]` 以下に置く、`rvpm browse` TUI 固有の設定。
 #[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone)]
-pub struct StoreOptions {
+pub struct BrowseOptions {
     /// README 表示を整形する外部コマンド。未設定/空なら内蔵 `tui-markdown`
     /// パイプラインを使う (offline fallback)。
     ///
@@ -97,7 +97,7 @@ pub struct StoreOptions {
     ///
     /// 例:
     /// ```toml
-    /// [options.store]
+    /// [options.browse]
     /// readme_command = ["mdcat"]
     /// # readme_command = ["mdcat", "--columns", "{{ width }}"]
     /// # readme_command = ["glow", "-s", "dark", "-w", "{{ width }}", "{{ file_path }}"]
@@ -294,7 +294,7 @@ impl Plugin {
 /// vars 内の相互参照を解決する最大反復回数。
 const MAX_VARS_RESOLVE_ITERATIONS: usize = 10;
 
-/// `options.store.readme_command` 内で使える placeholder 名。`parse_config`
+/// `options.browse.readme_command` 内で使える placeholder 名。`parse_config`
 /// の Tera レンダリング時に自己射影 (value = `{{ name }}` リテラル) させ、
 /// 実行時の `external_render::substitute` が展開するまで生き残らせる。
 /// `src/external_render.rs` の `expand_args` と同期。
@@ -409,7 +409,7 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     context.insert("is_windows", &cfg!(windows));
     context.insert("env", &env_map);
 
-    // 6. `options.store.readme_command` 用 placeholder (`{{ width }}` 等) を
+    // 6. `options.browse.readme_command` 用 placeholder (`{{ width }}` 等) を
     //    自己参照の literal 値として context に登録する。こうしないと Tera が
     //    未定義変数扱いで空文字列に置換してしまい、外部 renderer に
     //    `--columns ""` のような壊れた引数を渡してしまう。`{{ width }}` を
@@ -422,7 +422,22 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     // 7. 全体を Tera でレンダリング ({% if %} 等が動く)
     let rendered = Tera::one_off(toml_str, &context, false)?;
 
-    // 8. TOML パース
+    // 8. 旧 `[options.store]` は v3.10 で `[options.browse]` に改名された。
+    //    serde は未知のフィールドを黙って無視するので、そのままだと
+    //    `readme_command` が無効になっていることに気付けない。明示的に
+    //    warning を出してユーザーに migration を促す。
+    if rendered.lines().any(|line| {
+        line.split('#')
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<String>()
+            == "[options.store]"
+    }) {
+        eprintln!("\u{26a0} [options.store] is no longer supported; rename it to [options.browse]");
+    }
+
+    // 9. TOML パース
     let mut config: Config = toml::from_str(&rendered)?;
 
     // 9. lazy 自動解決: on_* トリガーがあれば lazy = true にする (明示 false は尊重)
@@ -606,7 +621,7 @@ url = "owner/repo"
     fn test_parse_config_preserves_readme_command_placeholders() {
         // `{{ width }}` 等は Tera パスで壊れず、リテラルのまま readme_command に残ること
         let toml = r#"
-[options.store]
+[options.browse]
 readme_command = ["mdcat", "--columns", "{{ width }}", "{{ file_path }}"]
 
 [[plugins]]
@@ -614,7 +629,7 @@ url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
         assert_eq!(
-            config.options.store.readme_command,
+            config.options.browse.readme_command,
             Some(vec![
                 "mdcat".to_string(),
                 "--columns".to_string(),
@@ -627,7 +642,7 @@ url = "owner/repo"
     #[test]
     fn test_parse_config_preserves_all_readme_command_placeholders() {
         let toml = r#"
-[options.store]
+[options.browse]
 readme_command = [
   "r",
   "{{ width }}", "{{ height }}",
@@ -639,7 +654,7 @@ readme_command = [
 url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
-        let cmd = config.options.store.readme_command.unwrap();
+        let cmd = config.options.browse.readme_command.unwrap();
         assert!(cmd.contains(&"{{ width }}".to_string()));
         assert!(cmd.contains(&"{{ height }}".to_string()));
         assert!(cmd.contains(&"{{ file_path }}".to_string()));

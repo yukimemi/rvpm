@@ -70,8 +70,8 @@ concurrency = 10
 # loader.lua だけさらに細かく上書き (base_dir より優先)
 loader_path = "~/.cache/nvim/rvpm/loader.lua"
 
-[options.store]
-# README 表示を外部コマンドに委譲する (store TUI 専用)。
+[options.browse]
+# README 表示を外部コマンドに委譲する (browse TUI 専用)。
 # stdin に raw markdown、stdout の ANSI エスケープを ansi-to-tui 経由で
 # ratatui Text に変換。失敗/タイムアウト時は tui-markdown 内蔵パスに fallback。
 # placeholder は Tera 風の `{{ name }}` 記法 (rvpm 他箇所と統一):
@@ -277,15 +277,15 @@ let _permit = sem.acquire_owned().await.unwrap();
 | `sync [--prune]` | `run_sync()` | clone/pull + merged + loader.lua 生成。`--prune` で未使用プラグインディレクトリも削除。無指定でも未使用があれば末尾で警告表示 |
 | `generate` | `run_generate()` | loader.lua のみ再生成 |
 | `clean` | `run_clean()` | config.toml から外したプラグインの `{cache_root}/plugins/repos/<host>/<owner>/<repo>/` を削除。git 操作なしで `sync --prune` より高速 (200+ プラグインでの所要時間対策)。共有ヘルパー `prune_unused_repos()` を `sync --prune` と共用 |
-| `add <repo>` | `run_add()` | TOML 追加 + 当該プラグインだけ clone + generate。重複検出は `installed_full_name` で正規化 (https / owner/repo / ssh / 大文字小文字 / `.git` / 末尾 `/` の揺れを吸収し、`rvpm store` の installed マークと同じロジックを共用)。書き込み URL 形式は `options.url_style` (`short` / `full`) に従う |
+| `add <repo>` | `run_add()` | TOML 追加 + 当該プラグインだけ clone + generate。重複検出は `installed_full_name` で正規化 (https / owner/repo / ssh / 大文字小文字 / `.git` / 末尾 `/` の揺れを吸収し、`rvpm browse` の installed マークと同じロジックを共用)。書き込み URL 形式は `options.url_style` (`short` / `full`) に従う |
 | `update [query]` | `run_update()` | 既存プラグインの pull (clone しない) |
 | `remove [query]` | `run_remove()` | TOML + ディレクトリ削除 + generate |
 | `edit [query] [--init\|--before\|--after] [--global]` | `run_edit()` | per-plugin init/before/after.lua をエディタで編集。フラグ指定でファイル選択をスキップ。`--global` で global hooks (`~/.config/rvpm/before.lua` / `after.lua`) を編集。インタラクティブ選択時は `[ Global hooks ]` sentinel でも同じ動作 |
 | `set [query] [flags]` | `run_set()` | lazy/merge/on_* などを対話式 or 引数で変更。`on_cmd` 等は comma-separated / JSON array 両対応、`--on-map` は JSON object/array で table 形式もサポート。`[ Open config.toml in $EDITOR ]` sentinel で TOML 直接編集に逃げられる |
 | `config` | `run_config()` | `config.toml` を `$EDITOR` で直接開く (終了後に generate のみ実行。新規プラグイン追加した場合は `rvpm sync` 明示実行) |
 | `init [--write]` | `run_init()` | Neovim `init.lua` に loader.lua を繋ぐ `dofile(...)` スニペットを案内。`--write` で自動追記 (init.lua がなければ新規作成)。`$NVIM_APPNAME` を尊重 |
-| `list [--no-tui]` | `run_list()` | プラグイン一覧表示。デフォルトは TUI で `[S] sync / [u/U] update / [d] remove / [e] edit / [s] set / [?] help` のアクションキー対応。ナビ: `j/k/g/G/Ctrl-d/u/f/b`、検索: `/n/N`。`--no-tui` で pipe-friendly な plain text 出力 |
-| `store` | `run_store()` | GitHub `neovim-plugin` トピックのプラグインブラウザ TUI (最大 300 件、3 ページ取得)。README は tui-markdown で GFM レンダ (`options.store.readme_command` を設定すれば外部 renderer = mdcat / glow 等に委譲可、fallback 込み)。行頭の `✓` でインストール済みを表示し、`Enter` で installed plugin は警告して add をスキップ。`/` ローカルインクリメンタル検索 (name + description + topics) + `n`/`N` でマッチジャンプ。`S` で GitHub API 検索。`Tab` でリスト/README フォーカス切替。`o` でブラウザ、`s` でソート切替、`R` でキャッシュクリア+再取得、`?` でヘルプ |
+| `list [--no-tui]` | `run_list()` | プラグイン一覧表示。デフォルトは TUI で `[S] sync / [u/U] update / [d] remove / [e] edit / [s] set / [c] config.toml / [b] browse / [?] help` のアクションキー対応。ナビ: `j/k/g/G/Ctrl-d/u/f/b`、検索: `/n/N`。`--no-tui` で pipe-friendly な plain text 出力 |
+| `browse` | `run_browse()` | GitHub `neovim-plugin` トピックのプラグインブラウザ TUI (最大 300 件、3 ページ取得)。README は tui-markdown で GFM レンダ (`options.browse.readme_command` を設定すれば外部 renderer = mdcat / glow 等に委譲可、fallback 込み)。行頭の `✓` でインストール済みを表示し、`Enter` で installed plugin は警告して add をスキップ。`/` ローカルインクリメンタル検索 (name + description + topics) + `n`/`N` でマッチジャンプ。`S` で GitHub API 検索。`Tab` でリスト/README フォーカス切替。`o` でブラウザ、`s` でソート切替、`R` でキャッシュクリア+再取得、`c` で config.toml をエディタで開く、`l` で list TUI に遷移、`?` でヘルプ |
 
 **廃止コマンド:**
 - `status` → `list --no-tui` に統合 (plain text 出力で機能同等)

@@ -1,6 +1,6 @@
-//! store TUI の README preview を外部コマンドに委譲するためのヘルパー。
+//! browse TUI の README preview を外部コマンドに委譲するためのヘルパー。
 //!
-//! `options.store.readme_command` に指定されたコマンド列を spawn し、
+//! `options.browse.readme_command` に指定されたコマンド列を spawn し、
 //! stdin に raw markdown を流し、stdout の ANSI エスケープを `ansi-to-tui`
 //! で `ratatui::text::Text<'static>` に変換して返す。
 //!
@@ -49,7 +49,7 @@ pub fn render(
     let needs_file = command.iter().any(|a| uses_file_placeholder(a));
     let tempfile_holder = if needs_file {
         let mut f = tempfile::Builder::new()
-            .prefix("rvpm-store-readme-")
+            .prefix("rvpm-browse-readme-")
             .suffix(".md")
             .tempfile()?;
         f.write_all(markdown.as_bytes())?;
