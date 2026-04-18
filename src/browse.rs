@@ -50,10 +50,10 @@ impl GitHubRepo {
     }
 }
 
-/// キャッシュディレクトリ。`<cache_root>/store/` に配置。
+/// キャッシュディレクトリ。`<cache_root>/browse/` に配置。
 /// 呼び出し元から cache_root を渡すことで `options.cache_root` を尊重する。
-fn store_cache_dir(cache_root: &Path) -> PathBuf {
-    cache_root.join("store")
+fn browse_cache_dir(cache_root: &Path) -> PathBuf {
+    cache_root.join("browse")
 }
 
 /// 検索結果のキャッシュパス。
@@ -62,13 +62,13 @@ fn search_cache_path(cache_root: &Path, query: &str) -> PathBuf {
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect();
-    store_cache_dir(cache_root).join(format!("search_{}.json", safe_name))
+    browse_cache_dir(cache_root).join(format!("search_{}.json", safe_name))
 }
 
 /// README のキャッシュパス。
 fn readme_cache_path(cache_root: &Path, full_name: &str) -> PathBuf {
     let safe_name = full_name.replace('/', "__");
-    store_cache_dir(cache_root)
+    browse_cache_dir(cache_root)
         .join("readme")
         .join(format!("{}.md", safe_name))
 }
@@ -221,7 +221,7 @@ pub fn fetch_readme(cache_root: &Path, repo: &GitHubRepo) -> Result<String> {
 
 /// 検索キャッシュをクリア (強制リフレッシュ用)。
 pub fn clear_search_cache(cache_root: &Path) {
-    let dir = store_cache_dir(cache_root);
+    let dir = browse_cache_dir(cache_root);
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -281,8 +281,8 @@ mod tests {
     }
 
     #[test]
-    fn test_store_cache_dir_uses_cache_root() {
+    fn test_browse_cache_dir_uses_cache_root() {
         let root = Path::new("/custom/cache");
-        assert_eq!(store_cache_dir(root), Path::new("/custom/cache/store"));
+        assert_eq!(browse_cache_dir(root), Path::new("/custom/cache/browse"));
     }
 }

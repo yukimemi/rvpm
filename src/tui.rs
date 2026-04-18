@@ -844,7 +844,11 @@ impl TuiState {
             )
         } else {
             Paragraph::new(Line::from(vec![
-                Span::styled(" e", Style::default().fg(Color::Cyan)),
+                Span::styled(" b", Style::default().fg(Color::Cyan)),
+                Span::styled(":browse ", Style::default().fg(Color::DarkGray)),
+                Span::styled("c", Style::default().fg(Color::Cyan)),
+                Span::styled(":config ", Style::default().fg(Color::DarkGray)),
+                Span::styled("e", Style::default().fg(Color::Cyan)),
                 Span::styled(":edit ", Style::default().fg(Color::DarkGray)),
                 Span::styled("s", Style::default().fg(Color::Cyan)),
                 Span::styled(":set ", Style::default().fg(Color::DarkGray)),
@@ -869,7 +873,7 @@ impl TuiState {
         if self.show_help {
             let area = f.area();
             let popup_w = 48u16.min(area.width.saturating_sub(4));
-            let popup_h = 16u16.min(area.height.saturating_sub(4));
+            let popup_h = 18u16.min(area.height.saturating_sub(4));
             let popup = Rect::new(
                 (area.width.saturating_sub(popup_w)) / 2,
                 (area.height.saturating_sub(popup_h)) / 2,
@@ -913,6 +917,14 @@ impl TuiState {
                         .add_modifier(Modifier::BOLD),
                 )]),
                 Line::from(""),
+                Line::from(vec![
+                    Span::styled("  b           ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Switch to browse TUI", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  c           ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Open config.toml", Style::default().fg(Color::White)),
+                ]),
                 Line::from(vec![
                     Span::styled("  e           ", Style::default().fg(Color::Cyan)),
                     Span::styled("Edit hooks", Style::default().fg(Color::White)),

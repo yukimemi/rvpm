@@ -16,9 +16,9 @@ sources everything without any runtime glob cost.
 
 ![list](vhs/demo.gif)
 
-**`rvpm store` — plugin browser**
+**`rvpm browse` — plugin browser**
 
-![store](vhs/store.gif)
+![browse](vhs/browse.gif)
 
 ## Why rvpm?
 
@@ -30,7 +30,7 @@ sources everything without any runtime glob cost.
 - **Full lazy-loading** — `on_cmd`, `on_ft`, `on_map`, `on_event`, `on_path`,
   `on_source`, auto-detected `ColorSchemePre`, and `depends`-aware loading
 - **Merge optimization** — `merge = true` plugins share a single rtp entry
-- **Plugin discovery TUI** — `rvpm store` browses the GitHub `neovim-plugin`
+- **Plugin discovery TUI** — `rvpm browse` browses the GitHub `neovim-plugin`
   topic with live README preview; `Tab` switches focus between panes
 - **Resilient** — cyclic dependencies, missing plugins, and config errors
   produce warnings, not crashes
@@ -91,7 +91,7 @@ rvpm add folke/snacks.nvim
 rvpm add nvim-telescope/telescope.nvim
 
 # 3. Browse the GitHub "neovim-plugin" topic and install from the TUI
-rvpm store
+rvpm browse
 
 # 4. Manage installed plugins interactively
 rvpm list
@@ -117,7 +117,7 @@ nvim_rc = "~/.config/nvim/rc"
 # Root of all rvpm config (config.toml, global hooks, plugins/ subdir)
 # Default: ~/.config/rvpm/<appname>
 # config_root = "{{ vars.nvim_rc }}"
-# Root of all rvpm cache (clones, merged rtp, loader.lua, store cache)
+# Root of all rvpm cache (clones, merged rtp, loader.lua, browse cache)
 # Default: ~/.cache/rvpm/<appname>
 # cache_root = "~/dotfiles/nvim/rvpm"
 # Parallel git operations limit (default: 8)
@@ -137,9 +137,9 @@ concurrency = 10
 # Duplicate detection normalises between styles either way.
 # url_style = "full"
 
-# Optional: run READMEs in the store TUI through an external renderer
+# Optional: run READMEs in the browse TUI through an external renderer
 # (mdcat / glow / bat). See "External README renderer" below.
-# [options.store]
+# [options.browse]
 # readme_command = ["mdcat"]
 
 [[plugins]]
@@ -181,7 +181,7 @@ for where files land).
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `config_root` | `string` | `~/.config/rvpm/<appname>` | Root for all rvpm config (`config.toml`, global `before.lua` / `after.lua`, and `plugins/<host>/<owner>/<repo>/` per-plugin hooks). Supports `~` and Tera templates. **Recommended: leave unset** |
-| `cache_root` | `string` | `~/.cache/rvpm/<appname>` | Root for all rvpm cache (`plugins/repos/`, `plugins/merged/`, `plugins/loader.lua`, `store/`). **Recommended: leave unset** |
+| `cache_root` | `string` | `~/.cache/rvpm/<appname>` | Root for all rvpm cache (`plugins/repos/`, `plugins/merged/`, `plugins/loader.lua`, `browse/`). **Recommended: leave unset** |
 | `concurrency` | `integer` | `8` | Max number of parallel git operations during `sync` / `update`. Kept moderate to avoid GitHub rate limits |
 | `chezmoi` | `boolean` | `false` | When `true`, rvpm writes mutations (`config.toml`, global hooks, per-plugin hooks) directly to the chezmoi **source** file (resolved via `chezmoi source-path`) and then runs `chezmoi apply --force` to materialise the change in the target. Falls back to writing the target directly if `chezmoi` is missing. Plain files only — `.tmpl` sources are rejected (rvpm has its own Tera engine). See [chezmoi integration](#chezmoi-integration) |
 | `auto_clean` | `boolean` | `false` | When `true`, `rvpm sync` and `rvpm generate` automatically delete plugin directories under `plugins/repos/` that are no longer referenced by `config.toml`. Equivalent to always passing `--prune` to `sync`. The standalone `rvpm clean` command is still available for one-off cleanups |
@@ -489,7 +489,7 @@ vim.keymap.set("n", "<leader>ff", "<cmd>Telescope find_files<cr>")
 | `rvpm config` | Open `config.toml` in `$EDITOR` |
 | `rvpm init [--write]` | Print (or write) the `dofile(...)` snippet to wire `loader.lua` into `init.lua` |
 | `rvpm list [--no-tui]` | TUI plugin list with action keys; `--no-tui` for pipe-friendly plain text |
-| `rvpm store` | TUI plugin browser over the GitHub `neovim-plugin` topic; Enter to install, `o` to open in browser |
+| `rvpm browse` | TUI plugin browser over the GitHub `neovim-plugin` topic; Enter to install, `o` to open in browser |
 
 Run `rvpm <command> --help` for flag-level details.
 
@@ -507,6 +507,8 @@ Run `rvpm <command> --help` for flag-level details.
 | `Ctrl-f` / `Ctrl-b` | Full page down / up |
 | `/` | Incremental search |
 | `n` / `N` | Next / previous search result |
+| `b` | Switch to `rvpm browse` TUI |
+| `c` | Open `config.toml` in `$EDITOR` |
 | `e` | Edit per-plugin hooks (init / before / after.lua) |
 | `s` | Set plugin options (lazy, merge, on_cmd, …) |
 | `S` | Sync all plugins |
@@ -518,10 +520,10 @@ Run `rvpm <command> --help` for flag-level details.
 
 </details>
 
-### `rvpm store` — plugin discovery TUI
+### `rvpm browse` — plugin discovery TUI
 
 Browse, search, and install plugins from GitHub without leaving the terminal.
-`rvpm store` fetches up to ~300 repositories tagged with the `neovim-plugin`
+`rvpm browse` fetches up to ~300 repositories tagged with the `neovim-plugin`
 topic, displays them in a split-pane TUI with a GitHub-flavored markdown
 preview, and installs the selected plugin into your `config.toml` on `Enter`.
 
@@ -550,6 +552,8 @@ plugin list and the README preview pane.
 | `n` / `N` | Jump to next / previous search match |
 | `S` | GitHub API search (`topic:neovim-plugin <query>`, replaces list) |
 | `Enter` | Add the selected plugin to `config.toml` (warns if already installed) |
+| `l` | Switch to `rvpm list` TUI |
+| `c` | Open `config.toml` in `$EDITOR` |
 | `o` | Open the plugin's GitHub page in your default browser |
 | `s` | Cycle sort mode (`stars` / `updated` / `name`) |
 | `R` | Clear the search cache and re-fetch |
@@ -563,10 +567,10 @@ plugin list and the README preview pane.
 </details>
 
 **Caching:** search results are cached for 24 hours under
-`{cache_root}/store/`; READMEs are cached for 7 days. Press `R` in the TUI
+`{cache_root}/browse/`; READMEs are cached for 7 days. Press `R` in the TUI
 to force-refresh the search cache (README cache expires on its own TTL).
 
-**Network requirement:** store needs network access to reach
+**Network requirement:** browse needs network access to reach
 `api.github.com` and `raw.githubusercontent.com`. Other commands
 (`sync` / `update` / `generate` / `list` / ...) work offline once plugins
 are cloned.
@@ -579,7 +583,7 @@ task lists, or themed output. Configure an external command and rvpm will
 pipe the raw README through it and render its ANSI output instead:
 
 ```toml
-[options.store]
+[options.browse]
 # Most common: mdcat reads from stdin by default
 readme_command = ["mdcat"]
 
@@ -602,7 +606,7 @@ literal. Supported names:
 - `{{ file_path }}` — absolute path to a temp file containing the raw README
   (the command receives an empty stdin when any `{{ file_* }}` is used)
 - `{{ file_dir }}` — parent directory of `{{ file_path }}`
-- `{{ file_name }}` — basename (e.g. `rvpm-store-readme-xxxx.md`)
+- `{{ file_name }}` — basename (e.g. `rvpm-browse-readme-xxxx.md`)
 - `{{ file_stem }}` — basename without extension
 - `{{ file_ext }}` — extension without the leading dot (e.g. `md`)
 
@@ -785,7 +789,7 @@ Beyond ordering, `depends` also affects **loading**:
 │   ├── repos/<host>/<owner>/<repo>/         ← plugin clones
 │   ├── merged/                              ← linked rtp for merge=true
 │   └── loader.lua                           ← generated loader
-└── store/                                   ← `rvpm store` cache (search + README)
+└── browse/                                  ← `rvpm browse` cache (search + README)
 ```
 
 Windows uses the same `.config` / `.cache` paths under `%USERPROFILE%` (no

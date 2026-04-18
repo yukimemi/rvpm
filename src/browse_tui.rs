@@ -1,4 +1,4 @@
-use crate::store::GitHubRepo;
+use crate::browse::GitHubRepo;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
@@ -14,7 +14,7 @@ pub enum Focus {
     Readme,
 }
 
-pub struct StoreTuiState {
+pub struct BrowseTuiState {
     pub plugins: Vec<GitHubRepo>,
     pub table_state: TableState,
     /// ローカルインクリメンタル検索の入力モード (`/` キー)
@@ -32,7 +32,7 @@ pub struct StoreTuiState {
     /// インストール済みプラグインの full_name (小文字) 集合。`Enter` 時の
     /// 重複 add 警告と、リスト行の ✓ マーク表示に使う。
     pub installed: HashSet<String>,
-    /// `[options.store.readme_command]` で設定された README 整形コマンド。
+    /// `[options.browse.readme_command]` で設定された README 整形コマンド。
     /// 未設定/空なら内蔵 tui-markdown パイプラインだけを使う。
     pub readme_command: Option<Vec<String>>,
     pub readme_content: Option<String>,
@@ -50,7 +50,7 @@ pub struct StoreTuiState {
     /// `readme_prepared_key` が変わらない限り再パースしないので、draw() ごとの
     /// コストは clone の string alloc だけ (再 parse + syntect ハイライトを回避)。
     pub readme_rendered: Option<ratatui::text::Text<'static>>,
-    /// 外部 renderer (`readme_command`) の結果。`run_store` の background task
+    /// 外部 renderer (`readme_command`) の結果。`run_browse` の background task
     /// が完了したときに書き込まれる。描画時は `readme_rendered` より優先される。
     /// 対応する `(full_name, content_len, visible_width)` が変わったら無効化する。
     pub readme_external_rendered: Option<ratatui::text::Text<'static>>,
@@ -373,7 +373,7 @@ fn extract_alt(tag: &str) -> Option<String> {
     Some(after[..end].to_string())
 }
 
-impl StoreTuiState {
+impl BrowseTuiState {
     pub fn new() -> Self {
         Self {
             plugins: Vec::new(),
@@ -687,7 +687,7 @@ impl StoreTuiState {
     }
 
     /// 現在の選択 repo / readme_content / pane 幅から外部 renderer 用の
-    /// cache key を作る。`run_store` から spawn タイミング判定にも使う。
+    /// cache key を作る。`run_browse` から spawn タイミング判定にも使う。
     pub fn external_key_current(&self) -> Option<(String, usize, u16)> {
         let full_name = self.selected_repo()?.full_name.clone();
         let content_len = self.readme_content.as_ref().map(|c| c.len()).unwrap_or(0);
@@ -760,9 +760,9 @@ impl StoreTuiState {
         // tui-markdown の Line 折返しが壊れる。リスト側と同じく PUA / VS を除去する。
         let sanitized = sanitize_cell_text(&cleaned);
 
-        // 外部 renderer (`options.store.readme_command`) は `draw()` 経由で
+        // 外部 renderer (`options.browse.readme_command`) は `draw()` 経由で
         // 同期実行すると 3 秒 timeout 間 TUI がフリーズするので、ここでは
-        // 呼ばない。代わりに `run_store` 側が README content 到着時に
+        // 呼ばない。代わりに `run_browse` 側が README content 到着時に
         // background task として spawn し、結果は `readme_external_rendered`
         // に格納する (下の draw() が優先的にそっちを使う)。このメソッドは
         // 常に built-in tui-markdown の結果を用意しておき、外部結果が来る
@@ -828,7 +828,7 @@ impl StoreTuiState {
             };
             Line::from(vec![
                 Span::styled(
-                    " rvpm store ",
+                    " rvpm browse ",
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Yellow)
@@ -869,7 +869,7 @@ impl StoreTuiState {
             };
             Line::from(vec![
                 Span::styled(
-                    " rvpm store ",
+                    " rvpm browse ",
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Yellow)
@@ -1069,6 +1069,10 @@ impl StoreTuiState {
                 ),
                 Span::styled("Enter", Style::default().fg(Color::Yellow)),
                 Span::styled(":add ", Style::default().fg(Color::DarkGray)),
+                Span::styled("l", Style::default().fg(Color::Yellow)),
+                Span::styled(":list ", Style::default().fg(Color::DarkGray)),
+                Span::styled("c", Style::default().fg(Color::Yellow)),
+                Span::styled(":config ", Style::default().fg(Color::DarkGray)),
                 Span::styled("?", Style::default().fg(Color::Yellow)),
                 Span::styled(":help ", Style::default().fg(Color::DarkGray)),
                 Span::styled("q", Style::default().fg(Color::Yellow)),
@@ -1086,7 +1090,7 @@ impl StoreTuiState {
             use ratatui::widgets::Clear;
             let area = f.area();
             let popup_w = 60u16.min(area.width.saturating_sub(4));
-            let popup_h = 26u16.min(area.height.saturating_sub(4));
+            let popup_h = 28u16.min(area.height.saturating_sub(4));
             let popup = Rect::new(
                 (area.width.saturating_sub(popup_w)) / 2,
                 (area.height.saturating_sub(popup_h)) / 2,
@@ -1163,6 +1167,14 @@ impl StoreTuiState {
                     Span::styled("Add plugin to config", Style::default().fg(Color::White)),
                 ]),
                 Line::from(vec![
+                    Span::styled("  l           ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Switch to list TUI", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  c           ", Style::default().fg(Color::Yellow)),
+                    Span::styled("Open config.toml", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
                     Span::styled("  o           ", Style::default().fg(Color::Yellow)),
                     Span::styled("Open in browser", Style::default().fg(Color::White)),
                 ]),
@@ -1226,7 +1238,7 @@ mod tests {
 
     #[test]
     fn test_sort_by_stars() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![
             make_repo("low", 10),
             make_repo("high", 1000),
@@ -1239,7 +1251,7 @@ mod tests {
 
     #[test]
     fn test_sort_by_name() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.sort_mode = SortMode::Name;
         state.set_plugins(vec![make_repo("zebra", 10), make_repo("alpha", 1000)]);
         assert_eq!(state.plugins[0].plugin_name(), "alpha");
@@ -1248,7 +1260,7 @@ mod tests {
 
     #[test]
     fn test_navigation() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![
             make_repo("a", 100),
             make_repo("b", 50),
@@ -1267,7 +1279,7 @@ mod tests {
 
     #[test]
     fn test_readme_scroll() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         // clamp を効かせるために表示範囲を設定 (100 行 README を高さ 20 の pane で)
         state.readme_line_count = 100;
         state.readme_visible_height = 20;
@@ -1281,7 +1293,7 @@ mod tests {
 
     #[test]
     fn test_scroll_readme_down_clamps_to_max() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.readme_line_count = 50;
         state.readme_visible_height = 20;
         // max = 50 - 20 = 30
@@ -1291,7 +1303,7 @@ mod tests {
 
     #[test]
     fn test_scroll_readme_to_bottom_lands_at_max() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.readme_line_count = 80;
         state.readme_visible_height = 25;
         state.scroll_readme_to_bottom();
@@ -1301,7 +1313,7 @@ mod tests {
 
     #[test]
     fn test_scroll_readme_to_bottom_on_short_content_stays_at_top() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         // 内容が pane より短いならスクロール不要
         state.readme_line_count = 10;
         state.readme_visible_height = 25;
@@ -1311,7 +1323,7 @@ mod tests {
 
     #[test]
     fn test_toggle_focus() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         assert_eq!(state.focus, Focus::List);
         state.toggle_focus();
         assert_eq!(state.focus, Focus::Readme);
@@ -1321,7 +1333,7 @@ mod tests {
 
     #[test]
     fn test_go_top_and_bottom() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![
             make_repo("a", 100),
             make_repo("b", 50),
@@ -1345,7 +1357,7 @@ mod tests {
 
     #[test]
     fn test_move_down_up() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![
             make_repo("a", 100),
             make_repo("b", 90),
@@ -1388,7 +1400,7 @@ mod tests {
 
     #[test]
     fn test_search_matches_plugin_name() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![
             make_repo_full("telescope", 100, Some("fuzzy"), vec![]),
             make_repo_full("snacks", 90, Some("misc"), vec![]),
@@ -1403,7 +1415,7 @@ mod tests {
 
     #[test]
     fn test_search_matches_description() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![
             make_repo_full("telescope", 100, Some("fuzzy finder"), vec![]),
             make_repo_full("snacks", 90, Some("misc utilities"), vec![]),
@@ -1417,7 +1429,7 @@ mod tests {
 
     #[test]
     fn test_search_matches_topic() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![
             make_repo_full("telescope", 100, Some("x"), vec!["lua"]),
             make_repo_full("snacks", 90, Some("y"), vec!["utility"]),
@@ -1431,7 +1443,7 @@ mod tests {
 
     #[test]
     fn test_search_case_insensitive() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![
             make_repo_full("Telescope", 100, Some("Fuzzy"), vec!["Lua"]),
             make_repo_full("snacks", 90, Some("z"), vec![]),
@@ -1445,7 +1457,7 @@ mod tests {
 
     #[test]
     fn test_search_next_wraps() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![
             make_repo_full("aaa-nvim", 300, None, vec![]),
             make_repo_full("bbb", 200, None, vec![]),
@@ -1467,7 +1479,7 @@ mod tests {
 
     #[test]
     fn test_search_prev_wraps() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![
             make_repo_full("aaa-nvim", 300, None, vec![]),
             make_repo_full("bbb", 200, None, vec![]),
@@ -1487,7 +1499,7 @@ mod tests {
 
     #[test]
     fn test_search_backspace_clears_matches_when_empty() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![make_repo_full("telescope", 100, None, vec![])]);
         state.start_search();
         state.search_type('t');
@@ -1499,7 +1511,7 @@ mod tests {
 
     #[test]
     fn test_search_cancel_clears_state() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![make_repo_full("telescope", 100, None, vec![])]);
         state.start_search();
         state.search_type('t');
@@ -1513,7 +1525,7 @@ mod tests {
 
     #[test]
     fn test_search_confirm_keeps_pattern_for_next() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![
             make_repo_full("aaa-nvim", 300, None, vec![]),
             make_repo_full("bbb-nvim", 200, None, vec![]),
@@ -1531,7 +1543,7 @@ mod tests {
 
     #[test]
     fn test_start_api_search_cancels_local_search() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.start_search();
         state.search_type('a');
         state.start_api_search();
@@ -1542,7 +1554,7 @@ mod tests {
 
     #[test]
     fn test_set_plugins_clears_search_state() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![make_repo_full("telescope", 100, None, vec![])]);
         state.start_search();
         state.search_type('t');
@@ -1558,7 +1570,7 @@ mod tests {
 
     #[test]
     fn test_is_installed_case_insensitive() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.installed.insert("folke/snacks.nvim".to_string());
         let repo = make_repo_full("Snacks.nvim", 100, None, vec![]);
         // full_name is "owner/Snacks.nvim" — different owner, miss
@@ -1573,7 +1585,7 @@ mod tests {
 
     #[test]
     fn test_mark_installed_adds_to_set() {
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         let repo = make_repo_full("telescope.nvim", 100, None, vec![]);
         assert!(!state.is_installed(&repo));
         state.mark_installed(&repo);
@@ -1585,7 +1597,7 @@ mod tests {
     #[test]
     fn test_build_external_source_returns_raw_content_unchanged() {
         // 契約: 外部 renderer には加工せず raw README を渡す
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![make_repo_full(
             "x.nvim",
             0,
@@ -1599,7 +1611,7 @@ mod tests {
 
     #[test]
     fn test_build_external_source_none_when_no_content() {
-        let state = StoreTuiState::new();
+        let state = BrowseTuiState::new();
         assert!(state.build_external_source().is_none());
     }
 
@@ -1781,7 +1793,7 @@ print(1)
     #[test]
     fn test_sort_rebuilds_search_matches() {
         // sort 後も search が追従して n/N の飛び先が正しいこと
-        let mut state = StoreTuiState::new();
+        let mut state = BrowseTuiState::new();
         state.set_plugins(vec![
             make_repo_full("aaa-nvim", 10, None, vec![]),
             make_repo_full("zzz", 100, None, vec![]),
