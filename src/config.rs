@@ -43,6 +43,11 @@ pub struct Options {
     /// 静かにスキップ。デフォルト `false`。
     #[serde(default)]
     pub chezmoi: bool,
+    /// `true` なら `sync` / `generate` 完了時に自動で `rvpm clean` 相当の処理
+    /// (config.toml に無いプラグインディレクトリの削除) を実行する。
+    /// `sync --prune` を毎回明示しなくてよくなる。デフォルト `false`。
+    #[serde(default)]
+    pub auto_clean: bool,
     /// `rvpm store` の README preview 用オプション。
     #[serde(default)]
     pub store: StoreOptions,

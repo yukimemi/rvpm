@@ -70,6 +70,14 @@ enum Commands {
     /// TOML triggers — skips the clone/pull phase entirely.
     Generate,
 
+    /// Delete plugin directories no longer referenced by config.toml
+    ///
+    /// Walks `{cache_root}/plugins/repos/` and removes every clone whose
+    /// plugin is no longer in `config.toml`. Does not run git operations,
+    /// so it is much faster than `sync --prune` on large configs
+    /// (hundreds of plugins).
+    Clean,
+
     /// Add a plugin and sync
     ///
     /// Accepts the same trigger flags as `set` to configure the plugin
@@ -242,6 +250,9 @@ async fn main() -> Result<()> {
         }
         Commands::Generate => {
             run_generate().await?;
+        }
+        Commands::Clean => {
+            run_clean()?;
         }
         Commands::Add {
             repo,
@@ -623,48 +634,58 @@ async fn run_sync(prune: bool) -> Result<()> {
     )?;
     println!("Done! -> {}", loader_path.display());
 
-    // 未使用 plugin ディレクトリの処理: --prune なら削除、それ以外なら警告表示
-    let repos_dir = resolve_repos_dir(&cache_root);
-    if repos_dir.exists() {
-        let unused = find_unused_repos(&config, &repos_dir).unwrap_or_default();
-        if !unused.is_empty() {
-            if prune {
-                println!();
-                println!(
-                    "Pruning {} unused plugin {}:",
-                    unused.len(),
-                    if unused.len() == 1 {
-                        "directory"
-                    } else {
-                        "directories"
-                    }
-                );
-                for path in &unused {
-                    println!("  - {}", path.display());
-                    if let Err(e) = std::fs::remove_dir_all(path) {
-                        eprintln!("    \u{26a0} failed: {}", e);
-                    }
-                }
-            } else {
-                println!();
-                println!(
-                    "\u{26a0} Found {} unused plugin {}:",
-                    unused.len(),
-                    if unused.len() == 1 {
-                        "directory"
-                    } else {
-                        "directories"
-                    }
-                );
-                for path in &unused {
-                    println!("    {}", path.display());
-                }
-                println!("  Run `rvpm sync --prune` to delete them.");
-            }
+    // 未使用 plugin ディレクトリの処理:
+    //  - `--prune` フラグまたは `options.auto_clean = true` で自動削除
+    //  - それ以外なら警告のみ (rvpm clean で後処理できる旨を案内)
+    let force = prune || config.options.auto_clean;
+    let (count, unused) = maybe_prune_unused_repos(&config, &cache_root, force);
+    if !force && count > 0 {
+        println!();
+        println!(
+            "\u{26a0} Found {} unused plugin {}:",
+            count,
+            plural("directory", "directories", count),
+        );
+        for path in &unused {
+            println!("    {}", path.display());
         }
+        println!(
+            "  Run `rvpm clean` (fast, no git) or `rvpm sync --prune` to delete them,\n  \
+             or set `auto_clean = true` under `[options]` to do it automatically."
+        );
     }
 
     print_init_lua_hint_if_missing(&config);
+    Ok(())
+}
+
+/// `rvpm clean` — git 操作なしで、config.toml に無いプラグインディレクトリだけを削除する。
+/// プラグイン数が多い環境で `sync --prune` が重いケースの受け皿。
+/// 非同期処理は無いので `async` は付けない (clippy::unused_async 回避)。
+fn run_clean() -> Result<()> {
+    let config_path = rvpm_config_path();
+    let toml_content = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+    let config = parse_config(&toml_content)?;
+
+    let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
+    let repos_dir = resolve_repos_dir(&cache_root);
+    if !repos_dir.exists() {
+        println!(
+            "No repos directory at {} — nothing to clean.",
+            repos_dir.display()
+        );
+        return Ok(());
+    }
+
+    // force=true で即削除。空なら helper は (0, []) を返すので別メッセージを出す。
+    let (count, _leftover) = maybe_prune_unused_repos(&config, &cache_root, true);
+    if count == 0 {
+        println!(
+            "No unused plugin directories under {}.",
+            repos_dir.display()
+        );
+    }
     Ok(())
 }
 
@@ -713,6 +734,13 @@ async fn run_generate() -> Result<()> {
         &build_loader_options(&config_root),
     )?;
     println!("Done! -> {}", loader_path.display());
+
+    // `options.auto_clean = true` なら config から外されたプラグインディレクトリも
+    // 自動削除 (git 操作は行わないので generate 自体のコストは増えない)。
+    if config.options.auto_clean {
+        let _ = maybe_prune_unused_repos(&config, &cache_root, true);
+    }
+
     print_init_lua_hint_if_missing(&config);
     Ok(())
 }
@@ -1809,11 +1837,78 @@ async fn run_set(
     Ok(false)
 }
 
-fn find_unused_repos(config: &config::Config, repos_dir: &Path) -> Result<Vec<PathBuf>> {
+/// 英語の単数/複数形切替。表示メッセージで使う小さなヘルパー。
+fn plural<'a>(singular: &'a str, plural: &'a str, n: usize) -> &'a str {
+    if n == 1 { singular } else { plural }
+}
+
+/// `sync --prune` / `generate` (auto_clean) / 両方の末尾で使う共通の「後片付け」。
+/// 未使用 repo を検出し、`force` が true なら `prune_unused_repos` で削除する。
+/// 戻り値は検出された未使用の件数。0 以外なら呼び出し側で警告メッセージを
+/// 出せるよう、発見はしたが削除していないケースを区別できるようにする。
+fn maybe_prune_unused_repos(
+    config: &config::Config,
+    cache_root: &Path,
+    force: bool,
+) -> (usize, Vec<PathBuf>) {
+    let repos_dir = resolve_repos_dir(cache_root);
+    if !repos_dir.exists() {
+        return (0, Vec::new());
+    }
+    let unused = find_unused_repos(config, cache_root, &repos_dir).unwrap_or_default();
+    if unused.is_empty() {
+        return (0, Vec::new());
+    }
+    let count = unused.len();
+    if force {
+        prune_unused_repos(&unused);
+        (count, Vec::new()) // 削除済みなのでパスは返さない
+    } else {
+        (count, unused)
+    }
+}
+
+/// 未使用 repo ディレクトリを削除する共通処理。`sync --prune` と `clean` 両方から呼ばれる。
+/// 削除失敗は eprintln で警告のみ出し、処理を続ける (resilience 原則)。
+fn prune_unused_repos(unused: &[PathBuf]) {
+    println!();
+    println!(
+        "Pruning {} unused plugin {}:",
+        unused.len(),
+        plural("directory", "directories", unused.len()),
+    );
+    for path in unused {
+        println!("  - {}", path.display());
+        if let Err(e) = std::fs::remove_dir_all(path) {
+            eprintln!("    \u{26a0} failed: {}", e);
+        }
+    }
+}
+
+/// `{cache_root}/plugins/repos/` 配下で、config.toml に載っていないプラグイン
+/// ディレクトリを列挙する (削除候補)。
+///
+/// 判定ルール:
+/// - 使用中セットには `resolve_plugin_dst()` の結果 (= `plugin.dst` があれば
+///   それ、無ければ canonical_path ベースの既定) のうち `repos_dir` 配下の
+///   ものだけを入れる。`dst` を別ツリーに逃がしてる plugin は対象外になる。
+/// - `.git` を持つ候補ディレクトリを検出し、**使用中パス自身またはその
+///   子孫であれば保護する** (= プラグイン本体の clone の中に置かれた
+///   submodule の `.git` を誤削除しない)。
+fn find_unused_repos(
+    config: &config::Config,
+    cache_root: &Path,
+    repos_dir: &Path,
+) -> Result<Vec<PathBuf>> {
     let mut unused = Vec::new();
-    let mut used_paths = std::collections::HashSet::new();
+    let mut used_paths: Vec<PathBuf> = Vec::new();
     for plugin in &config.plugins {
-        used_paths.insert(repos_dir.join(plugin.canonical_path()));
+        let dst = resolve_plugin_dst(plugin, cache_root);
+        // custom dst がツリー外 (`~/dev/...` 等) の場合は repos_dir のスキャン
+        // 対象外なので used 判定にも不要。
+        if dst.starts_with(repos_dir) {
+            used_paths.push(dst);
+        }
     }
     for entry in walkdir::WalkDir::new(repos_dir)
         .into_iter()
@@ -1822,7 +1917,9 @@ fn find_unused_repos(config: &config::Config, repos_dir: &Path) -> Result<Vec<Pa
     {
         let git_dir = entry.path();
         if let Some(repo_root) = git_dir.parent()
-            && !used_paths.contains(repo_root)
+            && !used_paths
+                .iter()
+                .any(|used| repo_root == used || repo_root.starts_with(used))
         {
             unused.push(repo_root.to_path_buf());
         }
@@ -3999,7 +4096,8 @@ lazy = false"#;
     #[test]
     fn test_find_unused_repos() {
         let root = tempdir().unwrap();
-        let repos_dir = root.path().join("repos");
+        // `cache_root` を root にして、標準の {cache_root}/plugins/repos/ 下に配置する
+        let repos_dir = root.path().join("plugins/repos");
         std::fs::create_dir_all(&repos_dir).unwrap();
         let used_dir = repos_dir.join("github.com/used/plugin");
         let unused_dir = repos_dir.join("github.com/unused/plugin");
@@ -4013,8 +4111,116 @@ lazy = false"#;
                 ..Default::default()
             }],
         };
-        let unused = find_unused_repos(&config, &repos_dir).unwrap();
+        let unused = find_unused_repos(&config, root.path(), &repos_dir).unwrap();
         assert_eq!(unused.len(), 1);
         assert!(unused[0].to_string_lossy().contains("unused"));
+    }
+
+    #[test]
+    fn test_find_unused_repos_respects_custom_dst_inside_repos_dir() {
+        // `plugin.dst` で canonical_path と違う場所に clone してる場合でも、
+        // その場所は "used" として保護されること。
+        let root = tempdir().unwrap();
+        let repos_dir = root.path().join("plugins/repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let custom = repos_dir.join("custom-slot/my-plugin");
+        std::fs::create_dir_all(custom.join(".git")).unwrap();
+        let config = Config {
+            vars: None,
+            options: Options::default(),
+            plugins: vec![Plugin {
+                url: "owner/my-plugin".to_string(),
+                dst: Some(custom.to_string_lossy().to_string()),
+                ..Default::default()
+            }],
+        };
+        let unused = find_unused_repos(&config, root.path(), &repos_dir).unwrap();
+        assert!(
+            unused.is_empty(),
+            "custom dst must be protected, got {:?}",
+            unused
+        );
+    }
+
+    #[test]
+    fn test_find_unused_repos_preserves_nested_git_inside_used_plugin() {
+        // 設定済みプラグインのクローン配下にある submodule 等の `.git` は
+        // 削除候補にしないこと (repo_root が used プラグインの子孫なら保護)。
+        let root = tempdir().unwrap();
+        let repos_dir = root.path().join("plugins/repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let plugin_dir = repos_dir.join("github.com/used/plugin");
+        std::fs::create_dir_all(plugin_dir.join(".git")).unwrap();
+        // submodule
+        let submodule = plugin_dir.join("deps/sub");
+        std::fs::create_dir_all(submodule.join(".git")).unwrap();
+        let config = Config {
+            vars: None,
+            options: Options::default(),
+            plugins: vec![Plugin {
+                url: "used/plugin".to_string(),
+                ..Default::default()
+            }],
+        };
+        let unused = find_unused_repos(&config, root.path(), &repos_dir).unwrap();
+        assert!(
+            unused.is_empty(),
+            "submodule .git must not be considered unused, got {:?}",
+            unused
+        );
+    }
+
+    #[test]
+    fn test_prune_unused_repos_removes_listed_dirs() {
+        let root = tempdir().unwrap();
+        let a = root.path().join("a/.git");
+        let b = root.path().join("b/.git");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let targets = vec![
+            a.parent().unwrap().to_path_buf(),
+            b.parent().unwrap().to_path_buf(),
+        ];
+        prune_unused_repos(&targets);
+        assert!(!targets[0].exists());
+        assert!(!targets[1].exists());
+    }
+
+    #[test]
+    fn test_prune_unused_repos_empty_slice_noop() {
+        // 空でもクラッシュしないこと
+        prune_unused_repos(&[]);
+    }
+
+    #[test]
+    fn test_plural_helper() {
+        assert_eq!(plural("dir", "dirs", 0), "dirs");
+        assert_eq!(plural("dir", "dirs", 1), "dir");
+        assert_eq!(plural("dir", "dirs", 2), "dirs");
+    }
+
+    #[test]
+    fn test_parse_config_auto_clean_defaults_to_false() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = crate::config::parse_config(toml).unwrap();
+        assert!(!config.options.auto_clean);
+    }
+
+    #[test]
+    fn test_parse_config_accepts_auto_clean_true() {
+        let toml = r#"
+[options]
+auto_clean = true
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = crate::config::parse_config(toml).unwrap();
+        assert!(config.options.auto_clean);
     }
 }

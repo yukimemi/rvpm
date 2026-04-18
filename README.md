@@ -131,6 +131,11 @@ concurrency = 10
 # Requires `chezmoi` in PATH. See "chezmoi integration" below.
 # chezmoi = true
 
+# Auto-prune plugin dirs no longer referenced by config.toml on every
+# `sync` and `generate`. Default: false. Same effect as always passing
+# `sync --prune`. Standalone `rvpm clean` remains available.
+# auto_clean = true
+
 # Optional: run READMEs in the store TUI through an external renderer
 # (mdcat / glow / bat). See "External README renderer" below.
 # [options.store]
@@ -178,6 +183,7 @@ for where files land).
 | `cache_root` | `string` | `~/.cache/rvpm/<appname>` | Root for all rvpm cache (`plugins/repos/`, `plugins/merged/`, `plugins/loader.lua`, `store/`). **Recommended: leave unset** |
 | `concurrency` | `integer` | `8` | Max number of parallel git operations during `sync` / `update`. Kept moderate to avoid GitHub rate limits |
 | `chezmoi` | `boolean` | `false` | When `true`, rvpm writes mutations (`config.toml`, global hooks, per-plugin hooks) directly to the chezmoi **source** file (resolved via `chezmoi source-path`) and then runs `chezmoi apply --force` to materialise the change in the target. Falls back to writing the target directly if `chezmoi` is missing. Plain files only — `.tmpl` sources are rejected (rvpm has its own Tera engine). See [chezmoi integration](#chezmoi-integration) |
+| `auto_clean` | `boolean` | `false` | When `true`, `rvpm sync` and `rvpm generate` automatically delete plugin directories under `plugins/repos/` that are no longer referenced by `config.toml`. Equivalent to always passing `--prune` to `sync`. The standalone `rvpm clean` command is still available for one-off cleanups |
 
 > **💡 Leave `config_root` / `cache_root` unset.** The defaults are already
 > `<appname>`-aware. Setting a literal path (e.g. `cache_root =
@@ -472,6 +478,7 @@ vim.keymap.set("n", "<leader>ff", "<cmd>Telescope find_files<cr>")
 |---|---|
 | `rvpm sync [--prune]` | Clone/pull plugins and regenerate `loader.lua`. `--prune` deletes unused plugin directories |
 | `rvpm generate` | Regenerate `loader.lua` only (skip git operations) |
+| `rvpm clean` | Delete plugin directories no longer referenced by `config.toml` (no git, faster than `sync --prune` on 200+ plugins) |
 | `rvpm add <repo>` | Add a plugin and sync |
 | `rvpm update [query]` | `git pull` installed plugins |
 | `rvpm remove [query]` | Remove a plugin from `config.toml` and delete its directory |
