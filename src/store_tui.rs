@@ -159,97 +159,6 @@ fn parse_tag_name(tag: &str) -> String {
         .collect()
 }
 
-/// Markdown の pipe テーブル (`| a | b |` + `| --- | --- |`) を検出して
-/// 列ごとに max 幅に合わせて space padding を追加する。tui-markdown 0.3 は
-/// テーブルを plain text として流すだけなので、行ごとの cell 長が違うと `|`
-/// 位置がバラつく。pre-pass で揃えておくと少なくとも pane に収まる table は
-/// 整って見える (pane 幅を超える場合は wrap するのでそこは仕方ない)。
-fn realign_markdown_tables(input: &str) -> String {
-    use unicode_width::UnicodeWidthStr;
-
-    let lines: Vec<&str> = input.lines().collect();
-    let mut out = String::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        if is_table_header(line) && i + 1 < lines.len() && is_table_separator(lines[i + 1]) {
-            // 連続する table 行を収集
-            let mut end = i + 2;
-            while end < lines.len() && is_table_row(lines[end]) {
-                end += 1;
-            }
-            let rows = &lines[i..end];
-            // 各行をセル列に分解 (先頭/末尾の `|` は除く、trim)
-            let parsed: Vec<Vec<&str>> = rows
-                .iter()
-                .map(|l| {
-                    let t = l.trim();
-                    let inner = t.strip_prefix('|').unwrap_or(t);
-                    let inner = inner.strip_suffix('|').unwrap_or(inner);
-                    inner.split('|').map(|c| c.trim()).collect()
-                })
-                .collect();
-            let ncols = parsed.iter().map(|r| r.len()).max().unwrap_or(0);
-            let mut widths = vec![0usize; ncols];
-            // separator 行 (index 1) は width 計算から除外
-            for (row_idx, row) in parsed.iter().enumerate() {
-                if row_idx == 1 {
-                    continue;
-                }
-                for (ci, cell) in row.iter().enumerate() {
-                    widths[ci] = widths[ci].max(UnicodeWidthStr::width(*cell));
-                }
-            }
-            for (row_idx, row) in parsed.iter().enumerate() {
-                out.push('|');
-                for (ci, width) in widths.iter().enumerate() {
-                    out.push(' ');
-                    let cell = row.get(ci).copied().unwrap_or("");
-                    if row_idx == 1 {
-                        out.push_str(&"-".repeat((*width).max(3)));
-                    } else {
-                        out.push_str(cell);
-                        let pad = width.saturating_sub(UnicodeWidthStr::width(cell));
-                        for _ in 0..pad {
-                            out.push(' ');
-                        }
-                    }
-                    out.push(' ');
-                    out.push('|');
-                }
-                out.push('\n');
-            }
-            i = end;
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-        i += 1;
-    }
-    out
-}
-
-fn is_table_row(line: &str) -> bool {
-    let t = line.trim();
-    t.starts_with('|') && t.len() >= 2 && t.contains('|')
-}
-
-fn is_table_header(line: &str) -> bool {
-    is_table_row(line)
-}
-
-fn is_table_separator(line: &str) -> bool {
-    let t = line.trim();
-    if !t.starts_with('|') || !t.ends_with('|') || t.len() < 3 {
-        return false;
-    }
-    let inner = &t[1..t.len() - 1];
-    inner.split('|').all(|cell| {
-        let c = cell.trim();
-        !c.is_empty() && c.chars().all(|ch| matches!(ch, '-' | ':' | ' '))
-    })
-}
-
 /// Paragraph が `Wrap { trim: false }` で描画したときの実行数を推定する。
 /// - 幅が 0 (draw 前) なら Text の Line 数をそのまま返す
 /// - 各 Line の spans 合計 display 幅を `pane_width` で割り切り上げ (空 Line は 1 行)
@@ -661,10 +570,7 @@ impl StoreTuiState {
         // `unicode-width` は幅 1 と答えるが terminal は 2 セルで描画するため
         // tui-markdown の Line 折返しが壊れる。リスト側と同じく PUA / VS を除去する。
         let sanitized = sanitize_cell_text(&cleaned);
-        // pipe テーブルは tui-markdown が plain text として流してしまい行毎に
-        // `|` 位置がバラつくので、事前に列幅を揃えておく。
-        let aligned = realign_markdown_tables(&sanitized);
-        self.readme_prepared = format!("{}{}", topics_prefix, aligned);
+        self.readme_prepared = format!("{}{}", topics_prefix, sanitized);
         // ratatui の Paragraph({ wrap: trim=false }) が pane 幅で折り返した後の
         // 実行数を推定する。各 Line の表示幅を unicode-width で測り、
         // pane の内側幅で割って切り上げて合計する近似 (空 Line は 1 行分)。
@@ -1528,65 +1434,6 @@ mod tests {
     fn test_sanitize_keeps_ascii() {
         let input = "A collection of small qol plugins for Neovim";
         assert_eq!(sanitize_cell_text(input), input);
-    }
-
-    // ───── realign_markdown_tables ─────
-
-    #[test]
-    fn test_realign_table_pads_short_cells() {
-        let input = "\
-| short | name |
-| --- | --- |
-| NoiceCmdlineIcon | desc |
-";
-        let out = realign_markdown_tables(input);
-        // 列ごとに `|` 位置が揃っているか
-        let lines: Vec<&str> = out.lines().collect();
-        let pipe_positions: Vec<Vec<usize>> = lines
-            .iter()
-            .map(|l| {
-                l.char_indices()
-                    .filter(|(_, c)| *c == '|')
-                    .map(|(i, _)| i)
-                    .collect()
-            })
-            .collect();
-        assert_eq!(pipe_positions[0], pipe_positions[2]);
-    }
-
-    #[test]
-    fn test_realign_table_preserves_non_table_lines() {
-        let input = "\
-Hello world
-| a | b |
-| --- | --- |
-| 1 | 2 |
-Goodbye
-";
-        let out = realign_markdown_tables(input);
-        assert!(out.contains("Hello world"));
-        assert!(out.contains("Goodbye"));
-    }
-
-    #[test]
-    fn test_realign_table_handles_empty_cells() {
-        let input = "\
-| a | b | c |
-| --- | --- | --- |
-| x | | z |
-";
-        let out = realign_markdown_tables(input);
-        // 空セルが原因で column 数が狂わないこと
-        assert_eq!(out.lines().count(), 3);
-    }
-
-    #[test]
-    fn test_realign_without_separator_is_noop() {
-        // separator が無い連続行はテーブル扱いしない
-        let input = "| not | a table |\nbecause no separator";
-        let out = realign_markdown_tables(input);
-        assert!(out.contains("| not | a table |"));
-        assert!(out.contains("because no separator"));
     }
 
     #[test]
