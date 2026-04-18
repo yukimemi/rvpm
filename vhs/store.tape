@@ -1,5 +1,5 @@
 # rvpm store TUI demo — README GIF
-# Usage: vhs store.tape
+# Usage: (cd vhs && vhs store.tape)   # output lands next to this tape
 # Note: On Windows, run from WSL (vhs hangs on Set Theme in native Windows).
 # Note: FontFamily must be installed in the system. Adjust if tofu appears.
 

@@ -14,10 +14,11 @@ sources everything without any runtime glob cost.
 
 | `rvpm init --write` → `add` → `list` | `rvpm store` (plugin browser) |
 |---|---|
-| ![list](demo.gif) | ![store](store.gif) |
+| ![list](vhs/demo.gif) | ![store](vhs/store.gif) |
 
-GIFs are generated from the `demo.tape` and `store.tape` files with
-[vhs](https://github.com/charmbracelet/vhs) — feel free to tweak and re-record.
+GIFs are generated from the `vhs/demo.tape` / `vhs/store.tape` files
+with [vhs](https://github.com/charmbracelet/vhs) — `cd vhs && vhs
+demo.tape` to re-record.
 
 ## Why rvpm?
 
