@@ -76,10 +76,33 @@ pub fn render(
     });
 
     let mut child = cmd.spawn()?;
-    if use_stdin && let Some(mut stdin) = child.stdin.take() {
-        // 書き込み失敗は子プロセスが早期終了した等で起きるので無視。
-        let _ = stdin.write_all(markdown.as_bytes());
-    }
+
+    // stdin への書き込みは別 thread に逃がす。同期で write_all してしまうと、
+    // child が stdout を書き始めて OS パイプバッファ (典型 64KB) を埋めた時点で
+    // child は次の write でブロックし、一方 parent は stdin の write で詰まる
+    // 古典的 deadlock が起きる。thread に切れば parent は wait + read に集中
+    // できる。
+    let stdin_writer = if use_stdin && let Some(mut stdin) = child.stdin.take() {
+        let data = markdown.as_bytes().to_vec();
+        Some(std::thread::spawn(move || {
+            // 書き込み失敗は子プロセス早期終了等で起きるので無視。
+            let _ = stdin.write_all(&data);
+            // drop(stdin) で EOF を送る (スコープ終端で自動)。
+        }))
+    } else {
+        None
+    };
+
+    // stdout も並行して読む。子プロセス側の stdout バッファが埋まって
+    // ブロックしないよう、wait より先に別 thread で読み切る。
+    let stdout_reader = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
 
     // wait-timeout で hard deadline を設ける。
     use wait_timeout::ChildExt;
@@ -88,19 +111,27 @@ pub fn render(
         None => {
             let _ = child.kill();
             let _ = child.wait();
+            if let Some(h) = stdin_writer {
+                let _ = h.join();
+            }
+            if let Some(h) = stdout_reader {
+                let _ = h.join();
+            }
             return Ok(None);
         }
     };
 
+    // 補助 thread を回収。join 失敗は thread 内 panic 等のレアケース、
+    // 致命ではないので握りつぶす。
+    if let Some(h) = stdin_writer {
+        let _ = h.join();
+    }
+    let buf = stdout_reader
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
     if !status.success() {
         return Ok(None);
-    }
-
-    let mut stdout = child.stdout.take();
-    let mut buf = Vec::new();
-    if let Some(mut s) = stdout.take() {
-        use std::io::Read;
-        s.read_to_end(&mut buf)?;
     }
     if buf.is_empty() {
         return Ok(None);

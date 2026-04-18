@@ -2776,10 +2776,20 @@ async fn run_store() -> Result<()> {
 
     // README を非同期で取得するためのチャネル
     let (readme_tx, mut readme_rx) = tokio::sync::mpsc::channel::<(String, String)>(1);
+    // 外部 renderer (`options.store.readme_command`) の結果用チャネル。
+    // 送信は `(key, rendered_text)` で、key は `(full_name, content_len, visible_width)`。
+    // capacity 2 にしているのは、readme_content arrive の spawn と resize 時 spawn が
+    // 連続したときに drop されないように少し余裕を持たせるため。
+    let (render_tx, mut render_rx) =
+        tokio::sync::mpsc::channel::<((String, usize, u16), ratatui::text::Text<'static>)>(2);
     let mut last_selected: Option<String> = None;
     // README pane の scroll が変化したら terminal.clear() して diff を無効化する。
     // highlight-code の styled span が zellij 等で残骸を残す問題への belt-and-suspenders。
     let mut last_readme_scroll: u16 = state.readme_scroll;
+    // 外部 renderer task の重複 spawn 防止用。`(full_name, content_len, width)`
+    // がこれと同じなら再スポーンしない。selection / content / resize いずれかの
+    // 変化で key が動けば次のループで spawn される。
+    let mut last_render_spawned: Option<(String, usize, u16)> = None;
 
     loop {
         if state.readme_scroll != last_readme_scroll {
@@ -2797,6 +2807,43 @@ async fn run_store() -> Result<()> {
         {
             state.readme_content = Some(content);
             state.readme_loading = false;
+            // 新 content で external_key_current が変わるので、下の統一 spawn 判定に任せる。
+        }
+
+        // 外部 renderer の結果を受信 (まだ有効な key なら採用)。
+        if let Ok((key, text)) = render_rx.try_recv()
+            && state.external_key_matches(&key)
+        {
+            state.readme_external_rendered = Some(text);
+            state.readme_external_key = Some(key);
+        }
+
+        // 選択変更 / content 受信 / resize いずれかで key が動いたら、
+        // 未 spawn の key なら外部 renderer task を spawn する。
+        // `last_render_spawned` が実際に飛ばしたキーの記憶役。
+        if let Some(cmd) = state.readme_command.as_ref()
+            && state.readme_content.is_some()
+            && let Some(key) = state.external_key_current()
+            && last_render_spawned.as_ref() != Some(&key)
+            && let Some(source) = state.build_external_source()
+        {
+            last_render_spawned = Some(key.clone());
+            let cmd = cmd.clone();
+            let w = state.readme_visible_width;
+            let h = state.readme_visible_height;
+            let tx = render_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                match crate::external_render::render(&cmd, &source, w, h) {
+                    Ok(Some(text)) => {
+                        let _ = tx.blocking_send((key, text));
+                    }
+                    // None = no output / empty / not configured → built-in fallback は既に出ている
+                    Ok(None) => {}
+                    // spawn 失敗などは message に出したいが、state をこの場から触れないので stderr 相当の
+                    // 扱いとして捨てる (次回 content 変更で再試行される)。
+                    Err(_) => {}
+                }
+            });
         }
 
         // 選択変更時に README を非同期取得
