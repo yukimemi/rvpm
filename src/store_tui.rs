@@ -664,6 +664,11 @@ impl StoreTuiState {
             )
             .wrap(Wrap { trim: false })
             .scroll((self.readme_scroll, 0));
+        // Paragraph は inner area の未使用セルを空白で埋めないため、前フレームの
+        // 長い README の残骸が残ることがある (特に zellij のようにターミナルが
+        // セル状態を厳密に保持するホストで顕在化する)。Clear でペイン全体を空白に
+        // してから Paragraph を重ねる。
+        f.render_widget(ratatui::widgets::Clear, main_chunks[1]);
         f.render_widget(readme, main_chunks[1]);
 
         // ── Footer ──
