@@ -3,9 +3,21 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState},
+    widgets::{Block, BorderType, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState},
 };
 use std::collections::HashMap;
+use std::time::Instant;
+
+/// Sync の UI で Syncing 状態の行に使う braille スピナーのフレーム。
+/// 80ms 毎に次のフレームへ (12.5fps 程度)。
+const SPINNER_BRAILLE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// ASCII 環境向けのフォールバック。
+const SPINNER_ASCII: &[&str] = &["|", "/", "-", "\\"];
+/// Title 部分の "syncing..." の末尾ドット。3 フレームで循環。
+const DOTS: &[&str] = &[".  ", ".. ", "..."];
+/// スピナー / ドットのフレーム進行速度 (ms/frame)。
+const FRAME_MS: u128 = 80;
+const DOTS_MS: u128 = 400;
 
 /// TUI で使用するアイコンセット。IconStyle に応じて切り替える。
 pub struct Icons {
@@ -19,6 +31,8 @@ pub struct Icons {
     pub modified: &'static str,
     pub hook_on: &'static str,
     pub hook_off: &'static str,
+    /// スピナーのフレームセットを選ぶためにスタイル情報を保持しておく。
+    pub style: crate::config::IconStyle,
 }
 
 impl Icons {
@@ -34,6 +48,7 @@ impl Icons {
                 modified: "\u{f071}",  //
                 hook_on: "\u{25cf}",   // ●
                 hook_off: "\u{25cb}",  // ○
+                style,
             },
             crate::config::IconStyle::Unicode => Self {
                 waiting: "\u{25cb}",   // ○
@@ -45,6 +60,7 @@ impl Icons {
                 modified: "\u{26a0}",  // ⚠
                 hook_on: "\u{25cf}",   // ●
                 hook_off: "\u{25cb}",  // ○
+                style,
             },
             crate::config::IconStyle::Ascii => Self {
                 waiting: ".",
@@ -56,6 +72,7 @@ impl Icons {
                 modified: "~",
                 hook_on: "o",
                 hook_off: "-",
+                style,
             },
         }
     }
@@ -85,6 +102,8 @@ pub struct TuiState {
     pub search_input: String,
     /// ヘルプ表示中
     pub show_help: bool,
+    /// TUI 起動時刻。Syncing スピナーや経過時間表示の基準にする。
+    pub started_at: Instant,
 }
 
 impl TuiState {
@@ -107,6 +126,51 @@ impl TuiState {
             search_mode: false,
             search_input: String::new(),
             show_help: false,
+            started_at: Instant::now(),
+        }
+    }
+
+    /// スピナー選択用のミリ秒基準 tick。`Instant::now().elapsed()` に依存せず
+    /// 関数型テスト可能 (タイムスタンプをモック出来る) にしたいときは `u128`
+    /// を直接渡せる下記のような実装にすると楽。ここではシンプルに経過時間を使う。
+    fn elapsed_ms(&self) -> u128 {
+        self.started_at.elapsed().as_millis()
+    }
+
+    /// Sync UI の title に出す経過時間 (`mm:ss`)。
+    fn elapsed_str(&self) -> String {
+        let s = self.started_at.elapsed().as_secs();
+        format!("{:02}:{:02}", s / 60, s % 60)
+    }
+
+    /// IconStyle に応じてスピナーフレームを返す。時間ベースで 80ms ごとに次の
+    /// フレームに進む (再描画頻度に依存しない、見た目が一定)。
+    fn spinner_frame(&self, style: crate::config::IconStyle) -> &'static str {
+        let frames: &[&str] = match style {
+            crate::config::IconStyle::Nerd | crate::config::IconStyle::Unicode => SPINNER_BRAILLE,
+            crate::config::IconStyle::Ascii => SPINNER_ASCII,
+        };
+        let idx = (self.elapsed_ms() / FRAME_MS) as usize % frames.len();
+        frames[idx]
+    }
+
+    /// "syncing." "syncing.." "syncing..." を循環させる用のドット部分。
+    fn dots_frame(&self) -> &'static str {
+        let idx = (self.elapsed_ms() / DOTS_MS) as usize % DOTS.len();
+        DOTS[idx]
+    }
+
+    /// progress ratio (0.0..=1.0) から段階的にゲージ色を決める。
+    /// 0-25% 赤, -50% 黄, -75% シアン, それ以上は緑。
+    fn progress_color(ratio: f64) -> Color {
+        if ratio < 0.25 {
+            Color::Red
+        } else if ratio < 0.5 {
+            Color::Yellow
+        } else if ratio < 0.75 {
+            Color::Cyan
+        } else {
+            Color::Green
         }
     }
 
@@ -307,40 +371,74 @@ impl TuiState {
             .values()
             .filter(|s| matches!(s, PluginStatus::Failed(_)))
             .count();
+        let syncing_count = self
+            .status_map
+            .values()
+            .filter(|s| matches!(s, PluginStatus::Syncing(_)))
+            .count();
+        // Finished と Failed は両方「処理済み」として ratio に含める。
+        // Failed のみ残るパターンで永遠に 100% に届かない状態を防ぐ。
+        let done_count = finished_count + failed_count;
+        let ratio = if !self.plugins.is_empty() {
+            done_count as f64 / self.plugins.len() as f64
+        } else {
+            1.0
+        };
+        let gauge_color = Self::progress_color(ratio);
+
+        // "syncing..." を dots animation 付きで、末尾に mm:ss と N in flight を足す。
+        let message_trim = message.trim_end_matches(['.', ' ']);
+        let animated_msg = format!("{}{}", message_trim, self.dots_frame());
 
         let title = Paragraph::new(Line::from(vec![
             Span::styled(
                 " rvpm ",
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .bg(gauge_color)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("  {} ", message),
-                Style::default().fg(Color::DarkGray),
+                format!("  {}  ", animated_msg),
+                Style::default().fg(Color::Gray),
             ),
             Span::styled(
                 format!("{}", finished_count),
-                Style::default().fg(Color::Green),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled("/", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("{}", self.plugins.len()),
                 Style::default().fg(Color::White),
             ),
+            if syncing_count > 0 {
+                Span::styled(
+                    format!("  {}{} ", self.spinner_frame(icons.style), syncing_count),
+                    Style::default().fg(Color::Cyan),
+                )
+            } else {
+                Span::raw("  ")
+            },
             if failed_count > 0 {
                 Span::styled(
-                    format!(" ({}err)", failed_count),
-                    Style::default().fg(Color::Red),
+                    format!(" {}err", failed_count),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )
             } else {
                 Span::raw("")
             },
+            Span::styled("   ", Style::default()),
+            Span::styled(
+                format!("⏱ {}", self.elapsed_str()),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]))
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::DarkGray)),
         );
         f.render_widget(title, chunks[0]);
@@ -355,6 +453,10 @@ impl TuiState {
             .unwrap_or(20)
             .min(available);
 
+        // Syncing 行は static な icons.syncing ではなく時間駆動の braille/ascii
+        // スピナーを使う。URL 名自体を薄めに (Waiting) / ボールド (Syncing /
+        // Failed) と段階的にハイライトして、どれがアクティブか視覚的に判別しやすくする。
+        let spinner_char = self.spinner_frame(icons.style);
         let rows: Vec<Row> = self
             .plugins
             .iter()
@@ -364,24 +466,61 @@ impl TuiState {
                     .get(url)
                     .cloned()
                     .unwrap_or(PluginStatus::Waiting);
-                let (icon, color, msg) = match &status {
-                    PluginStatus::Waiting => {
-                        (icons.waiting, Color::DarkGray, "Waiting...".to_string())
-                    }
-                    PluginStatus::Syncing(m) => (icons.syncing, Color::Cyan, m.clone()),
-                    PluginStatus::Finished => {
-                        (icons.finished, Color::Green, "Finished".to_string())
-                    }
-                    PluginStatus::Failed(e) => (icons.failed, Color::Red, e.clone()),
+                let (icon, icon_color, url_style, msg, msg_color) = match &status {
+                    PluginStatus::Waiting => (
+                        icons.waiting,
+                        Color::DarkGray,
+                        Style::default().fg(Color::DarkGray),
+                        "Waiting…".to_string(),
+                        Color::DarkGray,
+                    ),
+                    PluginStatus::Syncing(m) => (
+                        spinner_char,
+                        Color::Cyan,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                        m.clone(),
+                        Color::Cyan,
+                    ),
+                    PluginStatus::Finished => (
+                        icons.finished,
+                        Color::Green,
+                        Style::default().fg(Color::Gray),
+                        "Finished".to_string(),
+                        Color::DarkGray,
+                    ),
+                    PluginStatus::Failed(e) => (
+                        icons.failed,
+                        Color::Red,
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        e.clone(),
+                        Color::Red,
+                    ),
                 };
                 Row::new(vec![
-                    Cell::from(format!(" {} ", icon)).style(Style::default().fg(color)),
-                    Cell::from(url.as_str()).style(Style::default().fg(Color::White)),
-                    Cell::from(msg).style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(format!(" {} ", icon))
+                        .style(Style::default().fg(icon_color).add_modifier(Modifier::BOLD)),
+                    Cell::from(url.as_str()).style(url_style),
+                    Cell::from(msg).style(Style::default().fg(msg_color)),
                 ])
             })
             .collect();
 
+        // Plugins テーブル枠:
+        //  - 失敗あり: 赤
+        //  - 1 つでも sync 中: gauge_color (進行度に応じて赤→黄→シアン→緑)
+        //  - 全 Waiting (ジョブまだ始まってない): DarkGray
+        //  - 全 Finished: 緑
+        let table_border_color = if failed_count > 0 {
+            Color::Red
+        } else if syncing_count > 0 {
+            gauge_color
+        } else if done_count == self.plugins.len() && !self.plugins.is_empty() {
+            Color::Green
+        } else {
+            Color::DarkGray
+        };
         let table = Table::new(
             rows,
             [
@@ -392,9 +531,21 @@ impl TuiState {
         )
         .block(
             Block::default()
-                .title(" Plugins ")
+                .title(Line::from(vec![
+                    Span::styled(
+                        " Plugins ",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("({} in flight) ", syncing_count),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta)),
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(table_border_color)),
         )
         .row_highlight_style(
             Style::default()
@@ -403,15 +554,30 @@ impl TuiState {
         );
         f.render_stateful_widget(table, chunks[1], &mut self.table_state);
 
-        let ratio = if !self.plugins.is_empty() {
-            finished_count as f64 / self.plugins.len() as f64
-        } else {
-            1.0
-        };
+        // progress gauge: 色はプログレスでグラデーション、ラベルに x/y と percent。
+        let percent = (ratio * 100.0).round() as u16;
         let gauge = Gauge::default()
-            .block(Block::default().borders(Borders::ALL))
-            .gauge_style(Style::default().fg(Color::Cyan))
-            .ratio(ratio);
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(gauge_color)),
+            )
+            .gauge_style(
+                Style::default()
+                    .fg(gauge_color)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .label(Span::styled(
+                // percent と揃えるため done_count (finished + failed) を使う。
+                // finished だけだと failed がある時に `100%   8/9` のような
+                // 矛盾した表示になる。
+                format!("{:>3}%   {}/{}", percent, done_count, self.plugins.len()),
+                Style::default()
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .ratio(ratio.clamp(0.0, 1.0));
         f.render_widget(gauge, chunks[2]);
     }
 
@@ -807,6 +973,54 @@ mod tests {
         let mut state = TuiState::new(vec!["test".to_string()]);
         state.update_status("test", PluginStatus::Failed("Error".to_string()));
         assert!(matches!(state.status_map["test"], PluginStatus::Failed(_)));
+    }
+
+    #[test]
+    fn test_progress_color_buckets() {
+        assert_eq!(TuiState::progress_color(0.0), Color::Red);
+        assert_eq!(TuiState::progress_color(0.24), Color::Red);
+        assert_eq!(TuiState::progress_color(0.25), Color::Yellow);
+        assert_eq!(TuiState::progress_color(0.49), Color::Yellow);
+        assert_eq!(TuiState::progress_color(0.5), Color::Cyan);
+        assert_eq!(TuiState::progress_color(0.74), Color::Cyan);
+        assert_eq!(TuiState::progress_color(0.75), Color::Green);
+        assert_eq!(TuiState::progress_color(1.0), Color::Green);
+    }
+
+    #[test]
+    fn test_elapsed_str_format() {
+        // 起動直後なら 00:00、60 秒経てば 01:00 の形で mm:ss を出す
+        let state = TuiState::new(vec!["a".to_string()]);
+        let s = state.elapsed_str();
+        assert!(s.len() == 5 && s.as_bytes()[2] == b':', "got {}", s);
+        // 時間は 00:00 前後 (テスト実行で消費するマイクロ秒は無視できる)
+        assert_eq!(&s[0..3], "00:");
+    }
+
+    #[test]
+    fn test_spinner_frame_varies_over_time() {
+        use crate::config::IconStyle;
+        // 直接内部を触れないので、同一インスタンスから 2 回連続で取っても常に SPINNER_BRAILLE の要素であることだけ確認
+        let state = TuiState::new(vec!["a".to_string()]);
+        let frame = state.spinner_frame(IconStyle::Nerd);
+        assert!(
+            SPINNER_BRAILLE.contains(&frame),
+            "unexpected frame {}",
+            frame
+        );
+        let ascii_frame = state.spinner_frame(IconStyle::Ascii);
+        assert!(
+            SPINNER_ASCII.contains(&ascii_frame),
+            "ascii frame not in set: {}",
+            ascii_frame
+        );
+    }
+
+    #[test]
+    fn test_dots_frame_cycles() {
+        let state = TuiState::new(vec!["a".to_string()]);
+        let d = state.dots_frame();
+        assert!(DOTS.contains(&d));
     }
 
     #[test]

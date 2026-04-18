@@ -43,6 +43,18 @@ Sleep 500ms
 Enter
 Sleep 3s
 
+# Silently seed more plugins by appending to config.toml without cloning.
+# This way the sync demo below (S from the list TUI) has enough fresh
+# rows to actually show the spinner + gradient gauge for a few seconds.
+Hide
+Type `printf '\n[[plugins]]\nurl = "%s"\n' nvim-lua/plenary.nvim stevearc/oil.nvim MunifTanjim/nui.nvim lewis6991/gitsigns.nvim nvim-tree/nvim-tree.lua echasnovski/mini.nvim >> ~/.config/rvpm/nvim/config.toml`
+Enter
+Sleep 300ms
+Type "clear"
+Enter
+Sleep 200ms
+Show
+
 # 3. List TUI
 Type "rvpm list"
 Sleep 500ms
@@ -70,6 +82,18 @@ Type "?"
 Sleep 3s
 Type "?"
 Sleep 500ms
+
+# Trigger a full sync (S) from the list TUI to show the animated sync UI:
+# spinner frames, gradient gauge (red → yellow → cyan → green), elapsed
+# timer, rounded borders. 6 of the 9 plugins are not cloned yet (config
+# was seeded via raw append), so the fresh clones keep the animation
+# running long enough to see the spinner rotate and the gauge walk
+# through all four colour buckets.
+Type "S"
+Sleep 8s
+# "Press any key to return to list..." prompt
+Enter
+Sleep 1500ms
 
 # Quit list
 Type "q"
