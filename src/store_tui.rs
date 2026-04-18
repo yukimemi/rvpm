@@ -150,6 +150,29 @@ fn parse_tag_name(tag: &str) -> String {
         .collect()
 }
 
+/// リスト行のセル表示用に問題のある Unicode スカラを落とす。
+///
+/// nerd font の Private Use Area (U+E000-F8FF 等) は `unicode-width` が幅 1 と
+/// 答える一方で、nerd font を積んだ端末は 2 セルで描画するため、テーブル内に
+/// 1 つでも混じると後続の列が累積的にずれてしまう (terminal と ratatui の
+/// 合意が崩れる)。見た目より整列を優先して、該当レンジを抜く。
+fn sanitize_cell_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            let code = *c as u32;
+            // BMP PUA
+            !(0xE000..=0xF8FF).contains(&code)
+                // Supplementary PUA-A / PUA-B
+                && !(0xF0000..=0xFFFFD).contains(&code)
+                && !(0x100000..=0x10FFFD).contains(&code)
+                // Variation selectors (FE00-FE0F, E0100-E01EF) — nerd font 絵文字の
+                // 後ろにくっついて幅計算を乱すことがある。
+                && !(0xFE00..=0xFE0F).contains(&code)
+                && !(0xE0100..=0xE01EF).contains(&code)
+        })
+        .collect()
+}
+
 /// `<img ... alt="..." ...>` から `alt` 属性の値を取り出す。
 /// クォート必須、エスケープ非対応。UTF-8 安全 (`=` / クォートは ASCII)。
 fn extract_alt(tag: &str) -> Option<String> {
@@ -593,7 +616,9 @@ impl StoreTuiState {
             .iter()
             .map(|repo| {
                 let desc = repo.description.as_deref().unwrap_or("");
-                let desc_truncated: String = desc.chars().take(40).collect();
+                // PUA / VS 除去してから char 数で truncate。これで terminal 描画幅と
+                // ratatui の見積もり幅が一致し、以降の列が累積ずれしない。
+                let desc_truncated: String = sanitize_cell_text(desc).chars().take(40).collect();
                 let installed_cell = if self.is_installed(repo) {
                     ratatui::widgets::Cell::from(Span::styled(
                         "\u{2713}",
@@ -602,19 +627,21 @@ impl StoreTuiState {
                 } else {
                     ratatui::widgets::Cell::from(" ")
                 };
-                let topics_str: String = repo
-                    .topics
-                    .iter()
-                    .take(3)
-                    .map(|t| format!("#{}", t))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let topics_str: String = sanitize_cell_text(
+                    &repo
+                        .topics
+                        .iter()
+                        .take(3)
+                        .map(|t| format!("#{}", t))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+                let name_str = sanitize_cell_text(repo.plugin_name());
                 Row::new(vec![
                     installed_cell,
                     ratatui::widgets::Cell::from(format!(" \u{2605}{}", repo.stars_display()))
                         .style(Style::default().fg(Color::Yellow)),
-                    ratatui::widgets::Cell::from(repo.plugin_name().to_string())
-                        .style(Style::default().fg(Color::White)),
+                    ratatui::widgets::Cell::from(name_str).style(Style::default().fg(Color::White)),
                     ratatui::widgets::Cell::from(desc_truncated)
                         .style(Style::default().fg(Color::DarkGray)),
                     ratatui::widgets::Cell::from(topics_str)
@@ -1262,6 +1289,34 @@ mod tests {
         // markdown のインラインコード/カスタム要素は残す
         let out = strip_common_html("<mark>note</mark>");
         assert!(out.contains("<mark>"));
+    }
+
+    // ───── sanitize_cell_text ─────
+
+    #[test]
+    fn test_sanitize_strips_nerd_font_pua() {
+        let input = "icon \u{e801} here";
+        assert_eq!(sanitize_cell_text(input), "icon  here");
+    }
+
+    #[test]
+    fn test_sanitize_strips_variation_selectors() {
+        // U+FE0F (emoji presentation selector) — しばしば width 計算を乱す
+        let input = "gear\u{FE0F} icon";
+        assert_eq!(sanitize_cell_text(input), "gear icon");
+    }
+
+    #[test]
+    fn test_sanitize_keeps_ascii() {
+        let input = "A collection of small qol plugins for Neovim";
+        assert_eq!(sanitize_cell_text(input), input);
+    }
+
+    #[test]
+    fn test_sanitize_keeps_japanese_and_standard_emoji() {
+        // 日本語と通常絵文字 (unicode-width が正しく 2 と判定するもの) は残す
+        let input = "プラグイン 🎉 ready";
+        assert_eq!(sanitize_cell_text(input), input);
     }
 
     #[test]
