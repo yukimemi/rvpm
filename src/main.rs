@@ -1314,22 +1314,25 @@ async fn run_add(
     if let Item::Table(t) = new_plugin {
         plugins.push(t);
     }
-    // on_* フラグがあれば set_plugin_list_field / set_plugin_map_field で追加
+    // on_* フラグがあれば set_plugin_list_field / set_plugin_map_field で追加。
+    // 検索キーは上で書き込んだ `stored_url` に揃える必要がある — `repo` のままだと
+    // `options.url_style = "full"` で `owner/repo` → `https://github.com/owner/repo`
+    // に書き換えたとき entry 名とキーが一致せず、no-op になる。
     let maybe_parse = |raw: Option<String>| -> Result<Option<Vec<String>>> {
         raw.map(|s| parse_cli_string_list(&s)).transpose()
     };
     if let Some(items) = maybe_parse(on_cmd)? {
-        set_plugin_list_field(&mut doc, &repo, "on_cmd", items)?;
+        set_plugin_list_field(&mut doc, &stored_url, "on_cmd", items)?;
     }
     if let Some(items) = maybe_parse(on_ft)? {
-        set_plugin_list_field(&mut doc, &repo, "on_ft", items)?;
+        set_plugin_list_field(&mut doc, &stored_url, "on_ft", items)?;
     }
     if let Some(raw) = on_map {
         let specs = parse_on_map_cli(&raw)?;
-        set_plugin_map_field(&mut doc, &repo, specs)?;
+        set_plugin_map_field(&mut doc, &stored_url, specs)?;
     }
     if let Some(items) = maybe_parse(on_event)? {
-        set_plugin_list_field(&mut doc, &repo, "on_event", items)?;
+        set_plugin_list_field(&mut doc, &stored_url, "on_event", items)?;
     }
 
     let toml_content = doc.to_string();
@@ -1337,14 +1340,22 @@ async fn run_add(
     let wp = chezmoi::write_path(chezmoi_enabled, &config_path);
     std::fs::write(&wp, &toml_content)?;
     chezmoi::apply(&wp, &config_path);
-    println!("Added plugin to config: {}", repo);
+    println!("Added plugin to config: {}", stored_url);
 
     // 追加したプラグインだけ clone + merge し、loader.lua を再生成する
     let config_data = parse_config(&toml_content)?;
     let cache_root = resolve_cache_root(config_data.options.cache_root.as_deref());
     let merged_dir = resolve_merged_dir(&cache_root);
 
-    if let Some(mut plugin) = config_data.plugins.iter().find(|p| p.url == repo).cloned() {
+    // `stored_url` は format_plugin_url で canonical 化された URL なので、
+    // config.toml に書き込んだ entry とそのまま一致する。`repo` (入力のまま) で
+    // 引くと url_style="full" のときミスマッチで clone が走らなくなる。
+    if let Some(mut plugin) = config_data
+        .plugins
+        .iter()
+        .find(|p| p.url == stored_url)
+        .cloned()
+    {
         disable_merge_if_cond(&mut plugin);
         let dst_path = resolve_plugin_dst(&plugin, &cache_root);
 
@@ -4086,6 +4097,47 @@ url = "owner/repo"
             "1要素は配列にしないべき: {}",
             result
         );
+    }
+
+    #[test]
+    fn test_set_plugin_list_field_errors_on_url_mismatch() {
+        // `options.url_style = "full"` のケースで run_add 旧コードが踏んでいた
+        // regression の回帰テスト。
+        //
+        // `format_plugin_url("owner/repo", Full)` は `https://github.com/owner/repo`
+        // を返し、config.toml にはその canonical URL が書き込まれる。続けて
+        // 旧 run_add は入力文字列 (`owner/repo`) をキーに `set_plugin_list_field`
+        // を呼んでいたため、entry が見つからず Err を返し、on_cmd の書き込みと
+        // 後続の clone が両方失敗していた。現在は `stored_url` をキーに使う。
+        //
+        // format_plugin_url → set_plugin_list_field の end-to-end contract を
+        // 壊さないため、canonical URL をハードコードせず format_plugin_url の
+        // 戻り値をそのまま流して両者の一貫性も担保する。
+        use crate::config::UrlStyle;
+        let input = "owner/repo";
+        let stored_url = format_plugin_url(input, UrlStyle::Full);
+        assert_eq!(stored_url, "https://github.com/owner/repo");
+
+        let toml = format!("[[plugins]]\nurl = \"{}\"\n", stored_url);
+
+        // 旧バグ: 入力文字列をそのままキーに渡すと entry が見つからない
+        let mut doc = toml.parse::<DocumentMut>().unwrap();
+        let err = set_plugin_list_field(&mut doc, input, "on_cmd", vec!["Telescope".to_string()]);
+        assert!(
+            err.is_err(),
+            "入力 URL (owner/repo) と entry URL (https://...) が違えば見つからない"
+        );
+
+        // 現行: format_plugin_url の戻り値 (stored_url) をそのまま使えば成功
+        let mut doc = toml.parse::<DocumentMut>().unwrap();
+        set_plugin_list_field(
+            &mut doc,
+            &stored_url,
+            "on_cmd",
+            vec!["Telescope".to_string()],
+        )
+        .unwrap();
+        assert!(doc.to_string().contains("on_cmd = \"Telescope\""));
     }
 
     // -----------------------------------------------------------------
