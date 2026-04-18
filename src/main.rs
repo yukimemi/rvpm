@@ -2787,6 +2787,10 @@ async fn run_store() -> Result<()> {
                 state.readme_loading = true;
                 state.readme_content = None;
                 state.readme_scroll = 0;
+                // Clear widget だけでは ansi-to-tui の styled span の残骸が
+                // 一部ホスト (zellij 等) で残ることがあるため、選択変更時は
+                // ratatui の内部バッファを明示的に無効化して全セル再描画を強制する。
+                terminal.clear()?;
                 let tx = readme_tx.clone();
                 let cache_root_bg = cache_root.clone();
                 tokio::task::spawn_blocking(move || {
