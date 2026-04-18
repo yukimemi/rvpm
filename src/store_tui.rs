@@ -530,13 +530,12 @@ impl StoreTuiState {
 
         let cleaned = strip_common_html(&body);
         self.readme_prepared = format!("{}{}", topics_prefix, cleaned);
-        // pre-wrap の改行数で近似。wrap 後は増えるが scroll 上限としては十分。
-        self.readme_line_count = self
-            .readme_prepared
-            .lines()
-            .count()
-            .try_into()
-            .unwrap_or(u16::MAX);
+        // tui-markdown が実際に生成する Line 数で clamp する。`\n` を数えると
+        // paragraph 内のソフトラップ (改行はあるがブロック境界ではない) まで
+        // カウントしてしまい、G が実内容より遥かに下へ飛ぶ原因になる。
+        // pulldown-cmark + tui-markdown の block 整形を通した後の行数が正確。
+        let rendered = tui_markdown::from_str(&self.readme_prepared);
+        self.readme_line_count = rendered.lines.len().try_into().unwrap_or(u16::MAX);
         self.readme_prepared_key = Some(key);
     }
 
