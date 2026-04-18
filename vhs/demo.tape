@@ -19,10 +19,10 @@
 
 Output demo.gif
 Set Shell "bash"
-Set FontSize 15
+Set FontSize 16
 Set FontFamily "PlemolJP Console NF"
-Set Width 1200
-Set Height 720
+Set Width 900
+Set Height 600
 Set Padding 20
 Set TypingSpeed 50ms
 Set Theme "Catppuccin Mocha"
