@@ -1,0 +1,96 @@
+# rvpm store TUI demo — README GIF
+# Usage: vhs store.tape
+# Note: On Windows, run from WSL (vhs hangs on Set Theme in native Windows).
+# Note: FontFamily must be installed in the system. Adjust if tofu appears.
+
+Output store.gif
+Set Shell "bash"
+Set FontSize 14
+Set FontFamily "PlemolJP Console NF"
+Set Width 1200
+Set Height 720
+Set Padding 20
+Set TypingSpeed 50ms
+Set Theme "Catppuccin Mocha"
+
+# Clean slate and pre-seed a couple of plugins so the ✓ mark has something to show.
+Hide
+Type "rm -rf ~/.config/rvpm ~/.cache/rvpm 2>/dev/null"
+Enter
+Sleep 200ms
+Type "rvpm init --write >/dev/null"
+Enter
+Sleep 2s
+Type "rvpm add folke/snacks.nvim >/dev/null 2>&1"
+Enter
+Sleep 2s
+Type "rvpm add nvim-telescope/telescope.nvim >/dev/null 2>&1"
+Enter
+Sleep 2s
+Type "clear"
+Enter
+Sleep 200ms
+Show
+
+# Launch the store TUI.
+Sleep 500ms
+Type "rvpm store"
+Sleep 500ms
+Enter
+Sleep 5s
+
+# Navigate the plugin list.
+Type "j"
+Sleep 400ms
+Type "j"
+Sleep 400ms
+Type "j"
+Sleep 400ms
+Type "k"
+Sleep 600ms
+
+# Incremental local search.
+Type "/"
+Sleep 300ms
+Type "tele"
+Sleep 1500ms
+Enter
+Sleep 800ms
+
+# Jump between matches with n / N.
+Type "n"
+Sleep 500ms
+Type "n"
+Sleep 500ms
+Type "N"
+Sleep 800ms
+
+# Switch focus to the README pane and scroll.
+Tab
+Sleep 600ms
+Type "j"
+Sleep 300ms
+Type "j"
+Sleep 300ms
+Type "j"
+Sleep 300ms
+Ctrl+d
+Sleep 800ms
+Type "G"
+Sleep 1s
+Type "g"
+Sleep 800ms
+
+# Back to the list.
+Tab
+Sleep 500ms
+
+# Toggle help popup.
+Type "?"
+Sleep 3s
+Type "?"
+Sleep 500ms
+
+# Quit.
+Type "q"
+Sleep 1s

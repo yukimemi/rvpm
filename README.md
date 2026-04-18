@@ -6,11 +6,18 @@
 [![Release](https://github.com/yukimemi/rvpm/actions/workflows/release.yml/badge.svg)](https://github.com/yukimemi/rvpm/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-![demo](demo.gif)
-
 rvpm clones plugins in parallel, links `merge = true` plugins into a single
 runtime-path entry, and ahead-of-time compiles a static `loader.lua` that
 sources everything without any runtime glob cost.
+
+## Demos
+
+| `rvpm init --write` → `add` → `list` | `rvpm store` (plugin browser) |
+|---|---|
+| ![list](demo.gif) | ![store](store.gif) |
+
+GIFs are generated from the `demo.tape` and `store.tape` files with
+[vhs](https://github.com/charmbracelet/vhs) — feel free to tweak and re-record.
 
 ## Why rvpm?
 
@@ -75,11 +82,8 @@ binary into any directory on your `PATH`.
 ## Quick start
 
 ```sh
-# 1. One-time setup (creates both config.toml and init.lua)
+# 1. One-time setup — creates config.toml + wires the loader into init.lua
 rvpm init --write
-# → ~/.config/rvpm/<appname>/config.toml  (plugin configuration)
-# → ~/.config/nvim/init.lua               (loader wiring)
-# <appname> = $RVPM_APPNAME → $NVIM_APPNAME → "nvim"
 
 # 2. Add plugins
 rvpm add folke/snacks.nvim
@@ -94,6 +98,10 @@ rvpm list
 # 5. Open config.toml to tweak settings (lazy, triggers, etc.)
 rvpm config
 ```
+
+Files end up under `~/.config/rvpm/<appname>/` and `~/.cache/rvpm/<appname>/`
+(see [Directory layout](#directory-layout)). `<appname>` resolves to
+`$RVPM_APPNAME` → `$NVIM_APPNAME` → `"nvim"`.
 
 ## Configuration
 
@@ -117,9 +125,9 @@ concurrency = 10
 # source state after mutations (default: false). Requires `chezmoi` in PATH.
 # chezmoi = true
 
+# Optional: run READMEs in the store TUI through an external renderer
+# (mdcat / glow / bat). See "External README renderer" below.
 # [options.store]
-# Optional: run READMEs in the store TUI through an external renderer.
-# See "rvpm store — plugin discovery TUI > External README renderer".
 # readme_command = ["mdcat"]
 
 [[plugins]]
@@ -153,16 +161,10 @@ on_map = [
 
 ### `[options]` reference
 
-rvpm reads `config.toml` from `~/.config/rvpm/<appname>/config.toml`, where
-`<appname>` resolves to:
-
-1. `$RVPM_APPNAME` if set, else
-2. `$NVIM_APPNAME` if set, else
-3. `"nvim"` (default)
-
-This mirrors Neovim's `$NVIM_APPNAME` convention, so running
+rvpm mirrors Neovim's `$NVIM_APPNAME` convention, so
 `NVIM_APPNAME=nvim-test nvim` pairs with `NVIM_APPNAME=nvim-test rvpm sync`
-for fully isolated test configs.
+for fully isolated test configs (see [Directory layout](#directory-layout)
+for where files land).
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -171,33 +173,16 @@ for fully isolated test configs.
 | `concurrency` | `integer` | `8` | Max number of parallel git operations during `sync` / `update`. Kept moderate to avoid GitHub rate limits |
 | `chezmoi` | `boolean` | `false` | When `true`, rvpm automatically runs `chezmoi re-add` (or `chezmoi add` for new files whose ancestor is already managed) after mutating `config.toml`, global hooks, or per-plugin hooks. Warns if `chezmoi` is not in `PATH`. See [chezmoi integration](#chezmoi-integration) |
 
-> **Symmetric layout.** `config_root` and `cache_root` are structurally
-> parallel — each owns a `plugins/` subdirectory at the same depth:
+> **💡 Leave `config_root` / `cache_root` unset.** The defaults are already
+> `<appname>`-aware. Setting a literal path (e.g. `cache_root =
+> "~/dotfiles/rvpm"`) breaks appname isolation — every `$NVIM_APPNAME`
+> variant then shares the same cache. If you need a custom root *and*
+> appname isolation, use a Tera template:
+> `cache_root = "~/dotfiles/rvpm/{{ env.NVIM_APPNAME }}"`.
+> Prefer `~/` over `{{ env.HOME }}` (`~` is portable; `$HOME` isn't set on Windows).
 >
-> ```text
-> ~/.config/rvpm/<appname>/                ← config_root
->     ├── config.toml
->     ├── before.lua       (global, phase 3)
->     ├── after.lua        (global, phase 9)
->     └── plugins/<host>/<owner>/<repo>/   (per-plugin init/before/after.lua)
->
-> ~/.cache/rvpm/<appname>/                 ← cache_root
->     ├── plugins/
->     │   ├── repos/<host>/<owner>/<repo>/  (clones)
->     │   ├── merged/                       (linked rtp for merge=true)
->     │   └── loader.lua                    (generated)
->     └── store/                            (`rvpm store` cache)
-> ```
->
-> **💡 Leave `config_root` and `cache_root` unset** — the defaults are already
-> `<appname>`-aware. Setting a literal path (e.g. `cache_root = "~/dotfiles/rvpm"`)
-> **breaks appname isolation**: every `$NVIM_APPNAME` variant will share the same
-> cache. If you need a custom root *and* appname isolation, use a Tera template:
-> ```toml
-> cache_root = "~/dotfiles/rvpm/{{ env.NVIM_APPNAME }}"
-> ```
-> Prefer `~/` over `{{ env.HOME }}` — `~` is portable (Windows too), while
-> `$HOME` is not set on Windows.
+> See [Directory layout](#directory-layout) below for the full on-disk
+> structure under both roots.
 
 ### chezmoi integration
 
@@ -754,32 +739,29 @@ Beyond ordering, `depends` also affects **loading**:
 
 </details>
 
-## Directory layout (defaults)
+## Directory layout
 
 ```text
 ~/.config/rvpm/<appname>/                    ← config_root
 ├── config.toml                              ← main configuration
-├── before.lua                               ← global before hook (phase 3, auto-detected)
-├── after.lua                                ← global after hook (phase 9, auto-detected)
-└── plugins/
-    └── <host>/<owner>/<repo>/
-        ├── init.lua                         ← per-plugin hooks
-        ├── before.lua
-        └── after.lua
+├── before.lua                               ← global before hook (phase 3)
+├── after.lua                                ← global after hook (phase 9)
+└── plugins/<host>/<owner>/<repo>/
+    ├── init.lua                             ← per-plugin pre-rtp hook
+    ├── before.lua                           ← per-plugin pre-source hook
+    └── after.lua                            ← per-plugin post-source hook
 
 ~/.cache/rvpm/<appname>/                     ← cache_root
 ├── plugins/
 │   ├── repos/<host>/<owner>/<repo>/         ← plugin clones
-│   ├── merged/                              ← linked root for merge=true plugins
+│   ├── merged/                              ← linked rtp for merge=true
 │   └── loader.lua                           ← generated loader
 └── store/                                   ← `rvpm store` cache (search + README)
 ```
 
-Windows uses the same `.config` / `.cache` paths under `%USERPROFILE%` —
-no `%APPDATA%` — to keep dotfiles portable between Linux / macOS / WSL /
+Windows uses the same `.config` / `.cache` paths under `%USERPROFILE%` (no
+`%APPDATA%`) so the same layout is portable across Linux / macOS / WSL /
 Windows.
-
-`<appname>` resolves to `$RVPM_APPNAME` → `$NVIM_APPNAME` → `"nvim"`.
 
 ## Development
 
