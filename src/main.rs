@@ -1227,14 +1227,20 @@ async fn run_add(
     let config_path = rvpm_config_path();
     ensure_config_exists(&config_path)?;
     let toml_content = std::fs::read_to_string(&config_path)?;
-    // url_style を読むため TOML 全体を一度 parse_config で解析する。
-    // パース失敗時は Short にフォールバック (chezmoi や他の mutation と同様に
-    // 設定ファイルが壊れていても add 操作は継続できるようにする)。
-    let url_style = match parse_config(&toml_content) {
-        Ok(cfg) => cfg.options.url_style,
-        Err(_) => crate::config::UrlStyle::default(),
-    };
     let mut doc = toml_content.parse::<DocumentMut>()?;
+    // url_style は DocumentMut から直接読む (parse_config 経由だと Tera 展開と
+    // 全フィールドのデシリアライズが走って無駄。ここでは add に必要な
+    // option だけ拾えればよい)。値が無効 / 読めないなら default (Short)。
+    let url_style = doc
+        .get("options")
+        .and_then(|o| o.get("url_style"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| match s {
+            "short" => Some(crate::config::UrlStyle::Short),
+            "full" => Some(crate::config::UrlStyle::Full),
+            _ => None,
+        })
+        .unwrap_or_default();
     if doc.get("plugins").is_none() {
         doc["plugins"] = toml_edit::ArrayOfTables::new().into();
     }
@@ -2810,13 +2816,52 @@ fn github_owner_repo(url: &str) -> Option<String> {
     if trimmed.contains("://") {
         return None;
     }
+    // スキーム無しの 2 セグメント形式は **owner/repo** のみを受理し、ローカル
+    // パスは除外する。`./foo`, `../foo`, `~/foo`, `/foo`, `\foo`,
+    // `C:/foo` (Windows drive letter) 等を GitHub shorthand と誤認しない
+    // ようガードする。
+    if looks_like_local_path(trimmed) {
+        return None;
+    }
     if trimmed.contains('/') && !trimmed.contains(' ') {
         let parts: Vec<&str> = trimmed.split('/').collect();
-        if parts.len() == 2 {
+        if parts.len() == 2 && is_valid_github_owner(parts[0]) && is_valid_github_repo(parts[1]) {
             return Some(format!("{}/{}", parts[0], parts[1]));
         }
     }
     None
+}
+
+/// ローカルパスっぽい文字列を判定する (GitHub shorthand と区別するため)。
+/// - 先頭が `./` / `../` / `~` / `/` / `\`
+/// - Windows のドライブレター (`C:`, `D:` 等) で始まる
+fn looks_like_local_path(s: &str) -> bool {
+    if s.starts_with("./") || s.starts_with("../") {
+        return true;
+    }
+    if s.starts_with('~') || s.starts_with('/') || s.starts_with('\\') {
+        return true;
+    }
+    // Windows drive letter: `C:`, `d:` 等
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return true;
+    }
+    false
+}
+
+/// GitHub owner 名の許容文字集合 (alphanumeric と hyphen)。
+/// 先頭 `-` は GitHub 側が拒否するので弾く。
+fn is_valid_github_owner(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with('-') && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// GitHub repo 名の許容文字集合 (alphanumeric と `- _ .`)。
+/// owner よりやや緩く、`.` や `_` を受ける。
+fn is_valid_github_repo(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// Plugin URL を GitHub の `owner/repo` 形式 (小文字) に正規化する。
@@ -3418,6 +3463,41 @@ mod tests {
         assert_eq!(
             format_plugin_url("https://gitlab.com/g/h", UrlStyle::Full),
             "https://gitlab.com/g/h"
+        );
+    }
+
+    #[test]
+    fn test_github_owner_repo_rejects_local_paths() {
+        // `./foo`, `../foo`, `~/foo`, `/foo`, `\foo`, `C:/foo` を GitHub shorthand
+        // と誤認しないこと (CodeRabbit major fix)。
+        assert_eq!(github_owner_repo("./foo"), None);
+        assert_eq!(github_owner_repo("../foo"), None);
+        assert_eq!(github_owner_repo("~/foo"), None);
+        assert_eq!(github_owner_repo("/tmp/foo"), None);
+        assert_eq!(github_owner_repo("\\foo\\bar"), None);
+        assert_eq!(github_owner_repo("C:/foo"), None);
+        assert_eq!(github_owner_repo("d:/bar/baz"), None);
+    }
+
+    #[test]
+    fn test_github_owner_repo_rejects_invalid_chars() {
+        // owner / repo の文字集合を超えるものは GitHub shorthand と認めない。
+        // owner は alphanumeric + `-`、repo は + `. _` まで許容。
+        assert_eq!(github_owner_repo("foo bar/baz"), None);
+        assert_eq!(github_owner_repo("-foo/bar"), None); // owner 先頭 `-`
+        assert_eq!(github_owner_repo("foo!/bar"), None); // owner に `!`
+    }
+
+    #[test]
+    fn test_github_owner_repo_accepts_normal_shorthand() {
+        // 正常な owner/repo は従来どおり受理される
+        assert_eq!(
+            github_owner_repo("folke/snacks.nvim"),
+            Some("folke/snacks.nvim".to_string())
+        );
+        assert_eq!(
+            github_owner_repo("nvim-lua/plenary.nvim"),
+            Some("nvim-lua/plenary.nvim".to_string())
         );
     }
 
