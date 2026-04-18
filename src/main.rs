@@ -4109,24 +4109,30 @@ url = "owner/repo"
         // 旧 run_add は入力文字列 (`owner/repo`) をキーに `set_plugin_list_field`
         // を呼んでいたため、entry が見つからず Err を返し、on_cmd の書き込みと
         // 後続の clone が両方失敗していた。現在は `stored_url` をキーに使う。
-        let toml = "[[plugins]]\nurl = \"https://github.com/owner/repo\"\n";
+        //
+        // format_plugin_url → set_plugin_list_field の end-to-end contract を
+        // 壊さないため、canonical URL をハードコードせず format_plugin_url の
+        // 戻り値をそのまま流して両者の一貫性も担保する。
+        use crate::config::UrlStyle;
+        let input = "owner/repo";
+        let stored_url = format_plugin_url(input, UrlStyle::Full);
+        assert_eq!(stored_url, "https://github.com/owner/repo");
+
+        let toml = format!("[[plugins]]\nurl = \"{}\"\n", stored_url);
+
+        // 旧バグ: 入力文字列をそのままキーに渡すと entry が見つからない
         let mut doc = toml.parse::<DocumentMut>().unwrap();
-        let err = set_plugin_list_field(
-            &mut doc,
-            "owner/repo",
-            "on_cmd",
-            vec!["Telescope".to_string()],
-        );
+        let err = set_plugin_list_field(&mut doc, input, "on_cmd", vec!["Telescope".to_string()]);
         assert!(
             err.is_err(),
             "入力 URL (owner/repo) と entry URL (https://...) が違えば見つからない"
         );
 
-        // stored_url で引けば成功することの確認 (現行 run_add 相当)。
+        // 現行: format_plugin_url の戻り値 (stored_url) をそのまま使えば成功
         let mut doc = toml.parse::<DocumentMut>().unwrap();
         set_plugin_list_field(
             &mut doc,
-            "https://github.com/owner/repo",
+            &stored_url,
             "on_cmd",
             vec!["Telescope".to_string()],
         )
