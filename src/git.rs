@@ -74,6 +74,26 @@ impl<'a> Repo<'a> {
             .await
             .map_err(|e| anyhow::anyhow!("head_commit task panicked: {}", e))?
     }
+
+    /// fetch 後の remote tracking branch の tip commit を返す。HEAD は動かさない。
+    ///
+    /// lockfile pin (rev なしで lockfile commit に寄せられているケース) が remote の
+    /// 最新から乖離しているかを run_sync 側で判定するためのヘルパー。
+    /// HEAD を読むわけではないので `head_commit()` と組み合わせて使う:
+    /// `head != remote_head` なら「held back」。
+    ///
+    /// 解決順 (`gix_reset_to_remote` と同じロジック):
+    /// 1. `refs/remotes/<remote>/<current_branch>`
+    /// 2. `refs/remotes/<remote>/HEAD` (detached HEAD 時の fallback)
+    ///
+    /// どちらも解決できない場合は `None` (malformed repo、未 fetch 等)。
+    /// caller は `None` を「判定不能」として扱い held-back 分類から除外する。
+    pub async fn remote_head(&self) -> Result<Option<String>> {
+        let dst = self.dst.to_path_buf();
+        tokio::task::spawn_blocking(move || read_remote_head(&dst))
+            .await
+            .map_err(|e| anyhow::anyhow!("remote_head task panicked: {}", e))?
+    }
 }
 
 /// owner/repo 形式のショートハンドを GitHub URL に変換。
@@ -153,6 +173,32 @@ fn read_head(dst: &Path) -> Result<String> {
     let repo = gix::open(dst)?;
     let head = repo.head_commit()?;
     Ok(head.id().to_string())
+}
+
+/// remote tracking branch の tip を読み取る。HEAD は動かさない。
+/// tracking branch (`refs/remotes/<remote>/<branch>`) が見つからなければ
+/// `refs/remotes/<remote>/HEAD` に fallback。それも無ければ `Ok(None)`。
+fn read_remote_head(dst: &Path) -> Result<Option<String>> {
+    let repo = gix::open(dst)?;
+    let remote_name = repo
+        .find_default_remote(gix::remote::Direction::Fetch)
+        .and_then(|r| r.ok())
+        .and_then(|r| r.name().map(|n| n.as_bstr().to_string()))
+        .unwrap_or_else(|| "origin".to_string());
+
+    if let Some(head_name) = repo.head_name()? {
+        let branch = head_name.as_bstr().to_string();
+        let tracking = branch.replace("refs/heads/", &format!("refs/remotes/{}/", remote_name));
+        if let Ok(mut tr) = repo.find_reference(&tracking) {
+            return Ok(Some(tr.peel_to_id()?.detach().to_string()));
+        }
+    }
+
+    let remote_head_ref = format!("refs/remotes/{}/HEAD", remote_name);
+    if let Ok(mut r) = repo.find_reference(&remote_head_ref) {
+        return Ok(Some(r.peel_to_id()?.detach().to_string()));
+    }
+    Ok(None)
 }
 
 /// before/after の HEAD から `GitChange` を組み立てる。
@@ -694,6 +740,75 @@ mod tests {
         let change = repo.sync().await.unwrap().expect("HEAD moved");
         assert_eq!(change.breaking_subjects.len(), 1, "{:?}", change);
         assert!(change.breaking_subjects[0].contains("feat!: redesign"));
+    }
+
+    async fn git_head(dir: &Path) -> String {
+        let out = git_cmd(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_remote_head_reports_tracking_branch_tip() {
+        // Mirrors the "held back by lockfile pin" scenario: pin to an old
+        // commit, advance the remote, verify that remote_head reflects the
+        // new remote tip while HEAD stays at the pin.
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("a.txt"), "v1").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        let initial = git_head(&src).await;
+
+        // Fresh clone → local HEAD == remote tip.
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        repo.sync().await.unwrap();
+        assert_eq!(
+            repo.remote_head().await.unwrap().as_deref(),
+            Some(initial.as_str()),
+            "fresh clone: remote_head should match HEAD"
+        );
+
+        // Advance the remote by one commit.
+        fs::write(src.join("a.txt"), "v2").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "advance"])
+            .output()
+            .await
+            .unwrap();
+        let new_tip = git_head(&src).await;
+        assert_ne!(new_tip, initial, "remote tip must have moved");
+
+        // Re-sync with the pinned rev: fetch brings the new ref in, but
+        // HEAD stays at `initial`.
+        let pinned = Repo::new(src.to_str().unwrap(), &dst, Some(initial.as_str()));
+        pinned.sync().await.unwrap();
+        assert_eq!(
+            pinned.head_commit().await.unwrap(),
+            initial,
+            "pinned sync must keep HEAD at the requested rev"
+        );
+
+        // remote_head must return the NEW tip, signalling the held-back state.
+        let rh = pinned.remote_head().await.unwrap();
+        assert_eq!(
+            rh.as_deref(),
+            Some(new_tip.as_str()),
+            "remote_head must report the fetched remote tip, not HEAD"
+        );
+        assert_ne!(rh.as_deref(), Some(initial.as_str()));
     }
 
     #[tokio::test]
