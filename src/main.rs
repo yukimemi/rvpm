@@ -9,6 +9,7 @@ mod helptags;
 mod link;
 mod loader;
 mod tui;
+mod update_log;
 
 use crate::config::parse_config;
 use crate::git::Repo;
@@ -246,6 +247,28 @@ enum Commands {
     /// init.lua wiring, and required external tools (nvim / git / chezmoi /
     /// $EDITOR). Exits 0 on all-ok, 1 on any error, 2 on warn-only.
     Doctor,
+
+    /// Show recent sync/update/add changes
+    ///
+    /// Reads the per-run history persisted under `<cache_root>/update_log.json`
+    /// and prints a human-readable digest of plugin commit changes.
+    /// Pass a substring to filter by plugin name.
+    Log {
+        /// Case-insensitive substring filter on plugin display name
+        query: Option<String>,
+
+        /// How many recent runs to show (default: 1, max: 20)
+        #[arg(long, default_value_t = crate::update_log::DEFAULT_LAST)]
+        last: usize,
+
+        /// Show full commit body in addition to subject (currently subject-only)
+        #[arg(long)]
+        full: bool,
+
+        /// Inline `git diff` for changed README/CHANGELOG/doc files
+        #[arg(long)]
+        diff: bool,
+    },
 }
 
 #[tokio::main]
@@ -342,6 +365,14 @@ async fn main() -> Result<()> {
             if code != 0 {
                 std::process::exit(code);
             }
+        }
+        Commands::Log {
+            query,
+            last,
+            full,
+            diff,
+        } => {
+            run_log(query, last, full, diff).await?;
         }
     }
 
@@ -500,7 +531,7 @@ async fn run_sync(prune: bool) -> Result<()> {
             let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
             let res = repo.sync().await;
             match res {
-                Ok(_) => {
+                Ok(change) => {
                     if plugin.build.is_some() {
                         let _ = tx
                             .send((
@@ -524,7 +555,7 @@ async fn run_sync(prune: bool) -> Result<()> {
                             .await;
                     }
                     let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
-                    Ok((plugin, dst_path, build_warn))
+                    Ok((plugin, dst_path, build_warn, change))
                 }
                 Err(e) => {
                     let _ = tx
@@ -559,6 +590,7 @@ async fn run_sync(prune: bool) -> Result<()> {
     }
 
     let mut build_warnings: Vec<(String, String)> = Vec::new();
+    let mut sync_changes: Vec<crate::update_log::ChangeRecord> = Vec::new();
     let mut finished_tasks = 0;
     let dev_count = config.plugins.iter().filter(|p| p.dev).count();
     let total_tasks = config.plugins.len() - dev_count;
@@ -577,9 +609,12 @@ async fn run_sync(prune: bool) -> Result<()> {
             Some((url, status)) = rx.recv() => { tui_state.update_status(&url, status); }
             Some(res) = set.join_next() => {
                 finished_tasks += 1;
-                if let Ok(Ok((plugin, dst_path, build_warn))) = res {
+                if let Ok(Ok((plugin, dst_path, build_warn, git_change))) = res {
                     if let Some(warn) = build_warn {
                         build_warnings.push((plugin.url.clone(), warn));
+                    }
+                    if let Some(change) = git_change {
+                        sync_changes.push(change_record_from(&plugin, change));
                     }
                     // lazy プラグインは merge しない (trigger 前に merged/ 経由で
                     // lua モジュールが rtp に漏れて lazy の意味がなくなるため)
@@ -721,6 +756,12 @@ async fn run_sync(prune: bool) -> Result<()> {
     }
 
     print_merge_conflicts(&merge_conflicts);
+
+    // 並列 spawn 完了順で積まれているので plugin 名で安定 sort。
+    // `rvpm log` の出力が同じ sync 結果に対して常に同じになる。
+    sync_changes.sort_by(|a, b| a.name.cmp(&b.name));
+    record_changes_or_warn(&cache_root, "sync", sync_changes);
+
     print_init_lua_hint_if_missing(&config);
     Ok(())
 }
@@ -1399,9 +1440,9 @@ async fn run_update(query: Option<String>) -> Result<()> {
             let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
             let res = repo.update().await;
             match res {
-                Ok(_) => {
+                Ok(change) => {
                     let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
-                    Ok(())
+                    Ok((plugin, change))
                 }
                 Err(e) => {
                     let _ = tx
@@ -1417,6 +1458,7 @@ async fn run_update(query: Option<String>) -> Result<()> {
 
     let total_tasks = target_plugins.len();
     let mut finished_tasks = 0;
+    let mut update_changes: Vec<crate::update_log::ChangeRecord> = Vec::new();
 
     while finished_tasks < total_tasks {
         terminal.draw(|f| tui_state.draw(f, "updating...", &icons))?;
@@ -1430,7 +1472,12 @@ async fn run_update(query: Option<String>) -> Result<()> {
 
         tokio::select! {
             Some((url, status)) = rx.recv() => { tui_state.update_status(&url, status); }
-            Some(_) = set.join_next() => { finished_tasks += 1; }
+            Some(res) = set.join_next() => {
+                finished_tasks += 1;
+                if let Ok(Ok((plugin, Some(change)))) = res {
+                    update_changes.push(change_record_from(&plugin, change));
+                }
+            }
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
         }
     }
@@ -1439,6 +1486,10 @@ async fn run_update(query: Option<String>) -> Result<()> {
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
+
+    // 並列 spawn 完了順で積まれているので plugin 名で安定 sort (sync と同じ理由)。
+    update_changes.sort_by(|a, b| a.name.cmp(&b.name));
+    record_changes_or_warn(&cache_root, "update", update_changes);
 
     println!("Update complete. Regenerating loader.lua...");
     run_generate().await?;
@@ -1549,6 +1600,7 @@ async fn run_add(
     // `stored_url` は format_plugin_url で canonical 化された URL なので、
     // config.toml に書き込んだ entry とそのまま一致する。`repo` (入力のまま) で
     // 引くと url_style="full" のときミスマッチで clone が走らなくなる。
+    let mut add_changes: Vec<crate::update_log::ChangeRecord> = Vec::new();
     if let Some(mut plugin) = config_data
         .plugins
         .iter()
@@ -1560,21 +1612,29 @@ async fn run_add(
 
         println!("Syncing {}...", plugin.display_name());
         let git_repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
-        if let Err(e) = git_repo.sync().await {
-            eprintln!("Warning: failed to sync '{}': {}", plugin.display_name(), e);
-        } else {
-            if let Some(err) =
-                execute_build_command(&plugin, &dst_path, &config_data, &cache_root).await
-            {
-                eprintln!("Warning: {}: {}", plugin.display_name(), err);
+        match git_repo.sync().await {
+            Err(e) => {
+                eprintln!("Warning: failed to sync '{}': {}", plugin.display_name(), e);
             }
+            Ok(change) => {
+                if let Some(c) = change {
+                    add_changes.push(change_record_from(&plugin, c));
+                }
+                if let Some(err) =
+                    execute_build_command(&plugin, &dst_path, &config_data, &cache_root).await
+                {
+                    eprintln!("Warning: {}: {}", plugin.display_name(), err);
+                }
 
-            // run_add 直後に merge する必要は無い: 末尾で `run_generate()` を呼び、
-            // そこで merged/ を rm -rf して全 eager+merge を再構築するため。
-            // (旧実装はここで merge していたが run_generate に上書きされて冗長)
-            let _ = (&plugin, &dst_path, &merged_dir);
+                // run_add 直後に merge する必要は無い: 末尾で `run_generate()` を呼び、
+                // そこで merged/ を rm -rf して全 eager+merge を再構築するため。
+                // (旧実装はここで merge していたが run_generate に上書きされて冗長)
+                let _ = (&plugin, &dst_path, &merged_dir);
+            }
         }
     }
+
+    record_changes_or_warn(&cache_root, "add", add_changes);
 
     run_generate().await?;
     Ok(())
@@ -2669,6 +2729,47 @@ fn resolve_loader_path(cache_root: &Path) -> PathBuf {
     cache_root.join("plugins").join("loader.lua")
 }
 
+/// `rvpm log` の永続化先。常に `<cache_root>/update_log.json` (loader.lua の親
+/// ディレクトリと同階層 = cache_root 直下、`plugins/` 配下ではない)。
+fn resolve_update_log_path(cache_root: &Path) -> PathBuf {
+    cache_root.join("update_log.json")
+}
+
+/// `Plugin` + `GitChange` から永続化向けの `ChangeRecord` を組み立てる小ヘルパー。
+/// run_sync / run_update / run_add で共通利用。
+fn change_record_from(
+    plugin: &crate::config::Plugin,
+    change: crate::git::GitChange,
+) -> crate::update_log::ChangeRecord {
+    crate::update_log::ChangeRecord {
+        name: plugin.display_name(),
+        url: plugin.url.clone(),
+        from: change.from,
+        to: change.to,
+        subjects: change.subjects,
+        breaking_subjects: change.breaking_subjects,
+        doc_files_changed: change.doc_files_changed,
+    }
+}
+
+/// `record_run` を呼び、書き込み失敗時は警告を出すだけで panic / 操作中断はしない。
+/// 1 件の git 操作も発生しなかった (= changes が空) 場合でも run の事実は残す。
+fn record_changes_or_warn(
+    cache_root: &Path,
+    command: &str,
+    changes: Vec<crate::update_log::ChangeRecord>,
+) {
+    let path = resolve_update_log_path(cache_root);
+    if let Err(e) = crate::update_log::record_run(&path, command, changes) {
+        eprintln!(
+            "\u{26a0} update_log: failed to record {} run at {}: {}",
+            command,
+            path.display(),
+            e
+        );
+    }
+}
+
 /// repos の親ディレクトリ。`<cache_root>/plugins/repos`。
 fn resolve_repos_dir(cache_root: &Path) -> PathBuf {
     cache_root.join("plugins").join("repos")
@@ -3195,6 +3296,115 @@ fn format_plugin_url(input: &str, style: crate::config::UrlStyle) -> String {
         },
         None => input.to_string(),
     }
+}
+
+/// `rvpm log [query] [--last N] [--full] [--diff]` 本体。
+///
+/// 永続化 JSON を読み、`--diff` が指定されていれば対象 doc files の patch を
+/// `git diff <from>..<to> -- <file>` で 1 ファイルずつ取得し、整形して stdout に出す。
+async fn run_log(query: Option<String>, last: usize, full: bool, diff: bool) -> Result<()> {
+    // config.toml は **1 回だけ** 読む。resilience 原則: 壊れていても log は見える
+    // べきなので `Option<Config>` にして以降は参照使い回し。
+    let config_path = rvpm_config_path();
+    let config: Option<crate::config::Config> = if config_path.exists() {
+        match std::fs::read_to_string(&config_path) {
+            Ok(toml_content) => parse_config(&toml_content).ok(),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let cache_root = config
+        .as_ref()
+        .map(|c| resolve_cache_root(c.options.cache_root.as_deref()))
+        .unwrap_or_else(|| resolve_cache_root(None));
+    let icons = config.as_ref().map(|c| c.options.icons).unwrap_or_default();
+    let log_path = resolve_update_log_path(&cache_root);
+
+    let log = crate::update_log::load_log(&log_path);
+    // 上限を超える `--last` は MAX_RUNS に丸める。
+    let last = last.clamp(1, crate::update_log::MAX_RUNS);
+    // query の lowercase も 1 回だけ。
+    let query_lower: Option<String> = query.as_deref().map(|q| q.to_lowercase());
+    let matches_query = |name: &str| -> bool {
+        match &query_lower {
+            Some(q) => name.to_lowercase().contains(q.as_str()),
+            None => true,
+        }
+    };
+
+    // `--diff` 用の patch 取得は表示順 (新しい run から最大 `last` 件) にだけ実施し、
+    // クエリでフィルタされたプラグインに限る (無駄な git diff を避ける)。
+    // key は (url, from, to, file) で run を区別する。`--last 2 --diff` 時に同じ
+    // plugin の同じ doc file が複数 run で変わっていても patch が上書きされない。
+    let mut diffs: std::collections::HashMap<crate::update_log::DiffKey, String> =
+        std::collections::HashMap::new();
+    if diff {
+        let mut shown = 0;
+        for run in log.runs.iter().rev() {
+            if shown >= last {
+                break;
+            }
+            if !run.changes.iter().any(|c| matches_query(&c.name)) {
+                continue;
+            }
+            shown += 1;
+            for change in &run.changes {
+                if !matches_query(&change.name) {
+                    continue;
+                }
+                // 新規 clone (from = None) は from..to を作れないので skip
+                let Some(from) = change.from.as_deref() else {
+                    continue;
+                };
+                if change.doc_files_changed.is_empty() {
+                    continue;
+                }
+                // dst_path は事前パース済み config から解決。config が無ければ skip。
+                let Some(cfg) = config.as_ref() else { continue };
+                let Some(plugin) = cfg.plugins.iter().find(|p| p.url == change.url) else {
+                    continue;
+                };
+                let dst_path = resolve_plugin_dst(plugin, &cache_root);
+                for file in &change.doc_files_changed {
+                    let output = tokio::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&dst_path)
+                        .args(["diff", &format!("{}..{}", from, change.to), "--", file])
+                        .output()
+                        .await;
+                    if let Ok(out) = output
+                        && out.status.success()
+                    {
+                        let patch = String::from_utf8_lossy(&out.stdout).to_string();
+                        diffs.insert(
+                            crate::update_log::DiffKey {
+                                url: change.url.clone(),
+                                from: from.to_string(),
+                                to: change.to.clone(),
+                                file: file.clone(),
+                            },
+                            patch,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let opts = crate::update_log::LogRenderOptions {
+        last,
+        query: query.as_deref(),
+        full,
+        diff,
+        diffs,
+        icons,
+        now: std::time::SystemTime::now(),
+    };
+    let rendered = crate::update_log::render_log(&log, &opts);
+    print!("{}", rendered);
+    Ok(())
 }
 
 async fn run_browse() -> Result<bool> {
@@ -4846,5 +5056,102 @@ url = "owner/repo"
 "#;
         let config = crate::config::parse_config(toml).unwrap();
         assert!(config.options.auto_clean);
+    }
+
+    // ================================================================
+    // update_log wiring
+    // ================================================================
+
+    #[test]
+    fn test_resolve_update_log_path_is_cache_root_sibling() {
+        let cache = std::path::PathBuf::from("/tmp/cache_root");
+        let p = resolve_update_log_path(&cache);
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/tmp/cache_root/update_log.json")
+        );
+        // loader.lua の親 (= /tmp/cache_root/plugins/) には居ない
+        let loader = resolve_loader_path(&cache);
+        assert_ne!(p.parent(), loader.parent());
+    }
+
+    #[test]
+    fn test_change_record_from_preserves_fields() {
+        let plugin = Plugin {
+            url: "folke/snacks.nvim".to_string(),
+            name: Some("snacks".to_string()),
+            ..Default::default()
+        };
+        let change = crate::git::GitChange {
+            from: Some("aaaaaaa".to_string()),
+            to: "bbbbbbb".to_string(),
+            subjects: vec!["fix: x".to_string()],
+            breaking_subjects: vec![],
+            doc_files_changed: vec!["README.md".to_string()],
+        };
+        let rec = change_record_from(&plugin, change);
+        assert_eq!(rec.name, "snacks");
+        assert_eq!(rec.url, "folke/snacks.nvim");
+        assert_eq!(rec.from.as_deref(), Some("aaaaaaa"));
+        assert_eq!(rec.to, "bbbbbbb");
+        assert_eq!(rec.subjects, vec!["fix: x".to_string()]);
+        assert_eq!(rec.doc_files_changed, vec!["README.md".to_string()]);
+    }
+
+    #[test]
+    fn test_change_record_from_uses_default_name_when_no_name() {
+        let plugin = Plugin {
+            url: "https://github.com/owner/Repo.git".to_string(),
+            ..Default::default()
+        };
+        let change = crate::git::GitChange {
+            from: None,
+            to: "deadbee".to_string(),
+            subjects: vec![],
+            breaking_subjects: vec![],
+            doc_files_changed: vec![],
+        };
+        let rec = change_record_from(&plugin, change);
+        // default_name は `.git` を剥がして最終セグメントを返す
+        assert_eq!(rec.name, "Repo");
+        assert!(rec.from.is_none());
+    }
+
+    #[test]
+    fn test_record_changes_or_warn_writes_file() {
+        // 空 changes は file 自体を作らない方針 (有用履歴を押し出さないため)。
+        // 非空 changes 1 件渡したらきちんと書かれることを確認。
+        let dir = tempdir().unwrap();
+        let cache_root = dir.path().to_path_buf();
+        record_changes_or_warn(
+            &cache_root,
+            "sync",
+            vec![crate::update_log::ChangeRecord {
+                name: "x".into(),
+                url: "owner/x".into(),
+                from: Some("a".into()),
+                to: "b".into(),
+                subjects: vec!["fix: x".into()],
+                breaking_subjects: vec![],
+                doc_files_changed: vec![],
+            }],
+        );
+        let path = resolve_update_log_path(&cache_root);
+        assert!(path.exists(), "expected log file for non-empty changes");
+        let log = crate::update_log::load_log(&path);
+        assert_eq!(log.runs.len(), 1);
+        assert_eq!(log.runs[0].command, "sync");
+    }
+
+    #[test]
+    fn test_record_changes_or_warn_skips_empty() {
+        let dir = tempdir().unwrap();
+        let cache_root = dir.path().to_path_buf();
+        record_changes_or_warn(&cache_root, "sync", vec![]);
+        let path = resolve_update_log_path(&cache_root);
+        assert!(
+            !path.exists(),
+            "empty changes should not create the log file"
+        );
     }
 }
