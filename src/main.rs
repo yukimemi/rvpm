@@ -483,6 +483,48 @@ async fn execute_build_command(
     }
 }
 
+/// A plugin that sync left at a lockfile-pinned commit while its remote
+/// has advanced. Reported in the sync summary so users know `rvpm update`
+/// would actually change something.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeldBackPin {
+    name: String,
+    pinned: String,
+    remote: String,
+}
+
+/// Decide whether a just-synced plugin is being "held back" by a lockfile
+/// pin. Returns `Some((pinned_commit, remote_tip))` when:
+///
+/// - the plugin has **no explicit `rev`** (not the user's choice),
+/// - the **lockfile contributed** an effective rev (pin came from the lockfile),
+/// - and the pinned HEAD is **behind the remote tracking tip**.
+///
+/// Returns `None` otherwise — explicit `rev`, no lockfile contribution,
+/// already at remote tip, or either commit unknown (treat unknowns as
+/// "not held back" to avoid false positives).
+///
+/// This is the pure classification step; the caller is responsible for
+/// composing the plugin display name and emitting the summary line.
+fn classify_held_back(
+    plugin_rev: Option<&str>,
+    effective_rev: Option<&str>,
+    head_commit: Option<&str>,
+    remote_head: Option<&str>,
+) -> Option<(String, String)> {
+    if plugin_rev.is_some() {
+        return None;
+    }
+    effective_rev?;
+    let head = head_commit?;
+    let remote = remote_head?;
+    if head != remote {
+        Some((head.to_string(), remote.to_string()))
+    } else {
+        None
+    }
+}
+
 async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Result<()> {
     // `--frozen` は lockfile に依存した strict check、`--no-lock` は lockfile を
     // 完全無視する escape hatch。両方立つと「strict のつもりが silently latest を
@@ -664,8 +706,29 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Re
                     // lockfile エントリが新規作成できるよう別途取得する。
                     // 失敗しても sync 本体の成否には影響させない (resilience)。
                     let head_commit = repo.head_commit().await.ok();
+                    // held-back 判定用に remote tracking tip を読む (HEAD は動かさない)。
+                    // 失敗時は None → classify_held_back 側で「判定不能」扱いになり、
+                    // 結果として held_back リストには積まれない (resilience)。
+                    // 分類が None 確定の前提条件 (explicit rev / lockfile 寄与なし) では
+                    // gix open 自体をスキップして 200+ プラグイン構成の I/O を減らす。
+                    let remote_head = if plugin.rev.is_none() && effective_rev.is_some() {
+                        repo.remote_head().await.ok().flatten()
+                    } else {
+                        None
+                    };
+                    let held_back = classify_held_back(
+                        plugin.rev.as_deref(),
+                        effective_rev.as_deref(),
+                        head_commit.as_deref(),
+                        remote_head.as_deref(),
+                    )
+                    .map(|(pinned, remote)| HeldBackPin {
+                        name: plugin.display_name(),
+                        pinned,
+                        remote,
+                    });
                     let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
-                    Ok((plugin, dst_path, build_warn, change, head_commit))
+                    Ok((plugin, dst_path, build_warn, change, head_commit, held_back))
                 }
                 Err(e) => {
                     let _ = tx
@@ -706,6 +769,9 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Re
 
     let mut build_warnings: Vec<(String, String)> = Vec::new();
     let mut sync_changes: Vec<crate::update_log::ChangeRecord> = Vec::new();
+    // lockfile pin で最新から置いてけぼりになっているプラグインを集めて、sync 末尾に
+    // まとめて「`rvpm update` で進めて」と案内する (罠の緩和)。
+    let mut held_back: Vec<HeldBackPin> = Vec::new();
     let mut finished_tasks = 0;
     let dev_count = config.plugins.iter().filter(|p| p.dev).count();
     let total_tasks = config.plugins.len() - dev_count;
@@ -724,12 +790,15 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Re
             Some((url, status)) = rx.recv() => { tui_state.update_status(&url, status); }
             Some(res) = set.join_next() => {
                 finished_tasks += 1;
-                if let Ok(Ok((plugin, dst_path, build_warn, git_change, head_commit))) = res {
+                if let Ok(Ok((plugin, dst_path, build_warn, git_change, head_commit, pin))) = res {
                     if let Some(warn) = build_warn {
                         build_warnings.push((plugin.url.clone(), warn));
                     }
                     if let Some(change) = git_change {
                         sync_changes.push(change_record_from(&plugin, change));
+                    }
+                    if let Some(p) = pin {
+                        held_back.push(p);
                     }
                     // lockfile 更新: sync 完了後の現 HEAD を pin として記録。
                     // `--no-lock` 時もこの in-memory 更新は行うが、terminal save は飛ばすので
@@ -826,6 +895,24 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Re
         eprintln!("\n{} plugin(s) promoted lazy -> eager:", promoted.len());
         for name in &sorted_promoted {
             eprintln!("  -> {}", name);
+        }
+    }
+    // lockfile pin で最新から置いてけぼりのプラグインを案内する。`rvpm sync` は
+    // pin を尊重する (= update しない) 設計なので、rev を設定していないユーザーが
+    // 「sync したのに古いまま」と感じる罠を緩和する目的。
+    if !held_back.is_empty() {
+        held_back.sort_by(|a, b| a.name.cmp(&b.name));
+        eprintln!(
+            "\n{} plugin(s) held at lockfile pin (no `rev` set). Run `rvpm update` to advance:",
+            held_back.len()
+        );
+        for pin in &held_back {
+            eprintln!(
+                "  -> {}  {} -> {}",
+                pin.name,
+                crate::update_log::short_hash(&pin.pinned),
+                crate::update_log::short_hash(&pin.remote),
+            );
         }
     }
     println!("Generating loader.lua...");
@@ -4323,6 +4410,66 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    // ─── classify_held_back ──────────────────────────────────────────────
+    // Pure classification of "this plugin is being held back by a lockfile
+    // pin". The integration path is covered by the git::remote_head test
+    // on the git.rs side; these tests nail down the decision table only.
+
+    #[test]
+    fn test_classify_held_back_reports_pin_behind_remote() {
+        // No rev set, lockfile contributed a commit, and HEAD (= pin)
+        // lags behind remote → this is the case users hit.
+        let got = classify_held_back(
+            None,
+            Some("lockcommit"),
+            Some("lockcommit"),
+            Some("newcommit"),
+        );
+        assert_eq!(
+            got,
+            Some(("lockcommit".to_string(), "newcommit".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_classify_held_back_silent_when_explicit_rev_set() {
+        // If the user pinned via `rev`, the lag is intentional — not our
+        // call to flag.
+        let got = classify_held_back(Some("v1.0.0"), Some("v1.0.0"), Some("abc"), Some("def"));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_classify_held_back_silent_without_lockfile_contribution() {
+        // No lockfile entry → sync already reset to remote; there's no pin
+        // holding us back.
+        let got = classify_held_back(None, None, Some("abc"), Some("abc"));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_classify_held_back_silent_when_pin_matches_remote() {
+        // Lockfile pin and remote happen to line up — everyone's up to
+        // date, no reason to nag.
+        let got = classify_held_back(None, Some("abc"), Some("abc"), Some("abc"));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_classify_held_back_silent_when_remote_head_unknown() {
+        // Can't prove the pin is behind if we can't resolve the remote tip.
+        // Prefer silence over a false positive (resilience).
+        let got = classify_held_back(None, Some("abc"), Some("abc"), None);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_classify_held_back_silent_when_head_unknown() {
+        // Same resilience argument in the other direction.
+        let got = classify_held_back(None, Some("abc"), None, Some("def"));
+        assert_eq!(got, None);
     }
 
     #[test]
