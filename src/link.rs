@@ -10,25 +10,10 @@ use std::path::{Path, PathBuf};
 /// 参考: `:help rtp`、`:help runtime`、Neovim core の runtime/ ディレクトリ、
 /// denops.vim 慣習 (`denops/<plugin>/main.ts` を rtp 経由で discover する)。
 const RTP_DIRS: &[&str] = &[
-    "after",
-    "autoload",
-    "colors",
-    "compiler",
+    "after", "autoload", "colors", "compiler",
     "denops", // denops.vim — TypeScript plugin source
-    "doc",
-    "ftdetect",
-    "ftplugin",
-    "indent",
-    "keymap",
-    "lang",
-    "lua",
-    "pack",
-    "parser",
-    "plugin",
-    "queries",
-    "rplugin",
-    "spell",
-    "syntax",
+    "doc", "ftdetect", "ftplugin", "indent", "keymap", "lang", "lua", "pack", "parser", "plugin",
+    "queries", "rplugin", "spell", "syntax",
 ];
 
 /// ファイルをターゲットに張る。同一ボリューム内なら hard link (Windows でも
@@ -259,7 +244,10 @@ mod tests {
         let root = tempdir().unwrap();
         let merged = root.path().join("merged");
         let p = root.path().join("plug");
-        write(&p.join("denops/myplug/main.ts"), "export async function main() {}");
+        write(
+            &p.join("denops/myplug/main.ts"),
+            "export async function main() {}",
+        );
         write(&p.join("denops/myplug/util.ts"), "export const x = 1;");
 
         let r = merge_plugin(&p, &merged).unwrap();
