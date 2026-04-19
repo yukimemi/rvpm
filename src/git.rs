@@ -16,12 +16,28 @@ pub enum RepoStatus {
     Error(String),
 }
 
+/// `Repo::sync` / `Repo::update` の差分情報。`rvpm log` の永続化用。
+///
+/// `from = None` は新規 clone を意味する (commit walk もしないので subjects 等は空)。
+/// `from == to` (no-op の sync / update) の場合、呼び出し側は `Option<GitChange>::None`
+/// を受け取る (Repo 側で「変更なし」を判別して丸める)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitChange {
+    pub from: Option<String>,
+    pub to: String,
+    pub subjects: Vec<String>,
+    pub breaking_subjects: Vec<String>,
+    pub doc_files_changed: Vec<String>,
+}
+
 impl<'a> Repo<'a> {
     pub fn new(url: &'a str, dst: &'a Path, rev: Option<&'a str>) -> Self {
         Self { url, dst, rev }
     }
 
-    pub async fn sync(&self) -> Result<()> {
+    /// clone 済みなら fetch + checkout、未 clone なら shallow clone。
+    /// `Option<GitChange>` で差分を返す。HEAD が動かなかった場合は `None`。
+    pub async fn sync(&self) -> Result<Option<GitChange>> {
         let url = resolve_url(self.url);
         let dst = self.dst.to_path_buf();
         let rev = self.rev.map(|s| s.to_string());
@@ -30,7 +46,9 @@ impl<'a> Repo<'a> {
             .map_err(|e| anyhow::anyhow!("sync task panicked: {}", e))?
     }
 
-    pub async fn update(&self) -> Result<()> {
+    /// 既存 clone のみ受け付けて pull する。`Option<GitChange>` で差分を返す。
+    /// HEAD が動かなかった場合は `None`。
+    pub async fn update(&self) -> Result<Option<GitChange>> {
         let url = resolve_url(self.url);
         let dst = self.dst.to_path_buf();
         let rev = self.rev.map(|s| s.to_string());
@@ -77,34 +95,175 @@ fn resolve_url(url: &str) -> String {
 // status — gix で in-process 実行 (プロセス fork なし)
 // ======================================================
 
-fn sync_impl(url: &str, dst: &Path, rev: Option<&str>) -> Result<()> {
+fn sync_impl(url: &str, dst: &Path, rev: Option<&str>) -> Result<Option<GitChange>> {
     if dst.exists() {
+        let before = read_head(dst).ok();
         fetch_impl(dst)?;
         if let Some(rev) = rev {
             gix_checkout(dst, rev)?;
         } else {
             gix_reset_to_remote(dst)?;
         }
+        let after = read_head(dst)?;
+        Ok(build_change(dst, before, after))
     } else {
         clone_impl(url, dst)?;
         if let Some(rev) = rev {
             gix_checkout(dst, rev)?;
         }
+        let after = read_head(dst)?;
+        // 新規 clone は from = None。subjects は空のまま。
+        Ok(Some(GitChange {
+            from: None,
+            to: after,
+            subjects: Vec::new(),
+            breaking_subjects: Vec::new(),
+            doc_files_changed: Vec::new(),
+        }))
     }
-    Ok(())
 }
 
-fn update_impl(_url: &str, dst: &Path, rev: Option<&str>) -> Result<()> {
+fn update_impl(_url: &str, dst: &Path, rev: Option<&str>) -> Result<Option<GitChange>> {
     if !dst.exists() {
         anyhow::bail!("Plugin not installed: {}", dst.display());
     }
+    let before = read_head(dst).ok();
     fetch_impl(dst)?;
     if let Some(rev) = rev {
         gix_checkout(dst, rev)?;
     } else {
         gix_reset_to_remote(dst)?;
     }
-    Ok(())
+    let after = read_head(dst)?;
+    Ok(build_change(dst, before, after))
+}
+
+/// HEAD の commit hash を読み取る。failure は呼び出し側で None 化することもある。
+fn read_head(dst: &Path) -> Result<String> {
+    let repo = gix::open(dst)?;
+    let head = repo.head_commit()?;
+    Ok(head.id().to_string())
+}
+
+/// before/after の HEAD から `GitChange` を組み立てる。
+/// before == after なら `None` (no-op の sync/update を caller が判別できるように)。
+fn build_change(dst: &Path, before: Option<String>, after: String) -> Option<GitChange> {
+    match before {
+        Some(b) if b == after => None,
+        Some(b) => {
+            let (subjects, breaking) = collect_subjects_and_breaking(dst, &b, &after);
+            let doc_files = doc_files_changed(dst, &b, &after);
+            Some(GitChange {
+                from: Some(b),
+                to: after,
+                subjects,
+                breaking_subjects: breaking,
+                doc_files_changed: doc_files,
+            })
+        }
+        None => Some(GitChange {
+            from: None,
+            to: after,
+            subjects: Vec::new(),
+            breaking_subjects: Vec::new(),
+            doc_files_changed: Vec::new(),
+        }),
+    }
+}
+
+/// `<from>..<to>` を gix で walk し、(subjects, breaking_subjects) を返す。
+/// commit graph の取得や revparse に失敗した場合は空ベクタ (resilience: log は best-effort)。
+fn collect_subjects_and_breaking(dst: &Path, from: &str, to: &str) -> (Vec<String>, Vec<String>) {
+    let mut subjects = Vec::new();
+    let mut breaking = Vec::new();
+
+    let repo = match gix::open(dst) {
+        Ok(r) => r,
+        Err(_) => return (subjects, breaking),
+    };
+    let from_id = match repo.rev_parse_single(from) {
+        Ok(id) => id.detach(),
+        Err(_) => return (subjects, breaking),
+    };
+    let to_id = match repo.rev_parse_single(to) {
+        Ok(id) => id.detach(),
+        Err(_) => return (subjects, breaking),
+    };
+
+    // walk to → ... → from (exclude from itself)
+    let walk = match repo.rev_walk([to_id]).with_hidden([from_id]).all() {
+        Ok(w) => w,
+        Err(_) => return (subjects, breaking),
+    };
+
+    for info in walk.flatten() {
+        let commit = match info.object() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // gix の message_raw_sloppy は subject + body 全部入りの bytes。
+        // subject は最初の改行まで、body は残り。
+        let message = commit.message_raw_sloppy().to_string();
+        let (subject, body) = split_subject_body(&message);
+        let subj_str = subject.trim().to_string();
+        if subj_str.is_empty() {
+            continue;
+        }
+        let is_break = crate::update_log::is_breaking(&subj_str, body);
+        if is_break {
+            breaking.push(subj_str.clone());
+        }
+        subjects.push(subj_str);
+    }
+
+    (subjects, breaking)
+}
+
+fn split_subject_body(msg: &str) -> (&str, &str) {
+    if let Some(idx) = msg.find('\n') {
+        (&msg[..idx], &msg[idx + 1..])
+    } else {
+        (msg, "")
+    }
+}
+
+/// `<from>..<to>` で変更があった README/CHANGELOG/doc 系ファイルの相対パス一覧を返す。
+/// `git diff --name-only` を spawn する (gix の diff API は複雑なため subprocess)。
+/// `git` が PATH に無い / 失敗時は空 Vec (resilience)。
+fn doc_files_changed(dst: &Path, from: &str, to: &str) -> Vec<String> {
+    let output = match std::process::Command::new("git")
+        .arg("-C")
+        .arg(dst)
+        .args([
+            "diff",
+            "--name-only",
+            &format!("{}..{}", from, to),
+            "--",
+            "README*",
+            "readme*",
+            "Readme*",
+            "CHANGELOG*",
+            "changelog*",
+            "Changelog*",
+            "doc/",
+        ])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut files: Vec<String> = stdout
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    files.sort();
+    files.dedup();
+    files
 }
 
 fn clone_impl(url: &str, dst: &Path) -> Result<()> {
@@ -430,11 +589,17 @@ mod tests {
             .unwrap();
 
         let repo = Repo::new(src.to_str().unwrap(), &dst, None);
-        repo.sync().await.unwrap();
+        let change = repo.sync().await.unwrap();
 
         assert!(dst.join("hello.txt").exists());
         let content = fs::read_to_string(dst.join("hello.txt")).unwrap();
         assert_eq!(content, "hello");
+
+        // 新規 clone は from = None で GitChange::Some を返す
+        let c = change.expect("new clone should produce a GitChange");
+        assert!(c.from.is_none());
+        assert!(!c.to.is_empty());
+        assert!(c.subjects.is_empty());
     }
 
     #[tokio::test]
@@ -454,7 +619,12 @@ mod tests {
             .unwrap();
 
         let repo = Repo::new(src.to_str().unwrap(), &dst, None);
-        repo.sync().await.unwrap();
+        let initial = repo.sync().await.unwrap();
+        assert!(initial.is_some(), "first sync = clone produces a change");
+
+        // 同じ HEAD で再 sync → no-op (None)
+        let noop = repo.sync().await.unwrap();
+        assert!(noop.is_none(), "no-op sync should yield None");
 
         // src を更新
         fs::write(src.join("hello.txt"), "updated").unwrap();
@@ -465,10 +635,87 @@ mod tests {
             .await
             .unwrap();
 
-        // 再 sync
-        repo.sync().await.unwrap();
+        // 再 sync で差分発生
+        let updated = repo.sync().await.unwrap().expect("HEAD moved");
+        assert!(updated.from.is_some(), "from should be the previous HEAD");
+        assert_ne!(updated.from.as_deref(), Some(updated.to.as_str()));
+        assert!(
+            updated.subjects.iter().any(|s| s.contains("update")),
+            "subjects should contain the new commit, got {:?}",
+            updated.subjects
+        );
 
         let content = fs::read_to_string(dst.join("hello.txt")).unwrap();
         assert_eq!(content, "updated");
+    }
+
+    #[tokio::test]
+    async fn test_sync_breaking_commit_detected() {
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("hello.txt"), "v1").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        repo.sync().await.unwrap();
+
+        // bang 形式の breaking commit を 1 件追加
+        fs::write(src.join("hello.txt"), "v2").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "feat!: redesign"])
+            .output()
+            .await
+            .unwrap();
+
+        let change = repo.sync().await.unwrap().expect("HEAD moved");
+        assert_eq!(change.breaking_subjects.len(), 1, "{:?}", change);
+        assert!(change.breaking_subjects[0].contains("feat!: redesign"));
+    }
+
+    #[tokio::test]
+    async fn test_update_returns_change_or_none() {
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("a.txt"), "a").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+
+        // sync first to install
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        repo.sync().await.unwrap();
+
+        // update with no remote changes → None
+        assert!(repo.update().await.unwrap().is_none());
+
+        // bump remote
+        fs::write(src.join("a.txt"), "b").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "bump"])
+            .output()
+            .await
+            .unwrap();
+
+        let c = repo.update().await.unwrap().expect("HEAD moved");
+        assert!(c.from.is_some());
+        assert!(c.subjects.iter().any(|s| s.contains("bump")));
     }
 }
