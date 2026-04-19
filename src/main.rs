@@ -3246,10 +3246,7 @@ async fn run_log(query: Option<String>, last: usize, full: bool, diff: bool) -> 
         .as_ref()
         .map(|c| resolve_cache_root(c.options.cache_root.as_deref()))
         .unwrap_or_else(|| resolve_cache_root(None));
-    let icons = config
-        .as_ref()
-        .map(|c| c.options.icons)
-        .unwrap_or_default();
+    let icons = config.as_ref().map(|c| c.options.icons).unwrap_or_default();
     let log_path = resolve_update_log_path(&cache_root);
 
     let log = crate::update_log::load_log(&log_path);

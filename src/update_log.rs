@@ -169,9 +169,7 @@ pub fn format_rfc3339_utc(t: SystemTime) -> String {
 pub fn parse_rfc3339_utc(s: &str) -> Option<SystemTime> {
     // 期待: "YYYY-MM-DDTHH:MM:SSZ" (20 chars) or with "+00:00" (25 chars)
     let s = s.trim();
-    let core = s
-        .strip_suffix('Z')
-        .or_else(|| s.strip_suffix("+00:00"))?;
+    let core = s.strip_suffix('Z').or_else(|| s.strip_suffix("+00:00"))?;
     // ASCII 前提の byte-range 切り出しをするので、ASCII であることを先に検証。
     // 非 ASCII の multi-byte 文字が 19 byte に偶然フィットすると `core[0..4]`
     // が char boundary で panic するため。
@@ -714,7 +712,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("update_log.json");
         record_run(&path, "sync", vec![]).unwrap();
-        assert!(!path.exists(), "update_log.json should not be created for empty run");
+        assert!(
+            !path.exists(),
+            "update_log.json should not be created for empty run"
+        );
     }
 
     #[test]
