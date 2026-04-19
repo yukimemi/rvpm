@@ -269,6 +269,10 @@ commit、それも無ければ default branch の HEAD を pull する。
   fallback (resilience)。
 - `dev = true` プラグインは lockfile 対象外 (ローカル work in progress なので
   commit hash を pin する意味が無い)。
+- `options.chezmoi = true` のとき、lockfile も config.toml / hook と同じく
+  `chezmoi::write_path` + `chezmoi::apply` 経由で source 側に書いてから target に
+  反映する。これをやらないと chezmoi の「source が truth」原則と衝突して、
+  次回 `chezmoi apply` で古い lockfile に巻き戻る。
 
 ### helptags 自動生成 (`src/helptags.rs`)
 
