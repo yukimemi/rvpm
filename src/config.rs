@@ -34,7 +34,7 @@ pub enum UrlStyle {
     Full,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone)]
 pub struct Options {
     /// per-plugin init/before/after.lua の置き場。
     /// 未指定なら `~/.config/rvpm/<appname>/plugins`。
@@ -75,6 +75,25 @@ pub struct Options {
     /// `rvpm browse` の README preview 用オプション。
     #[serde(default)]
     pub browse: BrowseOptions,
+}
+
+impl Default for Options {
+    /// `Options::default()` は serde の `#[serde(default = ...)]` と一致させる。
+    /// 特に `auto_helptags` は serde では `true` がデフォルトなので、derive Default
+    /// を使うと `false` になり parse 経由 vs 直接構築で挙動が分かれる。
+    fn default() -> Self {
+        Self {
+            config_root: None,
+            concurrency: None,
+            cache_root: None,
+            icons: IconStyle::default(),
+            chezmoi: false,
+            auto_clean: false,
+            auto_helptags: default_auto_helptags(),
+            url_style: UrlStyle::default(),
+            browse: BrowseOptions::default(),
+        }
+    }
 }
 
 /// `[options.browse]` 以下に置く、`rvpm browse` TUI 固有の設定。

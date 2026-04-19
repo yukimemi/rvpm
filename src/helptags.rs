@@ -90,10 +90,14 @@ pub async fn build_helptags(
     ));
     std::fs::write(&tmp_path, &script)?;
 
-    let source_arg = format!(
-        "source {}",
-        tmp_path.display().to_string().replace('\\', "/")
-    );
+    // tmp_path に空白や Vim 特殊文字が混じっても壊れないよう fnameescape() で wrap。
+    // Windows の TEMP が "C:\Users\foo bar\..." 形式になるケースを想定。
+    let escaped_path = tmp_path
+        .display()
+        .to_string()
+        .replace('\\', "/")
+        .replace('\'', "''");
+    let source_arg = format!("execute 'source ' . fnameescape('{}')", escaped_path);
     let result = tokio::process::Command::new("nvim")
         .args(["--headless", "--clean", "-c", &source_arg, "-c", "qa!"])
         .output()
