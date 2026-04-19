@@ -159,7 +159,7 @@ integration, and the external README renderer — see
 
 | Command | Description |
 |---|---|
-| `rvpm sync [--prune] [--frozen] [--no-lock]` | Clone/pull plugins and regenerate `loader.lua`. `--prune` deletes unused plugin directories. `--frozen` errors out if any non-dev plugin is missing from `rvpm.lock` (CI reproducibility). `--no-lock` ignores the lockfile entirely |
+| `rvpm sync [--prune] [--frozen] [--no-lock] [--rebuild]` | Clone/pull plugins and regenerate `loader.lua`. `--prune` deletes unused plugin directories. `--frozen` errors out if any non-dev plugin is missing from `rvpm.lock` (CI reproducibility). `--no-lock` ignores the lockfile entirely. By default `build` commands are skipped when a pull is a no-op (saves time on configs with heavy `:TSUpdate`-style hooks); `--rebuild` forces every `build` to run regardless |
 | `rvpm generate` | Regenerate `loader.lua` only (skip git operations) |
 | `rvpm clean` | Delete plugin directories no longer referenced by `config.toml` (no git, faster than `sync --prune` on 200+ plugins) |
 | `rvpm add <repo>` | Add a plugin and sync (records the new plugin's commit to `rvpm.lock`) |
@@ -519,6 +519,7 @@ readme_command = ["mdcat"]
 | `e` | Edit per-plugin hooks (init / before / after.lua) |
 | `s` | Set plugin options (lazy, merge, on_cmd, …) |
 | `S` | Sync all plugins |
+| `R` | Sync all plugins with `--rebuild` (force-run every `build` command, even no-op pulls) |
 | `u` | Update selected plugin |
 | `U` | Update all plugins |
 | `d` | Remove selected plugin |

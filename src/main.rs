@@ -73,6 +73,12 @@ enum Commands {
         /// Ignore rvpm.lock entirely: pull latest and do not write the lockfile
         #[arg(long)]
         no_lock: bool,
+        /// Run each plugin's `build` command even when git HEAD did not move.
+        /// By default `sync` skips build for plugins whose pull was a no-op,
+        /// which makes "nothing changed" syncs much faster. Use this when you
+        /// need to rerun e.g. `:TSUpdate` or a manual rebuild step.
+        #[arg(long)]
+        rebuild: bool,
     },
 
     /// Regenerate loader.lua only (no git)
@@ -289,8 +295,9 @@ async fn main() -> Result<()> {
             prune,
             frozen,
             no_lock,
+            rebuild,
         } => {
-            run_sync(prune, frozen, no_lock).await?;
+            run_sync(prune, frozen, no_lock, rebuild).await?;
         }
         Commands::Generate => {
             run_generate().await?;
@@ -473,7 +480,7 @@ async fn execute_build_command(
     }
 }
 
-async fn run_sync(prune: bool, frozen: bool, no_lock: bool) -> Result<()> {
+async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Result<()> {
     // `--frozen` は lockfile に依存した strict check、`--no-lock` は lockfile を
     // 完全無視する escape hatch。両方立つと「strict のつもりが silently latest を
     // pull する」矛盾状態になるので、fail fast させる (CI の思い込みを防ぐ)。
@@ -620,7 +627,13 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool) -> Result<()> {
             let res = repo.sync().await;
             match res {
                 Ok(change) => {
-                    if plugin.build.is_some() {
+                    // build は HEAD が動いたとき (= fresh clone or pull で新 commit を
+                    // 取得したとき) だけ実行する。no-op sync で毎回 build を回すのは
+                    // 200+ プラグイン構成では体感で遅い。`--rebuild` で従来挙動 (常に
+                    // 全 build プラグインで実行) に戻せるので、`:TSUpdate` 等を強制
+                    // 走らせたいときの逃げ道は確保。
+                    let should_build = plugin.build.is_some() && (rebuild || change.is_some());
+                    let build_warn = if should_build {
                         let _ = tx
                             .send((
                                 plugin.url.clone(),
@@ -630,10 +643,11 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool) -> Result<()> {
                                 )),
                             ))
                             .await;
-                    }
-                    let build_warn =
                         execute_build_command(&plugin, &dst_path, &config_for_build, &cache_root)
-                            .await;
+                            .await
+                    } else {
+                        None
+                    };
                     if let Some(ref err) = build_warn {
                         let _ = tx
                             .send((
@@ -1506,7 +1520,13 @@ async fn run_list(no_tui: bool) -> Result<bool> {
                 }
                 crossterm::event::KeyCode::Char('S') => {
                     leave_tui(&mut terminal)?;
-                    let _ = run_sync(false, false, false).await;
+                    let _ = run_sync(false, false, false, false).await;
+                    wait_for_keypress("\nPress any key to return to list...")?;
+                    reload!();
+                }
+                crossterm::event::KeyCode::Char('R') => {
+                    leave_tui(&mut terminal)?;
+                    let _ = run_sync(false, false, false, true).await;
                     wait_for_keypress("\nPress any key to return to list...")?;
                     reload!();
                 }
