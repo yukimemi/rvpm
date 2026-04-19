@@ -900,7 +900,7 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool) -> Result<()> {
             .map(|p| p.display_name())
             .collect();
         lockfile.retain_by_names(&active);
-        let wp = chezmoi::write_path(config.options.chezmoi, &lockfile_path);
+        let wp = chezmoi::write_path(config.options.chezmoi, &lockfile_path).await;
         if let Err(e) = lockfile.save(&wp) {
             eprintln!(
                 "\u{26a0} failed to save {}: {} (lockfile not updated)",
@@ -908,7 +908,7 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool) -> Result<()> {
                 e
             );
         } else {
-            chezmoi::apply(&wp, &lockfile_path);
+            chezmoi::apply(&wp, &lockfile_path).await;
         }
     }
 
@@ -1683,7 +1683,7 @@ async fn run_update(query: Option<String>) -> Result<()> {
     // ここでは単に新 HEAD を反映した lockfile を atomic write するだけ。
     // (config.toml から外されたプラグインの整理は次の full `rvpm sync` で行う)。
     // chezmoi 連携: source 側に書いてから `chezmoi apply` で target に反映。
-    let wp = chezmoi::write_path(config.options.chezmoi, &lockfile_path);
+    let wp = chezmoi::write_path(config.options.chezmoi, &lockfile_path).await;
     if let Err(e) = lockfile.save(&wp) {
         eprintln!(
             "\u{26a0} failed to save {}: {} (lockfile not updated)",
@@ -1691,7 +1691,7 @@ async fn run_update(query: Option<String>) -> Result<()> {
             e
         );
     } else {
-        chezmoi::apply(&wp, &lockfile_path);
+        chezmoi::apply(&wp, &lockfile_path).await;
     }
 
     println!("Update complete. Regenerating loader.lua...");
@@ -1790,9 +1790,9 @@ async fn run_add(
 
     let toml_content = doc.to_string();
     let chezmoi_enabled = read_chezmoi_flag(&config_path);
-    let wp = chezmoi::write_path(chezmoi_enabled, &config_path);
+    let wp = chezmoi::write_path(chezmoi_enabled, &config_path).await;
     std::fs::write(&wp, &toml_content)?;
-    chezmoi::apply(&wp, &config_path);
+    chezmoi::apply(&wp, &config_path).await;
     println!("Added plugin to config: {}", stored_url);
 
     // 追加したプラグインだけ clone + merge し、loader.lua を再生成する
@@ -1858,7 +1858,7 @@ async fn run_add(
 
     if lockfile_dirty {
         // chezmoi 連携: source 側に書いてから `chezmoi apply` で target に反映。
-        let wp = chezmoi::write_path(config_data.options.chezmoi, &lockfile_path);
+        let wp = chezmoi::write_path(config_data.options.chezmoi, &lockfile_path).await;
         if let Err(e) = lockfile.save(&wp) {
             eprintln!(
                 "\u{26a0} failed to save {}: {} (lockfile not updated)",
@@ -1866,7 +1866,7 @@ async fn run_add(
                 e
             );
         } else {
-            chezmoi::apply(&wp, &lockfile_path);
+            chezmoi::apply(&wp, &lockfile_path).await;
         }
     }
 
@@ -1883,10 +1883,10 @@ async fn run_config() -> Result<bool> {
     let config_path = rvpm_config_path();
     ensure_config_exists(&config_path)?;
     let chezmoi_enabled = read_chezmoi_flag(&config_path);
-    let edit_target = chezmoi::write_path(chezmoi_enabled, &config_path);
+    let edit_target = chezmoi::write_path(chezmoi_enabled, &config_path).await;
     println!("Opening {}", edit_target.display());
     open_editor_at_line(&edit_target, 1)?;
-    chezmoi::apply(&edit_target, &config_path);
+    chezmoi::apply(&edit_target, &config_path).await;
     Ok(true)
 }
 
@@ -1905,7 +1905,7 @@ async fn run_init(write: bool) -> Result<()> {
     if write {
         // `config` は既にパース済みなので再読込せずそのまま使う。
         // 親ディレクトリ作成は write_init_lua_snippet が新規作成時に行うので不要。
-        let wp = chezmoi::write_path(config.options.chezmoi, &init_lua_path);
+        let wp = chezmoi::write_path(config.options.chezmoi, &init_lua_path).await;
         let result = write_init_lua_snippet(&wp, &snippet)?;
         match result {
             WriteInitResult::Created => {
@@ -1927,7 +1927,7 @@ async fn run_init(write: bool) -> Result<()> {
         // AlreadyConfigured で apply すると、target 側でユーザーが手で編集した
         // 差分を上書きしてしまう恐れがある。
         if result != WriteInitResult::AlreadyConfigured {
-            chezmoi::apply(&wp, &init_lua_path);
+            chezmoi::apply(&wp, &init_lua_path).await;
         }
     } else {
         println!("-- Add this to your Neovim init.lua:");
@@ -1983,7 +1983,7 @@ async fn run_edit(
 
         let target = config_dir.join(file_name);
         let chezmoi_enabled = read_chezmoi_flag(&config_path);
-        let edit_target = chezmoi::write_path(chezmoi_enabled, &target);
+        let edit_target = chezmoi::write_path(chezmoi_enabled, &target).await;
         if let Some(parent) = edit_target.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1992,7 +1992,7 @@ async fn run_edit(
         std::process::Command::new(editor)
             .arg(&edit_target)
             .status()?;
-        chezmoi::apply(&edit_target, &target);
+        chezmoi::apply(&edit_target, &target).await;
         return Ok(true);
     }
 
@@ -2095,7 +2095,7 @@ async fn run_edit(
     };
     let target_file = plugin_config_dir.join(file_name);
     let chezmoi_enabled = read_chezmoi_flag(&config_path);
-    let edit_target = chezmoi::write_path(chezmoi_enabled, &target_file);
+    let edit_target = chezmoi::write_path(chezmoi_enabled, &target_file).await;
     if let Some(parent) = edit_target.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -2103,7 +2103,7 @@ async fn run_edit(
     std::process::Command::new(editor)
         .arg(&edit_target)
         .status()?;
-    chezmoi::apply(&edit_target, &target_file);
+    chezmoi::apply(&edit_target, &target_file).await;
     Ok(true)
 }
 
@@ -2240,9 +2240,9 @@ async fn run_set(
                         // 対応 editor なら plugin の url 行にジャンプ
                         let line = find_plugin_line_in_toml(&toml_content, &selected_repo_url);
                         let cz = read_chezmoi_flag(&config_path);
-                        let ep = chezmoi::write_path(cz, &config_path);
+                        let ep = chezmoi::write_path(cz, &config_path).await;
                         open_editor_at_line(&ep, line)?;
-                        chezmoi::apply(&ep, &config_path);
+                        chezmoi::apply(&ep, &config_path).await;
                         // ユーザーが何を編集したか分からないので常に変更ありと見なす
                         return Ok(true);
                     }
@@ -2331,9 +2331,9 @@ async fn run_set(
                                 let line =
                                     find_plugin_line_in_toml(&toml_content, &selected_repo_url);
                                 let cz = read_chezmoi_flag(&config_path);
-                                let ep = chezmoi::write_path(cz, &config_path);
+                                let ep = chezmoi::write_path(cz, &config_path).await;
                                 open_editor_at_line(&ep, line)?;
-                                chezmoi::apply(&ep, &config_path);
+                                chezmoi::apply(&ep, &config_path).await;
                                 return Ok(true);
                             }
                             _ => return Ok(false),
@@ -2392,9 +2392,9 @@ async fn run_set(
 
     if modified {
         let chezmoi_enabled = read_chezmoi_flag(&config_path);
-        let wp = chezmoi::write_path(chezmoi_enabled, &config_path);
+        let wp = chezmoi::write_path(chezmoi_enabled, &config_path).await;
         std::fs::write(&wp, doc.to_string())?;
-        chezmoi::apply(&wp, &config_path);
+        chezmoi::apply(&wp, &config_path).await;
         println!("Updated config for: {}", selected_repo_url);
         return Ok(true);
     }
@@ -2541,9 +2541,9 @@ async fn run_remove(query: Option<String>) -> Result<()> {
     let mut doc = toml_content.parse::<DocumentMut>()?;
     remove_plugin_from_toml(&mut doc, &selected_url)?;
     let chezmoi_enabled = read_chezmoi_flag(&config_path);
-    let wp = chezmoi::write_path(chezmoi_enabled, &config_path);
+    let wp = chezmoi::write_path(chezmoi_enabled, &config_path).await;
     std::fs::write(&wp, doc.to_string())?;
-    chezmoi::apply(&wp, &config_path);
+    chezmoi::apply(&wp, &config_path).await;
     println!("Removed '{}' from config.", selected_url);
 
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
