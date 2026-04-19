@@ -3985,7 +3985,10 @@ mod tests {
         let root = tempdir().unwrap();
         let plugin = root.path().join("plugin-repo");
         // main.ts なし、main.js のみ
-        write_file(&plugin.join("denops/bar/main.js"), "export async function main() {}");
+        write_file(
+            &plugin.join("denops/bar/main.js"),
+            "export async function main() {}",
+        );
 
         let got = collect_denops_plugins(&plugin);
         assert_eq!(got.len(), 1);
