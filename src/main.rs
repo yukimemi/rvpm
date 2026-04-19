@@ -8,6 +8,7 @@ mod git;
 mod helptags;
 mod link;
 mod loader;
+mod lockfile;
 mod merge_conflicts;
 mod tui;
 mod update_log;
@@ -65,6 +66,13 @@ enum Commands {
         /// Delete unused plugin directories after syncing
         #[arg(long)]
         prune: bool,
+        /// Error out if any non-dev plugin is missing from rvpm.lock
+        /// (strict reproducibility for CI / fresh machines)
+        #[arg(long)]
+        frozen: bool,
+        /// Ignore rvpm.lock entirely: pull latest and do not write the lockfile
+        #[arg(long)]
+        no_lock: bool,
     },
 
     /// Regenerate loader.lua only (no git)
@@ -277,8 +285,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Commands::List { no_tui: false }) {
-        Commands::Sync { prune } => {
-            run_sync(prune).await?;
+        Commands::Sync {
+            prune,
+            frozen,
+            no_lock,
+        } => {
+            run_sync(prune, frozen, no_lock).await?;
         }
         Commands::Generate => {
             run_generate().await?;
@@ -461,7 +473,16 @@ async fn execute_build_command(
     }
 }
 
-async fn run_sync(prune: bool) -> Result<()> {
+async fn run_sync(prune: bool, frozen: bool, no_lock: bool) -> Result<()> {
+    // `--frozen` は lockfile に依存した strict check、`--no-lock` は lockfile を
+    // 完全無視する escape hatch。両方立つと「strict のつもりが silently latest を
+    // pull する」矛盾状態になるので、fail fast させる (CI の思い込みを防ぐ)。
+    if frozen && no_lock {
+        anyhow::bail!(
+            "--frozen cannot be combined with --no-lock (they contradict: one requires the lockfile, the other ignores it)"
+        );
+    }
+
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
@@ -475,6 +496,60 @@ async fn run_sync(prune: bool) -> Result<()> {
 
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
     let merged_dir = resolve_merged_dir(&cache_root);
+
+    // lockfile: sync 前に load、各 plugin 処理時に効く rev を引き、sync 後の HEAD
+    // で上書きして終端で save。`--no-lock` 時は load/save 両方スキップ。
+    // `--frozen` は全 non-dev plugin に lockfile entry があることを要求する
+    // (無ければ sync 開始前に bail) — CI / fresh machine で strict 再現を狙うケース。
+    let config_root_for_lock = resolve_config_root(config.options.config_root.as_deref());
+    let lockfile_path = resolve_lockfile_path(&config_root_for_lock);
+    let mut lockfile = if no_lock {
+        crate::lockfile::LockFile::default()
+    } else {
+        crate::lockfile::LockFile::load(&lockfile_path)
+    };
+    if frozen && !no_lock {
+        // 2 種類の問題を区別して報告する:
+        // - **missing**: lockfile にエントリ自体が無い
+        // - **stale**: エントリはあるが `url` が config と食い違っている
+        //   (例: 同 display_name で別リポジトリに差し替えた)
+        //   → 古い commit を適用すると sync がコケるので未ロック相当として拒否。
+        let mut issues: Vec<String> = Vec::new();
+        for plugin in config.plugins.iter().filter(|p| !p.dev) {
+            match lockfile.find(&plugin.display_name()) {
+                None => issues.push(format!("{} (missing)", plugin.display_name())),
+                Some(entry) if !urls_match(&entry.url, &plugin.url) => issues.push(format!(
+                    "{} (stale: lockfile url={}, config url={})",
+                    plugin.display_name(),
+                    entry.url,
+                    plugin.url,
+                )),
+                Some(_) => {}
+            }
+        }
+        if !issues.is_empty() {
+            anyhow::bail!(
+                "--frozen: {} plugin(s) not reproducible from {}:\n  {}",
+                issues.len(),
+                lockfile_path.display(),
+                issues.join("\n  "),
+            );
+        }
+    }
+    // plugin name -> 該当 LockEntry の lookup。`commit` に加えて `url` も
+    // 保持する理由は、同じ display_name で別リポジトリに差し替えられたケース
+    // (例: `owner/foo.nvim` → `different-owner/foo.nvim`) で古い commit を適用
+    // しないように URL の一致を確認してから checkout 対象とするため。URL 不一致
+    // なら未ロック扱い (sync 完了後の新 HEAD で lockfile 側が正しく上書きされる)。
+    let locked_entries: std::collections::HashMap<String, crate::lockfile::LockEntry> = if no_lock {
+        std::collections::HashMap::new()
+    } else {
+        lockfile
+            .plugins
+            .iter()
+            .map(|e| (e.name.clone(), e.clone()))
+            .collect()
+    };
 
     if merged_dir.exists() {
         let _ = std::fs::remove_dir_all(&merged_dir);
@@ -519,6 +594,18 @@ async fn run_sync(prune: bool) -> Result<()> {
         let tx = tx.clone();
         let sem = semaphore.clone();
 
+        // effective rev: plugin.rev (explicit) > lockfile commit (URL 一致時のみ) > None.
+        // URL 不一致時 (同名で別リポジトリに差し替え等) は未ロック扱いにして、誤った
+        // commit を適用して sync がコケるのを防ぐ — sync 完了後に新 HEAD で lockfile
+        // 側が上書きされて正しい URL/commit の対応に直る。
+        // `--no-lock` 時は locked_entries が空なので plugin.rev だけ効く。
+        let effective_rev: Option<String> = plugin.rev.clone().or_else(|| {
+            locked_entries
+                .get(&plugin.display_name())
+                .filter(|e| urls_match(&e.url, &plugin.url))
+                .map(|e| e.commit.clone())
+        });
+
         let config_for_build = config.clone();
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
@@ -529,7 +616,7 @@ async fn run_sync(prune: bool) -> Result<()> {
                     PluginStatus::Syncing("Syncing...".to_string()),
                 ))
                 .await;
-            let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
+            let repo = Repo::new(&plugin.url, &dst_path, effective_rev.as_deref());
             let res = repo.sync().await;
             match res {
                 Ok(change) => {
@@ -555,8 +642,13 @@ async fn run_sync(prune: bool) -> Result<()> {
                             ))
                             .await;
                     }
+                    // lockfile 記録用に現在の HEAD commit を確定させる。
+                    // GitChange は HEAD が動いた時のみ返されるので no-op sync でも
+                    // lockfile エントリが新規作成できるよう別途取得する。
+                    // 失敗しても sync 本体の成否には影響させない (resilience)。
+                    let head_commit = repo.head_commit().await.ok();
                     let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
-                    Ok((plugin, dst_path, build_warn, change))
+                    Ok((plugin, dst_path, build_warn, change, head_commit))
                 }
                 Err(e) => {
                     let _ = tx
@@ -615,12 +707,22 @@ async fn run_sync(prune: bool) -> Result<()> {
             Some((url, status)) = rx.recv() => { tui_state.update_status(&url, status); }
             Some(res) = set.join_next() => {
                 finished_tasks += 1;
-                if let Ok(Ok((plugin, dst_path, build_warn, git_change))) = res {
+                if let Ok(Ok((plugin, dst_path, build_warn, git_change, head_commit))) = res {
                     if let Some(warn) = build_warn {
                         build_warnings.push((plugin.url.clone(), warn));
                     }
                     if let Some(change) = git_change {
                         sync_changes.push(change_record_from(&plugin, change));
+                    }
+                    // lockfile 更新: sync 完了後の現 HEAD を pin として記録。
+                    // `--no-lock` 時もこの in-memory 更新は行うが、terminal save は飛ばすので
+                    // ディスクには書かれない (lockfile 自体が default 空インスタンスのまま)。
+                    if let Some(commit) = head_commit {
+                        lockfile.upsert(crate::lockfile::LockEntry {
+                            name: plugin.display_name(),
+                            url: plugin.url.clone(),
+                            commit,
+                        });
                     }
                     // lazy プラグインは merge しない (trigger 前に merged/ 経由で
                     // lua モジュールが rtp に漏れて lazy の意味がなくなるため)
@@ -784,6 +886,26 @@ async fn run_sync(prune: bool) -> Result<()> {
     // `rvpm log` の出力が同じ sync 結果に対して常に同じになる。
     sync_changes.sort_by(|a, b| a.name.cmp(&b.name));
     record_changes_or_warn(&cache_root, "sync", sync_changes);
+
+    // lockfile save: config.toml から外されたプラグインの entry を drop してから
+    // atomic write。`--no-lock` 時は完全スキップ (ディスクに触らない = 既存の
+    // lockfile がユーザーの dotfile にあってもそのまま保つ)。
+    if !no_lock {
+        let active: std::collections::HashSet<String> = config
+            .plugins
+            .iter()
+            .filter(|p| !p.dev)
+            .map(|p| p.display_name())
+            .collect();
+        lockfile.retain_by_names(&active);
+        if let Err(e) = lockfile.save(&lockfile_path) {
+            eprintln!(
+                "\u{26a0} failed to save {}: {} (lockfile not updated)",
+                lockfile_path.display(),
+                e
+            );
+        }
+    }
 
     print_init_lua_hint_if_missing(&config);
     Ok(())
@@ -1379,7 +1501,7 @@ async fn run_list(no_tui: bool) -> Result<bool> {
                 }
                 crossterm::event::KeyCode::Char('S') => {
                     leave_tui(&mut terminal)?;
-                    let _ = run_sync(false).await;
+                    let _ = run_sync(false, false, false).await;
                     wait_for_keypress("\nPress any key to return to list...")?;
                     reload!();
                 }
@@ -1450,6 +1572,14 @@ async fn run_update(query: Option<String>) -> Result<()> {
         return Ok(());
     }
 
+    // `update` は「意図的に最新を取りに行く」操作なので lockfile は **checkout 側には
+    // 使わない** (pull 後の新 HEAD で lockfile を上書きするだけ)。config.toml の
+    // `rev` は explicit pin なので従来通り従う (gix_checkout がそのまま動く)。
+    // query で絞って部分 update する場合も、他プラグインの lockfile entry は残す。
+    let config_root_for_lock = resolve_config_root(config.options.config_root.as_deref());
+    let lockfile_path = resolve_lockfile_path(&config_root_for_lock);
+    let mut lockfile = crate::lockfile::LockFile::load(&lockfile_path);
+
     let concurrency = resolve_concurrency(config.options.concurrency);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
@@ -1483,8 +1613,9 @@ async fn run_update(query: Option<String>) -> Result<()> {
             let res = repo.update().await;
             match res {
                 Ok(change) => {
+                    let head_commit = repo.head_commit().await.ok();
                     let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
-                    Ok((plugin, change))
+                    Ok((plugin, change, head_commit))
                 }
                 Err(e) => {
                     let _ = tx
@@ -1516,8 +1647,17 @@ async fn run_update(query: Option<String>) -> Result<()> {
             Some((url, status)) = rx.recv() => { tui_state.update_status(&url, status); }
             Some(res) = set.join_next() => {
                 finished_tasks += 1;
-                if let Ok(Ok((plugin, Some(change)))) = res {
-                    update_changes.push(change_record_from(&plugin, change));
+                if let Ok(Ok((plugin, change, head_commit))) = res {
+                    if let Some(change) = change {
+                        update_changes.push(change_record_from(&plugin, change));
+                    }
+                    if let Some(commit) = head_commit {
+                        lockfile.upsert(crate::lockfile::LockEntry {
+                            name: plugin.display_name(),
+                            url: plugin.url.clone(),
+                            commit,
+                        });
+                    }
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
@@ -1532,6 +1672,18 @@ async fn run_update(query: Option<String>) -> Result<()> {
     // 並列 spawn 完了順で積まれているので plugin 名で安定 sort (sync と同じ理由)。
     update_changes.sort_by(|a, b| a.name.cmp(&b.name));
     record_changes_or_warn(&cache_root, "update", update_changes);
+
+    // lockfile save: 部分 update (query 指定) の場合は `retain_by_names` を
+    // **かけない** — 更新対象外のプラグインの entry を削りたくないため。
+    // ここでは単に新 HEAD を反映した lockfile を atomic write するだけ。
+    // (config.toml から外されたプラグインの整理は次の full `rvpm sync` で行う)。
+    if let Err(e) = lockfile.save(&lockfile_path) {
+        eprintln!(
+            "\u{26a0} failed to save {}: {} (lockfile not updated)",
+            lockfile_path.display(),
+            e
+        );
+    }
 
     println!("Update complete. Regenerating loader.lua...");
     run_generate().await?;
@@ -1643,6 +1795,12 @@ async fn run_add(
     // config.toml に書き込んだ entry とそのまま一致する。`repo` (入力のまま) で
     // 引くと url_style="full" のときミスマッチで clone が走らなくなる。
     let mut add_changes: Vec<crate::update_log::ChangeRecord> = Vec::new();
+    // 新規追加したプラグインの HEAD を lockfile にも記録する (dotfiles
+    // にコミットすれば他マシンでも同じ commit を再現できる)。
+    let config_root_for_lock = resolve_config_root(config_data.options.config_root.as_deref());
+    let lockfile_path = resolve_lockfile_path(&config_root_for_lock);
+    let mut lockfile = crate::lockfile::LockFile::load(&lockfile_path);
+    let mut lockfile_dirty = false;
     if let Some(mut plugin) = config_data
         .plugins
         .iter()
@@ -1667,6 +1825,17 @@ async fn run_add(
                 {
                     eprintln!("Warning: {}: {}", plugin.display_name(), err);
                 }
+                // lockfile 記録 (no-op sync でも head_commit は読める)
+                if !plugin.dev
+                    && let Ok(commit) = git_repo.head_commit().await
+                {
+                    lockfile.upsert(crate::lockfile::LockEntry {
+                        name: plugin.display_name(),
+                        url: plugin.url.clone(),
+                        commit,
+                    });
+                    lockfile_dirty = true;
+                }
 
                 // run_add 直後に merge する必要は無い: 末尾で `run_generate()` を呼び、
                 // そこで merged/ を rm -rf して全 eager+merge を再構築するため。
@@ -1677,6 +1846,14 @@ async fn run_add(
     }
 
     record_changes_or_warn(&cache_root, "add", add_changes);
+
+    if lockfile_dirty && let Err(e) = lockfile.save(&lockfile_path) {
+        eprintln!(
+            "\u{26a0} failed to save {}: {} (lockfile not updated)",
+            lockfile_path.display(),
+            e
+        );
+    }
 
     run_generate().await?;
     Ok(())
@@ -2771,6 +2948,13 @@ fn resolve_loader_path(cache_root: &Path) -> PathBuf {
     cache_root.join("plugins").join("loader.lua")
 }
 
+/// lockfile (`rvpm.lock`) のパス。dotfiles にコミットされる想定のため、
+/// `cache_root` ではなく `config_root` (= `~/.config/rvpm/<appname>/`) 直下。
+/// `options.config_root` が上書きされていればそれに追従する。
+fn resolve_lockfile_path(config_root: &Path) -> PathBuf {
+    config_root.join("rvpm.lock")
+}
+
 /// `rvpm log` の永続化先。常に `<cache_root>/update_log.json` (loader.lua の親
 /// ディレクトリと同階層 = cache_root 直下、`plugins/` 配下ではない)。
 fn resolve_update_log_path(cache_root: &Path) -> PathBuf {
@@ -3387,6 +3571,17 @@ fn is_valid_github_repo(s: &str) -> bool {
 /// - GitHub 以外 (gitlab 等) → None
 fn installed_full_name(url: &str) -> Option<String> {
     github_owner_repo(url).map(|s| s.to_lowercase())
+}
+
+/// `config.toml` の url と lockfile / 他 plugin の url が同じリポジトリを
+/// 指しているかを判定する。両方が GitHub URL として認識できれば正規化した
+/// `owner/repo` で比較 (`owner/foo` と `https://github.com/owner/foo.git` を
+/// 同一視)、そうでなければ生文字列で一致を見る。`rvpm add` の重複検出と同じ方針。
+fn urls_match(a: &str, b: &str) -> bool {
+    match (installed_full_name(a), installed_full_name(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 /// `rvpm add` が `config.toml` に書き込む URL を `options.url_style` に従って整形する。
@@ -4167,6 +4362,45 @@ mod tests {
             installed_full_name("Folke/Snacks.NVIM"),
             Some("folke/snacks.nvim".to_string())
         );
+    }
+
+    // -------- urls_match --------
+
+    #[test]
+    fn test_urls_match_treats_github_short_and_full_as_equal() {
+        // `owner/repo` 形式と `https://github.com/owner/repo` 形式は同一リポジトリ扱い。
+        assert!(urls_match(
+            "folke/snacks.nvim",
+            "https://github.com/folke/snacks.nvim",
+        ));
+        assert!(urls_match(
+            "https://github.com/Folke/Snacks.NVIM.git",
+            "folke/snacks.nvim",
+        ));
+        assert!(urls_match(
+            "git@github.com:folke/snacks.nvim.git",
+            "folke/snacks.nvim",
+        ));
+    }
+
+    #[test]
+    fn test_urls_match_rejects_different_owner_or_repo() {
+        // 同じ repo 名でも owner が違うのは別プラグイン。
+        assert!(!urls_match("foo/snacks.nvim", "bar/snacks.nvim"));
+        assert!(!urls_match("folke/snacks.nvim", "folke/other.nvim"));
+    }
+
+    #[test]
+    fn test_urls_match_non_github_falls_back_to_string_eq() {
+        // GitHub と認識できない URL は生文字列比較。
+        assert!(urls_match(
+            "https://gitlab.com/x/y",
+            "https://gitlab.com/x/y",
+        ));
+        assert!(!urls_match(
+            "https://gitlab.com/x/y",
+            "https://gitlab.com/x/z",
+        ));
     }
 
     #[test]
