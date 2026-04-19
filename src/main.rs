@@ -3139,6 +3139,41 @@ fn collect_colorschemes(plugin_path: &Path) -> Vec<String> {
     names
 }
 
+/// `<plugin_path>/denops/<name>/main.{ts,js}` を走査して denops プラグイン情報を返す。
+/// denops.vim は main.ts を優先的に discover するため、存在すれば main.ts、
+/// なければ main.js を採用する (どちらも無ければ対象外)。
+fn collect_denops_plugins(plugin_path: &Path) -> Vec<crate::loader::DenopsPlugin> {
+    let dir = plugin_path.join("denops");
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut plugins: Vec<crate::loader::DenopsPlugin> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        // `Path::is_dir()` は symlink を follow するので、dev plugin や
+        // mono-repo で symlink された `denops/<name>/` も拾える。
+        // `DirEntry::file_type()` だと symlink 自体を見てしまい skip される。
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let sub = e.path();
+            let name = sub.file_name()?.to_string_lossy().to_string();
+            for candidate in ["main.ts", "main.js"] {
+                let script = sub.join(candidate);
+                if script.is_file() {
+                    return Some(crate::loader::DenopsPlugin {
+                        name,
+                        main_script: script.to_string_lossy().replace('\\', "/"),
+                    });
+                }
+            }
+            None
+        })
+        .collect();
+    plugins.sort_by(|a, b| a.name.cmp(&b.name));
+    plugins
+}
+
 fn collect_source_files(plugin_path: &Path, subdir: &str) -> Vec<String> {
     let dir = plugin_path.join(subdir);
     if !dir.exists() {
@@ -3187,6 +3222,7 @@ fn build_plugin_scripts(
         on_source: plugin.on_source.clone(),
         depends: plugin.depends.clone(),
         colorschemes: collect_colorschemes(plugin_path),
+        denops_plugins: collect_denops_plugins(plugin_path),
         cond: plugin.cond.clone(),
     }
 }
@@ -3904,6 +3940,120 @@ mod tests {
     use crate::loader::PluginScripts;
     use tempfile::tempdir;
     use toml_edit::DocumentMut;
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn test_collect_denops_plugins_finds_main_ts() {
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        write_file(
+            &plugin.join("denops/foo/main.ts"),
+            "export async function main() {}",
+        );
+        write_file(&plugin.join("denops/foo/util.ts"), "export const x = 1;");
+
+        let got = collect_denops_plugins(&plugin);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "foo");
+        assert!(
+            got[0].main_script.ends_with("denops/foo/main.ts"),
+            "main_script should be absolute path ending with denops/foo/main.ts, got: {}",
+            got[0].main_script
+        );
+        // forward slash に正規化されている
+        assert!(
+            !got[0].main_script.contains('\\'),
+            "main_script must use forward slashes"
+        );
+    }
+
+    #[test]
+    fn test_collect_denops_plugins_returns_empty_without_denops_dir() {
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        write_file(&plugin.join("plugin/foo.vim"), "echo 'foo'");
+        // denops/ が無い
+        let got = collect_denops_plugins(&plugin);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn test_collect_denops_plugins_falls_back_to_main_js() {
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        // main.ts なし、main.js のみ
+        write_file(
+            &plugin.join("denops/bar/main.js"),
+            "export async function main() {}",
+        );
+
+        let got = collect_denops_plugins(&plugin);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "bar");
+        assert!(got[0].main_script.ends_with("denops/bar/main.js"));
+    }
+
+    #[test]
+    fn test_collect_denops_plugins_prefers_main_ts_over_main_js() {
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        write_file(&plugin.join("denops/dual/main.ts"), "ts");
+        write_file(&plugin.join("denops/dual/main.js"), "js");
+        let got = collect_denops_plugins(&plugin);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].main_script.ends_with("main.ts"));
+    }
+
+    #[test]
+    fn test_collect_denops_plugins_skips_dirs_without_main() {
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        // main.ts も main.js も無いディレクトリは無視
+        write_file(&plugin.join("denops/incomplete/other.ts"), "");
+        write_file(&plugin.join("denops/ok/main.ts"), "");
+        let got = collect_denops_plugins(&plugin);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_denops_plugins_follows_symlinked_subdir() {
+        // dev plugin や mono-repo の構成で、denops/<name>/ が別ディレクトリへの
+        // symlink になっているケースを follow して検出する。
+        // Windows は symlink 作成に管理者権限が要るので Unix のみで実行。
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        let real = root.path().join("external").join("real-denops");
+        write_file(&real.join("main.ts"), "export async function main() {}");
+        std::fs::create_dir_all(plugin.join("denops")).unwrap();
+        std::os::unix::fs::symlink(&real, plugin.join("denops/sym-linked")).unwrap();
+
+        let got = collect_denops_plugins(&plugin);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "sym-linked");
+        assert!(got[0].main_script.ends_with("main.ts"));
+    }
+
+    #[test]
+    fn test_collect_denops_plugins_multiple_sorted_by_name() {
+        // 同一プラグイン repo が複数の denops サブモジュールを持つケース
+        // (例: 一部の mono-repo) も決定論的な順序を保証
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        write_file(&plugin.join("denops/zeta/main.ts"), "");
+        write_file(&plugin.join("denops/alpha/main.ts"), "");
+        write_file(&plugin.join("denops/mid/main.ts"), "");
+        let got = collect_denops_plugins(&plugin);
+        let names: Vec<&str> = got.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
 
     #[test]
     fn test_installed_full_name_owner_repo() {

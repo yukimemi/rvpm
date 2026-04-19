@@ -1,6 +1,17 @@
 use crate::config::MapSpec;
 use std::path::Path;
 
+/// denops.vim 製プラグインの 1 エントリ。
+/// `denops/<name>/main.{ts,js}` から検出され、lazy ロード時に
+/// `denops#plugin#load(name, main_script)` で明示登録するのに使う。
+#[derive(Clone, Debug)]
+pub struct DenopsPlugin {
+    /// denops 名 (= `denops/<name>/` のディレクトリ名)
+    pub name: String,
+    /// main.ts / main.js の絶対パス (forward slash に正規化済み)
+    pub main_script: String,
+}
+
 #[derive(Clone)]
 pub struct PluginScripts {
     pub name: String,
@@ -26,6 +37,9 @@ pub struct PluginScripts {
     pub depends: Option<Vec<String>>,
     /// 事前コンパイル: colors/*.{vim,lua} からファイル名 (拡張子なし) を抽出したカラースキーム名
     pub colorschemes: Vec<String>,
+    /// 事前コンパイル: `denops/<name>/main.{ts,js}` から検出した denops プラグイン。
+    /// lazy load 時に `denops#plugin#load(name, main_script)` を発行する。
+    pub denops_plugins: Vec<DenopsPlugin>,
     pub cond: Option<String>,
 }
 
@@ -52,6 +66,7 @@ impl PluginScripts {
             on_source: None,
             depends: None,
             colorschemes: Vec::new(),
+            denops_plugins: Vec::new(),
             cond: None,
         }
     }
@@ -67,6 +82,48 @@ fn lua_str_list(items: &[String]) -> String {
         .map(|s| format!("\"{}\"", s.replace('\\', "/")))
         .collect();
     format!("{{ {} }}", quoted.join(", "))
+}
+
+/// 文字列を Lua の double-quoted string literal に変換。
+/// backslash はまず `/` に正規化し (Windows path separator)、
+/// 残った特殊文字 (double quote, backslash, CR/LF, TAB) をエスケープする。
+/// これで generate path に空白や特殊文字が混ざっても安全に emit できる。
+fn lua_quote(s: &str) -> String {
+    let normalized = s.replace('\\', "/");
+    let mut out = String::with_capacity(normalized.len() + 2);
+    out.push('"');
+    for c in normalized.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// denops プラグイン list を Lua table literal に変換。
+/// `{ { "name1", "/path/to/main.ts" }, { "name2", "..." } }` 形式で、
+/// load_lazy の 8 番目引数として渡される。空なら `{}`。
+fn lua_denops_list(items: &[DenopsPlugin]) -> String {
+    if items.is_empty() {
+        return "{}".to_string();
+    }
+    let pairs: Vec<String> = items
+        .iter()
+        .map(|dp| {
+            format!(
+                "{{ {}, {} }}",
+                lua_quote(&dp.name),
+                lua_quote(&dp.main_script)
+            )
+        })
+        .collect();
+    format!("{{ {} }}", pairs.join(", "))
 }
 
 /// ローカル lua 変数名として安全な形に sanitize (英数字 + underscore のみ)
@@ -203,7 +260,7 @@ pub fn generate_loader(
     // load_lazy helper — lazy プラグインの実行時ローダー
     // 事前 glob 済みファイルリストを受け取り、ftdetect を augroup で wrap
     // ======================================================
-    lua.push_str(r#"local function load_lazy(name, path, plugin_files, ftdetect_files, after_plugin_files, before, after)
+    lua.push_str(r#"local function load_lazy(name, path, plugin_files, ftdetect_files, after_plugin_files, before, after, denops_plugins)
   if _G["rvpm_loaded_" .. name] then return end
   _G["rvpm_loaded_" .. name] = true
   vim.opt.rtp:append(path)
@@ -216,6 +273,18 @@ pub fn generate_loader(
   end
   for _, f in ipairs(after_plugin_files) do vim.cmd("source " .. f) end
   if after then dofile(after) end
+  if denops_plugins and #denops_plugins > 0 and vim.fn.exists("*denops#plugin#load") == 1 then
+    for _, dp in ipairs(denops_plugins) do
+      local ok = pcall(vim.fn["denops#plugin#load"], dp[1], dp[2])
+      if ok then
+        -- denops#plugin#load() は非同期。DenopsPluginPost を待たずに
+        -- on_cmd replay が走ると、`DenopsPluginPost` で command を登録する
+        -- 典型的な denops プラグインが "Not an editor command" で失敗する。
+        -- silent=1 で daemon 未起動時でもユーザー通知を抑制 (resilience)。
+        pcall(vim.fn["denops#plugin#wait"], dp[1], { silent = 1 })
+      end
+    end
+  end
   vim.api.nvim_exec_autocmds("User", { pattern = "rvpm_loaded_" .. name })
 end
 
@@ -330,6 +399,7 @@ end
         let pf_var = format!("_rvpm_pf_{}", safe);
         let fd_var = format!("_rvpm_fd_{}", safe);
         let ap_var = format!("_rvpm_ap_{}", safe);
+        let dn_var = format!("_rvpm_dn_{}", safe);
 
         let mut body = String::new();
         // do...end ブロックで local 変数をスコープ化 (Lua の 200 ローカル変数制限回避)
@@ -349,6 +419,11 @@ end
             "local {} = {}\n",
             ap_var,
             lua_str_list(&s.after_plugin_files)
+        ));
+        body.push_str(&format!(
+            "local {} = {}\n",
+            dn_var,
+            lua_denops_list(&s.denops_plugins)
         ));
 
         // deps がある場合は load_lazy の前に依存先をロードするコードを生成
@@ -382,16 +457,20 @@ end
                         "local _rvpm_ap_{dsafe} = {}\n",
                         lua_str_list(&dep_script.after_plugin_files)
                     ));
+                    body.push_str(&format!(
+                        "local _rvpm_dn_{dsafe} = {}\n",
+                        lua_denops_list(&dep_script.denops_plugins)
+                    ));
                     deps_load.push_str(&format!(
-                        "load_lazy(\"{dep}\", \"{dp}\", _rvpm_pf_{dsafe}, _rvpm_fd_{dsafe}, _rvpm_ap_{dsafe}, {db}, {da})\n  ",
+                        "load_lazy(\"{dep}\", \"{dp}\", _rvpm_pf_{dsafe}, _rvpm_fd_{dsafe}, _rvpm_ap_{dsafe}, {db}, {da}, _rvpm_dn_{dsafe})\n  ",
                     ));
                 }
             }
         }
 
         let load_call = format!(
-            "{deps_load}load_lazy(\"{}\", \"{}\", {}, {}, {}, {}, {})",
-            s.name, path, pf_var, fd_var, ap_var, before, after
+            "{deps_load}load_lazy(\"{}\", \"{}\", {}, {}, {}, {}, {}, {})",
+            s.name, path, pf_var, fd_var, ap_var, before, after, dn_var
         );
 
         // ---- on_cmd: lazy.nvim 方式 ----
@@ -567,9 +646,10 @@ end
             let pf_inline = lua_str_list(&s.plugin_files);
             let fd_inline = lua_str_list(&s.ftdetect_files);
             let ap_inline = lua_str_list(&s.after_plugin_files);
+            let dn_inline = lua_denops_list(&s.denops_plugins);
             for cs in &s.colorschemes {
                 cs_entries.push(format!(
-                    "[\"{cs}\"] = function() load_lazy(\"{name}\", \"{path}\", {pf}, {fd}, {ap}, {before}, {after}) end",
+                    "[\"{cs}\"] = function() load_lazy(\"{name}\", \"{path}\", {pf}, {fd}, {ap}, {before}, {after}, {dn}) end",
                     cs = cs,
                     name = s.name,
                     path = path,
@@ -578,6 +658,7 @@ end
                     ap = ap_inline,
                     before = before,
                     after = after,
+                    dn = dn_inline,
                 ));
             }
         }
@@ -1222,6 +1303,196 @@ mod tests {
         assert!(
             lua.contains("/path/a/after/plugin/a.vim"),
             "after/plugin file must be referenced"
+        );
+    }
+
+    // ========================================================
+    // denops プラグイン遅延ロード対応テスト
+    // ========================================================
+
+    #[test]
+    fn test_load_lazy_helper_has_denops_plugins_parameter() {
+        let lua = gen_loader(Path::new("/merged"), &[]);
+        let load_lazy_start = lua
+            .find("local function load_lazy")
+            .expect("load_lazy definition missing");
+        let signature_line = lua[load_lazy_start..].lines().next().unwrap();
+        assert!(
+            signature_line.contains("denops_plugins"),
+            "load_lazy signature must include denops_plugins parameter: {}",
+            signature_line
+        );
+    }
+
+    #[test]
+    fn test_load_lazy_helper_calls_denops_plugin_load() {
+        let lua = gen_loader(Path::new("/merged"), &[]);
+        let load_lazy_start = lua
+            .find("local function load_lazy")
+            .expect("load_lazy definition missing");
+        let end_marker = lua[load_lazy_start..]
+            .find("\nend\n")
+            .expect("load_lazy end missing")
+            + load_lazy_start;
+        let body = &lua[load_lazy_start..end_marker];
+        assert!(
+            body.contains("denops#plugin#load"),
+            "load_lazy must invoke denops#plugin#load for registered denops plugins"
+        );
+        // denops.vim 未ロード時も rvpm 全体を止めないよう pcall ガードを要求
+        assert!(
+            body.contains("pcall"),
+            "denops#plugin#load call must be wrapped in pcall for resilience"
+        );
+    }
+
+    #[test]
+    fn test_load_lazy_helper_guards_with_exists_before_denops_call() {
+        // pcall 単独では autoload 未ロード時に E117 が UI に出る。
+        // vim.fn.exists("*denops#plugin#load") == 1 で事前ガードしてから
+        // 呼ぶことで、denops.vim 未インストール環境でノイズを出さない。
+        let lua = gen_loader(Path::new("/merged"), &[]);
+        let load_lazy_start = lua
+            .find("local function load_lazy")
+            .expect("load_lazy definition missing");
+        let end_marker = lua[load_lazy_start..]
+            .find("\nend\n")
+            .expect("load_lazy end missing")
+            + load_lazy_start;
+        let body = &lua[load_lazy_start..end_marker];
+        assert!(
+            body.contains("vim.fn.exists(\"*denops#plugin#load\")"),
+            "load_lazy must guard denops call with vim.fn.exists before invocation"
+        );
+        assert!(
+            body.contains("== 1"),
+            "exists() guard must compare against 1 (Lua: 0 is truthy)"
+        );
+    }
+
+    #[test]
+    fn test_load_lazy_helper_waits_for_denops_plugin_post() {
+        // denops#plugin#load() は非同期で DenopsPluginPost を待たない。
+        // on_cmd 経由で lazy ロードされた denops プラグインが
+        // DenopsPluginPost ハンドラで command を register するケースでは、
+        // load_lazy 返却直後に command replay しても間に合わない。
+        // denops#plugin#wait を silent option 付きで呼んで同期待機する。
+        let lua = gen_loader(Path::new("/merged"), &[]);
+        let load_lazy_start = lua
+            .find("local function load_lazy")
+            .expect("load_lazy definition missing");
+        let end_marker = lua[load_lazy_start..]
+            .find("\nend\n")
+            .expect("load_lazy end missing")
+            + load_lazy_start;
+        let body = &lua[load_lazy_start..end_marker];
+        assert!(
+            body.contains("denops#plugin#wait"),
+            "load_lazy must wait for DenopsPluginPost before returning"
+        );
+        assert!(
+            body.contains("silent = 1"),
+            "wait call must pass silent=1 so daemon-missing doesn't interrupt"
+        );
+    }
+
+    #[test]
+    fn test_lazy_plugin_with_denops_emits_denops_table_in_trigger() {
+        let mut s = make_lazy_plugin("denops-silicon");
+        s.on_cmd = Some(vec!["Silicon".to_string()]);
+        s.denops_plugins = vec![DenopsPlugin {
+            name: "silicon".to_string(),
+            main_script: "/cache/repos/denops-silicon/denops/silicon/main.ts".to_string(),
+        }];
+        let lua = gen_loader(Path::new("/merged"), &[s]);
+        // denops プラグイン名と main.ts パスが emit されている
+        assert!(
+            lua.contains("\"silicon\""),
+            "denops plugin name must appear in emitted Lua"
+        );
+        assert!(
+            lua.contains("/cache/repos/denops-silicon/denops/silicon/main.ts"),
+            "denops main.ts absolute path must appear in emitted Lua"
+        );
+        // _rvpm_dn_<safe> 変数として宣言されている
+        assert!(
+            lua.contains("_rvpm_dn_denops_silicon"),
+            "denops list must be bound to _rvpm_dn_<safe> local variable"
+        );
+    }
+
+    #[test]
+    fn test_lazy_plugin_without_denops_emits_empty_denops_table() {
+        let mut s = make_lazy_plugin("plain");
+        s.on_cmd = Some(vec!["Plain".to_string()]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
+        // denops が無いプラグインも一貫して空テーブルを emit (load_lazy のシグネチャ統一のため)
+        assert!(
+            lua.contains("local _rvpm_dn_plain = {}"),
+            "lazy plugin without denops must still emit empty denops table"
+        );
+    }
+
+    #[test]
+    fn test_lazy_dep_denops_plugins_propagated_to_trigger_block() {
+        // lazy B が lazy A (denops 製) に depends → B の trigger 内で
+        // A の denops 情報も emit され、load_lazy 呼び出しに渡される
+        let mut a = make_lazy_plugin("denops-std");
+        a.denops_plugins = vec![DenopsPlugin {
+            name: "denops-std".to_string(),
+            main_script: "/repos/denops-std/denops/denops-std/main.ts".to_string(),
+        }];
+        let mut b = make_lazy_plugin("user");
+        b.depends = Some(vec!["denops-std".to_string()]);
+        b.on_cmd = Some(vec!["UserCmd".to_string()]);
+        let lua = gen_loader(Path::new("/merged"), &[a, b]);
+        // B の trigger block 内に A の denops main.ts パスが展開されている
+        assert!(
+            lua.contains("/repos/denops-std/denops/denops-std/main.ts"),
+            "lazy dep's denops main.ts must be emitted in the dependent's trigger block"
+        );
+        // load_lazy の dep 呼び出しに _rvpm_dn_denops_std が渡される
+        assert!(
+            lua.contains("_rvpm_dn_denops_std"),
+            "dep's denops var must be passed to load_lazy"
+        );
+    }
+
+    #[test]
+    fn test_lazy_colorscheme_handler_passes_denops_plugins() {
+        // 一応、denops 製の colorscheme プラグインも可能性としてある。
+        // ColorSchemePre handler 経由でも denops_plugins が load_lazy に渡されることを保証。
+        let mut s = make_lazy_plugin("fancy");
+        s.colorschemes = vec!["fancy".to_string()];
+        s.denops_plugins = vec![DenopsPlugin {
+            name: "fancy".to_string(),
+            main_script: "/repos/fancy/denops/fancy/main.ts".to_string(),
+        }];
+        let lua = gen_loader(Path::new("/merged"), &[s]);
+        // ColorSchemePre autocmd が生成されている
+        assert!(
+            lua.contains("ColorSchemePre"),
+            "ColorSchemePre handler must be generated for lazy colorscheme"
+        );
+        // colorscheme handler 内に denops 情報がインライン展開されている
+        assert!(
+            lua.contains("/repos/fancy/denops/fancy/main.ts"),
+            "colorscheme handler must inline denops main.ts path"
+        );
+    }
+
+    #[test]
+    fn test_load_lazy_invocation_has_eight_positional_args() {
+        let mut s = make_lazy_plugin("p");
+        s.on_cmd = Some(vec!["P".to_string()]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
+        // load_lazy("p", "/path/p", _rvpm_pf_p, _rvpm_fd_p, _rvpm_ap_p, nil, nil, _rvpm_dn_p) になる
+        let expected = "load_lazy(\"p\", \"/path/p\", _rvpm_pf_p, _rvpm_fd_p, _rvpm_ap_p, nil, nil, _rvpm_dn_p)";
+        assert!(
+            lua.contains(expected),
+            "load_lazy call must pass denops var as 8th arg.\nexpected: {}\ngot:\n{}",
+            expected,
+            lua
         );
     }
 
