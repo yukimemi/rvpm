@@ -890,6 +890,8 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool) -> Result<()> {
     // lockfile save: config.toml から外されたプラグインの entry を drop してから
     // atomic write。`--no-lock` 時は完全スキップ (ディスクに触らない = 既存の
     // lockfile がユーザーの dotfile にあってもそのまま保つ)。
+    // `options.chezmoi = true` なら source 側に書いて `chezmoi apply` で target
+    // へ反映する (config.toml / hook ファイルと同じ流儀)。
     if !no_lock {
         let active: std::collections::HashSet<String> = config
             .plugins
@@ -898,12 +900,15 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool) -> Result<()> {
             .map(|p| p.display_name())
             .collect();
         lockfile.retain_by_names(&active);
-        if let Err(e) = lockfile.save(&lockfile_path) {
+        let wp = chezmoi::write_path(config.options.chezmoi, &lockfile_path);
+        if let Err(e) = lockfile.save(&wp) {
             eprintln!(
                 "\u{26a0} failed to save {}: {} (lockfile not updated)",
-                lockfile_path.display(),
+                wp.display(),
                 e
             );
+        } else {
+            chezmoi::apply(&wp, &lockfile_path);
         }
     }
 
@@ -1677,12 +1682,16 @@ async fn run_update(query: Option<String>) -> Result<()> {
     // **かけない** — 更新対象外のプラグインの entry を削りたくないため。
     // ここでは単に新 HEAD を反映した lockfile を atomic write するだけ。
     // (config.toml から外されたプラグインの整理は次の full `rvpm sync` で行う)。
-    if let Err(e) = lockfile.save(&lockfile_path) {
+    // chezmoi 連携: source 側に書いてから `chezmoi apply` で target に反映。
+    let wp = chezmoi::write_path(config.options.chezmoi, &lockfile_path);
+    if let Err(e) = lockfile.save(&wp) {
         eprintln!(
             "\u{26a0} failed to save {}: {} (lockfile not updated)",
-            lockfile_path.display(),
+            wp.display(),
             e
         );
+    } else {
+        chezmoi::apply(&wp, &lockfile_path);
     }
 
     println!("Update complete. Regenerating loader.lua...");
@@ -1847,12 +1856,18 @@ async fn run_add(
 
     record_changes_or_warn(&cache_root, "add", add_changes);
 
-    if lockfile_dirty && let Err(e) = lockfile.save(&lockfile_path) {
-        eprintln!(
-            "\u{26a0} failed to save {}: {} (lockfile not updated)",
-            lockfile_path.display(),
-            e
-        );
+    if lockfile_dirty {
+        // chezmoi 連携: source 側に書いてから `chezmoi apply` で target に反映。
+        let wp = chezmoi::write_path(config_data.options.chezmoi, &lockfile_path);
+        if let Err(e) = lockfile.save(&wp) {
+            eprintln!(
+                "\u{26a0} failed to save {}: {} (lockfile not updated)",
+                wp.display(),
+                e
+            );
+        } else {
+            chezmoi::apply(&wp, &lockfile_path);
+        }
     }
 
     run_generate().await?;
