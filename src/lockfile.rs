@@ -91,14 +91,27 @@ impl LockFile {
                 return Self::default();
             }
         };
-        toml::from_str::<LockFile>(&content).unwrap_or_else(|e| {
+        let lock = toml::from_str::<LockFile>(&content).unwrap_or_else(|e| {
             eprintln!(
                 "\u{26a0} lockfile: failed to parse {}: {} (treating as empty)",
                 path.display(),
                 e
             );
             Self::default()
-        })
+        });
+        // 未対応の schema version は empty 扱いに落とす。古い rvpm で新フォーマットを
+        // silently 誤解釈して間違った commit に pin するのを防ぐ (malformed 時と同じ
+        // fallback パターン)。
+        if lock.version != CURRENT_VERSION {
+            eprintln!(
+                "\u{26a0} lockfile: unsupported version {} in {} (expected {}; treating as empty)",
+                lock.version,
+                path.display(),
+                CURRENT_VERSION
+            );
+            return Self::default();
+        }
+        lock
     }
 
     /// `path` に atomic write する。書き出し前に `plugins` を name で安定 sort
@@ -277,6 +290,33 @@ mod tests {
         assert!(kept.contains(&"a"));
         assert!(kept.contains(&"c"));
         assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn test_load_rejects_future_schema_version() {
+        // 古い rvpm バイナリが未対応の新フォーマット lockfile を読み込んでも、
+        // silently 誤解釈して commit を間違えないよう empty にフォールバックする。
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("future.lock");
+        std::fs::write(
+            &path,
+            r#"version = 99
+[[plugins]]
+name = "x"
+url = "o/x"
+commit = "abc"
+"#,
+        )
+        .unwrap();
+        let lock = LockFile::load(&path);
+        assert!(
+            lock.plugins.is_empty(),
+            "unsupported version must fall back to empty lockfile"
+        );
+        assert_eq!(
+            lock.version, CURRENT_VERSION,
+            "default always reports current schema version"
+        );
     }
 
     #[test]

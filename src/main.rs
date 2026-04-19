@@ -474,6 +474,15 @@ async fn execute_build_command(
 }
 
 async fn run_sync(prune: bool, frozen: bool, no_lock: bool) -> Result<()> {
+    // `--frozen` は lockfile に依存した strict check、`--no-lock` は lockfile を
+    // 完全無視する escape hatch。両方立つと「strict のつもりが silently latest を
+    // pull する」矛盾状態になるので、fail fast させる (CI の思い込みを防ぐ)。
+    if frozen && no_lock {
+        anyhow::bail!(
+            "--frozen cannot be combined with --no-lock (they contradict: one requires the lockfile, the other ignores it)"
+        );
+    }
+
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
@@ -500,32 +509,45 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool) -> Result<()> {
         crate::lockfile::LockFile::load(&lockfile_path)
     };
     if frozen && !no_lock {
-        let missing: Vec<String> = config
-            .plugins
-            .iter()
-            .filter(|p| !p.dev)
-            .filter(|p| lockfile.find(&p.display_name()).is_none())
-            .map(|p| p.display_name())
-            .collect();
-        if !missing.is_empty() {
+        // 2 種類の問題を区別して報告する:
+        // - **missing**: lockfile にエントリ自体が無い
+        // - **stale**: エントリはあるが `url` が config と食い違っている
+        //   (例: 同 display_name で別リポジトリに差し替えた)
+        //   → 古い commit を適用すると sync がコケるので未ロック相当として拒否。
+        let mut issues: Vec<String> = Vec::new();
+        for plugin in config.plugins.iter().filter(|p| !p.dev) {
+            match lockfile.find(&plugin.display_name()) {
+                None => issues.push(format!("{} (missing)", plugin.display_name())),
+                Some(entry) if !urls_match(&entry.url, &plugin.url) => issues.push(format!(
+                    "{} (stale: lockfile url={}, config url={})",
+                    plugin.display_name(),
+                    entry.url,
+                    plugin.url,
+                )),
+                Some(_) => {}
+            }
+        }
+        if !issues.is_empty() {
             anyhow::bail!(
-                "--frozen: {} plugin(s) missing from {}:\n  {}",
-                missing.len(),
+                "--frozen: {} plugin(s) not reproducible from {}:\n  {}",
+                issues.len(),
                 lockfile_path.display(),
-                missing.join("\n  "),
+                issues.join("\n  "),
             );
         }
     }
-    // plugin name -> locked commit hash。個々のタスクに clone して渡すための lookup。
-    // plugin.rev (explicit) があればそちらを優先するが、無ければ lockfile の commit を
-    // effective rev として gix_checkout() に渡し、HEAD を locked 状態に寄せる。
-    let locked_commits: std::collections::HashMap<String, String> = if no_lock {
+    // plugin name -> 該当 LockEntry の lookup。`commit` に加えて `url` も
+    // 保持する理由は、同じ display_name で別リポジトリに差し替えられたケース
+    // (例: `owner/foo.nvim` → `different-owner/foo.nvim`) で古い commit を適用
+    // しないように URL の一致を確認してから checkout 対象とするため。URL 不一致
+    // なら未ロック扱い (sync 完了後の新 HEAD で lockfile 側が正しく上書きされる)。
+    let locked_entries: std::collections::HashMap<String, crate::lockfile::LockEntry> = if no_lock {
         std::collections::HashMap::new()
     } else {
         lockfile
             .plugins
             .iter()
-            .map(|e| (e.name.clone(), e.commit.clone()))
+            .map(|e| (e.name.clone(), e.clone()))
             .collect()
     };
 
@@ -572,12 +594,17 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool) -> Result<()> {
         let tx = tx.clone();
         let sem = semaphore.clone();
 
-        // effective rev: plugin.rev (explicit) > lockfile commit > None (pull latest).
-        // `--no-lock` 時は locked_commits が空なので単純に plugin.rev だけ効く。
-        let effective_rev: Option<String> = plugin
-            .rev
-            .clone()
-            .or_else(|| locked_commits.get(&plugin.display_name()).cloned());
+        // effective rev: plugin.rev (explicit) > lockfile commit (URL 一致時のみ) > None.
+        // URL 不一致時 (同名で別リポジトリに差し替え等) は未ロック扱いにして、誤った
+        // commit を適用して sync がコケるのを防ぐ — sync 完了後に新 HEAD で lockfile
+        // 側が上書きされて正しい URL/commit の対応に直る。
+        // `--no-lock` 時は locked_entries が空なので plugin.rev だけ効く。
+        let effective_rev: Option<String> = plugin.rev.clone().or_else(|| {
+            locked_entries
+                .get(&plugin.display_name())
+                .filter(|e| urls_match(&e.url, &plugin.url))
+                .map(|e| e.commit.clone())
+        });
 
         let config_for_build = config.clone();
         set.spawn(async move {
@@ -3546,6 +3573,17 @@ fn installed_full_name(url: &str) -> Option<String> {
     github_owner_repo(url).map(|s| s.to_lowercase())
 }
 
+/// `config.toml` の url と lockfile / 他 plugin の url が同じリポジトリを
+/// 指しているかを判定する。両方が GitHub URL として認識できれば正規化した
+/// `owner/repo` で比較 (`owner/foo` と `https://github.com/owner/foo.git` を
+/// 同一視)、そうでなければ生文字列で一致を見る。`rvpm add` の重複検出と同じ方針。
+fn urls_match(a: &str, b: &str) -> bool {
+    match (installed_full_name(a), installed_full_name(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
 /// `rvpm add` が `config.toml` に書き込む URL を `options.url_style` に従って整形する。
 /// GitHub リポジトリと認識できる入力は `Short` / `Full` で書き換え、
 /// 認識できないもの (gitlab など) は入力をそのまま返す。
@@ -4324,6 +4362,45 @@ mod tests {
             installed_full_name("Folke/Snacks.NVIM"),
             Some("folke/snacks.nvim".to_string())
         );
+    }
+
+    // -------- urls_match --------
+
+    #[test]
+    fn test_urls_match_treats_github_short_and_full_as_equal() {
+        // `owner/repo` 形式と `https://github.com/owner/repo` 形式は同一リポジトリ扱い。
+        assert!(urls_match(
+            "folke/snacks.nvim",
+            "https://github.com/folke/snacks.nvim",
+        ));
+        assert!(urls_match(
+            "https://github.com/Folke/Snacks.NVIM.git",
+            "folke/snacks.nvim",
+        ));
+        assert!(urls_match(
+            "git@github.com:folke/snacks.nvim.git",
+            "folke/snacks.nvim",
+        ));
+    }
+
+    #[test]
+    fn test_urls_match_rejects_different_owner_or_repo() {
+        // 同じ repo 名でも owner が違うのは別プラグイン。
+        assert!(!urls_match("foo/snacks.nvim", "bar/snacks.nvim"));
+        assert!(!urls_match("folke/snacks.nvim", "folke/other.nvim"));
+    }
+
+    #[test]
+    fn test_urls_match_non_github_falls_back_to_string_eq() {
+        // GitHub と認識できない URL は生文字列比較。
+        assert!(urls_match(
+            "https://gitlab.com/x/y",
+            "https://gitlab.com/x/y",
+        ));
+        assert!(!urls_match(
+            "https://gitlab.com/x/y",
+            "https://gitlab.com/x/z",
+        ));
     }
 
     #[test]
