@@ -48,6 +48,14 @@ sources everything without any runtime glob cost.
 - **Auto helptags** — `sync` / `generate` end with one `nvim --headless`
   invocation that runs `:helptags <doc>` for the merged dir and every lazy
   plugin's `doc/`. No per-startup glob, no `:helptags ALL` needed
+- **`rvpm doctor`** — one-shot diagnostic across 4 categories (plugin
+  config, state integrity, Neovim integration, external tools). 16 checks,
+  exit codes `0`/`1`/`2` for CI-friendliness, `options.icons`-aware
+  rendering
+- **`rvpm log`** — per-run change history showing what commits landed in
+  each plugin on the last `sync` / `update`, with `⚠ BREAKING` highlight
+  for Conventional Commits' `<type>!:` / `BREAKING CHANGE:` footer, and
+  optional `--diff` for README / CHANGELOG / `doc/` patches
 - **Dependency ordering** — topological sort on `depends`, resilient to
   cycles and missing references; eager→lazy deps are auto-promoted
 - **Windows first-class** — hardcoded `~/.config` / `~/.cache` layout for
@@ -496,6 +504,8 @@ vim.keymap.set("n", "<leader>ff", "<cmd>Telescope find_files<cr>")
 | `rvpm init [--write]` | Print (or write) the `dofile(...)` snippet to wire `loader.lua` into `init.lua` |
 | `rvpm list [--no-tui]` | TUI plugin list with action keys; `--no-tui` for pipe-friendly plain text |
 | `rvpm browse` | TUI plugin browser over the GitHub `neovim-plugin` topic; Enter to install, `o` to open in browser |
+| `rvpm doctor` | Diagnose config, state, Neovim wiring, and external tools. Exit codes: `0` all-ok, `1` error, `2` warn-only. CI-friendly |
+| `rvpm log [query] [--last N] [--full] [--diff]` | Show what commits landed on the last `sync` / `update`. `--diff` embeds README / CHANGELOG / `doc/` patches. `⚠ BREAKING` highlight for Conventional Commits' `<type>!:` / `BREAKING CHANGE:` footer |
 
 Run `rvpm <command> --help` for flag-level details.
 
@@ -797,7 +807,8 @@ Beyond ordering, `depends` also affects **loading**:
 │   ├── merged/                              ← linked rtp for merge=true
 │   │   └── doc/tags                         ← helptags shared across merged plugins
 │   └── loader.lua                           ← generated loader
-└── browse/                                  ← `rvpm browse` cache (search + README)
+├── browse/                                  ← `rvpm browse` cache (search + README)
+└── update_log.json                          ← `rvpm log` history (last 20 sync / update runs)
 ```
 
 Windows uses the same `.config` / `.cache` paths under `%USERPROFILE%` (no
