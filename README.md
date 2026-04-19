@@ -810,6 +810,23 @@ cargo test dump_full_sample_loader -- --ignored --nocapture
 rvpm is developed with **TDD**: tests come first, and new behaviors are
 covered by either unit or integration tests before implementation.
 
+## Companion plugin
+
+[**rvpm.nvim**](https://github.com/yukimemi/rvpm.nvim) is a thin
+Neovim Lua layer that exposes `rvpm` as `:Rvpm <sub>` — async
+`vim.system` dispatch for non-interactive commands, a floating
+terminal for the TUIs (`list` / `browse` / `edit` / …), completion
+over `config.toml` plugin names, a BufWritePost auto-generate
+autocmd (with chezmoi re-add routing when `options.chezmoi = true`),
+and `:checkhealth rvpm` on top of `rvpm doctor`.
+
+The CLI remains the source of truth. rvpm.nvim just shortens the
+feedback loop when you'd rather not leave the editor.
+
+```sh
+rvpm add yukimemi/rvpm.nvim
+```
+
 ## Acknowledgments
 
 - **[lazy.nvim](https://github.com/folke/lazy.nvim)** — design inspiration
