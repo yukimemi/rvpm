@@ -59,6 +59,12 @@ pub struct Options {
     /// `sync --prune` を毎回明示しなくてよくなる。デフォルト `false`。
     #[serde(default)]
     pub auto_clean: bool,
+    /// `true` (デフォルト) なら `sync` / `generate` 完了時に `nvim --headless` を
+    /// 起動して helptags を自動生成する。lazy プラグインは runtimepath に載らない
+    /// ため、rvpm 側で対象 `doc/` ディレクトリを列挙して `:helptags <path>` を
+    /// 個別実行する。`nvim` が PATH に無い場合は警告して skip (resilience)。
+    #[serde(default = "default_auto_helptags")]
+    pub auto_helptags: bool,
     /// `rvpm add` が `config.toml` に書き込む URL の形式。
     /// - `"short"` (デフォルト): `owner/repo`
     /// - `"full"`: `https://github.com/owner/repo`
@@ -247,6 +253,10 @@ where
 }
 
 fn default_merge() -> bool {
+    true
+}
+
+fn default_auto_helptags() -> bool {
     true
 }
 
@@ -602,6 +612,31 @@ url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
         assert!(!config.options.chezmoi);
+    }
+
+    #[test]
+    fn test_parse_config_auto_helptags_defaults_to_true() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(config.options.auto_helptags);
+    }
+
+    #[test]
+    fn test_parse_config_accepts_auto_helptags_false() {
+        let toml = r#"
+[options]
+auto_helptags = false
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(!config.options.auto_helptags);
     }
 
     #[test]
