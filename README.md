@@ -747,10 +747,30 @@ cost; Neovim startup just sources a fixed list of files.
 <details>
 <summary><b>Merge optimization</b></summary>
 
-When `merge = true`, the plugin directory is linked (junction on Windows,
-symlink elsewhere) into `{cache_root}/plugins/merged/`. All `merge = true`
+When `merge = true`, the plugin's runtime files are **hard-linked at the
+file level** into `{cache_root}/plugins/merged/`. All `merge = true`
 plugins share a single `vim.opt.rtp:append(merged_dir)` call, keeping
 `&runtimepath` lean even with many eager plugins.
+
+File-level linking matters when multiple plugins place files under the
+same directory (e.g., several cmp-related plugins dropping files into
+`lua/cmp/`). The naive directory-link approach loses the later plugin's
+contents; rvpm walks each plugin recursively and hard-links individual
+files, surfacing any path collision in a `first-wins` summary at the end
+of `sync` / `generate`.
+
+Hard links work on Windows without admin rights (unlike symbolic links)
+and on every Unix; they only require the source and target to be on the
+same volume — and rvpm keeps both `repos/` and `merged/` under
+`<cache_root>` for that reason. If a hard link fails (cross-volume,
+non-NTFS quirks), the link falls back to a copy.
+
+Plugin-root metadata (`README.md`, `LICENSE`, `Makefile`, `*.toml`,
+`package.json`, etc.) is skipped — it's not on any runtimepath and
+just adds noise. Dotfiles at any depth (`.gitignore`, `.luarc.json`)
+are skipped for the same reason. Only the standard rtp directories
+(`plugin/`, `lua/`, `doc/`, `ftplugin/`, `colors/`, `queries/`, …)
+are walked.
 
 </details>
 

@@ -12,7 +12,6 @@ mod tui;
 
 use crate::config::parse_config;
 use crate::git::Repo;
-use crate::link::merge_plugin;
 use crate::loader::generate_loader;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -543,12 +542,18 @@ async fn run_sync(prune: bool) -> Result<()> {
 
     // dev プラグインは sync しないが loader には含めるので先に scripts を作る
     let mut plugin_scripts = Vec::new();
+    let mut merge_conflicts: Vec<(String, PathBuf)> = Vec::new();
     let config_root = resolve_config_root(config.options.config_root.as_deref());
     for plugin in config.plugins.iter().filter(|p| p.dev) {
         let dst_path = resolve_plugin_dst(plugin, &cache_root);
         let plugin_config_dir = resolve_plugin_config_dir(&config_root, plugin);
         if plugin.merge && !plugin.lazy {
-            let _ = merge_plugin(&dst_path, &merged_dir);
+            merge_and_record(
+                &dst_path,
+                &merged_dir,
+                &plugin.display_name(),
+                &mut merge_conflicts,
+            );
         }
         plugin_scripts.push(build_plugin_scripts(plugin, &dst_path, &plugin_config_dir));
     }
@@ -579,7 +584,12 @@ async fn run_sync(prune: bool) -> Result<()> {
                     // lazy プラグインは merge しない (trigger 前に merged/ 経由で
                     // lua モジュールが rtp に漏れて lazy の意味がなくなるため)
                     if plugin.merge && !plugin.lazy {
-                        let _ = merge_plugin(&dst_path, &merged_dir);
+                        merge_and_record(
+                            &dst_path,
+                            &merged_dir,
+                            &plugin.display_name(),
+                            &mut merge_conflicts,
+                        );
                     }
                     let config_root = resolve_config_root(config.options.config_root.as_deref());
                     let plugin_config_dir = resolve_plugin_config_dir(&config_root, &plugin);
@@ -609,7 +619,7 @@ async fn run_sync(prune: bool) -> Result<()> {
         for ps in &plugin_scripts {
             if promoted.contains(&ps.name) && ps.merge {
                 let dst = PathBuf::from(&ps.path);
-                let _ = merge_plugin(&dst, &merged_dir);
+                merge_and_record(&dst, &merged_dir, &ps.name, &mut merge_conflicts);
             }
         }
     }
@@ -710,6 +720,7 @@ async fn run_sync(prune: bool) -> Result<()> {
         );
     }
 
+    print_merge_conflicts(&merge_conflicts);
     print_init_lua_hint_if_missing(&config);
     Ok(())
 }
@@ -772,11 +783,12 @@ async fn run_generate() -> Result<()> {
         let _ = std::fs::remove_dir_all(&merged_dir);
     }
     std::fs::create_dir_all(&merged_dir)?;
+    let mut merge_conflicts: Vec<(String, PathBuf)> = Vec::new();
     for ps in &plugin_scripts {
         if !ps.lazy && ps.merge {
             let dst = PathBuf::from(&ps.path);
             if dst.exists() {
-                let _ = merge_plugin(&dst, &merged_dir);
+                merge_and_record(&dst, &merged_dir, &ps.name, &mut merge_conflicts);
             }
         }
     }
@@ -824,6 +836,7 @@ async fn run_generate() -> Result<()> {
         let _ = maybe_prune_unused_repos(&config, &cache_root, true);
     }
 
+    print_merge_conflicts(&merge_conflicts);
     print_init_lua_hint_if_missing(&config);
     Ok(())
 }
@@ -1556,10 +1569,10 @@ async fn run_add(
                 eprintln!("Warning: {}: {}", plugin.display_name(), err);
             }
 
-            if plugin.merge && !plugin.lazy {
-                std::fs::create_dir_all(&merged_dir).ok();
-                let _ = merge_plugin(&dst_path, &merged_dir);
-            }
+            // run_add 直後に merge する必要は無い: 末尾で `run_generate()` を呼び、
+            // そこで merged/ を rm -rf して全 eager+merge を再構築するため。
+            // (旧実装はここで merge していたが run_generate に上書きされて冗長)
+            let _ = (&plugin, &dst_path, &merged_dir);
         }
     }
 
@@ -2664,6 +2677,55 @@ fn resolve_repos_dir(cache_root: &Path) -> PathBuf {
 /// merged ディレクトリ。`<cache_root>/plugins/merged`。
 fn resolve_merged_dir(cache_root: &Path) -> PathBuf {
     cache_root.join("plugins").join("merged")
+}
+
+/// link.rs::merge_plugin を呼び出して、発生した衝突に plugin 名を紐付けて
+/// `conflicts` に積む。merge 自体が失敗した場合は stderr に warn を流すが
+/// エラーにはしない (resilience)。
+fn merge_and_record(
+    src: &Path,
+    dst_root: &Path,
+    plugin_name: &str,
+    conflicts: &mut Vec<(String, PathBuf)>,
+) {
+    match crate::link::merge_plugin(src, dst_root) {
+        Ok(result) => {
+            for c in result.conflicts {
+                conflicts.push((plugin_name.to_string(), c.relative));
+            }
+        }
+        Err(e) => {
+            eprintln!("\u{26a0} merge failed for {}: {}", plugin_name, e);
+        }
+    }
+}
+
+/// 収集した衝突を plugin ごとにグループ化して stderr にサマリ出力する。
+fn print_merge_conflicts(conflicts: &[(String, PathBuf)]) {
+    if conflicts.is_empty() {
+        return;
+    }
+    let mut by_plugin: std::collections::BTreeMap<&String, Vec<&PathBuf>> =
+        std::collections::BTreeMap::new();
+    for (name, rel) in conflicts {
+        by_plugin.entry(name).or_default().push(rel);
+    }
+    eprintln!();
+    eprintln!(
+        "\u{26a0} {} merge conflict(s) across {} plugin(s) — first-wins, later entries skipped:",
+        conflicts.len(),
+        by_plugin.len(),
+    );
+    for (plugin, files) in &by_plugin {
+        eprintln!("  {} ({} file{}):", plugin, files.len(), plural_s(files.len()));
+        for f in files {
+            eprintln!("    {}", f.display().to_string().replace('\\', "/"));
+        }
+    }
+}
+
+fn plural_s(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 // ====================================================================
