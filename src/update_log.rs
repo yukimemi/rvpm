@@ -104,11 +104,19 @@ pub fn cap_runs(log: &mut UpdateLog) {
     }
 }
 
-/// 1 回分の run を追記する。空の changes でも記録する (sync の事実は残したい)。
+/// 1 回分の run を追記する。**空の changes なら何もしない** (file に書かない)。
+///
+/// `MAX_RUNS` cap があるので空 run (HEAD が動かなかった no-op `sync`/`update`)
+/// を記録すると、有用な履歴を押し出す恐れがある。`rvpm log` は元々空 run を
+/// 表示しないので、そもそも記録する意味が無い。
+///
 /// 書き込みは tempfile + rename の atomic write。
 /// 失敗しても呼び出し元の操作を壊さないよう、エラーは Ok 扱いで eprintln する責務は
 /// caller 側に委ねる (Result を返すことでテスト可能性は保つ)。
 pub fn record_run(path: &Path, command: &str, changes: Vec<ChangeRecord>) -> Result<()> {
+    if changes.is_empty() {
+        return Ok(());
+    }
     let mut log = load_log(path);
     let timestamp = format_rfc3339_utc(SystemTime::now());
     log.runs.push(RunRecord {
@@ -161,14 +169,13 @@ pub fn format_rfc3339_utc(t: SystemTime) -> String {
 pub fn parse_rfc3339_utc(s: &str) -> Option<SystemTime> {
     // 期待: "YYYY-MM-DDTHH:MM:SSZ" (20 chars) or with "+00:00" (25 chars)
     let s = s.trim();
-    let core = if let Some(stripped) = s.strip_suffix('Z') {
-        stripped
-    } else if let Some(stripped) = s.strip_suffix("+00:00") {
-        stripped
-    } else {
-        return None;
-    };
-    if core.len() != 19 || core.as_bytes()[10] != b'T' {
+    let core = s
+        .strip_suffix('Z')
+        .or_else(|| s.strip_suffix("+00:00"))?;
+    // ASCII 前提の byte-range 切り出しをするので、ASCII であることを先に検証。
+    // 非 ASCII の multi-byte 文字が 19 byte に偶然フィットすると `core[0..4]`
+    // が char boundary で panic するため。
+    if core.len() != 19 || !core.is_ascii() || core.as_bytes()[10] != b'T' {
         return None;
     }
     let y: i64 = core[0..4].parse().ok()?;
@@ -301,17 +308,13 @@ fn subject_indicates_breaking(subject: &str) -> bool {
 fn body_indicates_breaking(body: &str) -> bool {
     for line in body.lines() {
         let trimmed = line.trim_start();
-        // 大文字小文字無視で接頭辞一致
-        if trimmed.len() < "BREAKING CHANGE:".len() {
-            continue;
-        }
-        let head = &trimmed[..trimmed
-            .char_indices()
-            .nth(16)
-            .map(|(i, _)| i)
-            .unwrap_or(trimmed.len())];
-        let lower = head.to_ascii_lowercase();
-        if lower.starts_with("breaking change:") || lower.starts_with("breaking-change:") {
+        // "BREAKING CHANGE:" / "BREAKING-CHANGE:" はどちらも 16 byte (ASCII)。
+        // byte-range で先頭 16 byte を直接取り、ASCII の大文字小文字無視比較する。
+        // `get(..16)` は char boundary に着地しない場合 None を返すので panic しない。
+        if let Some(head) = trimmed.get(..16)
+            && (head.eq_ignore_ascii_case("breaking change:")
+                || head.eq_ignore_ascii_case("breaking-change:"))
+        {
             return true;
         }
     }
@@ -321,6 +324,21 @@ fn body_indicates_breaking(body: &str) -> bool {
 // =====================================================================
 // Render (plain text)
 // =====================================================================
+
+/// `rvpm log --diff` が埋め込む patch の lookup キー。
+///
+/// - `url` で plugin を一意化 (同じ `name` が別 owner で使われていても衝突しない)
+/// - `(from, to)` の commit range で run を区別 (`--last 2 --diff` で同じ
+///   plugin の同じ doc file が複数 run に現れても、各 run の patch が別々に
+///   lookup できる)
+/// - `file` で doc file ごとに区別
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DiffKey {
+    pub url: String,
+    pub from: String,
+    pub to: String,
+    pub file: String,
+}
 
 /// `rvpm log` の表示オプション。CLI フラグから組み立てる。
 #[derive(Debug, Clone)]
@@ -335,9 +353,8 @@ pub struct LogRenderOptions<'a> {
     pub full: bool,
     /// `--diff`: doc files の patch を埋め込む (caller が Vec<String> を渡す)。
     pub diff: bool,
-    /// (plugin name, file path) → diff text の事前取得済みマップ。
-    /// `--diff` が false なら空でよい。
-    pub diffs: std::collections::HashMap<(String, String), String>,
+    /// `DiffKey` → diff text の事前取得済みマップ。`--diff` が false なら空。
+    pub diffs: std::collections::HashMap<DiffKey, String>,
     /// アイコンスタイル (BREAKING マーカーの装飾用)。
     pub icons: IconStyle,
     /// 「今」: テスト容易性のため呼び出し側から注入。
@@ -366,6 +383,9 @@ pub fn render_log(log: &UpdateLog, opts: &LogRenderOptions<'_>) -> String {
     }
 
     let breaking_marker = breaking_marker_for(opts.icons);
+    // query の lowercase は 1 回だけ評価する (ループ内で plugin ごとに
+    // `.to_lowercase()` を再計算するとプラグイン数に比例して無駄)。
+    let query_lower: Option<String> = opts.query.map(|q| q.to_lowercase());
 
     // 新しい順、`last` 件まで。query で絞り込んだ後の changes が空ならその run は表示しない。
     let mut shown = 0;
@@ -376,8 +396,8 @@ pub fn render_log(log: &UpdateLog, opts: &LogRenderOptions<'_>) -> String {
         let filtered: Vec<&ChangeRecord> = run
             .changes
             .iter()
-            .filter(|c| match opts.query {
-                Some(q) => c.name.to_lowercase().contains(&q.to_lowercase()),
+            .filter(|c| match &query_lower {
+                Some(q) => c.name.to_lowercase().contains(q.as_str()),
                 None => true,
             })
             .collect();
@@ -448,7 +468,13 @@ fn render_change(
                 if opts.diff {
                     for f in &change.doc_files_changed {
                         out.push_str(&format!("    \u{2500}\u{2500} diff: {}\n", f));
-                        if let Some(patch) = opts.diffs.get(&(change.name.clone(), f.clone())) {
+                        let key = DiffKey {
+                            url: change.url.clone(),
+                            from: from.clone(),
+                            to: change.to.clone(),
+                            file: f.clone(),
+                        };
+                        if let Some(patch) = opts.diffs.get(&key) {
                             for line in patch.lines() {
                                 out.push_str("    ");
                                 out.push_str(line);
@@ -659,11 +685,23 @@ mod tests {
         assert_eq!(log.runs.len(), 1);
     }
 
+    fn sample_change(name: &str) -> ChangeRecord {
+        ChangeRecord {
+            name: name.to_string(),
+            url: format!("owner/{}", name),
+            from: Some("a".into()),
+            to: "b".into(),
+            subjects: vec!["fix: x".into()],
+            breaking_subjects: vec![],
+            doc_files_changed: vec![],
+        }
+    }
+
     #[test]
     fn test_record_run_creates_file_and_persists() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("update_log.json");
-        record_run(&path, "sync", vec![]).unwrap();
+        record_run(&path, "sync", vec![sample_change("a")]).unwrap();
         assert!(path.exists());
         let log = load_log(&path);
         assert_eq!(log.runs.len(), 1);
@@ -671,11 +709,31 @@ mod tests {
     }
 
     #[test]
-    fn test_record_run_appends_existing() {
+    fn test_record_run_skips_empty_changes() {
+        // 空 run を persist すると MAX_RUNS cap で有用履歴を押し出すので書かない。
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("update_log.json");
         record_run(&path, "sync", vec![]).unwrap();
-        record_run(&path, "update", vec![]).unwrap();
+        assert!(!path.exists(), "update_log.json should not be created for empty run");
+    }
+
+    #[test]
+    fn test_record_run_skips_empty_but_preserves_existing() {
+        // 既存 file があっても空 run は追加しない (既存履歴を守る)。
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("update_log.json");
+        record_run(&path, "sync", vec![sample_change("a")]).unwrap();
+        record_run(&path, "sync", vec![]).unwrap();
+        let log = load_log(&path);
+        assert_eq!(log.runs.len(), 1, "empty run should not append");
+    }
+
+    #[test]
+    fn test_record_run_appends_existing() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("update_log.json");
+        record_run(&path, "sync", vec![sample_change("a")]).unwrap();
+        record_run(&path, "update", vec![sample_change("b")]).unwrap();
         let log = load_log(&path);
         assert_eq!(log.runs.len(), 2);
         assert_eq!(log.runs[0].command, "sync");
@@ -686,8 +744,8 @@ mod tests {
     fn test_record_run_caps_at_max_runs() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("update_log.json");
-        for _ in 0..(MAX_RUNS + 3) {
-            record_run(&path, "sync", vec![]).unwrap();
+        for i in 0..(MAX_RUNS + 3) {
+            record_run(&path, "sync", vec![sample_change(&format!("p{}", i))]).unwrap();
         }
         let log = load_log(&path);
         assert_eq!(log.runs.len(), MAX_RUNS);
@@ -886,7 +944,12 @@ mod tests {
     fn test_render_log_diff_embeds_patch() {
         let mut diffs = HashMap::new();
         diffs.insert(
-            ("snacks.nvim".into(), "README.md".into()),
+            DiffKey {
+                url: "folke/snacks.nvim".into(),
+                from: "abc1234aaaa".into(),
+                to: "def5678bbbb".into(),
+                file: "README.md".into(),
+            },
             "diff --git a/README.md b/README.md\n+ added line\n".to_string(),
         );
         let s = render_with(LogRenderOptions {

@@ -3230,37 +3230,45 @@ fn format_plugin_url(input: &str, style: crate::config::UrlStyle) -> String {
 /// 永続化 JSON を読み、`--diff` が指定されていれば対象 doc files の patch を
 /// `git diff <from>..<to> -- <file>` で 1 ファイルずつ取得し、整形して stdout に出す。
 async fn run_log(query: Option<String>, last: usize, full: bool, diff: bool) -> Result<()> {
-    // cache_root の決定: config.toml が parse できれば options.cache_root を尊重、
-    // 無ければ defaults にフォールバック (resilience: log を見たいだけなら config が
-    // 壊れていても閲覧できるべき)。
+    // config.toml は **1 回だけ** 読む。resilience 原則: 壊れていても log は見える
+    // べきなので `Option<Config>` にして以降は参照使い回し。
     let config_path = rvpm_config_path();
-    let cache_root = if config_path.exists() {
-        let toml_content = std::fs::read_to_string(&config_path).unwrap_or_default();
-        parse_config(&toml_content)
-            .map(|c| resolve_cache_root(c.options.cache_root.as_deref()))
-            .unwrap_or_else(|_| resolve_cache_root(None))
+    let config: Option<crate::config::Config> = if config_path.exists() {
+        match std::fs::read_to_string(&config_path) {
+            Ok(toml_content) => parse_config(&toml_content).ok(),
+            Err(_) => None,
+        }
     } else {
-        resolve_cache_root(None)
+        None
     };
-    let log_path = resolve_update_log_path(&cache_root);
 
-    // icons は config から、駄目なら default。
-    let icons = if config_path.exists() {
-        let toml_content = std::fs::read_to_string(&config_path).unwrap_or_default();
-        parse_config(&toml_content)
-            .map(|c| c.options.icons)
-            .unwrap_or_default()
-    } else {
-        crate::config::IconStyle::default()
-    };
+    let cache_root = config
+        .as_ref()
+        .map(|c| resolve_cache_root(c.options.cache_root.as_deref()))
+        .unwrap_or_else(|| resolve_cache_root(None));
+    let icons = config
+        .as_ref()
+        .map(|c| c.options.icons)
+        .unwrap_or_default();
+    let log_path = resolve_update_log_path(&cache_root);
 
     let log = crate::update_log::load_log(&log_path);
     // 上限を超える `--last` は MAX_RUNS に丸める。
     let last = last.clamp(1, crate::update_log::MAX_RUNS);
+    // query の lowercase も 1 回だけ。
+    let query_lower: Option<String> = query.as_deref().map(|q| q.to_lowercase());
+    let matches_query = |name: &str| -> bool {
+        match &query_lower {
+            Some(q) => name.to_lowercase().contains(q.as_str()),
+            None => true,
+        }
+    };
 
     // `--diff` 用の patch 取得は表示順 (新しい run から最大 `last` 件) にだけ実施し、
     // クエリでフィルタされたプラグインに限る (無駄な git diff を避ける)。
-    let mut diffs: std::collections::HashMap<(String, String), String> =
+    // key は (url, from, to, file) で run を区別する。`--last 2 --diff` 時に同じ
+    // plugin の同じ doc file が複数 run で変わっていても patch が上書きされない。
+    let mut diffs: std::collections::HashMap<crate::update_log::DiffKey, String> =
         std::collections::HashMap::new();
     if diff {
         let mut shown = 0;
@@ -3268,18 +3276,12 @@ async fn run_log(query: Option<String>, last: usize, full: bool, diff: bool) -> 
             if shown >= last {
                 break;
             }
-            let any_match = run.changes.iter().any(|c| match query.as_deref() {
-                Some(q) => c.name.to_lowercase().contains(&q.to_lowercase()),
-                None => true,
-            });
-            if !any_match {
+            if !run.changes.iter().any(|c| matches_query(&c.name)) {
                 continue;
             }
             shown += 1;
             for change in &run.changes {
-                if let Some(q) = query.as_deref()
-                    && !change.name.to_lowercase().contains(&q.to_lowercase())
-                {
+                if !matches_query(&change.name) {
                     continue;
                 }
                 // 新規 clone (from = None) は from..to を作れないので skip
@@ -3289,17 +3291,12 @@ async fn run_log(query: Option<String>, last: usize, full: bool, diff: bool) -> 
                 if change.doc_files_changed.is_empty() {
                     continue;
                 }
-                // dst_path は config から解決。config が壊れていれば skip。
-                let Ok(toml_content) = std::fs::read_to_string(&config_path) else {
+                // dst_path は事前パース済み config から解決。config が無ければ skip。
+                let Some(cfg) = config.as_ref() else { continue };
+                let Some(plugin) = cfg.plugins.iter().find(|p| p.url == change.url) else {
                     continue;
                 };
-                let Ok(cfg) = parse_config(&toml_content) else {
-                    continue;
-                };
-                let cache_root = resolve_cache_root(cfg.options.cache_root.as_deref());
-                let plugin_opt = cfg.plugins.iter().find(|p| p.url == change.url).cloned();
-                let Some(plugin) = plugin_opt else { continue };
-                let dst_path = resolve_plugin_dst(&plugin, &cache_root);
+                let dst_path = resolve_plugin_dst(plugin, &cache_root);
                 for file in &change.doc_files_changed {
                     let output = tokio::process::Command::new("git")
                         .arg("-C")
@@ -3311,7 +3308,15 @@ async fn run_log(query: Option<String>, last: usize, full: bool, diff: bool) -> 
                         && out.status.success()
                     {
                         let patch = String::from_utf8_lossy(&out.stdout).to_string();
-                        diffs.insert((change.name.clone(), file.clone()), patch);
+                        diffs.insert(
+                            crate::update_log::DiffKey {
+                                url: change.url.clone(),
+                                from: from.to_string(),
+                                to: change.to.clone(),
+                                file: file.clone(),
+                            },
+                            patch,
+                        );
                     }
                 }
             }
@@ -5044,13 +5049,39 @@ url = "owner/repo"
 
     #[test]
     fn test_record_changes_or_warn_writes_file() {
+        // 空 changes は file 自体を作らない方針 (有用履歴を押し出さないため)。
+        // 非空 changes 1 件渡したらきちんと書かれることを確認。
+        let dir = tempdir().unwrap();
+        let cache_root = dir.path().to_path_buf();
+        record_changes_or_warn(
+            &cache_root,
+            "sync",
+            vec![crate::update_log::ChangeRecord {
+                name: "x".into(),
+                url: "owner/x".into(),
+                from: Some("a".into()),
+                to: "b".into(),
+                subjects: vec!["fix: x".into()],
+                breaking_subjects: vec![],
+                doc_files_changed: vec![],
+            }],
+        );
+        let path = resolve_update_log_path(&cache_root);
+        assert!(path.exists(), "expected log file for non-empty changes");
+        let log = crate::update_log::load_log(&path);
+        assert_eq!(log.runs.len(), 1);
+        assert_eq!(log.runs[0].command, "sync");
+    }
+
+    #[test]
+    fn test_record_changes_or_warn_skips_empty() {
         let dir = tempdir().unwrap();
         let cache_root = dir.path().to_path_buf();
         record_changes_or_warn(&cache_root, "sync", vec![]);
         let path = resolve_update_log_path(&cache_root);
-        assert!(path.exists());
-        let log = crate::update_log::load_log(&path);
-        assert_eq!(log.runs.len(), 1);
-        assert_eq!(log.runs[0].command, "sync");
+        assert!(
+            !path.exists(),
+            "empty changes should not create the log file"
+        );
     }
 }
