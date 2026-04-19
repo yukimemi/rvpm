@@ -584,12 +584,19 @@ pub fn check_appname(resolved: &str, rvpm_env: Option<&str>, nvim_env: Option<&s
 }
 
 /// helptags チェック: `options.auto_helptags` に応じて挙動が変わる。
-/// - false (default): informational (`Ok` で "disabled" と表示)
-/// - true: 各プラグインの `doc/` を覗き、`doc/tags` が無いものを警告する
-pub fn check_helptags<F>(config: &Config, resolve_dst: F) -> Diagnostic
-where
-    F: Fn(&crate::config::Plugin) -> PathBuf,
-{
+/// - false: informational (`Ok` で "disabled" と表示)
+/// - true (default): `crate::helptags::collect_helptag_targets` と同じ規則で
+///   実際に `:helptags` の対象になる `doc/` ディレクトリだけを列挙し、
+///   各 target に `tags` ファイルがあるか確認する。
+///
+/// 重要: eager + merge=true プラグインは `merged/doc/` に統合されるので、
+/// 個別の plugin 配下の `doc/tags` は生成されない (= ここでチェックしない)。
+/// 各プラグインの `doc/` を素朴に walk するロジックは false-warn を生む。
+pub fn check_helptags(
+    config: &Config,
+    targets: &[PathBuf],
+    target_labels: &[String],
+) -> Diagnostic {
     if !config.options.auto_helptags {
         return Diagnostic::new(
             Severity::Ok,
@@ -599,37 +606,31 @@ where
         );
     }
 
-    let mut checked = 0usize;
+    let total = targets.len();
     let mut missing: Vec<String> = Vec::new();
-    for p in &config.plugins {
-        let dst = resolve_dst(p);
-        let doc_dir = dst.join("doc");
-        if !doc_dir.exists() {
-            continue;
-        }
-        checked += 1;
-        if !doc_dir.join("tags").exists() {
-            missing.push(format!("{}: {}", p.display_name(), doc_dir.display()));
+    for (target, label) in targets.iter().zip(target_labels.iter()) {
+        if !target.join("tags").exists() {
+            missing.push(format!("{}: {}", label, target.display()));
         }
     }
 
-    let have_tags = checked - missing.len();
+    let have_tags = total - missing.len();
     if missing.is_empty() {
         Diagnostic::new(
             Severity::Ok,
             CAT_NEOVIM,
             "helptags",
-            format!("{}/{} have doc/tags", have_tags, checked),
+            format!("{}/{} have doc/tags", have_tags, total),
         )
     } else {
         Diagnostic::new(
             Severity::Warn,
             CAT_NEOVIM,
             "helptags",
-            format!("{}/{} have doc/tags", have_tags, checked),
+            format!("{}/{} have doc/tags", have_tags, total),
         )
         .with_details(missing)
-        .with_hint("run `:helptags ALL` in Neovim or `rvpm sync` with auto_helptags")
+        .with_hint("run `rvpm sync` (auto_helptags) or `:helptags <doc>` in Neovim")
     }
 }
 
@@ -850,6 +851,12 @@ pub struct CheckContext<'a> {
     pub nvim_appname_env: Option<String>,
     pub resolver: Box<dyn VersionResolver>,
     pub resolve_dst: Box<dyn Fn(&crate::config::Plugin) -> PathBuf + 'a>,
+    /// `crate::helptags::collect_helptag_targets` で求めた `:helptags` 対象 doc/。
+    /// merged/doc/ + lazy/non-merge プラグインの個別 doc/ のみが含まれる。
+    pub helptag_targets: Vec<PathBuf>,
+    /// `helptag_targets` と 1:1 で対応する表示用ラベル
+    /// (例: "merged" / プラグイン名)。
+    pub helptag_target_labels: Vec<String>,
 }
 
 pub fn run_checks(ctx: &CheckContext) -> Vec<Diagnostic> {
@@ -872,7 +879,7 @@ pub fn run_checks(ctx: &CheckContext) -> Vec<Diagnostic> {
             ctx.rvpm_appname_env.as_deref(),
             ctx.nvim_appname_env.as_deref(),
         ),
-        check_helptags(ctx.config, |p| (ctx.resolve_dst)(p)),
+        check_helptags(ctx.config, &ctx.helptag_targets, &ctx.helptag_target_labels),
         // External tools
         check_tool_nvim(ctx.resolver.as_ref()),
         check_tool_git(ctx.resolver.as_ref()),
@@ -1315,35 +1322,45 @@ mod tests {
         // auto_helptags = false を明示すると check 自体をスキップして informational に。
         let mut cfg = mk_config(vec![plugin("owner/a")]);
         cfg.options.auto_helptags = false;
-        let d = check_helptags(&cfg, |_p| PathBuf::from("/tmp/whatever"));
+        let d = check_helptags(&cfg, &[], &[]);
         assert_eq!(d.severity, Severity::Ok);
         assert!(d.summary.contains("disabled"));
     }
 
     #[test]
     fn test_check_helptags_warns_when_missing_tags() {
+        // target ディレクトリに tags ファイルが無い → warn
         let tmp = tempfile::tempdir().unwrap();
-        let dst = tmp.path().join("pl");
-        std::fs::create_dir_all(dst.join("doc")).unwrap();
-        // doc/ あり、tags なし → warn
+        let doc = tmp.path().join("plugin/doc");
+        std::fs::create_dir_all(&doc).unwrap();
         let mut cfg = mk_config(vec![plugin("owner/a")]);
         cfg.options.auto_helptags = true;
-        let dst_clone = dst.clone();
-        let d = check_helptags(&cfg, move |_p| dst_clone.clone());
+        let d = check_helptags(&cfg, &[doc], &["owner/a".into()]);
         assert_eq!(d.severity, Severity::Warn);
+        assert!(d.summary.contains("0/1"));
     }
 
     #[test]
     fn test_check_helptags_ok_when_tags_present() {
         let tmp = tempfile::tempdir().unwrap();
-        let dst = tmp.path().join("pl");
-        std::fs::create_dir_all(dst.join("doc")).unwrap();
-        std::fs::write(dst.join("doc").join("tags"), "tags").unwrap();
+        let doc = tmp.path().join("plugin/doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        std::fs::write(doc.join("tags"), b"tags").unwrap();
         let mut cfg = mk_config(vec![plugin("owner/a")]);
         cfg.options.auto_helptags = true;
-        let dst_clone = dst.clone();
-        let d = check_helptags(&cfg, move |_p| dst_clone.clone());
+        let d = check_helptags(&cfg, &[doc], &["owner/a".into()]);
         assert_eq!(d.severity, Severity::Ok);
+        assert!(d.summary.contains("1/1"));
+    }
+
+    #[test]
+    fn test_check_helptags_no_targets_means_zero_zero() {
+        // sync 後に doc/ があるプラグインがゼロというケース。OK 表示。
+        let mut cfg = mk_config(vec![plugin("owner/a")]);
+        cfg.options.auto_helptags = true;
+        let d = check_helptags(&cfg, &[], &[]);
+        assert_eq!(d.severity, Severity::Ok);
+        assert!(d.summary.contains("0/0"));
     }
 
     // -------- external tools --------

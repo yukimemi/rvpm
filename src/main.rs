@@ -891,6 +891,33 @@ async fn run_doctor() -> Result<i32> {
         resolve_plugin_dst(p, &cache_root_for_fn)
     });
 
+    // helptags チェック用の target list を、本物の loader 生成と同じ規則で構築する。
+    // merged + lazy + non-merge eager だけが個別の `:helptags` 対象になる。
+    // lazy → eager 昇格も考慮するため、build_plugin_scripts → promote まで通す。
+    let config_root_for_scripts = resolve_config_root(config.options.config_root.as_deref());
+    let mut plugin_scripts: Vec<crate::loader::PluginScripts> = Vec::new();
+    for plugin in &config.plugins {
+        let dst = resolve_plugin_dst(plugin, &cache_root);
+        let plugin_config_dir = resolve_plugin_config_dir(&config_root_for_scripts, plugin);
+        plugin_scripts.push(build_plugin_scripts(plugin, &dst, &plugin_config_dir));
+    }
+    crate::loader::promote_lazy_to_eager(&mut plugin_scripts);
+    let helptag_targets = crate::helptags::collect_helptag_targets(&plugin_scripts, &merged_dir);
+    // collect_helptag_targets と同じイテレーションでラベルを並べる (順序を揃える)。
+    let mut helptag_target_labels: Vec<String> = Vec::with_capacity(helptag_targets.len());
+    if merged_dir.join("doc").is_dir() {
+        helptag_target_labels.push("merged".to_string());
+    }
+    for ps in &plugin_scripts {
+        if ps.merge && !ps.lazy {
+            continue;
+        }
+        if PathBuf::from(&ps.path).join("doc").is_dir() {
+            helptag_target_labels.push(ps.name.clone());
+        }
+    }
+    debug_assert_eq!(helptag_targets.len(), helptag_target_labels.len());
+
     let ctx = crate::doctor::CheckContext {
         config: &config,
         config_path: &config_path,
@@ -903,6 +930,8 @@ async fn run_doctor() -> Result<i32> {
         nvim_appname_env: nvim_env,
         resolver: Box::new(crate::doctor::SystemResolver),
         resolve_dst,
+        helptag_targets,
+        helptag_target_labels,
     };
 
     let diagnostics = crate::doctor::run_checks(&ctx);
