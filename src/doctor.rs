@@ -142,14 +142,20 @@ pub fn check_depends_cycles(config: &Config) -> Diagnostic {
         );
     }
 
-    // 重複除去: 循環 (A → B → A) と (B → A → B) は同じ循環。サイクルを
-    // display_name でソートした正規形で dedupe する。
+    // 重複除去: `[A, B, A]` と `[B, A, B]` は同じ循環。末尾の重複ノード (dfs が
+    // `chain(once(node))` で付加している) を落としたノード集合を sort して正規形
+    // にし、HashSet で dedupe する。末尾を落とさずに sort すると
+    // `[A, A, B]` vs `[A, B, B]` で異なるキーになり dedupe 失敗する (gemini-code-assist
+    // の指摘通り)。
     let mut normalized: HashSet<Vec<String>> = HashSet::new();
     let mut uniq_cycles: Vec<Vec<String>> = Vec::new();
     for cycle in cycles {
-        let mut canonical = cycle.clone();
-        canonical.sort();
-        if normalized.insert(canonical) {
+        let mut nodes = cycle.clone();
+        if nodes.len() > 1 {
+            nodes.pop();
+        }
+        nodes.sort();
+        if normalized.insert(nodes) {
             uniq_cycles.push(cycle);
         }
     }
@@ -435,11 +441,12 @@ pub fn check_merged_stale_links(merged_dir: &Path) -> Diagnostic {
     }
 
     let mut stale: Vec<String> = Vec::new();
-    // 浅い walk のみ (merged/ 直下の第 1, 2 レベル) で十分。リンクは `plugin/foo.lua`
-    // のような形で個別ファイルに張る場合もあり得るので、walkdir を使って壊れた
-    // symlink を列挙する (`follow_links = false` でリンク自体を訪ねる)。
+    // depth 制限なしで walk する。現行の link.rs は第 2 階層まで (`merged/<dir>/<file>`)
+    // しか link を張らないが、plugin 同士の path 競合 (blink 系等) を避けるため
+    // 将来的にファイル単位 link に移行する可能性がある。その場合 `merged/lua/foo/bar.lua`
+    // のように深くなるので、今のうちから深い壊れ symlink も検出できるようにしておく。
+    // `follow_links = false` でリンク自体を訪ねる (dead link の metadata が失敗する性質を利用)。
     for entry in walkdir::WalkDir::new(merged_dir)
-        .max_depth(2)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -1003,10 +1010,12 @@ impl Summary {
 const TITLE_WIDTH: usize = 25;
 
 /// 診断アイコンを Icons スタイルに合わせて返す (先頭プレフィクス)。
+/// Ascii モードではタイトル列を揃えるため全 prefix を 4 文字に統一する
+/// ("ok  " / "WARN" / "ERR ")。
 fn severity_prefix(sev: Severity, icons: &Icons) -> String {
     match icons.style {
         IconStyle::Ascii => match sev {
-            Severity::Ok => "ok ".to_string(),
+            Severity::Ok => "ok  ".to_string(),
             Severity::Warn => "WARN".to_string(),
             Severity::Error => "ERR ".to_string(),
         },
@@ -1199,6 +1208,31 @@ mod tests {
         let d = check_depends_cycles(&cfg);
         assert_eq!(d.severity, Severity::Error);
         assert!(!d.details.is_empty());
+    }
+
+    #[test]
+    fn test_check_depends_cycles_dedupes_equivalent_cycles() {
+        // A → B → A と B → A → B は同じ循環。dfs が両方検出しても dedupe で 1 件に。
+        let cfg = mk_config(vec![
+            Plugin {
+                url: "A".into(),
+                depends: Some(vec!["B".into()]),
+                ..Default::default()
+            },
+            Plugin {
+                url: "B".into(),
+                depends: Some(vec!["A".into()]),
+                ..Default::default()
+            },
+        ]);
+        let d = check_depends_cycles(&cfg);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(
+            d.details.len(),
+            1,
+            "equivalent cycles should dedupe, got: {:?}",
+            d.details
+        );
     }
 
     // -------- depends references --------
