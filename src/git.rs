@@ -64,6 +64,16 @@ impl<'a> Repo<'a> {
             .await
             .unwrap_or(RepoStatus::Error("status check panicked".to_string()))
     }
+
+    /// 現在 checkout 中の HEAD commit hash を返す。
+    /// lockfile 書き込み時に "no-op sync でも現在の commit を記録する" ために使う
+    /// (`sync()` の `GitChange` は HEAD が動いた時しか返されないため)。
+    pub async fn head_commit(&self) -> Result<String> {
+        let dst = self.dst.to_path_buf();
+        tokio::task::spawn_blocking(move || read_head(&dst))
+            .await
+            .map_err(|e| anyhow::anyhow!("head_commit task panicked: {}", e))?
+    }
 }
 
 /// owner/repo 形式のショートハンドを GitHub URL に変換。
