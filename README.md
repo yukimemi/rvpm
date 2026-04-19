@@ -141,7 +141,7 @@ for fully isolated test configs.
 | `concurrency` | `integer` | `8` | Max parallel git operations during `sync` / `update` |
 | `chezmoi` | `boolean` | `false` | Route writes through chezmoi source state. See [Advanced → chezmoi integration](#advanced) |
 | `auto_clean` | `boolean` | `false` | `sync` / `generate` auto-delete plugin dirs no longer in `config.toml` (= always `--prune`) |
-| `auto_helptags` | `boolean` | `true` | `sync` / `generate` run `nvim --headless` once at the end to build helptags for every plugin's `doc/`. Skipped silently if `nvim` is missing |
+| `auto_helptags` | `boolean` | `true` | `sync` / `generate` run `nvim --headless` once at the end to build helptags for every plugin's `doc/`. Skipped with a warning if `nvim` is missing |
 | `url_style` | `"short"` \| `"full"` | `"short"` | How `rvpm add` writes GitHub plugin URLs. Duplicate detection normalizes between styles |
 
 > **💡 Leave `config_root` / `cache_root` unset.** Defaults are already
@@ -166,7 +166,7 @@ integration, and the external README renderer — see
 | `rvpm update [query]` | `git pull` installed plugins |
 | `rvpm remove [query]` | Remove a plugin from `config.toml` and delete its directory |
 | `rvpm edit [query] [--init\|--before\|--after] [--global]` | Edit per-plugin Lua hooks in `$EDITOR`; `--global` for global hooks |
-| `rvpm set [query] [flags]` | Tweak plugin options (lazy, merge, on\_\*, rev) interactively or via flags |
+| `rvpm set [query] [flags]` | Tweak plugin options (`lazy`, `merge`, `on_*`, `rev`) interactively or via flags |
 | `rvpm config` | Open `config.toml` in `$EDITOR` |
 | `rvpm init [--write]` | Print (or write) the snippet to wire `loader.lua` into `init.lua` |
 | `rvpm list [--no-tui]` | TUI plugin list with action keys; `--no-tui` for pipe-friendly plain text |
@@ -650,8 +650,8 @@ Beyond ordering, `depends` also affects **loading**:
 - **Lazy plugin → lazy dep**: the dependency is loaded on-demand. When
   the trigger fires, the generated callback calls `load_lazy` for each
   lazy dep (in dependency order) before loading the plugin itself. A
-  double-load guard (`if loaded["<name>"] then return end`) prevents
-  redundant sourcing when multiple plugins share the same dep.
+  double-load guard (`if _G["rvpm_loaded_" .. name] then return end`)
+  prevents redundant sourcing when multiple plugins share the same dep.
 
 </details>
 
