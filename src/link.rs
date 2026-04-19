@@ -1,15 +1,34 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-/// Neovim の `runtimepath` が走査する慣習ディレクトリ。
+/// Neovim の `runtimepath` が走査する慣習ディレクトリ + denops エコシステム
+/// で必要なディレクトリ。
 /// plugin ルート直下にある **これらのディレクトリのみ** を merged にコピー
 /// 対象とする。`tests/`, `scripts/`, `examples/`, `src/` 等はランタイム的に
 /// 無関係で、衝突警告のノイズになるだけなので除外する。
 ///
-/// 参考: `:help rtp`、`:help runtime`、Neovim core の runtime/ ディレクトリ。
+/// 参考: `:help rtp`、`:help runtime`、Neovim core の runtime/ ディレクトリ、
+/// denops.vim 慣習 (`denops/<plugin>/main.ts` を rtp 経由で discover する)。
 const RTP_DIRS: &[&str] = &[
-    "after", "autoload", "colors", "compiler", "doc", "ftdetect", "ftplugin", "indent", "keymap",
-    "lang", "lua", "pack", "parser", "plugin", "queries", "rplugin", "spell", "syntax",
+    "after",
+    "autoload",
+    "colors",
+    "compiler",
+    "denops", // denops.vim — TypeScript plugin source
+    "doc",
+    "ftdetect",
+    "ftplugin",
+    "indent",
+    "keymap",
+    "lang",
+    "lua",
+    "pack",
+    "parser",
+    "plugin",
+    "queries",
+    "rplugin",
+    "spell",
+    "syntax",
 ];
 
 /// ファイルをターゲットに張る。同一ボリューム内なら hard link (Windows でも
@@ -230,6 +249,23 @@ mod tests {
         assert!(!merged.join("stylua.toml").exists());
         assert!(merged.join("plugin/foo.vim").exists());
         assert!(merged.join("doc/foo.txt").exists());
+        assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_merge_includes_denops_dir() {
+        // denops.vim 系のプラグイン (`denops/<plugin>/main.ts`) は runtime path
+        // 経由で discover されるので merge 対象に含める。
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        let p = root.path().join("plug");
+        write(&p.join("denops/myplug/main.ts"), "export async function main() {}");
+        write(&p.join("denops/myplug/util.ts"), "export const x = 1;");
+
+        let r = merge_plugin(&p, &merged).unwrap();
+
+        assert!(merged.join("denops/myplug/main.ts").exists());
+        assert!(merged.join("denops/myplug/util.ts").exists());
         assert!(r.conflicts.is_empty());
     }
 

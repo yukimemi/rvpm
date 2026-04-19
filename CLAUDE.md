@@ -265,7 +265,7 @@ let _permit = sem.acquire_owned().await.unwrap();
 - **ディレクトリは作るだけ** (`create_dir_all`)。ディレクトリ自体は実体を作り、その中身をファイル単位で再帰してリンクする。ディレクトリを junction で張る方式 (旧実装) だと、複数 plugin が同じ階層下にファイルを置くケース (例: 複数の cmp 系 plugin が `lua/cmp/` を共有) で後勝ち上書きになり前の内容が消える
 - **first-wins + 衝突サマリ** — 衝突したら新しい方を skip して `MergeConflict { relative }` を集める。`run_sync` / `run_generate` の末尾で `print_merge_conflicts` がプラグインごとにグループ化して stderr 表示
 - **plugin ルート直下のファイルは無視** — README.md / LICENSE / Makefile / package.json / *.toml 等のメタファイルは rtp に置く意味が無く、plugin 横断で同名衝突するだけのノイズ
-- **plugin ルート直下のディレクトリは rtp 慣習のみ allowlist** — `plugin/`, `lua/`, `doc/`, `ftplugin/`, `ftdetect/`, `syntax/`, `indent/`, `colors/`, `compiler/`, `autoload/`, `after/`, `queries/`, `parser/`, `rplugin/`, `spell/`, `keymap/`, `lang/`, `pack/`。`tests/` `scripts/` `examples/` `src/` 等は rtp 無関係なので除外
+- **plugin ルート直下のディレクトリは rtp 慣習 + denops のみ allowlist** — `plugin/`, `lua/`, `doc/`, `ftplugin/`, `ftdetect/`, `syntax/`, `indent/`, `colors/`, `compiler/`, `autoload/`, `after/`, `queries/`, `parser/`, `rplugin/`, `spell/`, `keymap/`, `lang/`, `pack/`, `denops/` (denops.vim の TypeScript plugin 用)。`tests/` `scripts/` `examples/` `src/` 等は rtp 無関係なので除外
 - **全階層で dotfile (`.gitignore`, `.luarc.json`, `.editorconfig`, `.gitkeep` 等) を skip** — Neovim 起動に無関係で、`doc/.gitignore` のように深い階層でも plugin 横断で名前が被って衝突警告のノイズになる
 
 ### Windows 対応
