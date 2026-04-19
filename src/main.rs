@@ -2717,7 +2717,12 @@ fn print_merge_conflicts(conflicts: &[(String, PathBuf)]) {
         by_plugin.len(),
     );
     for (plugin, files) in &by_plugin {
-        eprintln!("  {} ({} file{}):", plugin, files.len(), plural_s(files.len()));
+        eprintln!(
+            "  {} ({} file{}):",
+            plugin,
+            files.len(),
+            plural_s(files.len())
+        );
         for f in files {
             eprintln!("    {}", f.display().to_string().replace('\\', "/"));
         }

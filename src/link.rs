@@ -8,24 +8,8 @@ use std::path::{Path, PathBuf};
 ///
 /// 参考: `:help rtp`、`:help runtime`、Neovim core の runtime/ ディレクトリ。
 const RTP_DIRS: &[&str] = &[
-    "after",
-    "autoload",
-    "colors",
-    "compiler",
-    "doc",
-    "ftdetect",
-    "ftplugin",
-    "indent",
-    "keymap",
-    "lang",
-    "lua",
-    "pack",
-    "parser",
-    "plugin",
-    "queries",
-    "rplugin",
-    "spell",
-    "syntax",
+    "after", "autoload", "colors", "compiler", "doc", "ftdetect", "ftplugin", "indent", "keymap",
+    "lang", "lua", "pack", "parser", "plugin", "queries", "rplugin", "spell", "syntax",
 ];
 
 /// ファイルをターゲットに張る。同一ボリューム内なら hard link (Windows でも
@@ -73,12 +57,7 @@ pub fn merge_plugin(src: &Path, dst_root: &Path) -> Result<MergeResult> {
     Ok(result)
 }
 
-fn walk(
-    plugin_root: &Path,
-    dir: &Path,
-    dst_root: &Path,
-    result: &mut MergeResult,
-) -> Result<()> {
+fn walk(plugin_root: &Path, dir: &Path, dst_root: &Path, result: &mut MergeResult) -> Result<()> {
     let at_plugin_root = dir == plugin_root;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -183,7 +162,6 @@ mod tests {
             PathBuf::from("lua").join("shared").join("init.lua")
         );
         let _ = b; // skipped_plugin_root を struct で持たない方針に変更したので参照のみ
-
     }
 
     #[test]
