@@ -709,7 +709,13 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Re
                     // held-back 判定用に remote tracking tip を読む (HEAD は動かさない)。
                     // 失敗時は None → classify_held_back 側で「判定不能」扱いになり、
                     // 結果として held_back リストには積まれない (resilience)。
-                    let remote_head = repo.remote_head().await.ok().flatten();
+                    // 分類が None 確定の前提条件 (explicit rev / lockfile 寄与なし) では
+                    // gix open 自体をスキップして 200+ プラグイン構成の I/O を減らす。
+                    let remote_head = if plugin.rev.is_none() && effective_rev.is_some() {
+                        repo.remote_head().await.ok().flatten()
+                    } else {
+                        None
+                    };
                     let held_back = classify_held_back(
                         plugin.rev.as_deref(),
                         effective_rev.as_deref(),

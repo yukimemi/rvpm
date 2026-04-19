@@ -186,17 +186,24 @@ fn read_remote_head(dst: &Path) -> Result<Option<String>> {
         .and_then(|r| r.name().map(|n| n.as_bstr().to_string()))
         .unwrap_or_else(|| "origin".to_string());
 
+    // tracking ref が見つかっても peel 失敗時は `Ok(None)` に落とす (resilience:
+    // malformed ref や stale packed-refs で held-back 判定全体が止まるのを避け、
+    // 代わりにそのプラグインを「判定不能」として分類から除外する)。
     if let Some(head_name) = repo.head_name()? {
         let branch = head_name.as_bstr().to_string();
         let tracking = branch.replace("refs/heads/", &format!("refs/remotes/{}/", remote_name));
-        if let Ok(mut tr) = repo.find_reference(&tracking) {
-            return Ok(Some(tr.peel_to_id()?.detach().to_string()));
+        if let Ok(mut tr) = repo.find_reference(&tracking)
+            && let Ok(id) = tr.peel_to_id()
+        {
+            return Ok(Some(id.detach().to_string()));
         }
     }
 
     let remote_head_ref = format!("refs/remotes/{}/HEAD", remote_name);
-    if let Ok(mut r) = repo.find_reference(&remote_head_ref) {
-        return Ok(Some(r.peel_to_id()?.detach().to_string()));
+    if let Ok(mut r) = repo.find_reference(&remote_head_ref)
+        && let Ok(id) = r.peel_to_id()
+    {
+        return Ok(Some(id.detach().to_string()));
     }
     Ok(None)
 }
