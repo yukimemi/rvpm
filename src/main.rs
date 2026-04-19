@@ -1524,6 +1524,12 @@ async fn run_list(no_tui: bool) -> Result<bool> {
                     wait_for_keypress("\nPress any key to return to list...")?;
                     reload!();
                 }
+                crossterm::event::KeyCode::Char('R') => {
+                    leave_tui(&mut terminal)?;
+                    let _ = run_sync(false, false, false, true).await;
+                    wait_for_keypress("\nPress any key to return to list...")?;
+                    reload!();
+                }
                 crossterm::event::KeyCode::Char('u') => {
                     if let Some(url) = tui_state.selected_url() {
                         leave_tui(&mut terminal)?;

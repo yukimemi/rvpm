@@ -928,6 +928,10 @@ impl TuiState {
                     Span::styled("Sync all", Style::default().fg(Color::White)),
                 ]),
                 Line::from(vec![
+                    Span::styled("  R           ", Style::default().fg(Color::Cyan)),
+                    Span::styled("Sync all (rebuild)", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
                     Span::styled("  u / U       ", Style::default().fg(Color::Cyan)),
                     Span::styled("Update selected / all", Style::default().fg(Color::White)),
                 ]),
