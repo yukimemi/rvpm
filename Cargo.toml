@@ -65,7 +65,6 @@ open = "5"
 
 # File System & Path
 dirs = "6.0"
-junction = "1.4"
 walkdir = "2.5"
 
 # Git (in-process, no fork)

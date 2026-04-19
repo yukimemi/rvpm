@@ -147,7 +147,7 @@ src/
   config.rs    — TOML 設定のパース (Tera テンプレート展開込み)、MapSpec 型、sort_plugins
   git.rs       — git clone/pull/fetch/checkout の非同期ラッパー (Repo 構造体)
   helptags.rs  — nvim --headless で :helptags を実行して tags を生成
-  link.rs      — merged ディレクトリへのリンク / ジャンクション作成
+  link.rs      — merged ディレクトリへのファイル単位リンク (hard link、衝突 first-wins)
   loader.rs    — Neovim の loader.lua を生成するロジック
   tui.rs       — ratatui による進捗・一覧表示 TUI
 ```
@@ -257,9 +257,20 @@ let _permit = sem.acquire_owned().await.unwrap();
 
 書き込み側 (`set_plugin_list_field`) は 1 要素なら string、複数なら array で書き戻す (最小の表現)。
 
+### merge 戦略 (`src/link.rs`)
+
+`merge_plugin()` は **ファイル単位** で merged ディレクトリにリンクする。設計のポイント:
+
+- **ファイルは hard link** で張る (Windows でも管理者権限不要、Unix でも安定)。同一ボリューム必須だが repos / merged が同じ `<cache_root>` 配下なので OK。別ボリューム等で hard link が失敗したら `std::fs::copy` にフォールバック。junction はディレクトリ専用なのでファイルには使えない。symbolic link は Windows で admin 権限が要るので不採用
+- **ディレクトリは作るだけ** (`create_dir_all`)。ディレクトリ自体は実体を作り、その中身をファイル単位で再帰してリンクする。ディレクトリを junction で張る方式 (旧実装) だと、複数 plugin が同じ階層下にファイルを置くケース (例: 複数の cmp 系 plugin が `lua/cmp/` を共有) で後勝ち上書きになり前の内容が消える
+- **first-wins + 衝突サマリ** — 衝突したら新しい方を skip して `MergeConflict { relative }` を集める。`run_sync` / `run_generate` の末尾で `print_merge_conflicts` がプラグインごとにグループ化して stderr 表示
+- **plugin ルート直下のファイルは無視** — README.md / LICENSE / Makefile / package.json / *.toml 等のメタファイルは rtp に置く意味が無く、plugin 横断で同名衝突するだけのノイズ
+- **plugin ルート直下のディレクトリは rtp 慣習 + denops のみ allowlist** — `plugin/`, `lua/`, `doc/`, `ftplugin/`, `ftdetect/`, `syntax/`, `indent/`, `colors/`, `compiler/`, `autoload/`, `after/`, `queries/`, `parser/`, `rplugin/`, `spell/`, `keymap/`, `lang/`, `pack/`, `tutor/` (`:Tutor` 用)、`denops/` (denops.vim の TypeScript plugin 用)。`tests/` `scripts/` `examples/` `src/` 等は rtp 無関係なので除外
+- **全階層で dotfile (`.gitignore`, `.luarc.json`, `.editorconfig`, `.gitkeep` 等) を skip** — Neovim 起動に無関係で、`doc/.gitignore` のように深い階層でも plugin 横断で名前が被って衝突警告のノイズになる
+
 ### Windows 対応
 
-`src/link.rs` の `junction_or_symlink()` は `#[cfg(windows)]` で junction を使用し、シンボリックリンクの権限問題を回避する。
+merge 戦略がファイル単位 hard link に切り替わって以降、Windows でも管理者権限要らず・junction も symbolic link も使わない構成になった。`std::fs::hard_link` は NTFS 上で動き、admin 不要。ディレクトリは `create_dir_all` で実体を作るので junction は不要。シンボリックリンクの権限問題は回避済み。
 
 ### パス規約 (固定 + 上書き可能)
 
