@@ -8,6 +8,7 @@ mod git;
 mod helptags;
 mod link;
 mod loader;
+mod merge_conflicts;
 mod tui;
 mod update_log;
 
@@ -573,7 +574,11 @@ async fn run_sync(prune: bool) -> Result<()> {
 
     // dev プラグインは sync しないが loader には含めるので先に scripts を作る
     let mut plugin_scripts = Vec::new();
-    let mut merge_conflicts: Vec<(String, PathBuf)> = Vec::new();
+    let mut merge_conflicts: Vec<crate::merge_conflicts::MergeConflictReport> = Vec::new();
+    // merged/ 相対 path → 勝者 plugin 名。順次 merge しながら積み上げて、
+    // 後続 plugin の衝突時に勝者を lookup するのに使う。
+    let mut merge_ownership: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
     let config_root = resolve_config_root(config.options.config_root.as_deref());
     for plugin in config.plugins.iter().filter(|p| p.dev) {
         let dst_path = resolve_plugin_dst(plugin, &cache_root);
@@ -583,6 +588,7 @@ async fn run_sync(prune: bool) -> Result<()> {
                 &dst_path,
                 &merged_dir,
                 &plugin.display_name(),
+                &mut merge_ownership,
                 &mut merge_conflicts,
             );
         }
@@ -623,6 +629,7 @@ async fn run_sync(prune: bool) -> Result<()> {
                             &dst_path,
                             &merged_dir,
                             &plugin.display_name(),
+                            &mut merge_ownership,
                             &mut merge_conflicts,
                         );
                     }
@@ -654,7 +661,13 @@ async fn run_sync(prune: bool) -> Result<()> {
         for ps in &plugin_scripts {
             if promoted.contains(&ps.name) && ps.merge {
                 let dst = PathBuf::from(&ps.path);
-                merge_and_record(&dst, &merged_dir, &ps.name, &mut merge_conflicts);
+                merge_and_record(
+                    &dst,
+                    &merged_dir,
+                    &ps.name,
+                    &mut merge_ownership,
+                    &mut merge_conflicts,
+                );
             }
         }
     }
@@ -756,6 +769,16 @@ async fn run_sync(prune: bool) -> Result<()> {
     }
 
     print_merge_conflicts(&merge_conflicts);
+    // 直近 sync の衝突 snapshot を atomic write (empty でも上書き)。
+    // doctor が読む。失敗しても本処理は止めない (resilience)。
+    let mc_path = resolve_merge_conflicts_path(&cache_root);
+    if let Err(e) = crate::merge_conflicts::save_snapshot(&mc_path, merge_conflicts.clone()) {
+        eprintln!(
+            "\u{26a0} failed to save {}: {} (doctor state may be stale)",
+            mc_path.display(),
+            e
+        );
+    }
 
     // 並列 spawn 完了順で積まれているので plugin 名で安定 sort。
     // `rvpm log` の出力が同じ sync 結果に対して常に同じになる。
@@ -824,12 +847,20 @@ async fn run_generate() -> Result<()> {
         let _ = std::fs::remove_dir_all(&merged_dir);
     }
     std::fs::create_dir_all(&merged_dir)?;
-    let mut merge_conflicts: Vec<(String, PathBuf)> = Vec::new();
+    let mut merge_conflicts: Vec<crate::merge_conflicts::MergeConflictReport> = Vec::new();
+    let mut merge_ownership: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
     for ps in &plugin_scripts {
         if !ps.lazy && ps.merge {
             let dst = PathBuf::from(&ps.path);
             if dst.exists() {
-                merge_and_record(&dst, &merged_dir, &ps.name, &mut merge_conflicts);
+                merge_and_record(
+                    &dst,
+                    &merged_dir,
+                    &ps.name,
+                    &mut merge_ownership,
+                    &mut merge_conflicts,
+                );
             }
         }
     }
@@ -878,6 +909,15 @@ async fn run_generate() -> Result<()> {
     }
 
     print_merge_conflicts(&merge_conflicts);
+    // 直近 generate の衝突 snapshot を保存 (sync と同じ扱い)。
+    let mc_path = resolve_merge_conflicts_path(&cache_root);
+    if let Err(e) = crate::merge_conflicts::save_snapshot(&mc_path, merge_conflicts.clone()) {
+        eprintln!(
+            "\u{26a0} failed to save {}: {} (doctor state may be stale)",
+            mc_path.display(),
+            e
+        );
+    }
     print_init_lua_hint_if_missing(&config);
     Ok(())
 }
@@ -972,12 +1012,14 @@ async fn run_doctor() -> Result<i32> {
     }
     debug_assert_eq!(helptag_targets.len(), helptag_target_labels.len());
 
+    let merge_conflicts_path = resolve_merge_conflicts_path(&cache_root);
     let ctx = crate::doctor::CheckContext {
         config: &config,
         config_path: &config_path,
         loader_path: &loader_path,
         init_lua_path: &init_lua_path,
         merged_dir: &merged_dir,
+        merge_conflicts_path: &merge_conflicts_path,
         unused_cache_dirs: unused,
         appname_resolved: resolved,
         rvpm_appname_env: rvpm_env,
@@ -2735,6 +2777,12 @@ fn resolve_update_log_path(cache_root: &Path) -> PathBuf {
     cache_root.join("update_log.json")
 }
 
+/// `rvpm doctor` が読む最新 sync の merge 衝突スナップショット。
+/// `<cache_root>/merge_conflicts.json` 固定 (`update_log.json` と同じ場所)。
+fn resolve_merge_conflicts_path(cache_root: &Path) -> PathBuf {
+    cache_root.join("merge_conflicts.json")
+}
+
 /// `Plugin` + `GitChange` から永続化向けの `ChangeRecord` を組み立てる小ヘルパー。
 /// run_sync / run_update / run_add で共通利用。
 fn change_record_from(
@@ -2780,19 +2828,35 @@ fn resolve_merged_dir(cache_root: &Path) -> PathBuf {
     cache_root.join("plugins").join("merged")
 }
 
-/// link.rs::merge_plugin を呼び出して、発生した衝突に plugin 名を紐付けて
-/// `conflicts` に積む。merge 自体が失敗した場合は stderr に warn を流すが
-/// エラーにはしない (resilience)。
+/// link.rs::merge_plugin を呼び出して、発生した衝突を勝者 (先に同じ path を
+/// 置いた plugin) とセットで `conflicts` に積む。merge 自体が失敗した場合は
+/// stderr に warn を流すがエラーにはしない (resilience)。
+///
+/// `ownership` は merged/ 上の relative path → 勝者 plugin 名の shared map。
+/// 各 plugin 処理前に呼び出し側で 1 つだけ作り、順次 merge_and_record に
+/// 渡すことで、後続 plugin の衝突時に勝者を lookup できる。
 fn merge_and_record(
     src: &Path,
     dst_root: &Path,
     plugin_name: &str,
-    conflicts: &mut Vec<(String, PathBuf)>,
+    ownership: &mut std::collections::HashMap<PathBuf, String>,
+    conflicts: &mut Vec<crate::merge_conflicts::MergeConflictReport>,
 ) {
     match crate::link::merge_plugin(src, dst_root) {
         Ok(result) => {
+            // 今回新規配置したファイルを ownership に登録 (勝者 = この plugin)。
+            for placed in result.placed {
+                ownership.insert(placed, plugin_name.to_string());
+            }
+            // 衝突の勝者を ownership から lookup。
             for c in result.conflicts {
-                conflicts.push((plugin_name.to_string(), c.relative));
+                let winner = ownership.get(&c.relative).cloned();
+                let rel = c.relative.to_string_lossy().replace('\\', "/");
+                conflicts.push(crate::merge_conflicts::MergeConflictReport {
+                    loser: plugin_name.to_string(),
+                    winner,
+                    relative: rel,
+                });
             }
         }
         Err(e) => {
@@ -2802,14 +2866,18 @@ fn merge_and_record(
 }
 
 /// 収集した衝突を plugin ごとにグループ化して stderr にサマリ出力する。
-fn print_merge_conflicts(conflicts: &[(String, PathBuf)]) {
+/// 各ファイル行には `(kept: <winner>)` を付けて、どちらが first-wins で
+/// 残ったかをユーザーが即座に分かるようにする。
+fn print_merge_conflicts(conflicts: &[crate::merge_conflicts::MergeConflictReport]) {
     if conflicts.is_empty() {
         return;
     }
-    let mut by_plugin: std::collections::BTreeMap<&String, Vec<&PathBuf>> =
-        std::collections::BTreeMap::new();
-    for (name, rel) in conflicts {
-        by_plugin.entry(name).or_default().push(rel);
+    let mut by_plugin: std::collections::BTreeMap<
+        &str,
+        Vec<&crate::merge_conflicts::MergeConflictReport>,
+    > = std::collections::BTreeMap::new();
+    for r in conflicts {
+        by_plugin.entry(r.loser.as_str()).or_default().push(r);
     }
     eprintln!();
     eprintln!(
@@ -2817,15 +2885,16 @@ fn print_merge_conflicts(conflicts: &[(String, PathBuf)]) {
         conflicts.len(),
         by_plugin.len(),
     );
-    for (plugin, files) in &by_plugin {
+    for (plugin, reports) in &by_plugin {
         eprintln!(
             "  {} ({} file{}):",
             plugin,
-            files.len(),
-            plural_s(files.len())
+            reports.len(),
+            plural_s(reports.len())
         );
-        for f in files {
-            eprintln!("    {}", f.display().to_string().replace('\\', "/"));
+        for r in reports {
+            let winner = r.winner.as_deref().unwrap_or("<unknown>");
+            eprintln!("    {}  (kept: {})", r.relative, winner);
         }
     }
 }

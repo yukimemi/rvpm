@@ -39,6 +39,11 @@ fn is_helptags_file(name: &str) -> bool {
 #[derive(Debug, Default)]
 pub struct MergeResult {
     pub conflicts: Vec<MergeConflict>,
+    /// このコールで merged/ に新規配置された relative path のリスト。
+    /// 呼び出し側 (main.rs) が plugin 名との対応表を組み立て、後続 plugin で
+    /// conflict が起きたときに「勝者 plugin 名」を lookup するのに使う。
+    /// 既存ファイルを `first-wins` で skip したケースは含まれない。
+    pub placed: Vec<PathBuf>,
 }
 
 /// 衝突情報: merged dir 相対のファイルパス。`MergeResult` に積まれて返り、
@@ -139,6 +144,7 @@ fn walk(plugin_root: &Path, dir: &Path, dst_root: &Path, result: &mut MergeResul
             result.conflicts.push(MergeConflict { relative: rel });
         } else {
             hard_link_or_copy(&src_path, &dst_path)?;
+            result.placed.push(rel);
         }
     }
     Ok(())
@@ -366,6 +372,54 @@ mod tests {
         // B 側で 1 件 conflict 記録
         assert_eq!(r2.conflicts.len(), 1);
         assert_eq!(r2.conflicts[0].relative, PathBuf::from("lua").join("foo"));
+    }
+
+    #[test]
+    fn test_merge_placed_lists_newly_linked_files() {
+        // first-wins の勝者を後段で特定できるよう、merge_plugin は
+        // このコールで新規配置したファイルを `placed` に詰める。
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        let p = root.path().join("plug");
+        write(&p.join("plugin/init.lua"), "return {}");
+        write(&p.join("lua/foo/bar.lua"), "return {}");
+
+        let r = merge_plugin(&p, &merged).unwrap();
+
+        assert!(r.conflicts.is_empty());
+        // 新規配置されたファイル 2 件が記録される (順序は不問)
+        let mut placed: Vec<_> = r
+            .placed
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        placed.sort();
+        assert_eq!(placed, vec!["lua/foo/bar.lua", "plugin/init.lua"]);
+    }
+
+    #[test]
+    fn test_merge_placed_excludes_skipped_conflicts() {
+        // first-wins で skip されたファイルは placed に入らない
+        // (skip された方は conflict 側で記録される)。
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        let a = root.path().join("plug_a");
+        let b = root.path().join("plug_b");
+        write(&a.join("plugin/init.lua"), "from a");
+        write(&b.join("plugin/init.lua"), "from b");
+
+        let r1 = merge_plugin(&a, &merged).unwrap();
+        let r2 = merge_plugin(&b, &merged).unwrap();
+
+        // A は新規配置したので placed に入る
+        assert_eq!(r1.placed.len(), 1);
+        assert_eq!(
+            r1.placed[0].to_string_lossy().replace('\\', "/"),
+            "plugin/init.lua"
+        );
+        // B は first-wins で skip → conflict に入り、placed には入らない
+        assert!(r2.placed.is_empty());
+        assert_eq!(r2.conflicts.len(), 1);
     }
 
     #[test]
