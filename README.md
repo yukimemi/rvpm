@@ -45,6 +45,9 @@ sources everything without any runtime glob cost.
 - **Colorscheme auto-detection** — lazy plugins whose clone contains a
   `colors/*.vim` or `colors/*.lua` file automatically gain a `ColorSchemePre`
   autocmd handler so `:colorscheme <name>` loads the plugin on demand
+- **Auto helptags** — `sync` / `generate` end with one `nvim --headless`
+  invocation that runs `:helptags <doc>` for the merged dir and every lazy
+  plugin's `doc/`. No per-startup glob, no `:helptags ALL` needed
 - **Dependency ordering** — topological sort on `depends`, resilient to
   cycles and missing references; eager→lazy deps are auto-promoted
 - **Windows first-class** — hardcoded `~/.config` / `~/.cache` layout for
@@ -128,6 +131,12 @@ concurrency = 10
 # `sync --prune`. Standalone `rvpm clean` remains available.
 # auto_clean = true
 
+# Auto-generate helptags via `nvim --headless` after every `sync` /
+# `generate`. Default: true. Lazy plugins are not on runtimepath at
+# Neovim startup, so rvpm enumerates each plugin's `doc/` directory and
+# runs `:helptags <path>` individually. Set to false to skip.
+# auto_helptags = false
+
 # How `rvpm add` records GitHub plugin URLs in config.toml.
 # "short" (default) → owner/repo ; "full" → https://github.com/owner/repo.
 # Duplicate detection normalises between styles either way.
@@ -181,6 +190,7 @@ for where files land).
 | `concurrency` | `integer` | `8` | Max number of parallel git operations during `sync` / `update`. Kept moderate to avoid GitHub rate limits |
 | `chezmoi` | `boolean` | `false` | When `true`, rvpm writes mutations (`config.toml`, global hooks, per-plugin hooks) directly to the chezmoi **source** file (resolved via `chezmoi source-path`) and then runs `chezmoi apply --force` to materialise the change in the target. Falls back to writing the target directly if `chezmoi` is missing. Plain files only — `.tmpl` sources are rejected (rvpm has its own Tera engine). See [chezmoi integration](#chezmoi-integration) |
 | `auto_clean` | `boolean` | `false` | When `true`, `rvpm sync` and `rvpm generate` automatically delete plugin directories under `plugins/repos/` that are no longer referenced by `config.toml`. Equivalent to always passing `--prune` to `sync`. The standalone `rvpm clean` command is still available for one-off cleanups |
+| `auto_helptags` | `boolean` | `true` | When `true`, `rvpm sync` / `generate` run `nvim --headless` once at the end to build helptags. Lazy plugins are not on `runtimepath` at Neovim startup, so rvpm enumerates each plugin's `doc/` directory and runs `:helptags <path>` individually (merged plugins are processed via the single `merged/doc/` directory). If `nvim` is not on `PATH`, rvpm prints a warning and continues. Set to `false` to skip helptag generation entirely (you can still run `:helptags ALL` manually inside Neovim) |
 | `url_style` | `"short"` \| `"full"` | `"short"` | How `rvpm add` writes GitHub plugin URLs to `config.toml`. `"short"` → `owner/repo`, `"full"` → `https://github.com/owner/repo`. Non-GitHub URLs (gitlab etc.) are saved verbatim regardless. Duplicate detection normalizes between styles, so the two forms never produce double entries |
 
 > **💡 Leave `config_root` / `cache_root` unset.** The defaults are already
@@ -783,7 +793,9 @@ Beyond ordering, `depends` also affects **loading**:
 ~/.cache/rvpm/<appname>/                     ← cache_root
 ├── plugins/
 │   ├── repos/<host>/<owner>/<repo>/         ← plugin clones
+│   │   └── doc/tags                         ← helptags for lazy / merge=false plugins
 │   ├── merged/                              ← linked rtp for merge=true
+│   │   └── doc/tags                         ← helptags shared across merged plugins
 │   └── loader.lua                           ← generated loader
 └── browse/                                  ← `rvpm browse` cache (search + README)
 ```

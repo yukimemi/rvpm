@@ -34,7 +34,7 @@ pub enum UrlStyle {
     Full,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone)]
 pub struct Options {
     /// per-plugin init/before/after.lua の置き場。
     /// 未指定なら `~/.config/rvpm/<appname>/plugins`。
@@ -59,6 +59,12 @@ pub struct Options {
     /// `sync --prune` を毎回明示しなくてよくなる。デフォルト `false`。
     #[serde(default)]
     pub auto_clean: bool,
+    /// `true` (デフォルト) なら `sync` / `generate` 完了時に `nvim --headless` を
+    /// 起動して helptags を自動生成する。lazy プラグインは runtimepath に載らない
+    /// ため、rvpm 側で対象 `doc/` ディレクトリを列挙して `:helptags <path>` を
+    /// 個別実行する。`nvim` が PATH に無い場合は警告して skip (resilience)。
+    #[serde(default = "default_auto_helptags")]
+    pub auto_helptags: bool,
     /// `rvpm add` が `config.toml` に書き込む URL の形式。
     /// - `"short"` (デフォルト): `owner/repo`
     /// - `"full"`: `https://github.com/owner/repo`
@@ -69,6 +75,25 @@ pub struct Options {
     /// `rvpm browse` の README preview 用オプション。
     #[serde(default)]
     pub browse: BrowseOptions,
+}
+
+impl Default for Options {
+    /// `Options::default()` は serde の `#[serde(default = ...)]` と一致させる。
+    /// 特に `auto_helptags` は serde では `true` がデフォルトなので、derive Default
+    /// を使うと `false` になり parse 経由 vs 直接構築で挙動が分かれる。
+    fn default() -> Self {
+        Self {
+            config_root: None,
+            concurrency: None,
+            cache_root: None,
+            icons: IconStyle::default(),
+            chezmoi: false,
+            auto_clean: false,
+            auto_helptags: default_auto_helptags(),
+            url_style: UrlStyle::default(),
+            browse: BrowseOptions::default(),
+        }
+    }
 }
 
 /// `[options.browse]` 以下に置く、`rvpm browse` TUI 固有の設定。
@@ -247,6 +272,10 @@ where
 }
 
 fn default_merge() -> bool {
+    true
+}
+
+fn default_auto_helptags() -> bool {
     true
 }
 
@@ -602,6 +631,31 @@ url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
         assert!(!config.options.chezmoi);
+    }
+
+    #[test]
+    fn test_parse_config_auto_helptags_defaults_to_true() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(config.options.auto_helptags);
+    }
+
+    #[test]
+    fn test_parse_config_accepts_auto_helptags_false() {
+        let toml = r#"
+[options]
+auto_helptags = false
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(!config.options.auto_helptags);
     }
 
     #[test]

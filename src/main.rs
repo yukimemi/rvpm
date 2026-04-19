@@ -4,6 +4,7 @@ mod chezmoi;
 mod config;
 mod external_render;
 mod git;
+mod helptags;
 mod link;
 mod loader;
 mod tui;
@@ -646,6 +647,34 @@ async fn run_sync(prune: bool) -> Result<()> {
     )?;
     println!("Done! -> {}", loader_path.display());
 
+    if config.options.auto_helptags {
+        println!("Generating helptags...");
+        let report = crate::helptags::build_helptags(&plugin_scripts, &merged_dir).await?;
+        match (report.ran, report.exit_code) {
+            (true, Some(0)) => {
+                println!(
+                    "Done! helptags built for {} doc director(y/ies)",
+                    report.target_count
+                );
+            }
+            (true, Some(code)) => {
+                eprintln!(
+                    "\u{26a0} helptags: nvim exited with code {} ({} target(s) attempted)",
+                    code, report.target_count
+                );
+            }
+            (true, None) => {
+                eprintln!(
+                    "\u{26a0} helptags: nvim terminated without exit code ({} target(s) attempted)",
+                    report.target_count
+                );
+            }
+            (false, _) => {
+                // build_helptags 内で warn を流済み (nvim 不在 / target 0)。
+            }
+        }
+    }
+
     // 未使用 plugin ディレクトリの処理:
     //  - `--prune` フラグまたは `options.auto_clean = true` で自動削除
     //  - それ以外なら警告のみ (rvpm clean で後処理できる旨を案内)
@@ -746,6 +775,34 @@ async fn run_generate() -> Result<()> {
         &build_loader_options(&config_root),
     )?;
     println!("Done! -> {}", loader_path.display());
+
+    if config.options.auto_helptags {
+        println!("Generating helptags...");
+        let report = crate::helptags::build_helptags(&plugin_scripts, &merged_dir).await?;
+        match (report.ran, report.exit_code) {
+            (true, Some(0)) => {
+                println!(
+                    "Done! helptags built for {} doc director(y/ies)",
+                    report.target_count
+                );
+            }
+            (true, Some(code)) => {
+                eprintln!(
+                    "\u{26a0} helptags: nvim exited with code {} ({} target(s) attempted)",
+                    code, report.target_count
+                );
+            }
+            (true, None) => {
+                eprintln!(
+                    "\u{26a0} helptags: nvim terminated without exit code ({} target(s) attempted)",
+                    report.target_count
+                );
+            }
+            (false, _) => {
+                // build_helptags 内で warn を流済み (nvim 不在 / target 0)。
+            }
+        }
+    }
 
     // `options.auto_clean = true` なら config から外されたプラグインディレクトリも
     // 自動削除 (git 操作は行わないので generate 自体のコストは増えない)。
