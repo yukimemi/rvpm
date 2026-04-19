@@ -632,15 +632,91 @@ pub fn check_appname(resolved: &str, rvpm_env: Option<&str>, nvim_env: Option<&s
     Diagnostic::new(Severity::Ok, CAT_NEOVIM, "appname coherence", summary)
 }
 
+/// `doc/` ディレクトリを `:helptags` の観点で分類した結果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum DocStatus {
+    /// `*.txt` または `*.??x` (Vim language-specific help) があり、対応する
+    /// `tags` または `tags-<lang>` も存在する。
+    HasTags,
+    /// help ファイル (`*.txt` / `*.??x`) はあるが `tags` / `tags-*` が無い。
+    /// `:helptags` の実行漏れ → warn 対象。
+    MissingTags,
+    /// `doc/` 内に help ファイルが 1 つも無い (画像のみ等)。
+    /// `:helptags` の対象外なので OK 扱い。
+    NoHelpFiles,
+}
+
+/// `doc/` ディレクトリを 1 段だけ走査し、help ファイルと tags ファイルの状況
+/// から `DocStatus` を返す。Vim/Neovim の helptags は次の規則で動く:
+///
+/// - `<name>.txt` (英語ヘルプ) → `tags` ファイルが生成される
+/// - `<name>.<lang>x` (例: `kensaku.jax`、language-specific help) →
+///   `tags-<lang>` ファイルが生成される (e.g., `tags-ja`)
+///
+/// したがって `doc/tags` の有無だけで判定すると、日本語専用 plugin
+/// (vim-kensaku 等) や画像のみの plugin (log-highlight.nvim 等) を誤検知する。
+pub fn inspect_doc_dir(doc_dir: &Path) -> DocStatus {
+    let entries = match std::fs::read_dir(doc_dir) {
+        Ok(e) => e,
+        Err(_) => return DocStatus::NoHelpFiles, // 読めなければ「help 無し」扱い
+    };
+
+    let mut has_help = false;
+    let mut has_tags = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let lower = name_str.to_ascii_lowercase();
+
+        // tags / tags-ja / tags-en 等
+        if lower == "tags" || lower.starts_with("tags-") {
+            has_tags = true;
+            continue;
+        }
+
+        // <name>.txt
+        if lower.ends_with(".txt") {
+            has_help = true;
+            continue;
+        }
+
+        // <name>.<lang>x — `<lang>` は 2-3 文字 (Vim 慣習) だが厳密にはチェック
+        // しない: 拡張子が `x` で終わり、その手前が小文字英字 1+ なら language-
+        // specific help とみなす (`.jax`, `.brx`, `.cnx` など)。
+        if let Some((stem, ext)) = lower.rsplit_once('.')
+            && !stem.is_empty()
+            && ext.ends_with('x')
+            && ext.len() >= 2
+            && ext[..ext.len() - 1]
+                .chars()
+                .all(|c| c.is_ascii_alphabetic())
+        {
+            has_help = true;
+        }
+    }
+
+    if !has_help {
+        DocStatus::NoHelpFiles
+    } else if has_tags {
+        DocStatus::HasTags
+    } else {
+        DocStatus::MissingTags
+    }
+}
+
 /// helptags チェック: `options.auto_helptags` に応じて挙動が変わる。
 /// - false: informational (`Ok` で "disabled" と表示)
 /// - true (default): `crate::helptags::collect_helptag_targets` と同じ規則で
 ///   実際に `:helptags` の対象になる `doc/` ディレクトリだけを列挙し、
-///   各 target に `tags` ファイルがあるか確認する。
+///   各 target を `inspect_doc_dir` で分類する。
+///
+/// 判定ルール (per target):
+/// - `HasTags` → 正常 (`tags` または `tags-<lang>` が存在)
+/// - `NoHelpFiles` → `:helptags` の対象外なので skip (warn しない)
+/// - `MissingTags` → warn 対象
 ///
 /// 重要: eager + merge=true プラグインは `merged/doc/` に統合されるので、
-/// 個別の plugin 配下の `doc/tags` は生成されない (= ここでチェックしない)。
-/// 各プラグインの `doc/` を素朴に walk するロジックは false-warn を生む。
+/// 個別の plugin 配下の tags は生成されない (= ここでチェックしない)。
 pub fn check_helptags(
     config: &Config,
     targets: &[PathBuf],
@@ -655,28 +731,38 @@ pub fn check_helptags(
         );
     }
 
-    let total = targets.len();
+    let mut have_tags = 0usize;
+    let mut considered = 0usize;
     let mut missing: Vec<String> = Vec::new();
     for (target, label) in targets.iter().zip(target_labels.iter()) {
-        if !target.join("tags").exists() {
-            missing.push(format!("{}: {}", label, target.display()));
+        match inspect_doc_dir(target) {
+            DocStatus::HasTags => {
+                considered += 1;
+                have_tags += 1;
+            }
+            DocStatus::MissingTags => {
+                considered += 1;
+                missing.push(format!("{}: {}", label, target.display()));
+            }
+            DocStatus::NoHelpFiles => {
+                // `:helptags` の対象外。カウントから除外。
+            }
         }
     }
 
-    let have_tags = total - missing.len();
     if missing.is_empty() {
         Diagnostic::new(
             Severity::Ok,
             CAT_NEOVIM,
             "helptags",
-            format!("{}/{} have doc/tags", have_tags, total),
+            format!("{}/{} have doc/tags", have_tags, considered),
         )
     } else {
         Diagnostic::new(
             Severity::Warn,
             CAT_NEOVIM,
             "helptags",
-            format!("{}/{} have doc/tags", have_tags, total),
+            format!("{}/{} have doc/tags", have_tags, considered),
         )
         .with_details(missing)
         .with_hint("run `rvpm sync` (auto_helptags) or `:helptags <doc>` in Neovim")
@@ -1518,10 +1604,11 @@ mod tests {
 
     #[test]
     fn test_check_helptags_warns_when_missing_tags() {
-        // target ディレクトリに tags ファイルが無い → warn
+        // help ファイルがあるが tags 無し → warn
         let tmp = tempfile::tempdir().unwrap();
         let doc = tmp.path().join("plugin/doc");
         std::fs::create_dir_all(&doc).unwrap();
+        std::fs::write(doc.join("foo.txt"), b"*foo* help text").unwrap();
         let mut cfg = mk_config(vec![plugin("owner/a")]);
         cfg.options.auto_helptags = true;
         let d = check_helptags(&cfg, &[doc], &["owner/a".into()]);
@@ -1534,12 +1621,47 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let doc = tmp.path().join("plugin/doc");
         std::fs::create_dir_all(&doc).unwrap();
-        std::fs::write(doc.join("tags"), b"tags").unwrap();
+        std::fs::write(doc.join("foo.txt"), b"*foo* help").unwrap();
+        std::fs::write(doc.join("tags"), b"foo\tfoo.txt\t/*foo*\n").unwrap();
         let mut cfg = mk_config(vec![plugin("owner/a")]);
         cfg.options.auto_helptags = true;
         let d = check_helptags(&cfg, &[doc], &["owner/a".into()]);
         assert_eq!(d.severity, Severity::Ok);
         assert!(d.summary.contains("1/1"));
+    }
+
+    #[test]
+    fn test_check_helptags_ok_with_language_tags_only() {
+        // 日本語専用 plugin (kensaku.jax + tags-ja) は tags が無くても OK
+        // (vim-kensaku, vim-colorscheme-kemonofriends 等)。
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = tmp.path().join("plugin/doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        std::fs::write(doc.join("kensaku.jax"), b"*kensaku-ja* japanese help").unwrap();
+        std::fs::write(
+            doc.join("tags-ja"),
+            b"kensaku-ja\tkensaku.jax\t/*kensaku-ja*\n",
+        )
+        .unwrap();
+        let mut cfg = mk_config(vec![plugin("owner/a")]);
+        cfg.options.auto_helptags = true;
+        let d = check_helptags(&cfg, &[doc], &["owner/a".into()]);
+        assert_eq!(d.severity, Severity::Ok);
+        assert!(d.summary.contains("1/1"));
+    }
+
+    #[test]
+    fn test_check_helptags_skips_doc_with_no_help_files() {
+        // doc/images/ のみ (log-highlight.nvim 等) は :helptags の対象外、
+        // count から除外して 0/0 OK にする。
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = tmp.path().join("plugin/doc");
+        std::fs::create_dir_all(doc.join("images")).unwrap();
+        let mut cfg = mk_config(vec![plugin("owner/a")]);
+        cfg.options.auto_helptags = true;
+        let d = check_helptags(&cfg, &[doc], &["owner/a".into()]);
+        assert_eq!(d.severity, Severity::Ok);
+        assert!(d.summary.contains("0/0"));
     }
 
     #[test]
@@ -1550,6 +1672,82 @@ mod tests {
         let d = check_helptags(&cfg, &[], &[]);
         assert_eq!(d.severity, Severity::Ok);
         assert!(d.summary.contains("0/0"));
+    }
+
+    // -------- inspect_doc_dir --------
+
+    #[test]
+    fn test_inspect_doc_dir_missing_returns_no_help() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nope = tmp.path().join("does/not/exist");
+        assert_eq!(inspect_doc_dir(&nope), DocStatus::NoHelpFiles);
+    }
+
+    #[test]
+    fn test_inspect_doc_dir_empty_returns_no_help() {
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = tmp.path().join("doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        assert_eq!(inspect_doc_dir(&doc), DocStatus::NoHelpFiles);
+    }
+
+    #[test]
+    fn test_inspect_doc_dir_only_images_returns_no_help() {
+        // doc/images/ サブディレクトリのみ — help なし。
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = tmp.path().join("doc");
+        std::fs::create_dir_all(doc.join("images")).unwrap();
+        assert_eq!(inspect_doc_dir(&doc), DocStatus::NoHelpFiles);
+    }
+
+    #[test]
+    fn test_inspect_doc_dir_txt_without_tags_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = tmp.path().join("doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        std::fs::write(doc.join("plugin.txt"), b"*plugin*").unwrap();
+        assert_eq!(inspect_doc_dir(&doc), DocStatus::MissingTags);
+    }
+
+    #[test]
+    fn test_inspect_doc_dir_txt_with_tags_has_tags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = tmp.path().join("doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        std::fs::write(doc.join("plugin.txt"), b"*plugin*").unwrap();
+        std::fs::write(doc.join("tags"), b"plugin\tplugin.txt\t/*plugin*\n").unwrap();
+        assert_eq!(inspect_doc_dir(&doc), DocStatus::HasTags);
+    }
+
+    #[test]
+    fn test_inspect_doc_dir_jax_with_tags_ja_has_tags() {
+        // kensaku.jax + tags-ja = 日本語ヘルプの正常状態
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = tmp.path().join("doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        std::fs::write(doc.join("kensaku.jax"), b"*kensaku-ja*").unwrap();
+        std::fs::write(doc.join("tags-ja"), b"kensaku-ja\tkensaku.jax\n").unwrap();
+        assert_eq!(inspect_doc_dir(&doc), DocStatus::HasTags);
+    }
+
+    #[test]
+    fn test_inspect_doc_dir_jax_without_tags_ja_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = tmp.path().join("doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        std::fs::write(doc.join("kensaku.jax"), b"*kensaku-ja*").unwrap();
+        assert_eq!(inspect_doc_dir(&doc), DocStatus::MissingTags);
+    }
+
+    #[test]
+    fn test_inspect_doc_dir_tags_case_insensitive() {
+        // 大文字 TAGS はあまり無いが念のため
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = tmp.path().join("doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        std::fs::write(doc.join("plugin.txt"), b"*plugin*").unwrap();
+        std::fs::write(doc.join("TAGS"), b"plugin\tplugin.txt\n").unwrap();
+        assert_eq!(inspect_doc_dir(&doc), DocStatus::HasTags);
     }
 
     // -------- external tools --------
