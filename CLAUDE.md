@@ -276,8 +276,10 @@ commit、それも無ければ default branch の HEAD を pull する。
 - `chezmoi::write_path` / `chezmoi::apply` は **async + 2 秒タイムアウト** で実装
   (`tokio::process::Command` + `tokio::time::timeout`)。`run_doctor` の外部コマンド
   probe と同じ思想で、壊れた PATH shim や応答しない subprocess で rvpm 全体が
-  hang するのを防ぐ。タイムアウト時は warn を stderr に流して target 側を返す
-  (resilience)。
+  hang するのを防ぐ。`write_path` は `is_chezmoi_available` + 祖先を遡る複数の
+  `chezmoi source-path` 全体に **単一の 2 秒 budget** をかぶせる (個別 timeout が
+  累積して桁違いに膨らむのを防ぐため)。タイムアウト時は warn を stderr に流して
+  target 側を返す (resilience)。
 
 ### helptags 自動生成 (`src/helptags.rs`)
 
