@@ -664,22 +664,24 @@ pub fn inspect_doc_dir(doc_dir: &Path) -> DocStatus {
     let mut has_help = false;
     let mut has_tags = false;
     for entry in entries.flatten() {
+        // ディレクトリは判定対象外。`doc/tags-assets/` (画像置き場) や
+        // `doc/manual.txt/` (誤って .txt 名のディレクトリが切られたケース) を
+        // ファイルとカウントしない。
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         let lower = name_str.to_ascii_lowercase();
 
-        // tags / tags-ja / tags-en 等
-        if lower == "tags" || lower.starts_with("tags-") {
-            has_tags = true;
-            continue;
-        }
-
+        // help file 判定を tags 判定より先に。これは `tags-overview.txt` のような
+        // 「先頭が tags- だが実は help file」を help 側に正しく分類するため。
         // <name>.txt
         if lower.ends_with(".txt") {
             has_help = true;
             continue;
         }
-
         // <name>.<lang>x — `<lang>` は 2-3 文字 (Vim 慣習) だが厳密にはチェック
         // しない: 拡張子が `x` で終わり、その手前が小文字英字 1+ なら language-
         // specific help とみなす (`.jax`, `.brx`, `.cnx` など)。
@@ -692,6 +694,13 @@ pub fn inspect_doc_dir(doc_dir: &Path) -> DocStatus {
                 .all(|c| c.is_ascii_alphabetic())
         {
             has_help = true;
+            continue;
+        }
+
+        // tags / tags-ja / tags-en 等。Vim の tags ファイルは拡張子無しなので
+        // `.bak`, `.old`, `.orig` 等をつけたバックアップは tags 扱いしない。
+        if lower == "tags" || (lower.starts_with("tags-") && !lower.contains('.')) {
+            has_tags = true;
         }
     }
 
@@ -1747,6 +1756,58 @@ mod tests {
         std::fs::create_dir_all(&doc).unwrap();
         std::fs::write(doc.join("plugin.txt"), b"*plugin*").unwrap();
         std::fs::write(doc.join("TAGS"), b"plugin\tplugin.txt\n").unwrap();
+        assert_eq!(inspect_doc_dir(&doc), DocStatus::HasTags);
+    }
+
+    #[test]
+    fn test_inspect_doc_dir_skips_directory_named_like_help_or_tags() {
+        // ディレクトリは中身に関わらず判定対象外。`doc/manual.txt/` (誤って
+        // .txt 名のディレクトリ) を has_help、`doc/tags-assets/` を has_tags
+        // としてカウントしないこと。
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = tmp.path().join("doc");
+        std::fs::create_dir_all(doc.join("manual.txt")).unwrap();
+        std::fs::create_dir_all(doc.join("tags-assets")).unwrap();
+        // 実体の help / tags ファイルはどちらも無い
+        assert_eq!(inspect_doc_dir(&doc), DocStatus::NoHelpFiles);
+    }
+
+    #[test]
+    fn test_inspect_doc_dir_tags_with_extension_is_not_tags_file() {
+        // tags-ja.bak / tags.old のようなバックアップは tags ファイルではない。
+        // (Vim の tags ファイルは拡張子を持たない。)
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = tmp.path().join("doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        std::fs::write(doc.join("plugin.txt"), b"*plugin*").unwrap();
+        std::fs::write(doc.join("tags.bak"), b"old").unwrap();
+        std::fs::write(doc.join("tags-ja.old"), b"old-ja").unwrap();
+        // help はあるが tags は無い → MissingTags
+        assert_eq!(inspect_doc_dir(&doc), DocStatus::MissingTags);
+    }
+
+    #[test]
+    fn test_inspect_doc_dir_help_named_like_tags_counts_as_help() {
+        // `tags-overview.txt` のような「先頭が tags- だが拡張子 .txt」は
+        // help file として扱う (tags 検出より .txt 検出を先にしているため)。
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = tmp.path().join("doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        std::fs::write(doc.join("tags-overview.txt"), b"*tags-overview*").unwrap();
+        std::fs::write(doc.join("tags"), b"tags-overview\ttags-overview.txt\n").unwrap();
+        assert_eq!(inspect_doc_dir(&doc), DocStatus::HasTags);
+    }
+
+    #[test]
+    fn test_inspect_doc_dir_jax_named_like_tags_counts_as_help() {
+        // `tags-overview.jax` のような「先頭が tags- だが拡張子 .jax」も
+        // language-specific help として扱う。判定順序の bug guard。
+        let tmp = tempfile::tempdir().unwrap();
+        let doc = tmp.path().join("doc");
+        std::fs::create_dir_all(&doc).unwrap();
+        std::fs::write(doc.join("tags-overview.jax"), b"*tags-ja*").unwrap();
+        // tags-ja があるので OK
+        std::fs::write(doc.join("tags-ja"), b"...").unwrap();
         assert_eq!(inspect_doc_dir(&doc), DocStatus::HasTags);
     }
 
