@@ -673,25 +673,19 @@ impl TuiState {
         if let Some(init_lua_path) = nvim_init_lua_path {
             // [ Global hooks ] sentinel 行: per-plugin の I/B/A 表記と揃えて、
             // init.lua は Neovim 本体の path、before/after は <config_root> 配下を見る。
-            let hook_i = if init_lua_path.exists() {
-                icons.hook_on
+            // exists() を 1 ファイルにつき 1 回だけ叩く (TUI ループは ~50ms ごと
+            // に redraw されるので、毎フレーム重複 stat を避ける)。
+            let has_i = init_lua_path.exists();
+            let has_b = config_root.join("before.lua").exists();
+            let has_a = config_root.join("after.lua").exists();
+            let hook_i = if has_i { icons.hook_on } else { icons.hook_off };
+            let hook_b = if has_b { icons.hook_on } else { icons.hook_off };
+            let hook_a = if has_a { icons.hook_on } else { icons.hook_off };
+            let hooks_color = if has_i || has_b || has_a {
+                Color::Green
             } else {
-                icons.hook_off
+                Color::DarkGray
             };
-            let hook_b = if config_root.join("before.lua").exists() {
-                icons.hook_on
-            } else {
-                icons.hook_off
-            };
-            let hook_a = if config_root.join("after.lua").exists() {
-                icons.hook_on
-            } else {
-                icons.hook_off
-            };
-            let any = init_lua_path.exists()
-                || config_root.join("before.lua").exists()
-                || config_root.join("after.lua").exists();
-            let hooks_color = if any { Color::Green } else { Color::DarkGray };
             rows.push(Row::new(vec![
                 Cell::from(icons.installed).style(Style::default().fg(Color::Cyan)),
                 Cell::from("[ Global hooks ]").style(
@@ -772,27 +766,17 @@ impl TuiState {
 
             // I B A 列: init/before/after.lua の存在チェック
             // per-plugin hook は <config_root>/plugins/<host>/<owner>/<repo>/
+            // exists() は 1 ファイルにつき 1 回だけ叩く (TUI ループの redraw 頻度
+            // で N プラグイン × 6 stat → N × 3 stat に削減)。
             let pcdir = config_root.join("plugins").join(p.canonical_path());
-            let hook_i = if pcdir.join("init.lua").exists() {
-                icons.hook_on
-            } else {
-                icons.hook_off
-            };
-            let hook_b = if pcdir.join("before.lua").exists() {
-                icons.hook_on
-            } else {
-                icons.hook_off
-            };
-            let hook_a = if pcdir.join("after.lua").exists() {
-                icons.hook_on
-            } else {
-                icons.hook_off
-            };
+            let has_i = pcdir.join("init.lua").exists();
+            let has_b = pcdir.join("before.lua").exists();
+            let has_a = pcdir.join("after.lua").exists();
+            let hook_i = if has_i { icons.hook_on } else { icons.hook_off };
+            let hook_b = if has_b { icons.hook_on } else { icons.hook_off };
+            let hook_a = if has_a { icons.hook_on } else { icons.hook_off };
             let hooks_text = format!("{} {} {}", hook_i, hook_b, hook_a);
-            let has_hooks = pcdir.join("init.lua").exists()
-                || pcdir.join("before.lua").exists()
-                || pcdir.join("after.lua").exists();
-            let hooks_color = if has_hooks {
+            let hooks_color = if has_i || has_b || has_a {
                 Color::Green
             } else {
                 Color::DarkGray

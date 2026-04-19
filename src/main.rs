@@ -1401,6 +1401,10 @@ async fn run_list(no_tui: bool) -> Result<bool> {
         Ok((config, tui_state, rx, set, config_root))
     }
 
+    // env vars (RVPM_APPNAME / NVIM_APPNAME) は run_list 実行中に変わらないので
+    // ループ外で 1 回だけ resolve。draw_list の毎フレーム再呼び出しを避ける。
+    let init_lua = nvim_init_lua_path();
+
     loop {
         // バックグラウンドのステータス更新を非ブロッキングで受信
         if !bg_done {
@@ -1414,7 +1418,6 @@ async fn run_list(no_tui: bool) -> Result<bool> {
             while let Some(Ok(_)) = set.try_join_next() {}
         }
 
-        let init_lua = nvim_init_lua_path();
         terminal
             .draw(|f| tui_state.draw_list(f, &config, &config_root, &icons, Some(&init_lua)))?;
 
