@@ -27,6 +27,13 @@ fn hard_link_or_copy(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Vim の helptags ファイル名 (`tags` / `tags-<lang>`) かを判定する。
+/// 拡張子付きの `tags.bak` 等はバックアップなので false。
+fn is_helptags_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "tags" || (lower.starts_with("tags-") && !lower.contains('.'))
+}
+
 /// `merge_plugin` の返り値。衝突したファイルのリストを含む (first-wins、
 /// 後から来た plugin のファイルが skip された場合に記録)。
 #[derive(Debug, Default)]
@@ -96,6 +103,22 @@ fn walk(plugin_root: &Path, dir: &Path, dst_root: &Path, result: &mut MergeResul
             .expect("entry is under plugin_root")
             .to_path_buf();
         let dst_path = dst_root.join(&rel);
+
+        // `doc/<plugin>/tags` / `doc/.../tags-<lang>` は plugin が自分で
+        // commit している tags ファイルが時々ある。これを hard link すると
+        // 後段の `:helptags merged_dir/doc` が同 inode を書き換え、源 plugin の
+        // `repos/<plugin>/doc/tags` まで上書きしてしまい git status が汚れる。
+        // tags は merged 側で生成し直すので skip して構わない (doc/ 直下の
+        // *.txt / *.<lang>x が hard link されているので :helptags は機能する)。
+        if !src_path.is_dir()
+            && rel
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|n| n == "doc")
+            && is_helptags_file(&name_str)
+        {
+            continue;
+        }
 
         if src_path.is_dir() {
             // dst 側に既に **ファイル** が居るケース: 先行 plugin が同じ path に
@@ -244,6 +267,47 @@ mod tests {
         assert!(!merged.join("stylua.toml").exists());
         assert!(merged.join("plugin/foo.vim").exists());
         assert!(merged.join("doc/foo.txt").exists());
+        assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_merge_skips_committed_doc_tags() {
+        // plugin がリポジトリに `doc/tags` を commit していても hard link しない
+        // (後段の :helptags merged/doc が再生成するし、hard link だと源 plugin の
+        // tags ファイルまで書き換えて git status を汚す)。
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        let p = root.path().join("plug");
+        write(&p.join("doc/foo.txt"), "*foo*");
+        write(&p.join("doc/tags"), "stale-tags");
+        write(&p.join("doc/tags-ja"), "stale-tags-ja");
+
+        let r = merge_plugin(&p, &merged).unwrap();
+
+        assert!(merged.join("doc/foo.txt").exists());
+        assert!(
+            !merged.join("doc/tags").exists(),
+            "doc/tags should be skipped"
+        );
+        assert!(
+            !merged.join("doc/tags-ja").exists(),
+            "doc/tags-ja should be skipped"
+        );
+        assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_merge_keeps_doc_tags_named_files_with_extension() {
+        // tags.bak / tags-ja.old のようなバックアップは tags ファイルではないので
+        // 通常通り link される (doctor 側の判定と整合)。
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        let p = root.path().join("plug");
+        write(&p.join("doc/foo.txt"), "*foo*");
+        write(&p.join("doc/tags.bak"), "backup");
+
+        let r = merge_plugin(&p, &merged).unwrap();
+        assert!(merged.join("doc/tags.bak").exists());
         assert!(r.conflicts.is_empty());
     }
 

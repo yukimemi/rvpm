@@ -429,7 +429,10 @@ pub fn check_unused_cache_dirs(unused: &[PathBuf]) -> Diagnostic {
     .with_hint("`rvpm clean` or `rvpm sync --prune`")
 }
 
-/// merged/ 内の壊れた (存在しない target を指す) symlink / junction を検出する。
+/// merged/ 内の壊れた (存在しない target を指す) symlink を検出する。
+/// 現行 link.rs はファイル単位 hard link なので symlink は基本作らないが、
+/// 過去 (junction/symlink で merge していた時代) に作られた残骸や、ユーザーが
+/// 手動で張ったリンクが壊れているケースを拾う。
 pub fn check_merged_stale_links(merged_dir: &Path) -> Diagnostic {
     if !merged_dir.exists() {
         return Diagnostic::new(

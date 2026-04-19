@@ -270,7 +270,7 @@ let _permit = sem.acquire_owned().await.unwrap();
 
 ### Windows 対応
 
-ディレクトリリンクには `junction::create()` (`#[cfg(windows)]`) を使い、シンボリックリンクの権限問題を回避する。ファイルは前述の hard link で対応 (こちらも管理者権限不要)。
+merge 戦略がファイル単位 hard link に切り替わって以降、Windows でも管理者権限要らず・junction も symbolic link も使わない構成になった。`std::fs::hard_link` は NTFS 上で動き、admin 不要。ディレクトリは `create_dir_all` で実体を作るので junction は不要。シンボリックリンクの権限問題は回避済み。
 
 ### パス規約 (固定 + 上書き可能)
 
