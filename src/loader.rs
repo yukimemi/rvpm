@@ -531,16 +531,34 @@ end
                     Some(d) => format!(", {{ desc = \"{}\" }}", d.replace('"', "\\\"")),
                     None => String::new(),
                 };
+                // feedkeys mode は "im":
+                //   i = typeahead の **先頭** に挿入 (append "m" だと、ユーザーが
+                //       `<lhs><motion>` を素早く打ったとき motion が先に処理されて
+                //       しまう。例: vim-operator-replace で `_i"` を打つと `i` が
+                //       先に評価されて Insert mode に突入する)
+                //   m = remap 許可 (load 後の本物の keymap (e.g. <Plug>) を踏ませる)
+                // lazy.nvim 11+ と同じパターン。
+                //
+                // v:operator は **operator-pending mode のとき** (`mode(1)` が "no..." 系)
+                // にだけ capture する。`v:operator` は「直前に使ったオペレータ」を
+                // 持続的に保持するので、normal mode から stub を起動した瞬間にそれを
+                // 読むと stale な値 (例: 前回の `dw` から残った "d") を拾ってしまう。
+                // その状態で例えば vim-operator-replace の `_iw` を打つと、replay が
+                // `<Ignore>d_iw` になり `d_` (linewise motion で現在行削除) が走って
+                // しまう (実例: #65 修正後に user が遭遇した「行全体がひかる」症状)。
+                // count / register は「現在の Normal mode コマンド」用にリセットされる
+                // ので mode guard 不要 (e.g. `5_iw` の `5` は今のコマンドの count)。
                 body.push_str(&format!(
                     "vim.keymap.set({modes}, \"{lhs}\", function()\n\
-                     \x20 local op = vim.v.operator\n\
+                     \x20 local _m = vim.fn.mode(1)\n\
+                     \x20 local op = (_m:sub(1, 2) == \"no\") and vim.v.operator or \"\"\n\
                      \x20 local cnt = vim.v.count1\n\
                      \x20 local reg = vim.v.register\n\
                      \x20 vim.keymap.del({modes}, \"{lhs}\")\n\
                      \x20 {load}\n\
                      \x20 local prefix = (reg ~= '\"' and '\"' .. reg or \"\") .. op .. (cnt > 1 and cnt or \"\")\n\
                      \x20 local feed = vim.api.nvim_replace_termcodes(\"<Ignore>\" .. prefix .. \"{lhs}\", true, true, true)\n\
-                     \x20 vim.api.nvim_feedkeys(feed, \"m\", false)\n\
+                     \x20 vim.api.nvim_feedkeys(feed, \"im\", false)\n\
                      end{opts})\n",
                     modes = modes_lua,
                     lhs = lhs,
@@ -1678,6 +1696,63 @@ mod tests {
         assert!(
             lua.contains("<Ignore>"),
             "on_map replay must use <Ignore> prefix (lazy.nvim pattern)"
+        );
+    }
+
+    #[test]
+    fn test_on_map_only_captures_operator_in_op_pending_mode() {
+        // `v:operator` は直前に使ったオペレータを保持し続ける性質があるため、
+        // normal mode から stub を起動した瞬間に無条件で拾うと stale な
+        // operator を replay に prepend してしまう。
+        // 例: 直前に `dw` をしてから lazy load された `_` (vim-operator-replace)
+        // で `_iw` を打つと、stale "d" が混じって `<Ignore>d_iw` を再生し、
+        // `d_` (linewise) で行が消える regression。`mode(1)` で operator-pending
+        // ("no..." prefix) のときだけ capture するように gate する。
+        let mut s = make_lazy_plugin("operator-replace");
+        s.on_map = Some(vec![MapSpec {
+            lhs: "_".to_string(),
+            mode: vec!["n".to_string(), "x".to_string()],
+            desc: None,
+        }]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
+        // mode guard が入っていること
+        assert!(
+            lua.contains("vim.fn.mode(1)"),
+            "on_map must call vim.fn.mode(1) to detect operator-pending"
+        );
+        assert!(
+            lua.contains("\"no\""),
+            "on_map must compare mode prefix to \"no\" (operator-pending)"
+        );
+        // gate なしの裸 `local op = vim.v.operator` は許さない
+        assert!(
+            !lua.contains("local op = vim.v.operator\n"),
+            "on_map must NOT capture v:operator unconditionally — gate it on mode(1) so stale operators don't leak into replay"
+        );
+    }
+
+    #[test]
+    fn test_on_map_feedkeys_inserts_at_typeahead_start() {
+        // feedkeys mode は "im" でなければならない:
+        //   - "i" = typeahead の先頭に挿入。append "m" だとユーザーが
+        //     `<lhs><motion>` を素早く打ったとき motion が先に処理され、
+        //     例えば vim-operator-replace の `_i"` で `i` が Insert mode と
+        //     解釈されてしまう (regression test)。
+        //   - "m" = remap 許可 (本物の keymap、典型的には <Plug>... を踏ませる)
+        let mut s = make_lazy_plugin("operator-replace");
+        s.on_map = Some(vec![MapSpec {
+            lhs: "_".to_string(),
+            mode: vec!["n".to_string(), "x".to_string()],
+            desc: None,
+        }]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
+        assert!(
+            lua.contains("nvim_feedkeys(feed, \"im\""),
+            "on_map replay must insert at typeahead start (mode \"im\") so operator + motion sequences work; got: {lua}"
+        );
+        assert!(
+            !lua.contains("nvim_feedkeys(feed, \"m\""),
+            "on_map must NOT use mode \"m\" alone — that appends to typeahead and breaks `<op><motion>`"
         );
     }
 
