@@ -136,13 +136,15 @@ enum Commands {
     ///
     /// Without flags, prompts which plugin and file to edit.
     /// With --init / --before / --after, opens that file directly.
-    /// With --global, edits global before.lua / after.lua hooks
-    /// (~/.config/rvpm/) instead of per-plugin files.
+    /// With --global, edits global hooks instead of per-plugin files:
+    ///   --init   = Neovim's own init.lua (`~/.config/<appname>/init.lua`)
+    ///   --before = `<config_root>/before.lua`
+    ///   --after  = `<config_root>/after.lua`
     Edit {
         /// Fuzzy match plugin url (omit to pick interactively)
         query: Option<String>,
 
-        /// Open init.lua directly (per-plugin only)
+        /// Open init.lua directly (per-plugin path, or Neovim's own with --global)
         #[arg(long)]
         init: bool,
 
@@ -1263,8 +1265,16 @@ async fn run_list(no_tui: bool) -> Result<bool> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
+    // 先頭に空文字 sentinel を入れて [ Global hooks ] の仮想行にする (rvpm edit
+    // と同じ感覚で list TUI からも `e` キーで global edit に飛べるように)。
+    // empty URL は spawn_status_check の対象 (= config.plugins) には含まれないため
+    // 「Waiting」のままになる心配は無く、ここで Finished に印を付けるだけで OK。
+    let mut urls: Vec<String> = vec![String::new()];
+    urls.extend(config.plugins.iter().map(|p| p.url.clone()));
     let mut tui_state = TuiState::new(urls);
+    tui_state
+        .status_map
+        .insert(String::new(), PluginStatus::Finished);
 
     // バックグラウンドでステータスチェック開始 (TUI は即表示)
     let (mut rx, mut set) = spawn_status_check(&config, &cache_root);
@@ -1371,8 +1381,13 @@ async fn run_list(no_tui: bool) -> Result<bool> {
         let config = parse_config(&toml_content)?;
         let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
         let config_root = resolve_config_root(config.options.config_root.as_deref());
-        let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
-        let tui_state = TuiState::new(urls);
+        // run_list の入口と同じく [ Global hooks ] sentinel を先頭に積む
+        let mut urls: Vec<String> = vec![String::new()];
+        urls.extend(config.plugins.iter().map(|p| p.url.clone()));
+        let mut tui_state = TuiState::new(urls);
+        tui_state
+            .status_map
+            .insert(String::new(), PluginStatus::Finished);
         let (rx, set) = spawn_status_check(&config, &cache_root);
 
         // ── 3. 復帰直後に残留イベントを drain ──
@@ -1399,7 +1414,9 @@ async fn run_list(no_tui: bool) -> Result<bool> {
             while let Some(Ok(_)) = set.try_join_next() {}
         }
 
-        terminal.draw(|f| tui_state.draw_list(f, &config, &config_root, &icons))?;
+        let init_lua = nvim_init_lua_path();
+        terminal
+            .draw(|f| tui_state.draw_list(f, &config, &config_root, &icons, Some(&init_lua)))?;
 
         if crossterm::event::poll(std::time::Duration::from_millis(50))?
             && let crossterm::event::Event::Key(key) = crossterm::event::read()?
@@ -1490,7 +1507,13 @@ async fn run_list(no_tui: bool) -> Result<bool> {
                 crossterm::event::KeyCode::Char('e') => {
                     if let Some(url) = tui_state.selected_url() {
                         leave_tui(&mut terminal)?;
-                        if run_edit(Some(url), false, false, false, false).await? {
+                        // [ Global hooks ] sentinel: per-plugin ではなく global edit に飛ばす
+                        let edited = if url.is_empty() {
+                            run_edit(None, false, false, false, true).await?
+                        } else {
+                            run_edit(Some(url), false, false, false, false).await?
+                        };
+                        if edited {
                             run_generate().await?;
                         }
                         reload!();
@@ -1498,6 +1521,10 @@ async fn run_list(no_tui: bool) -> Result<bool> {
                 }
                 crossterm::event::KeyCode::Char('s') => {
                     if let Some(url) = tui_state.selected_url() {
+                        if url.is_empty() {
+                            // sentinel 行では set 対象が無いので何もしない
+                            continue;
+                        }
                         leave_tui(&mut terminal)?;
                         if run_set(
                             Some(url),
@@ -1532,6 +1559,9 @@ async fn run_list(no_tui: bool) -> Result<bool> {
                 }
                 crossterm::event::KeyCode::Char('u') => {
                     if let Some(url) = tui_state.selected_url() {
+                        if url.is_empty() {
+                            continue;
+                        }
                         leave_tui(&mut terminal)?;
                         let _ = run_update(Some(url)).await;
                         wait_for_keypress("\nPress any key to return to list...")?;
@@ -1546,6 +1576,9 @@ async fn run_list(no_tui: bool) -> Result<bool> {
                 }
                 crossterm::event::KeyCode::Char('d') => {
                     if let Some(url) = tui_state.selected_url() {
+                        if url.is_empty() {
+                            continue;
+                        }
                         leave_tui(&mut terminal)?;
                         let _ = run_remove(Some(url)).await;
                         reload!();
@@ -1966,7 +1999,11 @@ async fn run_edit(
     flag_after: bool,
     flag_global: bool,
 ) -> Result<bool> {
-    // --global: グローバル hooks (<config_root>/before.lua / after.lua)
+    // --global: グローバル hooks。init.lua は **Neovim 本体の init.lua**
+    // (~/.config/<appname>/init.lua) を指す — `rvpm init` と同じ対象。before.lua /
+    // after.lua は rvpm の <config_root> 配下。per-plugin の init/before/after と
+    // 同じ 3 択になり、`rvpm edit --init --global` で Neovim 本体 init.lua を
+    // 直接開ける。
     if flag_global {
         // config_root を決めるため config.toml を先読み (存在しなければデフォルト)。
         let config_path = rvpm_config_path();
@@ -1979,16 +2016,32 @@ async fn run_edit(
         };
         let config_dir = config_root.clone();
         std::fs::create_dir_all(&config_dir)?;
+        let nvim_init = nvim_init_lua_path();
 
-        let file_name = if flag_before {
-            "before.lua"
+        // (file_name, target_path) のペア。before/after は config_dir 配下、
+        // init.lua のみ Neovim 本体の path に飛ばす。
+        let target = if flag_init {
+            nvim_init.clone()
+        } else if flag_before {
+            config_dir.join("before.lua")
         } else if flag_after {
-            "after.lua"
+            config_dir.join("after.lua")
         } else {
-            let file_names = ["before.lua", "after.lua"];
-            let display_items: Vec<String> = file_names
+            let entries: [(&str, PathBuf); 3] = [
+                ("init.lua", nvim_init.clone()),
+                ("before.lua", config_dir.join("before.lua")),
+                ("after.lua", config_dir.join("after.lua")),
+            ];
+            let display_items: Vec<String> = entries
                 .iter()
-                .map(|f| file_with_icon(&config_dir, f))
+                .map(|(label, path)| {
+                    let icon = if path.exists() {
+                        "\u{25cf}"
+                    } else {
+                        "\u{25cb}"
+                    };
+                    format!("{} {}", icon, label)
+                })
                 .collect();
             let sel = Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
                 .with_prompt("Select global hook to edit (\u{25cf}=exists \u{25cb}=new)")
@@ -1996,12 +2049,11 @@ async fn run_edit(
                 .items(&display_items)
                 .interact_opt()?;
             match sel {
-                Some(index) => file_names[index],
+                Some(index) => entries[index].1.clone(),
                 None => return Ok(false),
             }
         };
 
-        let target = config_dir.join(file_name);
         let chezmoi_enabled = read_chezmoi_flag(&config_path);
         let edit_target = chezmoi::write_path(chezmoi_enabled, &target).await;
         if let Some(parent) = edit_target.parent() {
@@ -2044,7 +2096,7 @@ async fn run_edit(
             .unwrap_or(20)
             .max(global_label.len());
 
-        let global_indicators = hook_indicators(&config_dir);
+        let global_indicators = global_hook_indicators(&config_dir, &nvim_init_lua_path());
         let mut items: Vec<String> = vec![format!(
             "{:<width$}  {}",
             global_label,
@@ -3335,6 +3387,28 @@ fn hook_indicators(dir: &Path) -> String {
         "\u{25cb}"
     };
     let a = if dir.join("after.lua").exists() {
+        "\u{25cf}"
+    } else {
+        "\u{25cb}"
+    };
+    format!("{} {} {}", i, b, a)
+}
+
+/// global hooks 用のサークルアイコン。`init.lua` だけ Neovim 本体の場所
+/// (`nvim_init_lua_path()`) を見て、`before.lua` / `after.lua` は `<config_root>`
+/// 配下を見る — `rvpm edit --global` の対応と同じ。
+fn global_hook_indicators(config_root: &Path, init_lua_path: &Path) -> String {
+    let i = if init_lua_path.exists() {
+        "\u{25cf}"
+    } else {
+        "\u{25cb}"
+    };
+    let b = if config_root.join("before.lua").exists() {
+        "\u{25cf}"
+    } else {
+        "\u{25cb}"
+    };
+    let a = if config_root.join("after.lua").exists() {
         "\u{25cf}"
     } else {
         "\u{25cb}"
