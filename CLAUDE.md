@@ -273,6 +273,11 @@ commit、それも無ければ default branch の HEAD を pull する。
   `chezmoi::write_path` + `chezmoi::apply` 経由で source 側に書いてから target に
   反映する。これをやらないと chezmoi の「source が truth」原則と衝突して、
   次回 `chezmoi apply` で古い lockfile に巻き戻る。
+- `chezmoi::write_path` / `chezmoi::apply` は **async + 2 秒タイムアウト** で実装
+  (`tokio::process::Command` + `tokio::time::timeout`)。`run_doctor` の外部コマンド
+  probe と同じ思想で、壊れた PATH shim や応答しない subprocess で rvpm 全体が
+  hang するのを防ぐ。タイムアウト時は warn を stderr に流して target 側を返す
+  (resilience)。
 
 ### helptags 自動生成 (`src/helptags.rs`)
 

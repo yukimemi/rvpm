@@ -9,18 +9,25 @@
 //! 持っているため chezmoi のテンプレート機能は不要。
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
 
-/// target パスに対応する chezmoi source パスを解決する (pure function)。
+/// 外部 `chezmoi` コマンドに許す最大実行時間。これを越えたら諦めて何もしない
+/// (resilience)。`run_doctor` の `VERSION_PROBE_TIMEOUT` と同じ思想で、PATH 上の
+/// 壊れた shim や応答しない subprocess で rvpm 全体が hang するのを防ぐ。
+const CHEZMOI_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// target パスに対応する chezmoi source パスを解決する純粋ロジック。
 ///
 /// 1. `source_path_probe(target)` が Some を返せばそのまま使う
 /// 2. 返さなければ (新規ファイル等) 祖先を遡り、最初に managed な祖先から
 ///    相対パスを計算して source 側のフルパスを構築する
 /// 3. source パスが `.tmpl` で終わる場合は None (テンプレート非対応)
 ///
-/// `source_path_probe` は「`chezmoi source-path <p>` の結果」を返すクロージャ。
-/// テストでは mock を差し込む。
-pub fn resolve_source_path<F>(target: &Path, mut source_path_probe: F) -> Option<PathBuf>
+/// 本番コードは `resolve_source_path_async` 経由で `chezmoi source-path` を
+/// 呼ぶ (2 秒タイムアウト付き)。この sync 版は `source_path_probe` クロージャに
+/// mock を差し込めるためテストロジック検証専用に残してある。
+#[cfg(test)]
+fn resolve_source_path<F>(target: &Path, mut source_path_probe: F) -> Option<PathBuf>
 where
     F: FnMut(&Path) -> Option<PathBuf>,
 {
@@ -61,18 +68,27 @@ fn is_tmpl(p: &Path) -> bool {
 }
 
 /// `chezmoi source-path <target>` を実行し、managed なら source パスを返す。
-fn chezmoi_source_path(target: &Path) -> Option<PathBuf> {
-    let output = match Command::new("chezmoi")
+/// 2 秒のタイムアウト付き — chezmoi が hang しても呼び出し側を巻き込まない。
+async fn chezmoi_source_path(target: &Path) -> Option<PathBuf> {
+    let fut = tokio::process::Command::new("chezmoi")
         .arg("source-path")
         .arg(target)
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
+        .output();
+    let output = match tokio::time::timeout(CHEZMOI_TIMEOUT, fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
             eprintln!(
                 "\u{26a0} chezmoi source-path {} failed: {}",
                 target.display(),
                 e,
+            );
+            return None;
+        }
+        Err(_) => {
+            eprintln!(
+                "\u{26a0} chezmoi source-path {} timed out after {}s",
+                target.display(),
+                CHEZMOI_TIMEOUT.as_secs(),
             );
             return None;
         }
@@ -89,48 +105,101 @@ fn chezmoi_source_path(target: &Path) -> Option<PathBuf> {
     }
 }
 
-fn is_chezmoi_available() -> bool {
-    Command::new("chezmoi")
+async fn is_chezmoi_available() -> bool {
+    let fut = tokio::process::Command::new("chezmoi")
         .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .output();
+    matches!(
+        tokio::time::timeout(CHEZMOI_TIMEOUT, fut).await,
+        Ok(Ok(o)) if o.status.success(),
+    )
 }
 
 /// rvpm が書き込むべきパスを返す。chezmoi 有効かつ managed なら source 側、
 /// そうでなければ target そのまま。返り値が target と異なれば source に書いた
 /// ことを意味するので、呼び出し側は `apply()` を呼んで target へ反映する。
-pub fn write_path(enabled: bool, target: &Path) -> PathBuf {
+///
+/// 内部で `chezmoi source-path` を target → 各祖先の順に呼ぶため async。各呼び
+/// 出しに 2 秒の timeout が付くので、chezmoi が応答しなくても全体で hang しない。
+pub async fn write_path(enabled: bool, target: &Path) -> PathBuf {
     if !enabled {
         return target.to_path_buf();
     }
-    if !is_chezmoi_available() {
+    if !is_chezmoi_available().await {
         eprintln!(
             "\u{26a0} options.chezmoi = true but `chezmoi` is not in PATH. \
              Writing to target directly (install chezmoi or set chezmoi = false).",
         );
         return target.to_path_buf();
     }
-    resolve_source_path(target, chezmoi_source_path).unwrap_or_else(|| target.to_path_buf())
+    resolve_source_path_async(target)
+        .await
+        .unwrap_or_else(|| target.to_path_buf())
+}
+
+/// `resolve_source_path` の async 版。`chezmoi_source_path` を直接呼ぶため
+/// テスト用 mock は差し込めない (純粋なロジック検証は同期版 `resolve_source_path`
+/// で担保する)。
+async fn resolve_source_path_async(target: &Path) -> Option<PathBuf> {
+    if let Some(sp) = chezmoi_source_path(target).await {
+        if is_tmpl(&sp) {
+            eprintln!(
+                "\u{26a0} {} is a chezmoi template (.tmpl). \
+                 chezmoi=true requires plain files — use rvpm's Tera templates instead.",
+                target.display(),
+            );
+            return None;
+        }
+        return Some(sp);
+    }
+    let mut ancestor = target.parent();
+    while let Some(a) = ancestor {
+        if let Some(source_ancestor) = chezmoi_source_path(a).await {
+            if is_tmpl(&source_ancestor) {
+                eprintln!(
+                    "\u{26a0} ancestor {} resolves to a chezmoi template (.tmpl). \
+                     chezmoi=true requires plain files — use rvpm's Tera templates instead.",
+                    a.display(),
+                );
+                return None;
+            }
+            let relative = target.strip_prefix(a).ok()?;
+            return Some(source_ancestor.join(relative));
+        }
+        ancestor = a.parent();
+    }
+    None
 }
 
 /// source に書いた後、`chezmoi apply <target>` で target へ反映する。
 /// `wrote_to` は実際に書き込んだパス (`write_path` の返り値)。target と
 /// 異なる場合のみ apply が必要 (同一なら直接 target に書いたので不要)。
-pub fn apply(wrote_to: &Path, target: &Path) {
+///
+/// async + 2 秒 timeout — `chezmoi apply` が hang しても呼び出し側の async
+/// runtime をブロックしない (例: 並列 sync 中に 1 プラグインの apply が
+/// 詰まっても他の処理は進む)。
+pub async fn apply(wrote_to: &Path, target: &Path) {
     if wrote_to == target {
         return;
     }
-    let mut cmd = Command::new("chezmoi");
-    cmd.arg("apply").arg("--force").arg(target);
-    match cmd.status() {
-        Ok(s) if s.success() => {}
-        Ok(s) => eprintln!(
+    let fut = tokio::process::Command::new("chezmoi")
+        .arg("apply")
+        .arg("--force")
+        .arg(target)
+        .status();
+    match tokio::time::timeout(CHEZMOI_TIMEOUT, fut).await {
+        Ok(Ok(s)) if s.success() => {}
+        Ok(Ok(s)) => eprintln!(
             "\u{26a0} chezmoi apply {} failed (exit {})",
             target.display(),
             s.code().unwrap_or(-1),
         ),
-        Err(e) => eprintln!("\u{26a0} chezmoi apply {} failed: {}", target.display(), e,),
+        Ok(Err(e)) => eprintln!("\u{26a0} chezmoi apply {} failed: {}", target.display(), e),
+        Err(_) => eprintln!(
+            "\u{26a0} chezmoi apply {} timed out after {}s",
+            target.display(),
+            CHEZMOI_TIMEOUT.as_secs(),
+        ),
     }
 }
 
@@ -193,10 +262,26 @@ mod tests {
         assert_eq!(got, None);
     }
 
-    #[test]
-    fn test_write_path_disabled_returns_target() {
+    #[tokio::test]
+    async fn test_write_path_disabled_returns_target() {
         let target = Path::new("/some/target");
-        let got = write_path(false, target);
+        let got = write_path(false, target).await;
         assert_eq!(got, target);
+    }
+
+    /// `write_path(true, ...)` が呼ばれても、CI / 開発機に chezmoi が無ければ
+    /// `is_chezmoi_available` が即 false を返して target そのまま、また chezmoi
+    /// があっても 2s timeout で必ず有限時間で帰ってくる。回帰テストの目的は
+    /// 「無限 hang しない」を担保すること。タイムアウト 2s + spawn コスト分の
+    /// 余裕を見て 10s で test 自身を打ち切る。
+    #[tokio::test]
+    async fn test_write_path_enabled_does_not_hang() {
+        let target = Path::new("/some/target");
+        let fut = write_path(true, target);
+        let res = tokio::time::timeout(Duration::from_secs(10), fut).await;
+        assert!(
+            res.is_ok(),
+            "write_path must return within 10s even when chezmoi is missing or slow"
+        );
     }
 }
