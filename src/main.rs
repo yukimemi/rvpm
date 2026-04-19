@@ -2,6 +2,7 @@ mod browse;
 mod browse_tui;
 mod chezmoi;
 mod config;
+mod doctor;
 mod external_render;
 mod git;
 mod helptags;
@@ -239,6 +240,13 @@ enum Commands {
     },
     /// Browse and install Neovim plugins from GitHub
     Browse,
+
+    /// Diagnose rvpm's config, state, and environment
+    ///
+    /// Inspects config.toml, the plugin cache, generated loader.lua, Neovim
+    /// init.lua wiring, and required external tools (nvim / git / chezmoi /
+    /// $EDITOR). Exits 0 on all-ok, 1 on any error, 2 on warn-only.
+    Doctor,
 }
 
 #[tokio::main]
@@ -330,6 +338,12 @@ async fn main() -> Result<()> {
             }
             break;
         },
+        Commands::Doctor => {
+            let code = run_doctor().await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
     }
 
     Ok(())
@@ -812,6 +826,92 @@ async fn run_generate() -> Result<()> {
 
     print_init_lua_hint_if_missing(&config);
     Ok(())
+}
+
+/// `rvpm doctor` エントリポイント。config を読み、各チェックを走らせて
+/// 診断レポートを stdout に出し、exit code を返す。
+async fn run_doctor() -> Result<i32> {
+    let config_path = rvpm_config_path();
+    let toml_content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("rvpm doctor — diagnostic report");
+            println!();
+            println!("Config");
+            println!(
+                "  \u{2717} config.toml              — failed to read: {}",
+                e
+            );
+            println!("      hint: run `rvpm init --write` or create the file");
+            println!();
+            println!("Summary: 0 ok  ·  0 warn  ·  1 error   (exit 1)");
+            return Ok(1);
+        }
+    };
+    let mut config = match parse_config(&toml_content) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("rvpm doctor — diagnostic report");
+            println!();
+            println!("Config");
+            println!("  \u{2717} config.toml              — parse error: {}", e);
+            println!();
+            println!("Summary: 0 ok  ·  0 warn  ·  1 error   (exit 1)");
+            return Ok(1);
+        }
+    };
+    // sort_plugins は副作用で stderr に出るがエラーにはならない。doctor は
+    // 自前で cycles / missing refs を検出するので sort_plugins は呼ばない。
+    for plugin in config.plugins.iter_mut() {
+        disable_merge_if_cond(plugin);
+    }
+
+    let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
+    let merged_dir = resolve_merged_dir(&cache_root);
+    let loader_path = resolve_loader_path(&cache_root);
+    let init_lua_path = nvim_init_lua_path();
+    let repos_dir = resolve_repos_dir(&cache_root);
+
+    // 未使用 repo の検出 (find_unused_repos を再利用)。repos_dir が無い場合は空。
+    let mut unused: Vec<PathBuf> = if repos_dir.exists() {
+        find_unused_repos(&config, &cache_root, &repos_dir).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    unused.sort();
+
+    // appname coherence
+    let rvpm_env = std::env::var("RVPM_APPNAME").ok();
+    let nvim_env = std::env::var("NVIM_APPNAME").ok();
+    let resolved = appname();
+
+    // resolve_dst は doctor 内で clone() 可能なクロージャに閉じ込める
+    let cache_root_for_fn = cache_root.clone();
+    let resolve_dst = Box::new(move |p: &crate::config::Plugin| -> PathBuf {
+        resolve_plugin_dst(p, &cache_root_for_fn)
+    });
+
+    let ctx = crate::doctor::CheckContext {
+        config: &config,
+        config_path: &config_path,
+        loader_path: &loader_path,
+        init_lua_path: &init_lua_path,
+        merged_dir: &merged_dir,
+        unused_cache_dirs: unused,
+        appname_resolved: resolved,
+        rvpm_appname_env: rvpm_env,
+        nvim_appname_env: nvim_env,
+        resolver: Box::new(crate::doctor::SystemResolver),
+        resolve_dst,
+    };
+
+    let diagnostics = crate::doctor::run_checks(&ctx);
+    let icons = crate::tui::Icons::from_style(config.options.icons);
+    let output = crate::doctor::render(&diagnostics, &icons);
+    print!("{}", output);
+
+    let summary = crate::doctor::Summary::from(&diagnostics);
+    Ok(summary.exit_code())
 }
 
 /// 全プラグインの git 状態を並列で調べ、url -> PluginStatus のマップを返す。
@@ -2463,6 +2563,16 @@ fn ensure_config_exists(config_path: &Path) -> Result<bool> {
     std::fs::write(config_path, template)?;
     println!("Created {}", config_path.display());
     Ok(true)
+}
+
+/// doctor 用の pub 再公開 (元 `expand_tilde` を module 外から使いたいため)。
+pub(crate) fn expand_tilde_public(path: &str) -> PathBuf {
+    expand_tilde(path)
+}
+
+/// doctor 用の pub 再公開 (元 `init_lua_references_rvpm_loader` の同義)。
+pub(crate) fn init_lua_references_rvpm_loader_public(init_lua_path: &Path) -> bool {
+    init_lua_references_rvpm_loader(init_lua_path)
 }
 
 /// `~` / `~/foo` / `~\foo` 形式を home dir に展開する。
