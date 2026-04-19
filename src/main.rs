@@ -419,9 +419,10 @@ fn disable_merge_if_cond(plugin: &mut crate::config::Plugin) {
 }
 
 /// プラグインの clone 先パスを解決する。
+/// `plugin.dst` が `~/...` 形式の場合は home dir に展開する (dev プラグインで頻出)。
 fn resolve_plugin_dst(plugin: &crate::config::Plugin, cache_root: &Path) -> PathBuf {
     if let Some(d) = &plugin.dst {
-        PathBuf::from(d)
+        expand_tilde(d)
     } else {
         resolve_repos_dir(cache_root).join(plugin.canonical_path())
     }
@@ -4429,6 +4430,37 @@ mod tests {
         let got = collect_denops_plugins(&plugin);
         let names: Vec<&str> = got.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    #[test]
+    fn test_resolve_plugin_dst_expands_tilde_in_custom_dst() {
+        // `dst = "~/src/foo"` のような tilde 付きパスは home dir に展開される。
+        // 展開されないと dev プラグインの exists() チェックが常に false になる。
+        let home = dirs::home_dir().expect("home dir");
+        let cache_root = PathBuf::from("/tmp/rvpm-cache");
+        let plugin = Plugin {
+            url: "yukimemi/snacks-source-chronicle".to_string(),
+            dst: Some("~/src/github.com/yukimemi/snacks-source-chronicle".to_string()),
+            dev: true,
+            ..Default::default()
+        };
+        let got = resolve_plugin_dst(&plugin, &cache_root);
+        assert_eq!(
+            got,
+            home.join("src/github.com/yukimemi/snacks-source-chronicle")
+        );
+    }
+
+    #[test]
+    fn test_resolve_plugin_dst_uses_cache_root_when_dst_unset() {
+        let cache_root = PathBuf::from("/tmp/rvpm-cache");
+        let plugin = Plugin {
+            url: "folke/snacks.nvim".to_string(),
+            ..Default::default()
+        };
+        let got = resolve_plugin_dst(&plugin, &cache_root);
+        // repos_dir は `{cache_root}/plugins/repos`
+        assert!(got.starts_with(cache_root.join("plugins/repos")));
     }
 
     #[test]
