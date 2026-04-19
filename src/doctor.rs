@@ -486,6 +486,52 @@ pub fn check_merged_stale_links(merged_dir: &Path) -> Diagnostic {
     }
 }
 
+/// 直近 sync / generate で発生した merge 衝突を `<cache_root>/merge_conflicts.json`
+/// から読み出して報告する。衝突 0 件なら Ok、1 件以上なら Warn。詳細には
+/// `loser → winner: relative/path` 形式で最大 10 件を列挙する (超過分は省略表示)。
+///
+/// ファイルが存在しない場合 (まだ sync されていない) も Ok 扱いにする。
+/// malformed JSON も `load_snapshot` が空として扱うため Ok になる (resilience)。
+pub fn check_merge_conflicts(snapshot_path: &Path) -> Diagnostic {
+    let snapshot = crate::merge_conflicts::load_snapshot(snapshot_path);
+    if snapshot.reports.is_empty() {
+        return Diagnostic::new(Severity::Ok, CAT_STATE_INTEGRITY, "merge conflicts", "none");
+    }
+
+    let total = snapshot.reports.len();
+    let plugin_count: HashSet<&str> = snapshot.reports.iter().map(|r| r.loser.as_str()).collect();
+    let summary = format!(
+        "{} file{} across {} plugin{}",
+        total,
+        if total == 1 { "" } else { "s" },
+        plugin_count.len(),
+        if plugin_count.len() == 1 { "" } else { "s" },
+    );
+
+    const MAX_DETAILS: usize = 10;
+    let mut details: Vec<String> = snapshot
+        .reports
+        .iter()
+        .take(MAX_DETAILS)
+        .map(|r| {
+            let winner = r.winner.as_deref().unwrap_or("<unknown>");
+            format!("{} (kept: {}): {}", r.loser, winner, r.relative)
+        })
+        .collect();
+    if total > MAX_DETAILS {
+        details.push(format!("... and {} more", total - MAX_DETAILS));
+    }
+
+    Diagnostic::new(
+        Severity::Warn,
+        CAT_STATE_INTEGRITY,
+        "merge conflicts",
+        summary,
+    )
+    .with_details(details)
+    .with_hint("inspect the listed files in each plugin's repo; remove / rename duplicates or split into lazy plugins")
+}
+
 /// loader.lua が存在し、かつ config.toml より新しいかを検査する。
 pub fn check_loader_freshness(loader_path: &Path, config_path: &Path) -> Diagnostic {
     let loader_mtime = match std::fs::metadata(loader_path).and_then(|m| m.modified()) {
@@ -1004,6 +1050,9 @@ pub struct CheckContext<'a> {
     pub loader_path: &'a Path,
     pub init_lua_path: &'a Path,
     pub merged_dir: &'a Path,
+    /// `<cache_root>/merge_conflicts.json` の絶対パス。
+    /// `check_merge_conflicts` が直近 sync の snapshot を読み出す。
+    pub merge_conflicts_path: &'a Path,
     pub unused_cache_dirs: Vec<PathBuf>,
     pub appname_resolved: String,
     pub rvpm_appname_env: Option<String>,
@@ -1031,6 +1080,7 @@ pub async fn run_checks(ctx: &CheckContext<'_>) -> Vec<Diagnostic> {
         check_cloned_plugins(ctx.config, |p| (ctx.resolve_dst)(p)),
         check_unused_cache_dirs(&ctx.unused_cache_dirs),
         check_merged_stale_links(ctx.merged_dir),
+        check_merge_conflicts(ctx.merge_conflicts_path),
         check_loader_freshness(ctx.loader_path, ctx.config_path),
         // Neovim integration
         check_init_lua_hook(ctx.init_lua_path),
@@ -1477,6 +1527,109 @@ mod tests {
         let d = check_unused_cache_dirs(&[PathBuf::from("/x/y/z")]);
         assert_eq!(d.severity, Severity::Warn);
         assert_eq!(d.details.len(), 1);
+    }
+
+    // -------- merge conflicts --------
+
+    #[test]
+    fn test_check_merge_conflicts_missing_file_is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("merge_conflicts.json");
+        let d = check_merge_conflicts(&path);
+        assert_eq!(d.severity, Severity::Ok);
+        assert_eq!(d.summary, "none");
+    }
+
+    #[test]
+    fn test_check_merge_conflicts_empty_snapshot_is_ok() {
+        // 直近 sync が clean だった: 空 reports で書かれた file。
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("merge_conflicts.json");
+        crate::merge_conflicts::save_snapshot(&path, Vec::new()).unwrap();
+        let d = check_merge_conflicts(&path);
+        assert_eq!(d.severity, Severity::Ok);
+    }
+
+    #[test]
+    fn test_check_merge_conflicts_reports_warn_with_details() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("merge_conflicts.json");
+        let reports = vec![
+            crate::merge_conflicts::MergeConflictReport {
+                loser: "smart-splits.nvim".to_string(),
+                winner: Some("nvim-tree.lua".to_string()),
+                relative: "plugin/init.lua".to_string(),
+            },
+            crate::merge_conflicts::MergeConflictReport {
+                loser: "smart-splits.nvim".to_string(),
+                winner: Some("nvim-tree.lua".to_string()),
+                relative: "lua/util.lua".to_string(),
+            },
+        ];
+        crate::merge_conflicts::save_snapshot(&path, reports).unwrap();
+        let d = check_merge_conflicts(&path);
+        assert_eq!(d.severity, Severity::Warn);
+        assert!(
+            d.summary.contains("2 file"),
+            "summary should report file count: {}",
+            d.summary
+        );
+        assert_eq!(d.details.len(), 2);
+        assert!(
+            d.details[0].contains("smart-splits.nvim"),
+            "detail should include loser: {}",
+            d.details[0]
+        );
+        assert!(
+            d.details[0].contains("nvim-tree.lua"),
+            "detail should include winner: {}",
+            d.details[0]
+        );
+        assert!(
+            d.details[0].contains("plugin/init.lua"),
+            "detail should include path: {}",
+            d.details[0]
+        );
+        assert!(d.hint.is_some(), "should provide remediation hint");
+    }
+
+    #[test]
+    fn test_check_merge_conflicts_truncates_to_max_details() {
+        // 11 件超は "... and N more" で省略
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("merge_conflicts.json");
+        let reports: Vec<_> = (0..15)
+            .map(|i| crate::merge_conflicts::MergeConflictReport {
+                loser: format!("plug-{}", i),
+                winner: Some("winner".to_string()),
+                relative: format!("file-{}.lua", i),
+            })
+            .collect();
+        crate::merge_conflicts::save_snapshot(&path, reports).unwrap();
+        let d = check_merge_conflicts(&path);
+        assert_eq!(d.severity, Severity::Warn);
+        // 最大 10 件 + 省略行で 11 行
+        assert_eq!(d.details.len(), 11);
+        assert!(
+            d.details.last().unwrap().contains("5 more"),
+            "last line should be truncation summary: {}",
+            d.details.last().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_check_merge_conflicts_winner_none_renders_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("merge_conflicts.json");
+        let reports = vec![crate::merge_conflicts::MergeConflictReport {
+            loser: "x".to_string(),
+            winner: None,
+            relative: "plugin/foo.vim".to_string(),
+        }];
+        crate::merge_conflicts::save_snapshot(&path, reports).unwrap();
+        let d = check_merge_conflicts(&path);
+        assert_eq!(d.severity, Severity::Warn);
+        assert!(d.details[0].contains("<unknown>"));
     }
 
     // -------- loader freshness --------
