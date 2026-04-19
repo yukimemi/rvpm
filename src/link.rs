@@ -14,6 +14,7 @@ const RTP_DIRS: &[&str] = &[
     "denops", // denops.vim — TypeScript plugin source
     "doc", "ftdetect", "ftplugin", "indent", "keymap", "lang", "lua", "pack", "parser", "plugin",
     "queries", "rplugin", "spell", "syntax",
+    "tutor", // :Tutor 用、Neovim core が公式に走査する rtp ディレクトリ
 ];
 
 /// ファイルをターゲットに張る。同一ボリューム内なら hard link (Windows でも
@@ -97,12 +98,21 @@ fn walk(plugin_root: &Path, dir: &Path, dst_root: &Path, result: &mut MergeResul
         let dst_path = dst_root.join(&rel);
 
         if src_path.is_dir() {
+            // dst 側に既に **ファイル** が居るケース: 先行 plugin が同じ path に
+            // ファイルを張り済 (例: A の `foo/bar` がファイル、B では `foo/bar/baz`
+            // のディレクトリ階層)。`create_dir_all` は ENOTDIR で落ちるので、
+            // first-wins と整合させて conflict 記録 + skip する (resilience)。
+            if dst_path.is_file() {
+                result.conflicts.push(MergeConflict { relative: rel });
+                continue;
+            }
             if !dst_path.exists() {
                 std::fs::create_dir_all(&dst_path)?;
             }
             walk(plugin_root, &src_path, dst_root, result)?;
         } else if dst_path.exists() {
-            // first-wins: 既にファイルが居る (別プラグインのリンク) → skip
+            // first-wins: 既にファイル / ディレクトリが居る → skip
+            // (dst が dir で src が file の対称ケースもここでカバー)
             result.conflicts.push(MergeConflict { relative: rel });
         } else {
             hard_link_or_copy(&src_path, &dst_path)?;
@@ -235,6 +245,69 @@ mod tests {
         assert!(merged.join("plugin/foo.vim").exists());
         assert!(merged.join("doc/foo.txt").exists());
         assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_merge_includes_tutor_dir() {
+        // `:Tutor` 用の `tutor/` も Neovim core が走査する rtp ディレクトリ。
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        let p = root.path().join("plug");
+        write(&p.join("tutor/intro.tutor"), "# tutor");
+
+        let r = merge_plugin(&p, &merged).unwrap();
+
+        assert!(merged.join("tutor/intro.tutor").exists());
+        assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_merge_dir_vs_file_collision_is_recorded_as_conflict() {
+        // A: `lua/foo` がファイル, B: `lua/foo/bar.lua` (foo がディレクトリ)。
+        // create_dir_all が ENOTDIR で落ちずに first-wins で conflict 記録。
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        let a = root.path().join("plug_a");
+        let b = root.path().join("plug_b");
+        write(&a.join("lua/foo"), "i am a file from a");
+        write(&b.join("lua/foo/bar.lua"), "from b");
+
+        let _ = merge_plugin(&a, &merged).unwrap();
+        let r2 = merge_plugin(&b, &merged).unwrap();
+
+        // A のファイル `lua/foo` は残る
+        assert!(merged.join("lua/foo").is_file());
+        // B 側で 1 件 conflict 記録 (path は dir エントリ `lua/foo`)
+        assert_eq!(r2.conflicts.len(), 1);
+        assert_eq!(
+            r2.conflicts[0].relative,
+            PathBuf::from("lua").join("foo")
+        );
+    }
+
+    #[test]
+    fn test_merge_file_vs_dir_collision_is_recorded_as_conflict() {
+        // 逆方向: A: `lua/foo/bar.lua` (foo がディレクトリ), B: `lua/foo` がファイル。
+        // dst にディレクトリが存在 → file 張りで衝突 → conflict 記録。
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        let a = root.path().join("plug_a");
+        let b = root.path().join("plug_b");
+        write(&a.join("lua/foo/bar.lua"), "from a");
+        write(&b.join("lua/foo"), "i am a file from b");
+
+        let _ = merge_plugin(&a, &merged).unwrap();
+        let r2 = merge_plugin(&b, &merged).unwrap();
+
+        // A の bar.lua は残る、merged/lua/foo はディレクトリ
+        assert!(merged.join("lua/foo").is_dir());
+        assert!(merged.join("lua/foo/bar.lua").exists());
+        // B 側で 1 件 conflict 記録
+        assert_eq!(r2.conflicts.len(), 1);
+        assert_eq!(
+            r2.conflicts[0].relative,
+            PathBuf::from("lua").join("foo")
+        );
     }
 
     #[test]

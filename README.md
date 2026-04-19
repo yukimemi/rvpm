@@ -769,9 +769,10 @@ Plugin-root metadata (`README.md`, `LICENSE`, `Makefile`, `*.toml`,
 `package.json`, etc.) is skipped — it's not on any runtimepath and
 just adds noise. Dotfiles at any depth (`.gitignore`, `.luarc.json`)
 are skipped for the same reason. Only the standard rtp directories
-(`plugin/`, `lua/`, `doc/`, `ftplugin/`, `colors/`, `queries/`, …)
-plus `denops/` (for [denops.vim](https://github.com/vim-denops/denops.vim)
-TypeScript plugins) are walked.
+(`plugin/`, `lua/`, `doc/`, `ftplugin/`, `colors/`, `queries/`,
+`tutor/`, …) plus `denops/` (for
+[denops.vim](https://github.com/vim-denops/denops.vim) TypeScript
+plugins) are walked.
 
 </details>
 
