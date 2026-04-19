@@ -525,11 +525,6 @@ fn classify_held_back(
     }
 }
 
-/// Shorten a commit hash for user-facing display (7 chars, git-style).
-fn short_sha(sha: &str) -> String {
-    sha.chars().take(7).collect()
-}
-
 async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Result<()> {
     // `--frozen` は lockfile に依存した strict check、`--no-lock` は lockfile を
     // 完全無視する escape hatch。両方立つと「strict のつもりが silently latest を
@@ -909,8 +904,8 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Re
             eprintln!(
                 "  -> {}  {} -> {}",
                 pin.name,
-                short_sha(&pin.pinned),
-                short_sha(&pin.remote),
+                crate::update_log::short_hash(&pin.pinned),
+                crate::update_log::short_hash(&pin.remote),
             );
         }
     }
@@ -4469,14 +4464,6 @@ mod tests {
         // Same resilience argument in the other direction.
         let got = classify_held_back(None, Some("abc"), None, Some("def"));
         assert_eq!(got, None);
-    }
-
-    #[test]
-    fn test_short_sha_takes_first_seven_chars() {
-        assert_eq!(short_sha("abcdef1234567890"), "abcdef1");
-        // Shorter input: don't pad or error, just return what we've got.
-        assert_eq!(short_sha("abc"), "abc");
-        assert_eq!(short_sha(""), "");
     }
 
     #[test]
