@@ -439,6 +439,7 @@ pub fn check_merged_stale_links(merged_dir: &Path) -> Diagnostic {
     // のような形で個別ファイルに張る場合もあり得るので、walkdir を使って壊れた
     // symlink を列挙する (`follow_links = false` でリンク自体を訪ねる)。
     for entry in walkdir::WalkDir::new(merged_dir)
+        .max_depth(2)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -570,6 +571,12 @@ pub fn check_init_lua_hook(init_lua_path: &Path) -> Diagnostic {
 
 /// appname coherence: 解決された appname と source env vars を表示する。
 /// `$RVPM_APPNAME` と `$NVIM_APPNAME` の状態を注入可能にしてテスト容易に。
+///
+/// resolved appname と env var の値が食い違う場合は warn を返す。よくある罠:
+/// - `RVPM_APPNAME=foo` だが値が path 区切りなどで invalid → fallback して
+///   "nvim" になる (が、ユーザーは foo のつもり)
+/// - `NVIM_APPNAME=bar` で nvim を起動しているのに `RVPM_APPNAME` が設定
+///   されておらず rvpm 側は別の appname を解決している
 pub fn check_appname(resolved: &str, rvpm_env: Option<&str>, nvim_env: Option<&str>) -> Diagnostic {
     let rvpm_state = match rvpm_env {
         None => "$RVPM_APPNAME unset".to_string(),
@@ -580,6 +587,41 @@ pub fn check_appname(resolved: &str, rvpm_env: Option<&str>, nvim_env: Option<&s
         Some(v) => format!("$NVIM_APPNAME={:?}", v),
     };
     let summary = format!("{:?}  ({}, {})", resolved, rvpm_state, nvim_state);
+
+    // 不整合の検出 (どれか 1 つでも刺されば warn):
+    let rvpm_mismatch = rvpm_env.is_some_and(|v| v != resolved);
+    let nvim_mismatch = nvim_env.is_some_and(|v| v != resolved);
+    let invalid_fallback = matches!(rvpm_env, Some(v) if v != resolved && resolved == "nvim")
+        || matches!(nvim_env, Some(v) if v != resolved && resolved == "nvim");
+
+    if rvpm_mismatch || nvim_mismatch {
+        let mut details = Vec::new();
+        if let Some(v) = rvpm_env
+            && v != resolved
+        {
+            details.push(format!(
+                "$RVPM_APPNAME={:?} but rvpm resolved {:?}",
+                v, resolved
+            ));
+        }
+        if let Some(v) = nvim_env
+            && v != resolved
+        {
+            details.push(format!(
+                "$NVIM_APPNAME={:?} but rvpm resolved {:?}",
+                v, resolved
+            ));
+        }
+        let hint = if invalid_fallback {
+            "env var value rejected (path separators / `.` / `..` etc) — fell back to \"nvim\""
+        } else {
+            "env vars and rvpm's resolved appname disagree — config_root / cache_root may not match Neovim"
+        };
+        return Diagnostic::new(Severity::Warn, CAT_NEOVIM, "appname coherence", summary)
+            .with_details(details)
+            .with_hint(hint);
+    }
+
     Diagnostic::new(Severity::Ok, CAT_NEOVIM, "appname coherence", summary)
 }
 
@@ -639,24 +681,36 @@ pub fn check_helptags(
 // ============================================================
 
 /// 外部コマンドのバージョンを取得する trait。テストでは mock 実装を差し込む。
-pub trait VersionResolver {
+///
+/// `version()` は async — Tokio runtime 上で `tokio::process::Command` を spawn
+/// し、`tokio::time::timeout` で stalled subprocess (壊れた PATH shim 等) を
+/// 防ぐ。`env()` は同期で十分 (環境変数は in-process)。
+#[async_trait::async_trait]
+pub trait VersionResolver: Send + Sync {
     /// `cmd` (例: `"nvim"`, `"git"`) のバージョン文字列を返す。
-    /// コマンドが無い / 失敗した場合は None。
-    fn version(&self, cmd: &str) -> Option<String>;
+    /// コマンドが無い / 失敗 / timeout した場合は None。
+    async fn version(&self, cmd: &str) -> Option<String>;
 
     /// 環境変数の値 (None = unset)。
     fn env(&self, key: &str) -> Option<String>;
 }
 
-/// 本番実装: `cmd --version` を実行して 1 行目を取得する。
+/// 外部コマンドの `--version` 実行に許す最大時間。これを越えたら諦めて None。
+const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 本番実装: `tokio::process::Command` で `cmd --version` を実行して 1 行目を取得。
+/// 2 秒のタイムアウト付き (壊れた PATH shim や stalled subprocess で hang しない)。
 pub struct SystemResolver;
 
+#[async_trait::async_trait]
 impl VersionResolver for SystemResolver {
-    fn version(&self, cmd: &str) -> Option<String> {
-        let out = std::process::Command::new(cmd)
-            .arg("--version")
-            .output()
-            .ok()?;
+    async fn version(&self, cmd: &str) -> Option<String> {
+        let fut = tokio::process::Command::new(cmd).arg("--version").output();
+        let out = match tokio::time::timeout(VERSION_PROBE_TIMEOUT, fut).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(_)) => return None, // spawn failed (cmd not found 等)
+            Err(_) => return None,     // timeout
+        };
         if !out.status.success() {
             return None;
         }
@@ -703,8 +757,8 @@ fn shorten_version(raw: &str) -> String {
 }
 
 /// `nvim` コマンドの存在とバージョン。必須。
-pub fn check_tool_nvim(resolver: &dyn VersionResolver) -> Diagnostic {
-    match resolver.version("nvim") {
+pub async fn check_tool_nvim(resolver: &dyn VersionResolver) -> Diagnostic {
+    match resolver.version("nvim").await {
         Some(v) => Diagnostic::new(
             Severity::Ok,
             CAT_TOOLS,
@@ -722,8 +776,8 @@ pub fn check_tool_nvim(resolver: &dyn VersionResolver) -> Diagnostic {
 }
 
 /// `git` コマンドの存在とバージョン。必須。
-pub fn check_tool_git(resolver: &dyn VersionResolver) -> Diagnostic {
-    match resolver.version("git") {
+pub async fn check_tool_git(resolver: &dyn VersionResolver) -> Diagnostic {
+    match resolver.version("git").await {
         Some(v) => Diagnostic::new(
             Severity::Ok,
             CAT_TOOLS,
@@ -742,14 +796,14 @@ pub fn check_tool_git(resolver: &dyn VersionResolver) -> Diagnostic {
 
 /// `chezmoi` コマンドの存在。`options.chezmoi = true` の時のみ必須、それ以外は
 /// 情報表示。
-pub fn check_tool_chezmoi(config: &Config, resolver: &dyn VersionResolver) -> Diagnostic {
+pub async fn check_tool_chezmoi(config: &Config, resolver: &dyn VersionResolver) -> Diagnostic {
     let required = config.options.chezmoi;
     let label = if required {
         "(required: options.chezmoi=true)"
     } else {
         "(optional)"
     };
-    match resolver.version("chezmoi") {
+    match resolver.version("chezmoi").await {
         Some(v) => Diagnostic::new(
             Severity::Ok,
             CAT_TOOLS,
@@ -859,8 +913,9 @@ pub struct CheckContext<'a> {
     pub helptag_target_labels: Vec<String>,
 }
 
-pub fn run_checks(ctx: &CheckContext) -> Vec<Diagnostic> {
-    vec![
+pub async fn run_checks(ctx: &CheckContext<'_>) -> Vec<Diagnostic> {
+    // 同期 check は即評価 — async に渡せない `&Fn` 参照を含むため。
+    let sync_diags = vec![
         // Plugin config
         check_depends_cycles(ctx.config),
         check_depends_references(ctx.config),
@@ -880,12 +935,24 @@ pub fn run_checks(ctx: &CheckContext) -> Vec<Diagnostic> {
             ctx.nvim_appname_env.as_deref(),
         ),
         check_helptags(ctx.config, &ctx.helptag_targets, &ctx.helptag_target_labels),
-        // External tools
-        check_tool_nvim(ctx.resolver.as_ref()),
-        check_tool_git(ctx.resolver.as_ref()),
-        check_tool_chezmoi(ctx.config, ctx.resolver.as_ref()),
-        check_editor(ctx.resolver.as_ref()),
-    ]
+    ];
+
+    // External tools は async — 並列に投げて待つことで合計レイテンシを下げる
+    // (各 `cmd --version` が ~50ms 程度。順次なら 200ms、並列なら ~50ms)。
+    let resolver = ctx.resolver.as_ref();
+    let (nvim_d, git_d, chezmoi_d, editor_d) = tokio::join!(
+        check_tool_nvim(resolver),
+        check_tool_git(resolver),
+        check_tool_chezmoi(ctx.config, resolver),
+        async { check_editor(resolver) }, // editor は env() なので同期、形を揃えるだけ
+    );
+
+    let mut all = sync_diags;
+    all.push(nvim_d);
+    all.push(git_d);
+    all.push(chezmoi_d);
+    all.push(editor_d);
+    all
 }
 
 // ============================================================
@@ -951,9 +1018,41 @@ fn severity_prefix(sev: Severity, icons: &Icons) -> String {
     }
 }
 
+/// レンダリングで使う「文字種」の組。Ascii では box drawing / em-dash / middot
+/// を全て ASCII 等価に落とす (CI ログ / 非 UTF-8 ターミナル向け)。
+struct Glyphs {
+    /// title と summary を区切る dash
+    dash: &'static str,
+    /// summary 句読点として使う中点
+    middot: &'static str,
+    /// details の最終要素 bullet
+    last_bullet: &'static str,
+    /// details の中間要素 bullet
+    mid_bullet: &'static str,
+}
+
+fn glyphs_for(icons: &Icons) -> Glyphs {
+    if matches!(icons.style, IconStyle::Ascii) {
+        Glyphs {
+            dash: "-",
+            middot: ".",
+            last_bullet: "`",
+            mid_bullet: "|",
+        }
+    } else {
+        Glyphs {
+            dash: "\u{2014}",        // —
+            middot: "\u{00b7}",      // ·
+            last_bullet: "\u{2514}", // └
+            mid_bullet: "\u{251c}",  // ├
+        }
+    }
+}
+
 pub fn render(diagnostics: &[Diagnostic], icons: &Icons) -> String {
+    let g = glyphs_for(icons);
     let mut out = String::new();
-    out.push_str("rvpm doctor — diagnostic report\n\n");
+    out.push_str(&format!("rvpm doctor {} diagnostic report\n\n", g.dash));
 
     for (ci, cat) in CATEGORY_ORDER.iter().enumerate() {
         let diags_in_cat: Vec<&Diagnostic> =
@@ -970,12 +1069,19 @@ pub fn render(diagnostics: &[Diagnostic], icons: &Icons) -> String {
         for d in diags_in_cat {
             let prefix = severity_prefix(d.severity, icons);
             let padded_title = pad_right(&d.title, TITLE_WIDTH);
-            out.push_str(&format!("  {} {} — {}\n", prefix, padded_title, d.summary));
+            out.push_str(&format!(
+                "  {} {} {} {}\n",
+                prefix, padded_title, g.dash, d.summary
+            ));
 
-            // details: 最後の行は `└`、それ以外は `├` (単一要素なら直接 `└`)
+            // details: 最後の行は最終 bullet、それ以外は中間 bullet
             let n = d.details.len();
             for (i, line) in d.details.iter().enumerate() {
-                let bullet = if i == n - 1 { "└" } else { "├" };
+                let bullet = if i == n - 1 {
+                    g.last_bullet
+                } else {
+                    g.mid_bullet
+                };
                 out.push_str(&format!("      {} {}\n", bullet, line));
             }
             if let Some(h) = &d.hint {
@@ -987,9 +1093,11 @@ pub fn render(diagnostics: &[Diagnostic], icons: &Icons) -> String {
     let summary = Summary::from(diagnostics);
     out.push('\n');
     out.push_str(&format!(
-        "Summary: {} ok  ·  {} warn  ·  {} error   (exit {})\n",
+        "Summary: {} ok  {}  {} warn  {}  {} error   (exit {})\n",
         summary.ok,
+        g.middot,
         summary.warn,
+        g.middot,
         summary.error,
         summary.exit_code()
     ));
@@ -1310,9 +1418,56 @@ mod tests {
     }
 
     #[test]
-    fn test_check_appname_with_env_set() {
+    fn test_check_appname_with_env_set_matching() {
+        // env と resolved が一致 → ok
         let d = check_appname("mynvim", Some("mynvim"), None);
+        assert_eq!(d.severity, Severity::Ok);
         assert!(d.summary.contains("$RVPM_APPNAME=\"mynvim\""));
+    }
+
+    #[test]
+    fn test_check_appname_warns_on_rvpm_mismatch() {
+        // RVPM_APPNAME=foo だが resolved は別 → warn
+        let d = check_appname("nvim", Some("foo"), None);
+        assert_eq!(d.severity, Severity::Warn);
+        assert!(
+            d.details
+                .iter()
+                .any(|s| s.contains("$RVPM_APPNAME=\"foo\"") && s.contains("\"nvim\"")),
+            "expected mismatch detail, got: {:?}",
+            d.details
+        );
+    }
+
+    #[test]
+    fn test_check_appname_warns_on_nvim_mismatch() {
+        // NVIM_APPNAME=bar で nvim を起動しているのに rvpm は別を解決 → warn
+        let d = check_appname("nvim", None, Some("bar"));
+        assert_eq!(d.severity, Severity::Warn);
+        assert!(
+            d.details
+                .iter()
+                .any(|s| s.contains("$NVIM_APPNAME=\"bar\""))
+        );
+    }
+
+    #[test]
+    fn test_check_appname_warns_on_invalid_fallback() {
+        // 無効な値 (path 区切り含む等) で fallback して "nvim" になったケース
+        // (ここでは resolved=nvim、env=invalid を擬似的に再現)
+        let d = check_appname("nvim", Some("foo/bar"), None);
+        assert_eq!(d.severity, Severity::Warn);
+        assert!(
+            d.hint.as_deref().is_some_and(|h| h.contains("rejected")),
+            "expected fallback hint, got hint={:?}",
+            d.hint
+        );
+    }
+
+    #[test]
+    fn test_check_appname_ok_when_both_env_match() {
+        let d = check_appname("custom", Some("custom"), Some("custom"));
+        assert_eq!(d.severity, Severity::Ok);
     }
 
     // -------- helptags --------
@@ -1387,8 +1542,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl VersionResolver for MockResolver {
-        fn version(&self, cmd: &str) -> Option<String> {
+        async fn version(&self, cmd: &str) -> Option<String> {
             self.map.get(cmd).cloned()
         }
         fn env(&self, key: &str) -> Option<String> {
@@ -1396,45 +1552,45 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_check_tool_nvim_present() {
+    #[tokio::test]
+    async fn test_check_tool_nvim_present() {
         let r = MockResolver::new().with_cmd("nvim", "NVIM v0.13.0-dev-some-build");
-        let d = check_tool_nvim(&r);
+        let d = check_tool_nvim(&r).await;
         assert_eq!(d.severity, Severity::Ok);
         assert!(d.summary.contains("v0.13.0-dev-some-build"));
     }
 
-    #[test]
-    fn test_check_tool_nvim_missing() {
+    #[tokio::test]
+    async fn test_check_tool_nvim_missing() {
         let r = MockResolver::new();
-        let d = check_tool_nvim(&r);
+        let d = check_tool_nvim(&r).await;
         assert_eq!(d.severity, Severity::Error);
     }
 
-    #[test]
-    fn test_check_tool_git_present() {
+    #[tokio::test]
+    async fn test_check_tool_git_present() {
         let r = MockResolver::new().with_cmd("git", "git version 2.49.1");
-        let d = check_tool_git(&r);
+        let d = check_tool_git(&r).await;
         assert_eq!(d.severity, Severity::Ok);
         assert!(d.summary.contains("v2.49.1"));
     }
 
-    #[test]
-    fn test_check_tool_chezmoi_optional_when_disabled() {
+    #[tokio::test]
+    async fn test_check_tool_chezmoi_optional_when_disabled() {
         let cfg = mk_config(vec![]);
         let r = MockResolver::new();
-        let d = check_tool_chezmoi(&cfg, &r);
+        let d = check_tool_chezmoi(&cfg, &r).await;
         // chezmoi 無し + options.chezmoi = false → Ok (informational)
         assert_eq!(d.severity, Severity::Ok);
         assert!(d.summary.contains("optional"));
     }
 
-    #[test]
-    fn test_check_tool_chezmoi_required_when_enabled() {
+    #[tokio::test]
+    async fn test_check_tool_chezmoi_required_when_enabled() {
         let mut cfg = mk_config(vec![]);
         cfg.options.chezmoi = true;
         let r = MockResolver::new();
-        let d = check_tool_chezmoi(&cfg, &r);
+        let d = check_tool_chezmoi(&cfg, &r).await;
         // chezmoi 無し + options.chezmoi = true → Error
         assert_eq!(d.severity, Severity::Error);
     }
@@ -1452,6 +1608,14 @@ mod tests {
         let r = MockResolver::new();
         let d = check_editor(&r);
         assert_eq!(d.severity, Severity::Warn);
+    }
+
+    #[tokio::test]
+    async fn test_system_resolver_handles_missing_command() {
+        // SystemResolver の version() はコマンド不在で None を返す (resilient)
+        let r = SystemResolver;
+        let d = r.version("__rvpm_nonexistent_cmd__").await;
+        assert_eq!(d, None);
     }
 
     // -------- summary / exit code --------
@@ -1537,6 +1701,58 @@ mod tests {
         assert!(out.contains("ok  "));
         assert!(out.contains("WARN"));
         assert!(out.contains("ERR "));
+    }
+
+    #[test]
+    fn test_render_ascii_is_pure_ascii() {
+        // ASCII モードでは出力が完全に ASCII で完結し、box drawing /
+        // em-dash / middot / Nerd Font 文字を含まないこと。
+        let diags = vec![
+            Diagnostic::new(Severity::Ok, CAT_PLUGIN_CONFIG, "title-a", "done"),
+            Diagnostic::new(Severity::Warn, CAT_STATE_INTEGRITY, "title-b", "1 found")
+                .with_details(vec!["alpha".into(), "beta".into()])
+                .with_hint("try `rvpm clean`"),
+        ];
+        let icons = Icons::from_style(IconStyle::Ascii);
+        let out = render(&diags, &icons);
+        for ch in out.chars() {
+            assert!(
+                ch.is_ascii(),
+                "non-ASCII char {:?} (U+{:04X}) found in ASCII output:\n{}",
+                ch,
+                ch as u32,
+                out
+            );
+        }
+        // セパレータ系も置換されていること
+        assert!(out.contains(" - "), "expected ' - ' in ASCII summary line");
+        assert!(
+            out.contains("|"),
+            "expected '|' (mid bullet) in ASCII output"
+        );
+        assert!(
+            out.contains("`"),
+            "expected '`' (last bullet) in ASCII output"
+        );
+        assert!(
+            out.contains(" . "),
+            "expected ' . ' (middot replacement) in ASCII summary"
+        );
+    }
+
+    #[test]
+    fn test_render_unicode_keeps_box_chars() {
+        // Unicode モードでは従来通り — / · / ├ / └ を使う (regression guard)
+        let diags = vec![
+            Diagnostic::new(Severity::Warn, CAT_STATE_INTEGRITY, "x", "1 found")
+                .with_details(vec!["a".into(), "b".into()]),
+        ];
+        let icons = Icons::from_style(IconStyle::Unicode);
+        let out = render(&diags, &icons);
+        assert!(out.contains("\u{2014}")); // —
+        assert!(out.contains("\u{00b7}")); // ·
+        assert!(out.contains("\u{251c}")); // ├
+        assert!(out.contains("\u{2514}")); // └
     }
 
     #[test]

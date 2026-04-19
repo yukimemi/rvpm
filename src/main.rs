@@ -934,7 +934,7 @@ async fn run_doctor() -> Result<i32> {
         helptag_target_labels,
     };
 
-    let diagnostics = crate::doctor::run_checks(&ctx);
+    let diagnostics = crate::doctor::run_checks(&ctx).await;
     let icons = crate::tui::Icons::from_style(config.options.icons);
     let output = crate::doctor::render(&diagnostics, &icons);
     print!("{}", output);
