@@ -84,6 +84,28 @@ fn lua_str_list(items: &[String]) -> String {
     format!("{{ {} }}", quoted.join(", "))
 }
 
+/// 文字列を Lua の double-quoted string literal に変換。
+/// backslash はまず `/` に正規化し (Windows path separator)、
+/// 残った特殊文字 (double quote, backslash, CR/LF, TAB) をエスケープする。
+/// これで generate path に空白や特殊文字が混ざっても安全に emit できる。
+fn lua_quote(s: &str) -> String {
+    let normalized = s.replace('\\', "/");
+    let mut out = String::with_capacity(normalized.len() + 2);
+    out.push('"');
+    for c in normalized.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// denops プラグイン list を Lua table literal に変換。
 /// `{ { "name1", "/path/to/main.ts" }, { "name2", "..." } }` 形式で、
 /// load_lazy の 8 番目引数として渡される。空なら `{}`。
@@ -95,9 +117,9 @@ fn lua_denops_list(items: &[DenopsPlugin]) -> String {
         .iter()
         .map(|dp| {
             format!(
-                "{{ \"{}\", \"{}\" }}",
-                dp.name.replace('"', "\\\""),
-                dp.main_script.replace('\\', "/")
+                "{{ {}, {} }}",
+                lua_quote(&dp.name),
+                lua_quote(&dp.main_script)
             )
         })
         .collect();
@@ -251,9 +273,16 @@ pub fn generate_loader(
   end
   for _, f in ipairs(after_plugin_files) do vim.cmd("source " .. f) end
   if after then dofile(after) end
-  if denops_plugins and #denops_plugins > 0 then
+  if denops_plugins and #denops_plugins > 0 and vim.fn.exists("*denops#plugin#load") == 1 then
     for _, dp in ipairs(denops_plugins) do
-      pcall(vim.fn["denops#plugin#load"], dp[1], dp[2])
+      local ok = pcall(vim.fn["denops#plugin#load"], dp[1], dp[2])
+      if ok then
+        -- denops#plugin#load() は非同期。DenopsPluginPost を待たずに
+        -- on_cmd replay が走ると、`DenopsPluginPost` で command を登録する
+        -- 典型的な denops プラグインが "Not an editor command" で失敗する。
+        -- silent=1 で daemon 未起動時でもユーザー通知を抑制 (resilience)。
+        pcall(vim.fn["denops#plugin#wait"], dp[1], { silent = 1 })
+      end
     end
   end
   vim.api.nvim_exec_autocmds("User", { pattern = "rvpm_loaded_" .. name })
@@ -1314,6 +1343,56 @@ mod tests {
         assert!(
             body.contains("pcall"),
             "denops#plugin#load call must be wrapped in pcall for resilience"
+        );
+    }
+
+    #[test]
+    fn test_load_lazy_helper_guards_with_exists_before_denops_call() {
+        // pcall 単独では autoload 未ロード時に E117 が UI に出る。
+        // vim.fn.exists("*denops#plugin#load") == 1 で事前ガードしてから
+        // 呼ぶことで、denops.vim 未インストール環境でノイズを出さない。
+        let lua = gen_loader(Path::new("/merged"), &[]);
+        let load_lazy_start = lua
+            .find("local function load_lazy")
+            .expect("load_lazy definition missing");
+        let end_marker = lua[load_lazy_start..]
+            .find("\nend\n")
+            .expect("load_lazy end missing")
+            + load_lazy_start;
+        let body = &lua[load_lazy_start..end_marker];
+        assert!(
+            body.contains("vim.fn.exists(\"*denops#plugin#load\")"),
+            "load_lazy must guard denops call with vim.fn.exists before invocation"
+        );
+        assert!(
+            body.contains("== 1"),
+            "exists() guard must compare against 1 (Lua: 0 is truthy)"
+        );
+    }
+
+    #[test]
+    fn test_load_lazy_helper_waits_for_denops_plugin_post() {
+        // denops#plugin#load() は非同期で DenopsPluginPost を待たない。
+        // on_cmd 経由で lazy ロードされた denops プラグインが
+        // DenopsPluginPost ハンドラで command を register するケースでは、
+        // load_lazy 返却直後に command replay しても間に合わない。
+        // denops#plugin#wait を silent option 付きで呼んで同期待機する。
+        let lua = gen_loader(Path::new("/merged"), &[]);
+        let load_lazy_start = lua
+            .find("local function load_lazy")
+            .expect("load_lazy definition missing");
+        let end_marker = lua[load_lazy_start..]
+            .find("\nend\n")
+            .expect("load_lazy end missing")
+            + load_lazy_start;
+        let body = &lua[load_lazy_start..end_marker];
+        assert!(
+            body.contains("denops#plugin#wait"),
+            "load_lazy must wait for DenopsPluginPost before returning"
+        );
+        assert!(
+            body.contains("silent = 1"),
+            "wait call must pass silent=1 so daemon-missing doesn't interrupt"
         );
     }
 

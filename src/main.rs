@@ -3151,7 +3151,10 @@ fn collect_denops_plugins(plugin_path: &Path) -> Vec<crate::loader::DenopsPlugin
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        // `Path::is_dir()` は symlink を follow するので、dev plugin や
+        // mono-repo で symlink された `denops/<name>/` も拾える。
+        // `DirEntry::file_type()` だと symlink 自体を見てしまい skip される。
+        .filter(|e| e.path().is_dir())
         .filter_map(|e| {
             let sub = e.path();
             let name = sub.file_name()?.to_string_lossy().to_string();
@@ -4017,6 +4020,25 @@ mod tests {
         let got = collect_denops_plugins(&plugin);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_denops_plugins_follows_symlinked_subdir() {
+        // dev plugin や mono-repo の構成で、denops/<name>/ が別ディレクトリへの
+        // symlink になっているケースを follow して検出する。
+        // Windows は symlink 作成に管理者権限が要るので Unix のみで実行。
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        let real = root.path().join("external").join("real-denops");
+        write_file(&real.join("main.ts"), "export async function main() {}");
+        std::fs::create_dir_all(plugin.join("denops")).unwrap();
+        std::os::unix::fs::symlink(&real, plugin.join("denops/sym-linked")).unwrap();
+
+        let got = collect_denops_plugins(&plugin);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "sym-linked");
+        assert!(got[0].main_script.ends_with("main.ts"));
     }
 
     #[test]
