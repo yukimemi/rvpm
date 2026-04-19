@@ -279,10 +279,7 @@ mod tests {
         assert!(merged.join("lua/foo").is_file());
         // B 側で 1 件 conflict 記録 (path は dir エントリ `lua/foo`)
         assert_eq!(r2.conflicts.len(), 1);
-        assert_eq!(
-            r2.conflicts[0].relative,
-            PathBuf::from("lua").join("foo")
-        );
+        assert_eq!(r2.conflicts[0].relative, PathBuf::from("lua").join("foo"));
     }
 
     #[test]
@@ -304,10 +301,7 @@ mod tests {
         assert!(merged.join("lua/foo/bar.lua").exists());
         // B 側で 1 件 conflict 記録
         assert_eq!(r2.conflicts.len(), 1);
-        assert_eq!(
-            r2.conflicts[0].relative,
-            PathBuf::from("lua").join("foo")
-        );
+        assert_eq!(r2.conflicts[0].relative, PathBuf::from("lua").join("foo"));
     }
 
     #[test]
