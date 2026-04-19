@@ -196,7 +196,11 @@ fn collect_subjects_and_breaking(dst: &Path, from: &str, to: &str) -> (Vec<Strin
         Err(_) => return (subjects, breaking),
     };
 
-    for info in walk.flatten() {
+    // 上限: 長期未更新後の pull や branch 切り替えで履歴が膨大になっても
+    // `update_log.json` を肥大化させないため、subjects は最大 100 commit に制限。
+    // 100 を超えた場合は新しい順 100 件だけ残る (rev_walk は新しい順)。
+    const SUBJECT_WALK_LIMIT: usize = 100;
+    for info in walk.flatten().take(SUBJECT_WALK_LIMIT) {
         let commit = match info.object() {
             Ok(c) => c,
             Err(_) => continue,

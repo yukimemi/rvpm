@@ -368,12 +368,40 @@ pub fn short_hash(h: &str) -> String {
     h[..take].to_string()
 }
 
+/// レンダリング装飾の glyph セット。`IconStyle::Ascii` の時は box drawing /
+/// em-dash / arrow を全て ASCII 等価に落とす (CI ログ / 非 UTF-8 ターミナル向け)。
+struct LogGlyphs {
+    /// title と summary を区切る dash
+    dash: &'static str,
+    /// 新規 install を示す矢印
+    arrow: &'static str,
+    /// diff ヘッダの horizontal bar (2 文字)
+    hbar: &'static str,
+}
+
+fn glyphs_for(icons: IconStyle) -> LogGlyphs {
+    if matches!(icons, IconStyle::Ascii) {
+        LogGlyphs {
+            dash: "-",
+            arrow: "->",
+            hbar: "--",
+        }
+    } else {
+        LogGlyphs {
+            dash: "\u{2014}",         // —
+            arrow: "\u{2192}",        // →
+            hbar: "\u{2500}\u{2500}", // ──
+        }
+    }
+}
+
 /// `runs` を新しい順 (= `runs` の末尾から) に取り出して整形する。
 ///
 /// 出力は `\n` 終端、改行を `\r\n` 化したりはしない。
 pub fn render_log(log: &UpdateLog, opts: &LogRenderOptions<'_>) -> String {
+    let g = glyphs_for(opts.icons);
     let mut out = String::new();
-    out.push_str("rvpm log \u{2014} recent updates\n\n");
+    out.push_str(&format!("rvpm log {} recent updates\n\n", g.dash));
 
     if log.runs.is_empty() {
         out.push_str("(no runs recorded yet)\n");
@@ -407,8 +435,9 @@ pub fn render_log(log: &UpdateLog, opts: &LogRenderOptions<'_>) -> String {
         let when = parse_rfc3339_utc(&run.timestamp).unwrap_or(opts.now);
         let rel = format_relative(when, opts.now);
         out.push_str(&format!(
-            "# {} \u{2014} {} ({} {})\n",
+            "# {} {} {} ({} {})\n",
             rel,
+            g.dash,
             run.command,
             filtered.len(),
             if filtered.len() == 1 {
@@ -419,7 +448,7 @@ pub fn render_log(log: &UpdateLog, opts: &LogRenderOptions<'_>) -> String {
         ));
 
         for change in filtered {
-            render_change(&mut out, change, opts, breaking_marker);
+            render_change(&mut out, change, opts, breaking_marker, &g);
             out.push('\n');
         }
     }
@@ -435,13 +464,15 @@ fn render_change(
     change: &ChangeRecord,
     opts: &LogRenderOptions<'_>,
     breaking_marker: &str,
+    g: &LogGlyphs,
 ) {
     let name_pad = format!("{:<width$}", change.name, width = PLUGIN_NAME_PAD);
     match &change.from {
         None => {
             out.push_str(&format!(
-                "  {} (new install) \u{2192} {}\n",
+                "  {} (new install) {} {}\n",
                 name_pad,
+                g.arrow,
                 short_hash(&change.to)
             ));
         }
@@ -465,7 +496,7 @@ fn render_change(
             if !change.doc_files_changed.is_empty() {
                 if opts.diff {
                     for f in &change.doc_files_changed {
-                        out.push_str(&format!("    \u{2500}\u{2500} diff: {}\n", f));
+                        out.push_str(&format!("    {} diff: {}\n", g.hbar, f));
                         let key = DiffKey {
                             url: change.url.clone(),
                             from: from.clone(),
@@ -1001,6 +1032,74 @@ mod tests {
             "expected warn icon in BREAKING marker, got:\n{}",
             s
         );
+    }
+
+    #[test]
+    fn test_render_log_ascii_is_pure_ascii() {
+        // Ascii モードでは出力が完全に ASCII で完結し、em-dash / arrow / box
+        // drawing / Nerd Font 文字を含まないこと。
+        let mut diffs = HashMap::new();
+        diffs.insert(
+            DiffKey {
+                url: "folke/snacks.nvim".into(),
+                from: "abc1234aaaa".into(),
+                to: "def5678bbbb".into(),
+                file: "README.md".into(),
+            },
+            "diff --git a/README.md b/README.md\n+ new\n".to_string(),
+        );
+        let s = render_with(LogRenderOptions {
+            last: 1,
+            query: None,
+            full: false,
+            diff: true,
+            diffs,
+            icons: IconStyle::Ascii,
+            now: now_for_log(),
+        });
+        for ch in s.chars() {
+            assert!(
+                ch.is_ascii(),
+                "non-ASCII char {:?} (U+{:04X}) found in ASCII output:\n{}",
+                ch,
+                ch as u32,
+                s
+            );
+        }
+        // 各 glyph が ASCII 等価に置換されていること
+        assert!(s.contains(" - "), "expected ' - ' in ASCII title");
+        assert!(
+            s.contains("(new install) -> "),
+            "expected '->' for new install"
+        );
+        assert!(s.contains("-- diff:"), "expected '--' for diff header");
+    }
+
+    #[test]
+    fn test_render_log_unicode_keeps_special_chars() {
+        // Unicode モードでは em-dash / arrow / box drawing が残る (regression guard)
+        let mut diffs = HashMap::new();
+        diffs.insert(
+            DiffKey {
+                url: "folke/snacks.nvim".into(),
+                from: "abc1234aaaa".into(),
+                to: "def5678bbbb".into(),
+                file: "README.md".into(),
+            },
+            "diff --git a/README.md b/README.md\n+ new\n".to_string(),
+        );
+        let s = render_with(LogRenderOptions {
+            last: 1,
+            query: None,
+            full: false,
+            diff: true,
+            diffs,
+            icons: IconStyle::Unicode,
+            now: now_for_log(),
+        });
+        assert!(s.contains("\u{2014}"), "expected em-dash"); // —
+        assert!(s.contains("\u{2192}"), "expected arrow"); // →
+        assert!(s.contains("\u{2500}\u{2500}"), "expected ── horizontal bar");
     }
 
     // ================================================================

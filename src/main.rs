@@ -745,6 +745,9 @@ async fn run_sync(prune: bool) -> Result<()> {
         );
     }
 
+    // 並列 spawn 完了順で積まれているので plugin 名で安定 sort。
+    // `rvpm log` の出力が同じ sync 結果に対して常に同じになる。
+    sync_changes.sort_by(|a, b| a.name.cmp(&b.name));
     record_changes_or_warn(&cache_root, "sync", sync_changes);
 
     print_init_lua_hint_if_missing(&config);
@@ -1470,6 +1473,8 @@ async fn run_update(query: Option<String>) -> Result<()> {
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
 
+    // 並列 spawn 完了順で積まれているので plugin 名で安定 sort (sync と同じ理由)。
+    update_changes.sort_by(|a, b| a.name.cmp(&b.name));
     record_changes_or_warn(&cache_root, "update", update_changes);
 
     println!("Update complete. Regenerating loader.lua...");
