@@ -651,7 +651,10 @@ async fn run_sync(prune: bool) -> Result<()> {
         println!("Generating helptags...");
         let report = crate::helptags::build_helptags(&plugin_scripts, &merged_dir).await?;
         if report.ran {
-            println!("Done! helptags built for {} doc director(y/ies)", report.target_count);
+            println!(
+                "Done! helptags built for {} doc director(y/ies)",
+                report.target_count
+            );
         }
     }
 
@@ -760,7 +763,10 @@ async fn run_generate() -> Result<()> {
         println!("Generating helptags...");
         let report = crate::helptags::build_helptags(&plugin_scripts, &merged_dir).await?;
         if report.ran {
-            println!("Done! helptags built for {} doc director(y/ies)", report.target_count);
+            println!(
+                "Done! helptags built for {} doc director(y/ies)",
+                report.target_count
+            );
         }
     }
 
