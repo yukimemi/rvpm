@@ -165,7 +165,7 @@ integration, and the external README renderer — see
 | `rvpm add <repo>` | Add a plugin and sync (records the new plugin's commit to `rvpm.lock`) |
 | `rvpm update [query]` | `git pull` installed plugins and write new HEADs back to `rvpm.lock` |
 | `rvpm remove [query]` | Remove a plugin from `config.toml` and delete its directory |
-| `rvpm edit [query] [--init\|--before\|--after] [--global]` | Edit per-plugin Lua hooks in `$EDITOR`; `--global` for global hooks |
+| `rvpm edit [query] [--init\|--before\|--after] [--global]` | Edit per-plugin Lua hooks in `$EDITOR`. With `--global`: `--init` opens Neovim's own `init.lua`, `--before` / `--after` open `<config_root>/before.lua` / `after.lua` |
 | `rvpm set [query] [flags]` | Tweak plugin options (`lazy`, `merge`, `on_*`, `rev`) interactively or via flags |
 | `rvpm config` | Open `config.toml` in `$EDITOR` |
 | `rvpm init [--write]` | Print (or write) the snippet to wire `loader.lua` into `init.lua` |
@@ -516,7 +516,7 @@ readme_command = ["mdcat"]
 | `n` / `N` | Next / previous search result |
 | `b` | Switch to `rvpm browse` TUI |
 | `c` | Open `config.toml` in `$EDITOR` |
-| `e` | Edit per-plugin hooks (init / before / after.lua) |
+| `e` | Edit hooks for the selected row. On `[ Global hooks ]` (top row) it opens the global selector (Neovim init.lua / global before / global after); on a plugin row it opens that plugin's per-plugin init / before / after.lua |
 | `s` | Set plugin options (lazy, merge, on_cmd, …) |
 | `S` | Sync all plugins |
 | `R` | Sync all plugins with `--rebuild` (force-run every `build` command, even no-op pulls) |
@@ -744,6 +744,8 @@ rvpm edit lspconfig --before
 
 # ── Edit global hooks ────────────────────────────────────
 
+rvpm edit --global             # interactive: pick init / before / after
+rvpm edit --global --init      # Neovim's own init.lua (~/.config/<appname>/init.lua)
 rvpm edit --global --before    # phase 3
 rvpm edit --global --after     # phase 9
 

@@ -587,6 +587,11 @@ impl TuiState {
         config: &crate::config::Config,
         config_root: &std::path::Path,
         icons: &Icons,
+        // 一番上に [ Global hooks ] sentinel 行を描く。`None` を渡せば従来通り
+        // plugin だけを描く (将来 list 以外の用途を想定して Option にしてある)。
+        // Some の場合、`tui_state.plugins[0]` は空文字 sentinel で、selected_url()
+        // が `Some("")` を返す前提。
+        nvim_init_lua_path: Option<&std::path::Path>,
     ) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -663,109 +668,130 @@ impl TuiState {
         .height(1)
         .bottom_margin(1);
 
-        let rows: Vec<Row> = config
-            .plugins
-            .iter()
-            .map(|p| {
-                // インストール状態アイコン
-                let install_status = self
-                    .status_map
-                    .get(&p.url)
-                    .cloned()
-                    .unwrap_or(PluginStatus::Waiting);
-                let (inst_icon, inst_color) = match &install_status {
-                    PluginStatus::Finished => (icons.installed, Color::Green),
-                    PluginStatus::Failed(m) if m == "Missing" => (icons.missing, Color::Red),
-                    PluginStatus::Failed(_) => (icons.failed, Color::Red),
-                    PluginStatus::Syncing(m) if m.contains("Modified") => {
-                        (icons.modified, Color::Yellow)
+        let mut rows: Vec<Row> = Vec::with_capacity(config.plugins.len() + 1);
+
+        if let Some(init_lua_path) = nvim_init_lua_path {
+            // [ Global hooks ] sentinel 行: per-plugin の I/B/A 表記と揃えて、
+            // init.lua は Neovim 本体の path、before/after は <config_root> 配下を見る。
+            // exists() を 1 ファイルにつき 1 回だけ叩く (TUI ループは ~50ms ごと
+            // に redraw されるので、毎フレーム重複 stat を避ける)。
+            let has_i = init_lua_path.exists();
+            let has_b = config_root.join("before.lua").exists();
+            let has_a = config_root.join("after.lua").exists();
+            let hook_i = if has_i { icons.hook_on } else { icons.hook_off };
+            let hook_b = if has_b { icons.hook_on } else { icons.hook_off };
+            let hook_a = if has_a { icons.hook_on } else { icons.hook_off };
+            let hooks_color = if has_i || has_b || has_a {
+                Color::Green
+            } else {
+                Color::DarkGray
+            };
+            rows.push(Row::new(vec![
+                Cell::from(icons.installed).style(Style::default().fg(Color::Cyan)),
+                Cell::from("[ Global hooks ]").style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Cell::from("-").style(Style::default().fg(Color::DarkGray)),
+                Cell::from("-").style(Style::default().fg(Color::DarkGray)),
+                Cell::from("-").style(Style::default().fg(Color::DarkGray)),
+                Cell::from(format!("{} {} {}", hook_i, hook_b, hook_a))
+                    .style(Style::default().fg(hooks_color)),
+                Cell::from("nvim init.lua + global before/after.lua")
+                    .style(Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+
+        rows.extend(config.plugins.iter().map(|p| {
+            // インストール状態アイコン
+            let install_status = self
+                .status_map
+                .get(&p.url)
+                .cloned()
+                .unwrap_or(PluginStatus::Waiting);
+            let (inst_icon, inst_color) = match &install_status {
+                PluginStatus::Finished => (icons.installed, Color::Green),
+                PluginStatus::Failed(m) if m == "Missing" => (icons.missing, Color::Red),
+                PluginStatus::Failed(_) => (icons.failed, Color::Red),
+                PluginStatus::Syncing(m) if m.contains("Modified") => {
+                    (icons.modified, Color::Yellow)
+                }
+                PluginStatus::Syncing(_) => (icons.syncing, Color::Cyan),
+                PluginStatus::Waiting => (icons.waiting, Color::DarkGray),
+            };
+
+            // 詳細列: エラー/変更時はその内容、正常時はトリガー情報
+            let (detail_text, detail_color) = match &install_status {
+                PluginStatus::Finished => {
+                    let mut trg = Vec::new();
+                    if let Some(c) = &p.on_cmd {
+                        trg.push(format!("cmd:{}", c.len()));
                     }
-                    PluginStatus::Syncing(_) => (icons.syncing, Color::Cyan),
-                    PluginStatus::Waiting => (icons.waiting, Color::DarkGray),
-                };
-
-                // 詳細列: エラー/変更時はその内容、正常時はトリガー情報
-                let (detail_text, detail_color) = match &install_status {
-                    PluginStatus::Finished => {
-                        let mut trg = Vec::new();
-                        if let Some(c) = &p.on_cmd {
-                            trg.push(format!("cmd:{}", c.len()));
-                        }
-                        if let Some(f) = &p.on_ft {
-                            trg.push(format!("ft:{}", f.len()));
-                        }
-                        if let Some(m) = &p.on_map {
-                            trg.push(format!("map:{}", m.len()));
-                        }
-                        if let Some(e) = &p.on_event {
-                            trg.push(format!("ev:{}", e.len()));
-                        }
-                        if let Some(s) = &p.on_source {
-                            trg.push(format!("src:{}", s.len()));
-                        }
-                        if p.cond.is_some() {
-                            trg.push("cond".to_string());
-                        }
-                        (trg.join(" "), Color::DarkGray)
+                    if let Some(f) = &p.on_ft {
+                        trg.push(format!("ft:{}", f.len()));
                     }
-                    PluginStatus::Failed(msg) => (msg.clone(), Color::Red),
-                    PluginStatus::Syncing(msg) => (msg.clone(), Color::Yellow),
-                    PluginStatus::Waiting => ("Checking...".to_string(), Color::DarkGray),
-                };
+                    if let Some(m) = &p.on_map {
+                        trg.push(format!("map:{}", m.len()));
+                    }
+                    if let Some(e) = &p.on_event {
+                        trg.push(format!("ev:{}", e.len()));
+                    }
+                    if let Some(s) = &p.on_source {
+                        trg.push(format!("src:{}", s.len()));
+                    }
+                    if p.cond.is_some() {
+                        trg.push("cond".to_string());
+                    }
+                    (trg.join(" "), Color::DarkGray)
+                }
+                PluginStatus::Failed(msg) => (msg.clone(), Color::Red),
+                PluginStatus::Syncing(msg) => (msg.clone(), Color::Yellow),
+                PluginStatus::Waiting => ("Checking...".to_string(), Color::DarkGray),
+            };
 
-                let mode = if p.dev {
-                    ("Dev", Color::Magenta)
-                } else if p.lazy {
-                    ("Lazy", Color::Yellow)
-                } else {
-                    ("Eager", Color::Green)
-                };
-                let merged = if p.merge {
-                    (icons.installed, Color::Cyan)
-                } else {
-                    ("-", Color::DarkGray)
-                };
-                let rev = p.rev.as_deref().unwrap_or("-");
+            let mode = if p.dev {
+                ("Dev", Color::Magenta)
+            } else if p.lazy {
+                ("Lazy", Color::Yellow)
+            } else {
+                ("Eager", Color::Green)
+            };
+            let merged = if p.merge {
+                (icons.installed, Color::Cyan)
+            } else {
+                ("-", Color::DarkGray)
+            };
+            let rev = p.rev.as_deref().unwrap_or("-");
 
-                // I B A 列: init/before/after.lua の存在チェック
-                // per-plugin hook は <config_root>/plugins/<host>/<owner>/<repo>/
-                let pcdir = config_root.join("plugins").join(p.canonical_path());
-                let hook_i = if pcdir.join("init.lua").exists() {
-                    icons.hook_on
-                } else {
-                    icons.hook_off
-                };
-                let hook_b = if pcdir.join("before.lua").exists() {
-                    icons.hook_on
-                } else {
-                    icons.hook_off
-                };
-                let hook_a = if pcdir.join("after.lua").exists() {
-                    icons.hook_on
-                } else {
-                    icons.hook_off
-                };
-                let hooks_text = format!("{} {} {}", hook_i, hook_b, hook_a);
-                let has_hooks = pcdir.join("init.lua").exists()
-                    || pcdir.join("before.lua").exists()
-                    || pcdir.join("after.lua").exists();
-                let hooks_color = if has_hooks {
-                    Color::Green
-                } else {
-                    Color::DarkGray
-                };
+            // I B A 列: init/before/after.lua の存在チェック
+            // per-plugin hook は <config_root>/plugins/<host>/<owner>/<repo>/
+            // exists() は 1 ファイルにつき 1 回だけ叩く (TUI ループの redraw 頻度
+            // で N プラグイン × 6 stat → N × 3 stat に削減)。
+            let pcdir = config_root.join("plugins").join(p.canonical_path());
+            let has_i = pcdir.join("init.lua").exists();
+            let has_b = pcdir.join("before.lua").exists();
+            let has_a = pcdir.join("after.lua").exists();
+            let hook_i = if has_i { icons.hook_on } else { icons.hook_off };
+            let hook_b = if has_b { icons.hook_on } else { icons.hook_off };
+            let hook_a = if has_a { icons.hook_on } else { icons.hook_off };
+            let hooks_text = format!("{} {} {}", hook_i, hook_b, hook_a);
+            let hooks_color = if has_i || has_b || has_a {
+                Color::Green
+            } else {
+                Color::DarkGray
+            };
 
-                Row::new(vec![
-                    Cell::from(inst_icon).style(Style::default().fg(inst_color)),
-                    Cell::from(p.display_name()).style(Style::default().fg(Color::White)),
-                    Cell::from(mode.0).style(Style::default().fg(mode.1)),
-                    Cell::from(merged.0).style(Style::default().fg(merged.1)),
-                    Cell::from(rev).style(Style::default().fg(Color::Magenta)),
-                    Cell::from(hooks_text).style(Style::default().fg(hooks_color)),
-                    Cell::from(detail_text).style(Style::default().fg(detail_color)),
-                ])
-            })
-            .collect();
+            Row::new(vec![
+                Cell::from(inst_icon).style(Style::default().fg(inst_color)),
+                Cell::from(p.display_name()).style(Style::default().fg(Color::White)),
+                Cell::from(mode.0).style(Style::default().fg(mode.1)),
+                Cell::from(merged.0).style(Style::default().fg(merged.1)),
+                Cell::from(rev).style(Style::default().fg(Color::Magenta)),
+                Cell::from(hooks_text).style(Style::default().fg(hooks_color)),
+                Cell::from(detail_text).style(Style::default().fg(detail_color)),
+            ])
+        }));
 
         // URL 列をコンテンツの最大長に合わせる (最小 20、最大 60)
         let name_col_w = config
