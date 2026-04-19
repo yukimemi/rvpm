@@ -531,6 +531,13 @@ end
                     Some(d) => format!(", {{ desc = \"{}\" }}", d.replace('"', "\\\"")),
                     None => String::new(),
                 };
+                // feedkeys mode は "im":
+                //   i = typeahead の **先頭** に挿入 (append "m" だと、ユーザーが
+                //       `<lhs><motion>` を素早く打ったとき motion が先に処理されて
+                //       しまう。例: vim-operator-replace で `_i"` を打つと `i` が
+                //       先に評価されて Insert mode に突入する)
+                //   m = remap 許可 (load 後の本物の keymap (e.g. <Plug>) を踏ませる)
+                // lazy.nvim 11+ と同じパターン。
                 body.push_str(&format!(
                     "vim.keymap.set({modes}, \"{lhs}\", function()\n\
                      \x20 local op = vim.v.operator\n\
@@ -540,7 +547,7 @@ end
                      \x20 {load}\n\
                      \x20 local prefix = (reg ~= '\"' and '\"' .. reg or \"\") .. op .. (cnt > 1 and cnt or \"\")\n\
                      \x20 local feed = vim.api.nvim_replace_termcodes(\"<Ignore>\" .. prefix .. \"{lhs}\", true, true, true)\n\
-                     \x20 vim.api.nvim_feedkeys(feed, \"m\", false)\n\
+                     \x20 vim.api.nvim_feedkeys(feed, \"im\", false)\n\
                      end{opts})\n",
                     modes = modes_lua,
                     lhs = lhs,
@@ -1678,6 +1685,31 @@ mod tests {
         assert!(
             lua.contains("<Ignore>"),
             "on_map replay must use <Ignore> prefix (lazy.nvim pattern)"
+        );
+    }
+
+    #[test]
+    fn test_on_map_feedkeys_inserts_at_typeahead_start() {
+        // feedkeys mode は "im" でなければならない:
+        //   - "i" = typeahead の先頭に挿入。append "m" だとユーザーが
+        //     `<lhs><motion>` を素早く打ったとき motion が先に処理され、
+        //     例えば vim-operator-replace の `_i"` で `i` が Insert mode と
+        //     解釈されてしまう (regression test)。
+        //   - "m" = remap 許可 (本物の keymap、典型的には <Plug>... を踏ませる)
+        let mut s = make_lazy_plugin("operator-replace");
+        s.on_map = Some(vec![MapSpec {
+            lhs: "_".to_string(),
+            mode: vec!["n".to_string(), "x".to_string()],
+            desc: None,
+        }]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
+        assert!(
+            lua.contains("nvim_feedkeys(feed, \"im\""),
+            "on_map replay must insert at typeahead start (mode \"im\") so operator + motion sequences work; got: {lua}"
+        );
+        assert!(
+            !lua.contains("nvim_feedkeys(feed, \"m\""),
+            "on_map must NOT use mode \"m\" alone — that appends to typeahead and breaks `<op><motion>`"
         );
     }
 
