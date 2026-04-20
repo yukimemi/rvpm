@@ -11,6 +11,8 @@ mod link;
 mod loader;
 mod lockfile;
 mod merge_conflicts;
+mod profile;
+mod profile_tui;
 mod tui;
 mod update_log;
 
@@ -277,6 +279,31 @@ enum Commands {
     /// $EDITOR). Exits 0 on all-ok, 1 on any error, 2 on warn-only.
     Doctor,
 
+    /// Profile Neovim startup time per plugin
+    ///
+    /// Spawns `nvim --headless --startuptime <tmp> +qa` N times, parses the
+    /// output, and attributes each sourced file back to its plugin via path
+    /// prefix match. Shows per-plugin self / total ms with a cool TUI that
+    /// highlights the slow ones. Pipe-friendly plain text with `--no-tui`,
+    /// JSON with `--json`.
+    Profile {
+        /// Number of nvim runs to average (default 3, max 20)
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+
+        /// Limit plain / JSON output to top N plugins (TUI ignores this)
+        #[arg(long)]
+        top: Option<usize>,
+
+        /// Emit the averaged report as JSON to stdout
+        #[arg(long, conflicts_with = "no_tui")]
+        json: bool,
+
+        /// Plain text output instead of the TUI
+        #[arg(long)]
+        no_tui: bool,
+    },
+
     /// Show recent sync/update/add changes
     ///
     /// Reads the per-run history persisted under `<cache_root>/update_log.json`
@@ -409,6 +436,14 @@ async fn main() -> Result<()> {
             diff,
         } => {
             run_log(query, last, full, diff).await?;
+        }
+        Commands::Profile {
+            runs,
+            top,
+            json,
+            no_tui,
+        } => {
+            run_profile(runs, top, json, no_tui).await?;
         }
     }
 
@@ -4088,6 +4123,79 @@ async fn run_log(query: Option<String>, last: usize, full: bool, diff: bool) -> 
     };
     let rendered = crate::update_log::render_log(&log, &opts);
     print!("{}", rendered);
+    Ok(())
+}
+
+/// `rvpm profile` 本体。
+///
+/// config.toml からプラグインパス一覧を組み立て、`nvim --headless --startuptime`
+/// を `runs` 回起動してファイル別の所要時間を集計。TUI / plain / JSON で出力。
+///
+/// resilience 方針:
+///   - config 読み込み失敗: エラー終了 (profile は config 由来の plugin 情報が必須)
+///   - nvim 実行失敗: 明確にエラー (profile 本来の目的が達成できないため)
+async fn run_profile(runs: usize, top: Option<usize>, json: bool, no_tui: bool) -> Result<()> {
+    let runs = runs.clamp(1, 20);
+
+    let config_path = rvpm_config_path();
+    let toml_content = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+    let config = parse_config(&toml_content)?;
+
+    let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
+    let merged_dir = resolve_merged_dir(&cache_root);
+    let loader_path = resolve_loader_path(&cache_root);
+    let user_config_root = resolve_config_root(config.options.config_root.as_deref());
+
+    // プラグインパスをフォワードスラッシュで正規化して profile モジュールへ渡す。
+    // dev プラグイン (plugin.dst) も tilde 展開込みで同じ形に揃える。
+    let plugin_entries: Vec<crate::profile::PluginPathEntry> = config
+        .plugins
+        .iter()
+        .map(|p| {
+            let root = resolve_plugin_dst(p, &cache_root)
+                .to_string_lossy()
+                .to_string();
+            crate::profile::PluginPathEntry {
+                name: p.display_name(),
+                root,
+                lazy: p.lazy,
+            }
+        })
+        .collect();
+
+    // TUI モードでは計測中のメッセージを短く出して、終わったら TUI に切り替える。
+    // plain / JSON では結果だけ出すので前置き省略。
+    if !json && !no_tui {
+        eprintln!(
+            "\u{26a1} rvpm profile: measuring nvim startup ({} run{})…",
+            runs,
+            if runs == 1 { "" } else { "s" }
+        );
+    }
+
+    let report = crate::profile::run_profile(
+        runs,
+        plugin_entries,
+        merged_dir,
+        loader_path,
+        user_config_root,
+    )
+    .await
+    .context("profile run failed")?;
+
+    if json {
+        let v = crate::profile::report_to_json(&report);
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+
+    if no_tui {
+        crate::profile_tui::print_plain(&report, top);
+        return Ok(());
+    }
+
+    crate::profile_tui::run(report)?;
     Ok(())
 }
 
