@@ -56,8 +56,8 @@ nvim_rc = "~/.config/nvim/rc"
 # per-plugin の init/before/after.lua を置くディレクトリの root
 # 未指定なら ~/.config/rvpm/<appname>/plugins
 config_root = "{{ vars.nvim_rc }}/plugins"
-# 並列数上限 (デフォルト 8、GitHub rate limit 回避のため控えめ)
-concurrency = 10
+# 並列数上限 (デフォルト 13、GitHub rate limit 回避のため控えめ)
+concurrency = 16
 # config.toml から外したプラグインディレクトリを sync / generate 完了時に
 # 自動削除 (デフォルト false)。毎回 `sync --prune` を指定する代わり。
 # auto_clean = true
