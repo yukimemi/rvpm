@@ -109,15 +109,20 @@ impl ProfileTuiState {
                     .file_count
                     .cmp(&self.report.plugins[a].file_count)
             }),
-            SortKey::Name => idxs
-                .sort_by(|&a, &b| self.report.plugins[a].name.cmp(&self.report.plugins[b].name)),
+            SortKey::Name => idxs.sort_by(|&a, &b| {
+                self.report.plugins[a]
+                    .name
+                    .cmp(&self.report.plugins[b].name)
+            }),
         }
         idxs
     }
 
     fn selected_plugin_index(&self) -> Option<usize> {
         let vis = self.visible_indices();
-        self.table_state.selected().and_then(|i| vis.get(i).copied())
+        self.table_state
+            .selected()
+            .and_then(|i| vis.get(i).copied())
     }
 
     fn move_by(&mut self, delta: isize) {
@@ -238,7 +243,11 @@ fn draw_banner(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
         Span::styled(rating, Style::default().fg(rating_color)),
         Span::raw("   "),
         Span::styled(
-            format!("avg of {} run{}", state.report.runs, if state.report.runs == 1 { "" } else { "s" }),
+            format!(
+                "avg of {} run{}",
+                state.report.runs,
+                if state.report.runs == 1 { "" } else { "s" }
+            ),
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw("   "),
@@ -264,7 +273,13 @@ fn draw_phase_breakdown(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
 
     let rows = vec![
         summary_row("Eager plugins", managed_ms, total, bar_width, Color::Green),
-        summary_row("Lazy (pre-trigger)", managed_lazy_ms, total, bar_width, Color::Cyan),
+        summary_row(
+            "Lazy (pre-trigger)",
+            managed_lazy_ms,
+            total,
+            bar_width,
+            Color::Cyan,
+        ),
         summary_row("Merged rtp", merged_ms, total, bar_width, Color::Yellow),
         summary_row("Runtime + loader", group_ms, total, bar_width, Color::Blue),
     ];
@@ -276,10 +291,7 @@ fn draw_phase_breakdown(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            "(% of total startup)",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled("(% of total startup)", Style::default().fg(Color::DarkGray)),
     ]);
     let block = Block::default()
         .title(title)
@@ -295,7 +307,10 @@ fn summary_row(label: &str, ms: f64, total: f64, bar_w: usize, color: Color) -> 
     let ratio = (ms / total).clamp(0.0, 1.0);
     let filled = (ratio * bar_w as f64).round() as usize;
     let bar: String = std::iter::repeat_n('\u{2588}', filled)
-        .chain(std::iter::repeat_n('\u{2591}', bar_w.saturating_sub(filled)))
+        .chain(std::iter::repeat_n(
+            '\u{2591}',
+            bar_w.saturating_sub(filled),
+        ))
         .collect();
     Line::from(vec![
         Span::styled(format!(" {:<19}", label), Style::default().fg(Color::Gray)),
@@ -400,7 +415,10 @@ fn draw_plugin_table(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
             let bar_color = bar_color(p.total_self_ms, max_ms);
             let filled = ((p.total_self_ms / max_ms) * bar_w as f64).round() as usize;
             let bar: String = std::iter::repeat_n('\u{2588}', filled)
-                .chain(std::iter::repeat_n('\u{2591}', bar_w.saturating_sub(filled)))
+                .chain(std::iter::repeat_n(
+                    '\u{2591}',
+                    bar_w.saturating_sub(filled),
+                ))
                 .collect();
 
             Row::new(vec![
@@ -420,9 +438,7 @@ fn draw_plugin_table(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
                 )),
                 Cell::from(Span::styled(
                     format!("{:>7.2}", p.total_self_ms),
-                    Style::default()
-                        .fg(bar_color)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(bar_color).add_modifier(Modifier::BOLD),
                 )),
                 Cell::from(Span::styled(
                     format!("{:>7.2}", p.total_sourced_ms),
@@ -449,7 +465,11 @@ fn draw_plugin_table(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
                 "({} shown, sorted by {}{})  ",
                 vis.len(),
                 state.sort_key.label(),
-                if state.hide_groups { ", groups hidden" } else { "" }
+                if state.hide_groups {
+                    ", groups hidden"
+                } else {
+                    ""
+                }
             ),
             Style::default().fg(Color::DarkGray),
         ),
@@ -491,8 +511,8 @@ fn draw_plugin_table(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None);
-        let mut sb_state = ScrollbarState::new(vis.len())
-            .position(state.table_state.selected().unwrap_or(0));
+        let mut sb_state =
+            ScrollbarState::new(vis.len()).position(state.table_state.selected().unwrap_or(0));
         f.render_stateful_widget(
             scrollbar,
             area.inner(Margin {
@@ -558,11 +578,17 @@ fn draw_detail(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
     for (i, file) in p.top_files.iter().take(5).enumerate() {
         let filled = ((file.self_ms / max_file_ms) * bar_w as f64).round() as usize;
         let bar: String = std::iter::repeat_n('\u{2588}', filled)
-            .chain(std::iter::repeat_n('\u{2591}', bar_w.saturating_sub(filled)))
+            .chain(std::iter::repeat_n(
+                '\u{2591}',
+                bar_w.saturating_sub(filled),
+            ))
             .collect();
         let color = bar_color(file.self_ms, max_file_ms);
         lines.push(Line::from(vec![
-            Span::styled(format!(" {:>2}. ", i + 1), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(" {:>2}. ", i + 1),
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(
                 truncate(&file.relative_path, 34),
                 Style::default().fg(Color::Gray),
@@ -580,11 +606,17 @@ fn draw_detail(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
             format!(" {} ", p.name),
             Style::default()
                 .fg(Color::Black)
-                .bg(bar_color(p.total_self_ms, state.report.total_startup_ms.max(1.0)))
+                .bg(bar_color(
+                    p.total_self_ms,
+                    state.report.total_startup_ms.max(1.0),
+                ))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("  {:.2} ms self  /  {:.2} ms total", p.total_self_ms, p.total_sourced_ms),
+            format!(
+                "  {:.2} ms self  /  {:.2} ms total",
+                p.total_self_ms, p.total_sourced_ms
+            ),
             Style::default().fg(Color::Gray),
         ),
     ]);
@@ -610,12 +642,14 @@ fn draw_footer(f: &mut Frame, area: Rect, _state: &ProfileTuiState) {
     ] {
         spans.extend(key_hint(k, d));
     }
-    let widget = Paragraph::new(Line::from(spans)).alignment(Alignment::Center).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
+    let widget = Paragraph::new(Line::from(spans))
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
     f.render_widget(widget, area);
 }
 

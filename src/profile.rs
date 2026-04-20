@@ -220,8 +220,11 @@ pub fn aggregate_single_run(
 
     // 各 PluginStats 内で top_files を self_ms 降順にソート
     for s in stats.values_mut() {
-        s.top_files
-            .sort_by(|a, b| b.self_ms.partial_cmp(&a.self_ms).unwrap_or(std::cmp::Ordering::Equal));
+        s.top_files.sort_by(|a, b| {
+            b.self_ms
+                .partial_cmp(&a.self_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     stats
@@ -254,7 +257,12 @@ fn resolve_owner(
     }
 
     if path_lc == loader.to_ascii_lowercase() {
-        return (GROUP_LOADER.to_string(), false, false, "loader.lua".to_string());
+        return (
+            GROUP_LOADER.to_string(),
+            false,
+            false,
+            "loader.lua".to_string(),
+        );
     }
 
     let user_lc = user_root.to_ascii_lowercase();
@@ -411,7 +419,9 @@ pub async fn run_single_startuptime(extra_args: &[&str]) -> anyhow::Result<(Stri
 /// `nvim --version` の 1 行目を取得 (resilience: 取れなければ None)。
 pub async fn probe_nvim_version() -> Option<String> {
     let timeout = std::time::Duration::from_secs(2);
-    let cmd = tokio::process::Command::new("nvim").arg("--version").output();
+    let cmd = tokio::process::Command::new("nvim")
+        .arg("--version")
+        .output();
     let out = tokio::time::timeout(timeout, cmd).await.ok()?.ok()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     stdout.lines().next().map(|s| s.trim().to_string())
@@ -437,9 +447,9 @@ pub async fn run_profile(
     let mut runs_stats = Vec::with_capacity(runs);
 
     for i in 0..runs {
-        let (content, total) = run_single_startuptime(&[]).await.map_err(|e| {
-            anyhow::anyhow!("profile run {}/{} failed: {}", i + 1, runs, e)
-        })?;
+        let (content, total) = run_single_startuptime(&[])
+            .await
+            .map_err(|e| anyhow::anyhow!("profile run {}/{} failed: {}", i + 1, runs, e))?;
         totals.push(total);
         let entries = parse_startuptime(&content);
         let stats = aggregate_single_run(&entries, &plugins, &merged_s, &loader_s, &user_s);
@@ -565,11 +575,7 @@ times in msec
                 sourced_ms: 5.0,
             },
         ];
-        let plugins = vec![plugin(
-            "foo",
-            "/cache/repos/github.com/owner/foo",
-            false,
-        )];
+        let plugins = vec![plugin("foo", "/cache/repos/github.com/owner/foo", false)];
         let stats = aggregate_single_run(
             &entries,
             &plugins,
