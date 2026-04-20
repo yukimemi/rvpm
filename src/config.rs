@@ -39,7 +39,7 @@ pub struct Options {
     /// per-plugin init/before/after.lua の置き場。
     /// 未指定なら `~/.config/rvpm/<appname>/plugins`。
     pub config_root: Option<String>,
-    /// git 並列実行数 (default: 8)。
+    /// git 並列実行数 (default: 13)。
     pub concurrency: Option<usize>,
     /// rvpm のキャッシュ root。
     /// 未指定なら `~/.cache/rvpm/<appname>`。

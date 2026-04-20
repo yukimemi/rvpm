@@ -84,7 +84,7 @@ Files end up under `~/.config/rvpm/<appname>/` and
 nvim_rc = "~/.config/nvim/rc"
 
 [options]
-# Parallel git operations limit (default: 8)
+# Parallel git operations limit (default: 13)
 concurrency = 10
 
 # Auto-prune plugin dirs no longer referenced by config.toml on every
@@ -138,7 +138,7 @@ for fully isolated test configs.
 |---|---|---|---|
 | `config_root` | `string` | `~/.config/rvpm/<appname>` | Root for `config.toml`, global hooks, and per-plugin hooks. **Recommended: leave unset** |
 | `cache_root` | `string` | `~/.cache/rvpm/<appname>` | Root for clones, merged rtp, generated loader, and browse cache. **Recommended: leave unset** |
-| `concurrency` | `integer` | `8` | Max parallel git operations during `sync` / `update` |
+| `concurrency` | `integer` | `13` | Max parallel git operations during `sync` / `update` |
 | `chezmoi` | `boolean` | `false` | Route writes through chezmoi source state. See [Advanced → chezmoi integration](#advanced) |
 | `auto_clean` | `boolean` | `false` | `sync` / `generate` auto-delete plugin dirs no longer in `config.toml` (= always `--prune`) |
 | `auto_helptags` | `boolean` | `true` | `sync` / `generate` run `nvim --headless` once at the end to build helptags for every plugin's `doc/`. Skipped with a warning if `nvim` is missing |

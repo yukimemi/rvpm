@@ -3141,7 +3141,7 @@ fn write_loader_to_path(
 }
 
 /// デフォルト並列数。GitHub の rate limit を避けるため控えめに。
-const DEFAULT_CONCURRENCY: usize = 8;
+const DEFAULT_CONCURRENCY: usize = 13;
 
 fn resolve_concurrency(config_value: Option<usize>) -> usize {
     config_value.unwrap_or(DEFAULT_CONCURRENCY)
@@ -5409,10 +5409,10 @@ url = "owner/repo"
     }
 
     #[test]
-    fn test_resolve_concurrency_defaults_to_8() {
+    fn test_resolve_concurrency_defaults_to_13() {
         let result = resolve_concurrency(None);
         assert_eq!(result, DEFAULT_CONCURRENCY);
-        assert_eq!(result, 8);
+        assert_eq!(result, 13);
     }
 
     #[test]
