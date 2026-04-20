@@ -49,6 +49,12 @@ pub struct PluginStats {
     pub is_managed: bool,
     /// lazy プラグインか (擬似グループは false)
     pub lazy: bool,
+    /// Phase 4 (per-plugin init.lua) 所要時間 (ms)。instrumentation 有効時のみ。
+    pub init_ms: f64,
+    /// Phase 6 (eager main load) 所要時間 (ms)。lazy プラグインは 0。
+    pub load_ms: f64,
+    /// Phase 7 (lazy trigger 登録) 所要時間 (ms)。eager は 0。
+    pub trig_ms: f64,
 }
 
 /// プラグイン内の 1 ファイルの統計。
@@ -58,6 +64,15 @@ pub struct FileStat {
     pub relative_path: String,
     pub self_ms: f64,
     pub sourced_ms: f64,
+}
+
+/// 1 フェーズ分の所要時間 (平均値)。
+#[derive(Debug, Clone, Default)]
+pub struct PhaseTime {
+    /// phase 名 ("phase-3" / "phase-4" / ... / "phase-9")
+    pub name: String,
+    /// 所要時間 (ms、平均)
+    pub duration_ms: f64,
 }
 
 /// `rvpm profile` 実行結果の全体レポート。
@@ -71,6 +86,12 @@ pub struct ProfileReport {
     pub plugins: Vec<PluginStats>,
     /// nvim バイナリ情報 (取得できれば)
     pub nvim_version: Option<String>,
+    /// instrumented run から得た phase タイムライン (None なら profile_mode OFF)。
+    pub phase_timeline: Option<Vec<PhaseTime>>,
+    /// --no-merge で計測したか (UI で注意表示するため)
+    pub no_merge: bool,
+    /// --no-instrument モードで計測したか (phase_timeline が常に None)
+    pub no_instrument: bool,
 }
 
 /// --startuptime 1 ファイル分の出力をパースして SourceEntry 列を返す。
@@ -206,6 +227,9 @@ pub fn aggregate_single_run(
                 file_count: 0,
                 top_files: Vec::new(),
                 is_managed,
+                init_ms: 0.0,
+                load_ms: 0.0,
+                trig_ms: 0.0,
                 lazy,
             });
         s.total_self_ms += entry.self_ms;
@@ -317,9 +341,15 @@ pub fn average_stats(
                 top_files: Vec::new(),
                 is_managed: s.is_managed,
                 lazy: s.lazy,
+                init_ms: 0.0,
+                load_ms: 0.0,
+                trig_ms: 0.0,
             });
             entry.total_self_ms += s.total_self_ms;
             entry.total_sourced_ms += s.total_sourced_ms;
+            entry.init_ms += s.init_ms;
+            entry.load_ms += s.load_ms;
+            entry.trig_ms += s.trig_ms;
             // file_count は run 間で同じはずなので max を取る
             entry.file_count = entry.file_count.max(s.file_count);
             // top_files は最新 run のものを採用 (run 間で顔ぶれはほぼ同じ想定)
@@ -334,6 +364,9 @@ pub fn average_stats(
         .map(|mut s| {
             s.total_self_ms /= runs as f64;
             s.total_sourced_ms /= runs as f64;
+            s.init_ms /= runs as f64;
+            s.load_ms /= runs as f64;
+            s.trig_ms /= runs as f64;
             for f in s.top_files.iter_mut() {
                 // top_files の時間も run 平均に近づけるため runs で割る
                 // (実際にはその run 1 回分の値だが、視覚上プラグイン合計とズレるのを防ぐ)
@@ -350,6 +383,165 @@ pub fn average_stats(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     out
+}
+
+/// `rvpm profile` instrumentation 由来の marker event。
+/// `<marker_dir>/<name>.vim` を source した行の clock 値を記録する。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarkerEvent {
+    /// event 名 (`phase-3-begin`, `init-telescope-end` 等、.vim 拡張子除去済み)
+    pub name: String,
+    /// sourcing 時の clock 値 (ms)
+    pub clock_ms: f64,
+}
+
+/// --startuptime 出力から marker event を抽出する。
+///
+/// `sourcing <marker_dir>/<name>.vim` という形の行を検出し、
+/// event 名 (拡張子除く) と clock 値を取り出す。
+/// marker_dir は forward-slash 正規化済みの絶対パス前提。
+pub fn parse_marker_events(content: &str, marker_dir_normalized: &str) -> Vec<MarkerEvent> {
+    let prefix_lc = marker_dir_normalized.to_ascii_lowercase();
+    let mut events = Vec::new();
+    for line in content.lines() {
+        let Some((head, tail)) = line.split_once(':') else {
+            continue;
+        };
+        let nums: Vec<f64> = head
+            .split_whitespace()
+            .filter_map(|s| s.parse::<f64>().ok())
+            .collect();
+        if nums.len() != 3 {
+            continue;
+        }
+        let Some(rest) = tail.trim_start().strip_prefix("sourcing ") else {
+            continue;
+        };
+        let path = normalize_path(rest.trim());
+        let path_lc = path.to_ascii_lowercase();
+        // prefix match with trailing slash to avoid adjacency collisions
+        if !path_lc.starts_with(&prefix_lc) {
+            continue;
+        }
+        let rest_after = &path[prefix_lc.len()..];
+        let rest_after = rest_after.trim_start_matches('/');
+        // `.vim` 拡張子を除いて event 名として取り出す
+        let name = rest_after.trim_end_matches(".vim").to_string();
+        if name.is_empty() {
+            continue;
+        }
+        events.push(MarkerEvent {
+            name,
+            clock_ms: nums[0],
+        });
+    }
+    events
+}
+
+/// phase-<N>-begin / phase-<N>-end のペアから各 phase の所要時間を計算する。
+///
+/// 対応する begin/end が両方見つかった phase のみ結果に含める。
+/// 順序通りに (phase-3, phase-4, ..., phase-9) で並べる。
+pub fn compute_phase_times(events: &[MarkerEvent]) -> Vec<PhaseTime> {
+    use std::collections::HashMap;
+    let mut begins: HashMap<&str, f64> = HashMap::new();
+    let mut ends: HashMap<&str, f64> = HashMap::new();
+    for e in events {
+        if let Some(phase) = e.name.strip_suffix("-begin") {
+            begins.insert(phase, e.clock_ms);
+        } else if let Some(phase) = e.name.strip_suffix("-end") {
+            ends.insert(phase, e.clock_ms);
+        }
+    }
+    let order = [
+        "phase-3", "phase-4", "phase-5", "phase-6", "phase-7", "phase-9",
+    ];
+    let mut out = Vec::new();
+    for phase in order {
+        if let (Some(b), Some(e)) = (begins.get(phase), ends.get(phase)) {
+            out.push(PhaseTime {
+                name: phase.to_string(),
+                duration_ms: (e - b).max(0.0),
+            });
+        }
+    }
+    out
+}
+
+/// per-plugin の init-<safe>-begin/end と trig-<safe>-begin/end から
+/// (init_ms, trig_ms) のマップを組み立てる。サニタイズ前の元の表示名は
+/// main.rs 側で逆引きして合わせる (loader.rs::sanitize_name は `_` に置換する規則)。
+///
+/// 返り値の key は sanitize 済みの safe 名 — 呼び出し側で同じ規則で plugin.name
+/// を正規化して lookup する。
+pub fn compute_per_plugin_phase_times(
+    events: &[MarkerEvent],
+) -> std::collections::HashMap<String, (f64, f64)> {
+    use std::collections::HashMap;
+    let mut init_begin: HashMap<String, f64> = HashMap::new();
+    let mut init_end: HashMap<String, f64> = HashMap::new();
+    let mut trig_begin: HashMap<String, f64> = HashMap::new();
+    let mut trig_end: HashMap<String, f64> = HashMap::new();
+    for e in events {
+        if let Some(rest) = e.name.strip_prefix("init-") {
+            if let Some(name) = rest.strip_suffix("-begin") {
+                init_begin.insert(name.to_string(), e.clock_ms);
+            } else if let Some(name) = rest.strip_suffix("-end") {
+                init_end.insert(name.to_string(), e.clock_ms);
+            }
+        } else if let Some(rest) = e.name.strip_prefix("trig-") {
+            if let Some(name) = rest.strip_suffix("-begin") {
+                trig_begin.insert(name.to_string(), e.clock_ms);
+            } else if let Some(name) = rest.strip_suffix("-end") {
+                trig_end.insert(name.to_string(), e.clock_ms);
+            }
+        }
+    }
+    let mut out: HashMap<String, (f64, f64)> = HashMap::new();
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    names.extend(init_begin.keys().cloned());
+    names.extend(trig_begin.keys().cloned());
+    for name in names {
+        let i = match (init_begin.get(&name), init_end.get(&name)) {
+            (Some(b), Some(e)) => (e - b).max(0.0),
+            _ => 0.0,
+        };
+        let t = match (trig_begin.get(&name), trig_end.get(&name)) {
+            (Some(b), Some(e)) => (e - b).max(0.0),
+            _ => 0.0,
+        };
+        out.insert(name, (i, t));
+    }
+    out
+}
+
+/// 複数 run の phase timeline を平均化。phase 名は決まっているので順序は保てる。
+pub fn average_phase_timelines(timelines: Vec<Vec<PhaseTime>>) -> Vec<PhaseTime> {
+    use std::collections::HashMap;
+    if timelines.is_empty() {
+        return Vec::new();
+    }
+    let runs = timelines.len() as f64;
+    let mut acc: HashMap<String, f64> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for t in &timelines {
+        for p in t {
+            if !acc.contains_key(&p.name) {
+                order.push(p.name.clone());
+            }
+            *acc.entry(p.name.clone()).or_insert(0.0) += p.duration_ms;
+        }
+    }
+    order
+        .into_iter()
+        .map(|name| {
+            let total = acc.get(&name).copied().unwrap_or(0.0);
+            PhaseTime {
+                name,
+                duration_ms: total / runs,
+            }
+        })
+        .collect()
 }
 
 /// --startuptime 出力の最終行から「全体起動時間」を推定する。
@@ -427,45 +619,113 @@ pub async fn probe_nvim_version() -> Option<String> {
     stdout.lines().next().map(|s| s.trim().to_string())
 }
 
+/// `rvpm profile` 1 回分の実行パラメータ。
+/// main.rs の run_profile から渡される (loader.lua の swap はそちら側で済んでいる前提)。
+pub struct ProfileRunConfig {
+    pub runs: usize,
+    pub plugins: Vec<PluginPathEntry>,
+    pub merged_dir: PathBuf,
+    pub loader_path: PathBuf,
+    pub user_config_root: PathBuf,
+    /// instrumentation 有効時の marker dir (空なら phase 分解をスキップ)。
+    pub marker_dir: Option<PathBuf>,
+    pub no_merge: bool,
+    pub no_instrument: bool,
+}
+
 /// N 回実行 → 平均して ProfileReport を組み立てる。
-pub async fn run_profile(
-    runs: usize,
-    plugins: Vec<PluginPathEntry>,
-    merged_dir: PathBuf,
-    loader_path: PathBuf,
-    user_config_root: PathBuf,
-) -> anyhow::Result<ProfileReport> {
-    if runs == 0 {
+pub async fn run_profile(cfg: ProfileRunConfig) -> anyhow::Result<ProfileReport> {
+    if cfg.runs == 0 {
         anyhow::bail!("runs must be >= 1");
     }
 
-    let merged_s = merged_dir.to_string_lossy().to_string();
-    let loader_s = loader_path.to_string_lossy().to_string();
-    let user_s = user_config_root.to_string_lossy().to_string();
+    let merged_s = cfg.merged_dir.to_string_lossy().to_string();
+    let loader_s = cfg.loader_path.to_string_lossy().to_string();
+    let user_s = cfg.user_config_root.to_string_lossy().to_string();
+    let marker_s = cfg
+        .marker_dir
+        .as_ref()
+        .map(|p| normalize_path(&p.to_string_lossy()));
 
-    let mut totals = Vec::with_capacity(runs);
-    let mut runs_stats = Vec::with_capacity(runs);
+    let mut totals = Vec::with_capacity(cfg.runs);
+    let mut runs_stats = Vec::with_capacity(cfg.runs);
+    let mut phase_timelines: Vec<Vec<PhaseTime>> = Vec::new();
 
-    for i in 0..runs {
+    for i in 0..cfg.runs {
         let (content, total) = run_single_startuptime(&[])
             .await
-            .map_err(|e| anyhow::anyhow!("profile run {}/{} failed: {}", i + 1, runs, e))?;
+            .map_err(|e| anyhow::anyhow!("profile run {}/{} failed: {}", i + 1, cfg.runs, e))?;
         totals.push(total);
         let entries = parse_startuptime(&content);
-        let stats = aggregate_single_run(&entries, &plugins, &merged_s, &loader_s, &user_s);
+        let mut stats = aggregate_single_run(&entries, &cfg.plugins, &merged_s, &loader_s, &user_s);
+
+        // phase / per-plugin marker を parse できれば stats に反映
+        if let Some(mdir) = &marker_s {
+            let markers = parse_marker_events(&content, mdir);
+            let phases = compute_phase_times(&markers);
+            let per_plugin = compute_per_plugin_phase_times(&markers);
+
+            // lazy プラグインは sourcing 行を出さないので stats に entry が無い。
+            // marker で init/trig が取れたプラグインの空エントリを事前に作る。
+            for plugin in &cfg.plugins {
+                let safe = crate::loader::sanitize_name(&plugin.name);
+                if per_plugin.contains_key(&safe) && !stats.contains_key(&plugin.name) {
+                    stats.insert(
+                        plugin.name.clone(),
+                        PluginStats {
+                            name: plugin.name.clone(),
+                            total_self_ms: 0.0,
+                            total_sourced_ms: 0.0,
+                            file_count: 0,
+                            top_files: Vec::new(),
+                            is_managed: true,
+                            lazy: plugin.lazy,
+                            init_ms: 0.0,
+                            load_ms: 0.0,
+                            trig_ms: 0.0,
+                        },
+                    );
+                }
+            }
+
+            for s in stats.values_mut() {
+                if let Some(plugin) = cfg.plugins.iter().find(|p| p.name == s.name) {
+                    let safe = crate::loader::sanitize_name(&plugin.name);
+                    if let Some((init, trig)) = per_plugin.get(&safe) {
+                        s.init_ms = *init;
+                        s.trig_ms = *trig;
+                    }
+                }
+                // eager プラグインの load_ms は sourcing 合計で近似
+                if s.is_managed && !s.lazy {
+                    s.load_ms = s.total_self_ms;
+                }
+            }
+            phase_timelines.push(phases);
+        }
+
         runs_stats.push(stats);
     }
 
-    let total_startup_ms = totals.iter().sum::<f64>() / runs as f64;
-    let plugins_stats = average_stats(runs_stats, runs);
+    let total_startup_ms = totals.iter().sum::<f64>() / cfg.runs as f64;
+    let plugins_stats = average_stats(runs_stats, cfg.runs);
+
+    let phase_timeline = if phase_timelines.is_empty() {
+        None
+    } else {
+        Some(average_phase_timelines(phase_timelines))
+    };
 
     let nvim_version = probe_nvim_version().await;
 
     Ok(ProfileReport {
-        runs,
+        runs: cfg.runs,
         total_startup_ms,
         plugins: plugins_stats,
         nvim_version,
+        phase_timeline,
+        no_merge: cfg.no_merge,
+        no_instrument: cfg.no_instrument,
     })
 }
 
@@ -483,10 +743,19 @@ pub fn report_to_json(report: &ProfileReport) -> serde_json::Value {
         "runs": report.runs,
         "total_startup_ms": report.total_startup_ms,
         "nvim_version": report.nvim_version,
+        "no_merge": report.no_merge,
+        "no_instrument": report.no_instrument,
+        "phase_timeline": report.phase_timeline.as_ref().map(|pts| pts.iter().map(|p| serde_json::json!({
+            "name": p.name,
+            "duration_ms": p.duration_ms,
+        })).collect::<Vec<_>>()),
         "plugins": report.plugins.iter().map(|p| serde_json::json!({
             "name": p.name,
             "total_self_ms": p.total_self_ms,
             "total_sourced_ms": p.total_sourced_ms,
+            "init_ms": p.init_ms,
+            "load_ms": p.load_ms,
+            "trig_ms": p.trig_ms,
             "file_count": p.file_count,
             "is_managed": p.is_managed,
             "lazy": p.lazy,
@@ -673,6 +942,9 @@ times in msec
                 }],
                 is_managed: true,
                 lazy: false,
+                init_ms: 0.0,
+                load_ms: 0.0,
+                trig_ms: 0.0,
             },
         );
         run1.insert(
@@ -685,6 +957,9 @@ times in msec
                 top_files: vec![],
                 is_managed: true,
                 lazy: false,
+                init_ms: 0.0,
+                load_ms: 0.0,
+                trig_ms: 0.0,
             },
         );
         let mut run2 = HashMap::new();
@@ -698,6 +973,9 @@ times in msec
                 top_files: vec![],
                 is_managed: true,
                 lazy: false,
+                init_ms: 0.0,
+                load_ms: 0.0,
+                trig_ms: 0.0,
             },
         );
         // b は run2 には無い (0 ms として扱う)
@@ -717,5 +995,130 @@ times in msec
             extract_source_path("sourcing /foo/bar.lua"),
             Some("/foo/bar.lua".to_string())
         );
+    }
+
+    #[test]
+    fn parse_marker_events_extracts_phase_markers() {
+        let content = "\
+010.100  000.005  000.005: sourcing /tmp/markers/phase-3-begin.vim
+010.500  000.008  000.008: sourcing /tmp/markers/phase-3-end.vim
+011.200  000.003  000.003: sourcing /tmp/markers/init-telescope-begin.vim
+011.800  000.012  000.012: sourcing /tmp/markers/init-telescope-end.vim
+020.000  000.010  000.010: sourcing /some/other/plugin.lua
+";
+        let events = parse_marker_events(content, "/tmp/markers");
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].name, "phase-3-begin");
+        assert_eq!(events[0].clock_ms, 10.100);
+        assert_eq!(events[3].name, "init-telescope-end");
+        assert!((events[3].clock_ms - 11.800).abs() < 1e-6);
+    }
+
+    #[test]
+    fn compute_phase_times_pairs_begin_end() {
+        let events = vec![
+            MarkerEvent {
+                name: "phase-3-begin".into(),
+                clock_ms: 10.0,
+            },
+            MarkerEvent {
+                name: "phase-3-end".into(),
+                clock_ms: 15.0,
+            },
+            MarkerEvent {
+                name: "phase-6-begin".into(),
+                clock_ms: 20.0,
+            },
+            MarkerEvent {
+                name: "phase-6-end".into(),
+                clock_ms: 100.0,
+            },
+        ];
+        let phases = compute_phase_times(&events);
+        assert_eq!(phases.len(), 2);
+        assert_eq!(phases[0].name, "phase-3");
+        assert_eq!(phases[0].duration_ms, 5.0);
+        assert_eq!(phases[1].name, "phase-6");
+        assert_eq!(phases[1].duration_ms, 80.0);
+    }
+
+    #[test]
+    fn compute_phase_times_skips_unpaired() {
+        // phase-4 に begin しか無い場合 (壊れた instrumentation) は skip
+        let events = vec![
+            MarkerEvent {
+                name: "phase-3-begin".into(),
+                clock_ms: 10.0,
+            },
+            MarkerEvent {
+                name: "phase-3-end".into(),
+                clock_ms: 12.0,
+            },
+            MarkerEvent {
+                name: "phase-4-begin".into(),
+                clock_ms: 13.0,
+            },
+            // phase-4-end 欠落
+        ];
+        let phases = compute_phase_times(&events);
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0].name, "phase-3");
+    }
+
+    #[test]
+    fn compute_per_plugin_phase_times_extracts_init_and_trig() {
+        let events = vec![
+            MarkerEvent {
+                name: "init-alpha-begin".into(),
+                clock_ms: 10.0,
+            },
+            MarkerEvent {
+                name: "init-alpha-end".into(),
+                clock_ms: 10.5,
+            },
+            MarkerEvent {
+                name: "trig-beta-begin".into(),
+                clock_ms: 20.0,
+            },
+            MarkerEvent {
+                name: "trig-beta-end".into(),
+                clock_ms: 20.3,
+            },
+        ];
+        let pp = compute_per_plugin_phase_times(&events);
+        assert!((pp["alpha"].0 - 0.5).abs() < 1e-6, "alpha init_ms");
+        assert_eq!(pp["alpha"].1, 0.0, "alpha has no trig");
+        assert!((pp["beta"].1 - 0.3).abs() < 1e-6, "beta trig_ms");
+        assert_eq!(pp["beta"].0, 0.0, "beta has no init");
+    }
+
+    #[test]
+    fn average_phase_timelines_handles_multiple_runs() {
+        let r1 = vec![
+            PhaseTime {
+                name: "phase-3".into(),
+                duration_ms: 4.0,
+            },
+            PhaseTime {
+                name: "phase-6".into(),
+                duration_ms: 100.0,
+            },
+        ];
+        let r2 = vec![
+            PhaseTime {
+                name: "phase-3".into(),
+                duration_ms: 6.0,
+            },
+            PhaseTime {
+                name: "phase-6".into(),
+                duration_ms: 80.0,
+            },
+        ];
+        let avg = average_phase_timelines(vec![r1, r2]);
+        assert_eq!(avg.len(), 2);
+        assert_eq!(avg[0].name, "phase-3");
+        assert!((avg[0].duration_ms - 5.0).abs() < 1e-6);
+        assert_eq!(avg[1].name, "phase-6");
+        assert!((avg[1].duration_ms - 90.0).abs() < 1e-6);
     }
 }

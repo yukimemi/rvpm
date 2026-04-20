@@ -126,8 +126,9 @@ fn lua_denops_list(items: &[DenopsPlugin]) -> String {
     format!("{{ {} }}", pairs.join(", "))
 }
 
-/// ローカル lua 変数名として安全な形に sanitize (英数字 + underscore のみ)
-fn sanitize_name(name: &str) -> String {
+/// ローカル lua 変数名として安全な形に sanitize (英数字 + underscore のみ)。
+/// `rvpm profile` の marker ファイル名もこれと同じ正規化を使うため `pub(crate)`。
+pub(crate) fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
@@ -150,6 +151,68 @@ pub struct LoaderOptions {
     pub global_before: Option<String>,
     /// `~/.config/rvpm/after.lua` が存在すれば Some (グローバル after.lua)
     pub global_after: Option<String>,
+    /// Some の場合、`rvpm profile` 用の instrumentation を埋め込む。
+    /// 通常の generate では None (ゼロコスト)。
+    pub profile: Option<ProfileOptions>,
+}
+
+/// `rvpm profile` 時のみ有効化されるオプション。
+///
+/// phase 境界 / 各プラグインの init / load / trig タイミングを計測するため、
+/// 空の `.vim` ファイルを `vim.cmd("source <marker_dir>/<event>.vim")` で
+/// source する。`--startuptime` はこれを `sourcing <path>  <clock>` 行として
+/// emit するので、clock 差を取れば phase / plugin 単位の所要時間が出せる。
+///
+/// `marker_dir` 内の `.vim` ファイルは `run_profile` 側で事前作成される。
+/// `generate_loader` は source 命令を emit するだけ。
+pub struct ProfileOptions {
+    /// 空 marker ファイル (`<event>.vim`) の置き場。forward-slash で保持。
+    pub marker_dir: String,
+    /// true にすると全 plugin を merge=false として扱う
+    /// (merged rtp append を skip、各 plugin を個別に rtp:append)。
+    /// `--no-merge` CLI フラグから来る。merged/ ディレクトリ自体は触らない
+    /// (hardlink なので別経路の source でも同じ内容が読める)。
+    pub force_unmerge: bool,
+}
+
+/// `rvpm profile` instrumentation で使う event 名を返す。
+/// run_profile 側で marker_dir 配下に `<event>.vim` を空ファイルで事前作成する。
+///
+/// phase-6 (eager プラグインのメイン source) は既存の `sourcing <plugin file>`
+/// 行で path prefix 経由で個別集計可能なので、per-plugin の load-begin/end 対は不要
+/// (その代わり phase-6 全体の開始/終了だけ記録)。
+pub fn expected_markers(scripts: &[PluginScripts]) -> Vec<String> {
+    let mut names = Vec::new();
+    // phase 境界マーカー (phase 3/4/5/6/7/9 の begin + 全体 end)
+    for p in [
+        "phase-3", "phase-4", "phase-5", "phase-6", "phase-7", "phase-9",
+    ] {
+        names.push(format!("{}-begin", p));
+        names.push(format!("{}-end", p));
+    }
+    // 各プラグインの init.lua (phase 4) と lazy trigger 登録 (phase 7)
+    for s in scripts {
+        let safe = sanitize_name(&s.name);
+        if s.init.is_some() {
+            names.push(format!("init-{}-begin", safe));
+            names.push(format!("init-{}-end", safe));
+        }
+        if s.lazy {
+            names.push(format!("trig-{}-begin", safe));
+            names.push(format!("trig-{}-end", safe));
+        }
+    }
+    names
+}
+
+/// marker の source 命令を emit する helper。profile が有効な場合のみ動作。
+fn emit_marker(lua: &mut String, profile: Option<&ProfileOptions>, event: &str) {
+    if let Some(p) = profile {
+        lua.push_str(&format!(
+            "vim.cmd(\"source {}/{}.vim\")\n",
+            p.marker_dir, event
+        ));
+    }
 }
 
 /// lazy → eager 自動昇格を行い、昇格されたプラグイン名のリストを返す。
@@ -256,6 +319,9 @@ pub fn generate_loader(
     // ======================================================
     lua.push_str("vim.go.loadplugins = false\n\n");
 
+    let profile = opts.profile.as_ref();
+    emit_marker(&mut lua, profile, "phase-3-begin");
+
     // ======================================================
     // load_lazy helper — lazy プラグインの実行時ローダー
     // 事前 glob 済みファイルリストを受け取り、ftdetect を augroup で wrap
@@ -297,6 +363,8 @@ end
     if let Some(before) = &opts.global_before {
         lua.push_str(&format!("dofile(\"{}\")\n\n", before.replace('\\', "/")));
     }
+    emit_marker(&mut lua, profile, "phase-3-end");
+    emit_marker(&mut lua, profile, "phase-4-begin");
 
     // ======================================================
     // 全プラグインの init.lua (依存順)
@@ -304,19 +372,39 @@ end
     // ======================================================
     for s in &scripts {
         if let Some(init) = &s.init {
-            let body = format!("dofile(\"{}\")\n", init.replace('\\', "/"));
+            let safe = sanitize_name(&s.name);
+            let mut body = String::new();
+            if let Some(p) = profile {
+                body.push_str(&format!(
+                    "vim.cmd(\"source {}/init-{}-begin.vim\")\n",
+                    p.marker_dir, safe
+                ));
+            }
+            body.push_str(&format!("dofile(\"{}\")\n", init.replace('\\', "/")));
+            if let Some(p) = profile {
+                body.push_str(&format!(
+                    "vim.cmd(\"source {}/init-{}-end.vim\")\n",
+                    p.marker_dir, safe
+                ));
+            }
             push_with_cond(&mut lua, &s.cond, &body);
         }
     }
     lua.push('\n');
+    emit_marker(&mut lua, profile, "phase-4-end");
+    emit_marker(&mut lua, profile, "phase-5-begin");
 
     // ======================================================
     // merged rtp append (merge=true プラグインがあれば 1 回)
+    // `force_unmerge=true` 時は skip (各プラグインを個別に rtp:append する)。
     // ======================================================
-    if scripts.iter().any(|s| s.merge) {
+    let force_unmerge = profile.map(|p| p.force_unmerge).unwrap_or(false);
+    if !force_unmerge && scripts.iter().any(|s| s.merge) {
         let merged_path = merged_dir.to_string_lossy().replace('\\', "/");
         lua.push_str(&format!("vim.opt.rtp:append(\"{}\")\n\n", merged_path));
     }
+    emit_marker(&mut lua, profile, "phase-5-end");
+    emit_marker(&mut lua, profile, "phase-6-begin");
 
     // ======================================================
     // eager プラグイン処理 (依存順)
@@ -331,8 +419,8 @@ end
         let mut body = String::new();
         let path = s.path.replace('\\', "/");
 
-        // 非 merge な eager プラグインは個別に rtp に追加
-        if !s.merge {
+        // `force_unmerge=true` 時は merge=true でも個別 rtp:append する
+        if !s.merge || force_unmerge {
             body.push_str(&format!("vim.opt.rtp:append(\"{}\")\n", path));
         }
 
@@ -374,6 +462,8 @@ end
         push_with_cond(&mut lua, &s.cond, &body);
     }
     lua.push('\n');
+    emit_marker(&mut lua, profile, "phase-6-end");
+    emit_marker(&mut lua, profile, "phase-7-begin");
 
     // ======================================================
     // lazy trigger 登録
@@ -385,6 +475,13 @@ end
             continue;
         }
         let path = s.path.replace('\\', "/");
+        if let Some(p) = profile {
+            let safe = sanitize_name(&s.name);
+            lua.push_str(&format!(
+                "vim.cmd(\"source {}/trig-{}-begin.vim\")\n",
+                p.marker_dir, safe
+            ));
+        }
         let before = s
             .before
             .as_ref()
@@ -634,6 +731,13 @@ end
         }
 
         body.push_str("end\n");
+        if let Some(p) = profile {
+            let safe = sanitize_name(&s.name);
+            body.push_str(&format!(
+                "vim.cmd(\"source {}/trig-{}-end.vim\")\n",
+                p.marker_dir, safe
+            ));
+        }
         push_with_cond(&mut lua, &s.cond, &body);
     }
 
@@ -698,6 +802,9 @@ end
         }
     }
 
+    emit_marker(&mut lua, profile, "phase-7-end");
+    emit_marker(&mut lua, profile, "phase-9-begin");
+
     // ======================================================
     // グローバル after.lua (全プラグインの後)
     // colorscheme / 最終 UI 調整を書く場所
@@ -705,6 +812,8 @@ end
     if let Some(after) = &opts.global_after {
         lua.push_str(&format!("\ndofile(\"{}\")\n", after.replace('\\', "/")));
     }
+
+    emit_marker(&mut lua, profile, "phase-9-end");
 
     lua
 }
@@ -1101,6 +1210,7 @@ mod tests {
         let opts = LoaderOptions {
             global_before: Some("/rvpm/before.lua".to_string()),
             global_after: None,
+            profile: None,
         };
         let lua = generate_loader(Path::new("/merged"), &[s], &opts);
         let before_pos = lua.find("/rvpm/before.lua").expect("global before missing");
@@ -1119,6 +1229,7 @@ mod tests {
         let opts = LoaderOptions {
             global_before: None,
             global_after: Some("/rvpm/after.lua".to_string()),
+            profile: None,
         };
         let lua = generate_loader(Path::new("/merged"), &[s], &opts);
         let trigger_pos = lua
@@ -1136,6 +1247,7 @@ mod tests {
         let opts = LoaderOptions {
             global_before: None,
             global_after: None,
+            profile: None,
         };
         let lua = generate_loader(Path::new("/merged"), &[], &opts);
         // global hooks のセクションコメントがあっても dofile は出ない
@@ -1143,6 +1255,136 @@ mod tests {
             !lua.contains("dofile") || lua.contains("load_lazy"),
             "no dofile for global hooks when None"
         );
+    }
+
+    // ========================================================
+    // profile instrumentation テスト (phase markers + force_unmerge)
+    // ========================================================
+
+    fn profile_opts(marker_dir: &str, force_unmerge: bool) -> LoaderOptions {
+        LoaderOptions {
+            global_before: None,
+            global_after: None,
+            profile: Some(ProfileOptions {
+                marker_dir: marker_dir.to_string(),
+                force_unmerge,
+            }),
+        }
+    }
+
+    #[test]
+    fn test_profile_mode_emits_phase_boundary_markers() {
+        let opts = profile_opts("/tmp/markers", false);
+        let lua = generate_loader(Path::new("/merged"), &[], &opts);
+        for phase in [
+            "phase-3", "phase-4", "phase-5", "phase-6", "phase-7", "phase-9",
+        ] {
+            assert!(
+                lua.contains(&format!("/tmp/markers/{}-begin.vim", phase)),
+                "missing begin marker for {}",
+                phase
+            );
+            assert!(
+                lua.contains(&format!("/tmp/markers/{}-end.vim", phase)),
+                "missing end marker for {}",
+                phase
+            );
+        }
+    }
+
+    #[test]
+    fn test_profile_mode_zero_cost_when_disabled() {
+        // profile: None なら marker source 命令は一切出ない
+        let opts = LoaderOptions::default();
+        let lua = generate_loader(Path::new("/merged"), &[], &opts);
+        assert!(
+            !lua.contains("phase-3-begin"),
+            "no markers expected when profile is None"
+        );
+        assert!(
+            !lua.contains("markers"),
+            "no marker paths expected when profile is None"
+        );
+    }
+
+    #[test]
+    fn test_profile_per_plugin_init_markers() {
+        let mut s = PluginScripts::for_test("my.plugin", "/path/myplugin");
+        s.init = Some("/cfg/myplugin/init.lua".to_string());
+        let opts = profile_opts("/tmp/m", false);
+        let lua = generate_loader(Path::new("/merged"), &[s], &opts);
+        assert!(lua.contains("/tmp/m/init-my_plugin-begin.vim"));
+        assert!(lua.contains("/tmp/m/init-my_plugin-end.vim"));
+        // begin が dofile より前にあること
+        let begin_pos = lua.find("init-my_plugin-begin.vim").unwrap();
+        let dofile_pos = lua.find("/cfg/myplugin/init.lua").unwrap();
+        let end_pos = lua.find("init-my_plugin-end.vim").unwrap();
+        assert!(begin_pos < dofile_pos && dofile_pos < end_pos);
+    }
+
+    #[test]
+    fn test_profile_per_plugin_trig_markers() {
+        let mut s = PluginScripts::for_test("lazy-one", "/path/lazy-one");
+        s.lazy = true;
+        s.on_cmd = Some(vec!["Foo".to_string()]);
+        let opts = profile_opts("/tmp/m", false);
+        let lua = generate_loader(Path::new("/merged"), &[s], &opts);
+        assert!(lua.contains("/tmp/m/trig-lazy_one-begin.vim"));
+        assert!(lua.contains("/tmp/m/trig-lazy_one-end.vim"));
+    }
+
+    #[test]
+    fn test_force_unmerge_skips_merged_rtp_append() {
+        let mut s = PluginScripts::for_test("a", "/path/a");
+        s.merge = true;
+        let opts = profile_opts("/tmp/m", true);
+        let lua = generate_loader(Path::new("/merged"), &[s], &opts);
+        // merged/ への一括 rtp:append は出ない
+        assert!(
+            !lua.contains("vim.opt.rtp:append(\"/merged\")"),
+            "force_unmerge=true should skip merged rtp:append"
+        );
+        // 代わりに個別プラグイン path が rtp:append される
+        assert!(
+            lua.contains("vim.opt.rtp:append(\"/path/a\")"),
+            "force_unmerge=true should emit per-plugin rtp:append"
+        );
+    }
+
+    #[test]
+    fn test_force_unmerge_false_preserves_merged() {
+        let mut s = PluginScripts::for_test("a", "/path/a");
+        s.merge = true;
+        let opts = profile_opts("/tmp/m", false);
+        let lua = generate_loader(Path::new("/merged"), &[s], &opts);
+        assert!(
+            lua.contains("vim.opt.rtp:append(\"/merged\")"),
+            "force_unmerge=false preserves merged rtp"
+        );
+        assert!(
+            !lua.contains("vim.opt.rtp:append(\"/path/a\")"),
+            "force_unmerge=false does not emit per-plugin rtp:append for merge=true plugins"
+        );
+    }
+
+    #[test]
+    fn test_expected_markers_includes_phases_and_per_plugin() {
+        let mut s1 = PluginScripts::for_test("alpha", "/path/a");
+        s1.init = Some("/cfg/a/init.lua".to_string());
+        let mut s2 = PluginScripts::for_test("beta", "/path/b");
+        s2.lazy = true;
+        s2.on_cmd = Some(vec!["Beta".to_string()]);
+        let names = expected_markers(&[s1, s2]);
+        assert!(names.iter().any(|n| n == "phase-3-begin"));
+        assert!(names.iter().any(|n| n == "phase-9-end"));
+        assert!(names.iter().any(|n| n == "init-alpha-begin"));
+        assert!(names.iter().any(|n| n == "init-alpha-end"));
+        assert!(names.iter().any(|n| n == "trig-beta-begin"));
+        assert!(names.iter().any(|n| n == "trig-beta-end"));
+        // eager プラグイン alpha には trig- が出ない
+        assert!(!names.iter().any(|n| n == "trig-alpha-begin"));
+        // init 無しの beta には init- が出ない
+        assert!(!names.iter().any(|n| n == "init-beta-begin"));
     }
 
     // ========================================================
