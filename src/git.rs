@@ -75,6 +75,24 @@ impl<'a> Repo<'a> {
             .map_err(|e| anyhow::anyhow!("head_commit task panicked: {}", e))?
     }
 
+    /// `rev` (commit SHA / branch / tag) をローカルリポジトリで解決し、対応する
+    /// commit SHA を返す。network を打たない。
+    ///
+    /// fetch cache の fast-path で「effective_rev (branch 名など) と local HEAD が
+    /// 同じ commit を指してるか」を判定するために使う。commit SHA 同士の直接
+    /// 比較だと `rev = "main"` / `rev = "v1.2.3"` 系をフォローできず、fast path
+    /// の恩恵が失われるため。
+    ///
+    /// 未 clone / rev が local DB に無い / パースエラー → `Ok(None)` (caller は
+    /// fast path 不適用として full flow に fall through する)。
+    pub async fn resolve_revision_locally(&self, rev: &str) -> Result<Option<String>> {
+        let dst = self.dst.to_path_buf();
+        let rev = rev.to_string();
+        tokio::task::spawn_blocking(move || resolve_revision_impl(&dst, &rev))
+            .await
+            .map_err(|e| anyhow::anyhow!("resolve_revision task panicked: {}", e))?
+    }
+
     /// fetch 後の remote tracking branch の tip commit を返す。HEAD は動かさない。
     ///
     /// lockfile pin (rev なしで lockfile commit に寄せられているケース) が remote の
@@ -173,6 +191,21 @@ fn read_head(dst: &Path) -> Result<String> {
     let repo = gix::open(dst)?;
     let head = repo.head_commit()?;
     Ok(head.id().to_string())
+}
+
+/// `rev` を local DB で解決して SHA 文字列を返す。未 clone / 未解決は `None`。
+fn resolve_revision_impl(dst: &Path, rev: &str) -> Result<Option<String>> {
+    if !dst.exists() {
+        return Ok(None);
+    }
+    let repo = match gix::open(dst) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    match repo.rev_parse_single(rev) {
+        Ok(id) => Ok(Some(id.detach().to_string())),
+        Err(_) => Ok(None),
+    }
 }
 
 /// remote tracking branch の tip を読み取る。HEAD は動かさない。
@@ -816,6 +849,72 @@ mod tests {
             "remote_head must report the fetched remote tip, not HEAD"
         );
         assert_ne!(rh.as_deref(), Some(initial.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_revision_locally_handles_sha_branch_tag_and_missing() {
+        // Fast-path comparison depends on being able to resolve branch/tag
+        // refs to SHAs locally without hitting the network. Exercise all
+        // four cases (full SHA / branch / tag / bogus) from a single repo.
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("a.txt"), "seed").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        git_cmd(&src)
+            .args(["tag", "v1.0.0"])
+            .output()
+            .await
+            .unwrap();
+        let head_sha = git_head(&src).await;
+        let branch = {
+            let out = git_cmd(&src)
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .output()
+                .await
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        repo.sync().await.unwrap();
+
+        // Full SHA round-trips.
+        assert_eq!(
+            repo.resolve_revision_locally(&head_sha).await.unwrap(),
+            Some(head_sha.clone()),
+        );
+        // Branch name resolves to the same SHA.
+        assert_eq!(
+            repo.resolve_revision_locally(&branch).await.unwrap(),
+            Some(head_sha.clone()),
+        );
+        // Tag name resolves to the same SHA.
+        assert_eq!(
+            repo.resolve_revision_locally("v1.0.0").await.unwrap(),
+            Some(head_sha.clone()),
+        );
+        // Nonexistent rev degrades to None (caller falls through to full sync).
+        assert_eq!(
+            repo.resolve_revision_locally("no-such-rev").await.unwrap(),
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_revision_locally_returns_none_on_missing_clone() {
+        let root = tempdir().unwrap();
+        let dst = root.path().join("never-cloned");
+        let repo = Repo::new("dummy", &dst, None);
+        assert_eq!(repo.resolve_revision_locally("HEAD").await.unwrap(), None,);
     }
 
     #[tokio::test]

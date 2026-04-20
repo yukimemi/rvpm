@@ -143,7 +143,7 @@ for fully isolated test configs.
 | `auto_clean` | `boolean` | `false` | `sync` / `generate` auto-delete plugin dirs no longer in `config.toml` (= always `--prune`) |
 | `auto_helptags` | `boolean` | `true` | `sync` / `generate` run `nvim --headless` once at the end to build helptags for every plugin's `doc/`. Skipped with a warning if `nvim` is missing |
 | `url_style` | `"short"` \| `"full"` | `"short"` | How `rvpm add` writes GitHub plugin URLs. Duplicate detection normalizes between styles |
-| `fetch_interval` | duration string (`"6h"`, `"30m"`, `"1d"`, `"0"`) | `"6h"` | Per-plugin fetch cache window. `sync` skips `git fetch` for plugins pulled within the last *fetch_interval*. Set to `"0"` to disable caching (pre-v3.19 behavior). Override per-run with `rvpm sync --refresh` / `--no-refresh` |
+| `fetch_interval` | duration string (`"6h"`, `"30m"`, `"45s"`, `"1d"`, `"0"`) | `"6h"` | Per-plugin fetch cache window. `sync` skips `git fetch` for plugins pulled within the last *fetch_interval*. Accepted units: `s` / `m` / `h` / `d`. Set to `"0"` to disable caching (pre-v3.19 behavior). Override per-run with `rvpm sync --refresh` / `--no-refresh` |
 
 > **💡 Leave `config_root` / `cache_root` unset.** Defaults are already
 > `<appname>`-aware. Setting a literal path (e.g. `cache_root = "~/dotfiles/rvpm"`)
@@ -160,7 +160,7 @@ integration, and the external README renderer — see
 
 | Command | Description |
 |---|---|
-| `rvpm sync [--prune] [--frozen] [--no-lock] [--rebuild] [--refresh\|--no-refresh]` | Clone/pull plugins and regenerate `loader.lua`. `--prune` deletes unused plugin directories. `--frozen` errors out if any non-dev plugin is missing from `rvpm.lock` (CI reproducibility). `--no-lock` ignores the lockfile entirely. By default `build` commands are skipped when a pull is a no-op (saves time on configs with heavy `:TSUpdate`-style hooks); `--rebuild` forces every `build` to run regardless. `--refresh` forces every plugin to `git fetch` ignoring `options.fetch_interval`; `--no-refresh` skips `git fetch` entirely (offline mode — errors out if the local checkout can't satisfy the pinned rev) |
+| `rvpm sync [--prune] [--frozen] [--no-lock] [--rebuild] [--refresh\|--no-refresh]` | Clone/pull plugins and regenerate `loader.lua`. `--prune` deletes unused plugin directories. `--frozen` errors out if any non-dev plugin is missing from `rvpm.lock` (CI reproducibility). `--no-lock` ignores the lockfile entirely. By default `build` commands are skipped when a pull is a no-op (saves time on configs with heavy `:TSUpdate`-style hooks); `--rebuild` forces every `build` to run regardless. `--refresh` forces every plugin to `git fetch` ignoring `options.fetch_interval`; `--no-refresh` skips `git fetch` entirely (offline mode — errors out if the local checkout can't satisfy the pinned rev). `--refresh` and `--no-refresh` are mutually exclusive |
 | `rvpm generate` | Regenerate `loader.lua` only (skip git operations) |
 | `rvpm clean` | Delete plugin directories no longer referenced by `config.toml` (no git, faster than `sync --prune` on 200+ plugins) |
 | `rvpm add <repo>` | Add a plugin and sync (records the new plugin's commit to `rvpm.lock`) |

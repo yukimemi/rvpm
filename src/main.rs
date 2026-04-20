@@ -647,18 +647,30 @@ async fn run_sync(
     let fetch_interval =
         crate::fetch_state::resolve_fetch_interval(config.options.fetch_interval.as_deref());
     let now_sys = std::time::SystemTime::now();
-    // 各 plugin で「今 fetch すべきか」を pre-compute。spawn task は bool を 1 個
-    // 持っていれば判断できるので、mode や interval を closure にクローンせずに済む。
+    // name → &FetchEntry の lookup map を先に組んで、plugin ごとの find を O(1) に
+    // する (fetch_state.find は線形スキャンなので、200+ plugin 構成で pre-compute
+    // 全体が O(N^2) になってしまう)。URL 不一致 (= 同じ name で別リポジトリに
+    // 差し替えられた等) は lockfile と同じく「未管理」扱いにして last_fetched を
+    // 無視する — 旧 URL のタイムスタンプで fetch を省略して、新 URL の fetch を
+    // 取りこぼすのを防ぐ。
+    let fetch_lookup: std::collections::HashMap<&str, &crate::fetch_state::FetchEntry> =
+        fetch_state
+            .entries
+            .iter()
+            .map(|e| (e.name.as_str(), e))
+            .collect();
     let fetch_decisions: std::collections::HashMap<String, bool> = config
         .plugins
         .iter()
         .filter(|p| !p.dev)
         .map(|p| {
-            let last = fetch_state
-                .find(&p.display_name())
+            let name = p.display_name();
+            let last = fetch_lookup
+                .get(name.as_str())
+                .filter(|e| urls_match(&e.url, &p.url))
                 .map(|e| e.last_fetched.as_str());
             (
-                p.display_name(),
+                name,
                 crate::fetch_state::should_fetch(last, now_sys, fetch_interval, refresh_mode),
             )
         })
@@ -739,8 +751,12 @@ async fn run_sync(
             let repo = Repo::new(&plugin.url, &dst_path, effective_rev.as_deref());
             // sync 実行判定:
             //   want_fetch=true              → full flow (git fetch + checkout)
-            //   want_fetch=false, 完全一致    → fast path (no-op: HEAD == effective_rev)
-            //   want_fetch=false, 不一致      → hard_skip なら error、それ以外は full flow
+            //   want_fetch=false, fast path OK → no-op (effective_rev を local 解決して HEAD 一致)
+            //   want_fetch=false, fast path NG → hard_skip なら error、それ以外は full flow
+            //
+            // effective_rev が branch/tag の場合でも local DB で SHA に解決してから
+            // 比較するので、`rev = "main"` / `rev = "v1.2.3"` 系でも fast path が効く。
+            // None (pin 無し) の場合は「HEAD 自体を target とみなす」= no-op ですませる。
             let mut fetched = false;
             let res: Result<Option<crate::git::GitChange>> = if want_fetch {
                 fetched = true;
@@ -751,8 +767,11 @@ async fn run_sync(
                 } else {
                     None
                 };
-                let can_fast_path =
-                    head_now.is_some() && head_now.as_deref() == effective_rev.as_deref();
+                let target_sha: Option<String> = match effective_rev.as_deref() {
+                    None => head_now.clone(),
+                    Some(rev) => repo.resolve_revision_locally(rev).await.ok().flatten(),
+                };
+                let can_fast_path = head_now.is_some() && head_now == target_sha;
                 if can_fast_path {
                     Ok(None)
                 } else if hard_skip {
@@ -804,24 +823,34 @@ async fn run_sync(
                     // held-back 判定用に remote tracking tip を読む (HEAD は動かさない)。
                     // 失敗時は None → classify_held_back 側で「判定不能」扱いになり、
                     // 結果として held_back リストには積まれない (resilience)。
+                    //
+                    // fast-path (fetched = false) で分類すると local の remote tracking
+                    // ref が stale なので、window 中に上流が動いたケースで false positive
+                    // を出す。fast path では一律 None にして、window 超過で full fetch
+                    // したタイミングで再評価する。
+                    //
                     // 分類が None 確定の前提条件 (explicit rev / lockfile 寄与なし) では
                     // gix open 自体をスキップして 200+ プラグイン構成の I/O を減らす。
-                    let remote_head = if plugin.rev.is_none() && effective_rev.is_some() {
-                        repo.remote_head().await.ok().flatten()
+                    let held_back = if fetched {
+                        let remote_head = if plugin.rev.is_none() && effective_rev.is_some() {
+                            repo.remote_head().await.ok().flatten()
+                        } else {
+                            None
+                        };
+                        classify_held_back(
+                            plugin.rev.as_deref(),
+                            effective_rev.as_deref(),
+                            head_commit.as_deref(),
+                            remote_head.as_deref(),
+                        )
+                        .map(|(pinned, remote)| HeldBackPin {
+                            name: plugin.display_name(),
+                            pinned,
+                            remote,
+                        })
                     } else {
                         None
                     };
-                    let held_back = classify_held_back(
-                        plugin.rev.as_deref(),
-                        effective_rev.as_deref(),
-                        head_commit.as_deref(),
-                        remote_head.as_deref(),
-                    )
-                    .map(|(pinned, remote)| HeldBackPin {
-                        name: plugin.display_name(),
-                        pinned,
-                        remote,
-                    });
                     let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
                     Ok((plugin, dst_path, build_warn, change, head_commit, held_back, fetched))
                 }

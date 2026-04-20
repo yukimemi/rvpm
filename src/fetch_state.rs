@@ -132,6 +132,9 @@ impl FetchState {
         Ok(())
     }
 
+    /// 単発検索 API。run_sync は事前に `HashMap` lookup を組んで O(N) で回す
+    /// ので本番からは使っていないが、将来の consumer と tests 用に残す。
+    #[allow(dead_code)]
     pub fn find(&self, name: &str) -> Option<&FetchEntry> {
         self.entries.iter().find(|e| e.name == name)
     }
