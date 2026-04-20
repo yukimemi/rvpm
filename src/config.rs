@@ -75,6 +75,17 @@ pub struct Options {
     /// `rvpm browse` の README preview 用オプション。
     #[serde(default)]
     pub browse: BrowseOptions,
+    /// `rvpm sync` の fetch staleness window。humantime-lite 書式
+    /// (`"6h" / "30m" / "1d" / "45s" / "0"`)。
+    ///
+    /// - 未指定 → デフォルト `"6h"`
+    /// - `"0"` → cache 無効 (毎回 fetch、v3.18 以前の挙動)
+    /// - 不正な値 → warn を出して `"6h"` にフォールバック (resilience)
+    ///
+    /// プラグイン単位で「前回 fetch から window 以内」なら sync 時の
+    /// `git fetch` をスキップする。CLI からは `rvpm sync --refresh` / `--no-refresh`
+    /// で上書き可能。
+    pub fetch_interval: Option<String>,
 }
 
 impl Default for Options {
@@ -92,6 +103,7 @@ impl Default for Options {
             auto_helptags: default_auto_helptags(),
             url_style: UrlStyle::default(),
             browse: BrowseOptions::default(),
+            fetch_interval: None,
         }
     }
 }
