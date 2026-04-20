@@ -152,9 +152,29 @@ fn cmp_f64(a: f64, b: f64) -> std::cmp::Ordering {
     a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
 }
 
+/// raw mode + alt screen を借りている間、panic / 早期 return でも必ず戻す RAII guard。
+///
+/// `enable_raw_mode()` 直後に `EnterAlternateScreen` や `Terminal::new` が失敗すると、
+/// cleanup ルートが走らず端末が壊れた状態で返ってしまう。`Drop` 実装で明示的に
+/// 後始末を走らせることで、どのルートから抜けても端末を戻せるようにする。
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let mut stdout = std::io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen);
+        // カーソル表示は crossterm の show_cursor() を直接叩く
+        let _ = execute!(stdout, crossterm::cursor::Show);
+    }
+}
+
 /// エントリポイント: TUI を起動してユーザが q で終了するまでブロック。
 pub fn run(report: ProfileReport) -> Result<()> {
     enable_raw_mode()?;
+    // raw mode を掴んだ直後に guard を作る — 以降の `?` や panic は Drop 経由で cleanup される。
+    let _guard = TerminalGuard;
+
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -163,8 +183,7 @@ pub fn run(report: ProfileReport) -> Result<()> {
     let mut state = ProfileTuiState::new(report);
     let result = run_loop(&mut terminal, &mut state);
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    // 正常終了ルート (Drop も追加で走るが冪等)
     terminal.show_cursor()?;
     result
 }

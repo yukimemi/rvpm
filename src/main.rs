@@ -4263,7 +4263,18 @@ async fn run_profile(
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
     let merged_dir = resolve_merged_dir(&cache_root);
     let loader_path = resolve_loader_path(&cache_root);
-    let user_config_root = resolve_config_root(config.options.config_root.as_deref());
+    // [user config] グループに入れるパス。rvpm 側 (`~/.config/rvpm/<appname>`) と
+    // Neovim 側 (`~/.config/<appname>/`) 両方を候補にして、init.lua が [runtime] に
+    // 落ちないようにする。
+    let rvpm_config_root = resolve_config_root(config.options.config_root.as_deref());
+    let nvim_config_root = nvim_init_lua_path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let user_config_roots: Vec<std::path::PathBuf> = [rvpm_config_root, nvim_config_root]
+        .into_iter()
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
 
     recover_stale_loader_backup(&loader_path);
 
@@ -4349,7 +4360,7 @@ async fn run_profile(
         plugins: plugin_entries,
         merged_dir,
         loader_path: loader_path.clone(),
-        user_config_root,
+        user_config_roots,
         marker_dir: marker_dir.clone(),
         no_merge,
         no_instrument,
@@ -4367,6 +4378,12 @@ async fn run_profile(
     }
 
     if json {
+        // `--top` は plain / JSON 両方に適用したいので、JSON 側でも truncate して
+        // 出力する。元の report は mutate せず clone を加工する。
+        let mut report = report.clone();
+        if let Some(n) = top {
+            report.plugins.truncate(n);
+        }
         let v = crate::profile::report_to_json(&report);
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());

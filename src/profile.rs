@@ -185,7 +185,7 @@ pub const GROUP_USER: &str = "[user config]";
 ///   1. `<plugin.root>/...` にマッチ → そのプラグイン
 ///   2. `<merged_dir>/...`             → [merged]
 ///   3. `<loader_path>` 完全一致        → [rvpm loader]
-///   4. `<user_config_root>/...`        → [user config]
+///   4. `<user_config_roots[i]>/...`    → [user config] (rvpm と Neovim 両方)
 ///   5. それ以外                         → [runtime]
 ///
 /// plugin の prefix は長い順に試す (深いパスが先にマッチするように) — 通常は
@@ -196,7 +196,7 @@ pub fn aggregate_single_run(
     plugins: &[PluginPathEntry],
     merged_dir: &str,
     loader_path: &str,
-    user_config_root: &str,
+    user_config_roots: &[String],
 ) -> HashMap<String, PluginStats> {
     // Windows 由来の backslash パスと nvim の forward slash 出力が混在するので、
     // 比較前にすべて forward slash + lowercase 化して揃える必要がある。
@@ -210,13 +210,17 @@ pub fn aggregate_single_run(
 
     let merged = normalize_path(merged_dir);
     let loader = normalize_path(loader_path);
-    let user_root = normalize_path(user_config_root);
+    let user_roots: Vec<String> = user_config_roots
+        .iter()
+        .map(|s| normalize_path(s))
+        .filter(|s| !s.is_empty())
+        .collect();
 
     let mut stats: HashMap<String, PluginStats> = HashMap::new();
 
     for entry in entries {
         let (owner_name, is_managed, lazy, rel) =
-            resolve_owner(&entry.path, &sorted_plugins, &merged, &loader, &user_root);
+            resolve_owner(&entry.path, &sorted_plugins, &merged, &loader, &user_roots);
 
         let s = stats
             .entry(owner_name.clone())
@@ -261,7 +265,7 @@ fn resolve_owner(
     sorted_plugins: &[&(String, PluginPathEntry)],
     merged: &str,
     loader: &str,
-    user_root: &str,
+    user_roots: &[String],
 ) -> (String, bool, bool, String) {
     // case-insensitive prefix match — Windows でドライブレター / 正規化揺れがあっても拾う
     let path_lc = path.to_ascii_lowercase();
@@ -269,14 +273,14 @@ fn resolve_owner(
     for (root, p) in sorted_plugins {
         let root_lc = root.to_ascii_lowercase();
         if path_starts_with(&path_lc, &root_lc) {
-            let rel = strip_prefix_with_sep(path, root);
+            let rel = strip_prefix_case_insensitive(path, root);
             return (p.name.clone(), true, p.lazy, rel);
         }
     }
 
     let merged_lc = merged.to_ascii_lowercase();
     if path_starts_with(&path_lc, &merged_lc) {
-        let rel = strip_prefix_with_sep(path, merged);
+        let rel = strip_prefix_case_insensitive(path, merged);
         return (GROUP_MERGED.to_string(), false, false, rel);
     }
 
@@ -289,10 +293,15 @@ fn resolve_owner(
         );
     }
 
-    let user_lc = user_root.to_ascii_lowercase();
-    if !user_root.is_empty() && path_starts_with(&path_lc, &user_lc) {
-        let rel = strip_prefix_with_sep(path, user_root);
-        return (GROUP_USER.to_string(), false, false, rel);
+    // 複数の user config root を長い順に試す (Neovim の ~/.config/nvim と rvpm の両方)
+    let mut sorted_user_roots: Vec<&String> = user_roots.iter().collect();
+    sorted_user_roots.sort_by_key(|r| std::cmp::Reverse(r.len()));
+    for user_root in sorted_user_roots {
+        let user_lc = user_root.to_ascii_lowercase();
+        if path_starts_with(&path_lc, &user_lc) {
+            let rel = strip_prefix_case_insensitive(path, user_root);
+            return (GROUP_USER.to_string(), false, false, rel);
+        }
     }
 
     // 最後の segment (basename) を相対パスとして保持 — 見やすさ重視
@@ -310,11 +319,17 @@ fn path_starts_with(path: &str, prefix: &str) -> bool {
     rest.is_empty() || rest.starts_with('/')
 }
 
-/// `path` から `prefix/` を除去した相対パス。prefix が末尾に `/` 無しでも対応。
-fn strip_prefix_with_sep(path: &str, prefix: &str) -> String {
-    let Some(rest) = path.strip_prefix(prefix) else {
+/// `path` から `prefix/` を除去した相対パス (case-insensitive 版)。
+///
+/// 呼び出し元は path_starts_with で小文字化した比較で一致確認済み前提。
+/// prefix.len() バイト分を slice する (ASCII 前提) ことで、大文字小文字の違いで
+/// strip_prefix が失敗して path 丸ごと返ってしまうのを防ぐ。ASCII 以外が prefix
+/// に含まれるケースは rvpm のパス生成経路では発生しない。
+fn strip_prefix_case_insensitive(path: &str, prefix: &str) -> String {
+    if path.len() < prefix.len() {
         return path.to_string();
-    };
+    }
+    let rest = &path[prefix.len()..];
     rest.trim_start_matches('/').to_string()
 }
 
@@ -322,6 +337,11 @@ fn strip_prefix_with_sep(path: &str, prefix: &str) -> String {
 /// Vec<PluginStats> (総 self 時間降順) に変換する。
 ///
 /// 各 run で出現しないプラグインは 0 ms として平均に含める (= 分母は runs)。
+///
+/// top_files は plugin 毎に `HashMap<path, 累積 (self_sum, sourced_sum)>` として
+/// run 間で累積してから平均化する。単一 run の top_files を丸ごと使って後で割る
+/// 方式だと「その 1 回に出た顔ぶれだけ」で、しかも 1 回分の時間を runs で割る分
+/// 過小評価になる問題があった。
 pub fn average_stats(
     runs_stats: Vec<HashMap<String, PluginStats>>,
     runs: usize,
@@ -330,6 +350,8 @@ pub fn average_stats(
         return Vec::new();
     }
     let mut merged: HashMap<String, PluginStats> = HashMap::new();
+    // plugin name → { file relative_path → (self_sum, sourced_sum) }
+    let mut files_acc: HashMap<String, HashMap<String, (f64, f64)>> = HashMap::new();
 
     for single in runs_stats {
         for (name, s) in single {
@@ -352,26 +374,41 @@ pub fn average_stats(
             entry.trig_ms += s.trig_ms;
             // file_count は run 間で同じはずなので max を取る
             entry.file_count = entry.file_count.max(s.file_count);
-            // top_files は最新 run のものを採用 (run 間で顔ぶれはほぼ同じ想定)
-            if entry.top_files.is_empty() || s.top_files.len() > entry.top_files.len() {
-                entry.top_files = s.top_files;
+            // ファイル単位で累積する
+            let file_map = files_acc.entry(name).or_default();
+            for f in &s.top_files {
+                let e = file_map
+                    .entry(f.relative_path.clone())
+                    .or_insert((0.0, 0.0));
+                e.0 += f.self_ms;
+                e.1 += f.sourced_ms;
             }
         }
     }
 
     let mut out: Vec<PluginStats> = merged
-        .into_values()
-        .map(|mut s| {
+        .into_iter()
+        .map(|(name, mut s)| {
             s.total_self_ms /= runs as f64;
             s.total_sourced_ms /= runs as f64;
             s.init_ms /= runs as f64;
             s.load_ms /= runs as f64;
             s.trig_ms /= runs as f64;
-            for f in s.top_files.iter_mut() {
-                // top_files の時間も run 平均に近づけるため runs で割る
-                // (実際にはその run 1 回分の値だが、視覚上プラグイン合計とズレるのを防ぐ)
-                f.self_ms /= runs as f64;
-                f.sourced_ms /= runs as f64;
+            if let Some(file_map) = files_acc.remove(&name) {
+                let mut files: Vec<FileStat> = file_map
+                    .into_iter()
+                    .map(|(path, (self_sum, sourced_sum))| FileStat {
+                        relative_path: path,
+                        self_ms: self_sum / runs as f64,
+                        sourced_ms: sourced_sum / runs as f64,
+                    })
+                    .collect();
+                files.sort_by(|a, b| {
+                    b.self_ms
+                        .partial_cmp(&a.self_ms)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                s.top_files = files;
             }
             s
         })
@@ -564,16 +601,17 @@ pub fn extract_total_ms(content: &str) -> f64 {
 }
 
 /// 1 回分の nvim startup を計測する。成功時は (startuptime 出力内容, 総起動 ms)。
-/// nvim コマンド失敗時は Err。
+/// nvim コマンド失敗時 (spawn 失敗 / 非 0 exit / timeout) は Err。
+///
+/// 一時ファイルは `tempfile::NamedTempFile` で取る — `Drop` で自動削除されるので、
+/// panic / 早期 return / timeout 時にも確実にクリーンアップされる。
 pub async fn run_single_startuptime(extra_args: &[&str]) -> anyhow::Result<(String, f64)> {
-    let tmp_path = std::env::temp_dir().join(format!(
-        "rvpm-profile-{}-{}.log",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let tmp = tempfile::Builder::new()
+        .prefix("rvpm-profile-")
+        .suffix(".log")
+        .tempfile()
+        .map_err(|e| anyhow::anyhow!("failed to create startuptime tempfile: {}", e))?;
+    let tmp_path = tmp.path().to_path_buf();
 
     let mut cmd = tokio::process::Command::new("nvim");
     cmd.arg("--headless")
@@ -588,21 +626,26 @@ pub async fn run_single_startuptime(extra_args: &[&str]) -> anyhow::Result<(Stri
     let out_result = tokio::time::timeout(timeout, cmd.output()).await;
 
     match out_result {
-        Ok(Ok(_out)) => {
+        Ok(Ok(out)) => {
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                anyhow::bail!(
+                    "nvim exited with {} (stderr: {})",
+                    out.status,
+                    stderr.trim()
+                );
+            }
             let content = std::fs::read_to_string(&tmp_path).unwrap_or_default();
-            let _ = std::fs::remove_file(&tmp_path);
             if content.is_empty() {
                 anyhow::bail!("nvim produced empty --startuptime output");
             }
             let total = extract_total_ms(&content);
+            // tmp は drop で自動削除される
+            drop(tmp);
             Ok((content, total))
         }
-        Ok(Err(e)) => {
-            let _ = std::fs::remove_file(&tmp_path);
-            Err(anyhow::anyhow!("failed to spawn nvim: {}", e))
-        }
+        Ok(Err(e)) => Err(anyhow::anyhow!("failed to spawn nvim: {}", e)),
         Err(_) => {
-            let _ = std::fs::remove_file(&tmp_path);
             anyhow::bail!("nvim --startuptime timed out after {:?}", timeout)
         }
     }
@@ -626,7 +669,9 @@ pub struct ProfileRunConfig {
     pub plugins: Vec<PluginPathEntry>,
     pub merged_dir: PathBuf,
     pub loader_path: PathBuf,
-    pub user_config_root: PathBuf,
+    /// rvpm 側と Neovim 側の config ディレクトリ。両方を [user config] 擬似
+    /// グループの帰属先として扱う (Neovim の init.lua が [runtime] に落ちないように)。
+    pub user_config_roots: Vec<PathBuf>,
     /// instrumentation 有効時の marker dir (空なら phase 分解をスキップ)。
     pub marker_dir: Option<PathBuf>,
     pub no_merge: bool,
@@ -641,7 +686,11 @@ pub async fn run_profile(cfg: ProfileRunConfig) -> anyhow::Result<ProfileReport>
 
     let merged_s = cfg.merged_dir.to_string_lossy().to_string();
     let loader_s = cfg.loader_path.to_string_lossy().to_string();
-    let user_s = cfg.user_config_root.to_string_lossy().to_string();
+    let user_s: Vec<String> = cfg
+        .user_config_roots
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
     let marker_s = cfg
         .marker_dir
         .as_ref()
@@ -657,7 +706,13 @@ pub async fn run_profile(cfg: ProfileRunConfig) -> anyhow::Result<ProfileReport>
             .map_err(|e| anyhow::anyhow!("profile run {}/{} failed: {}", i + 1, cfg.runs, e))?;
         totals.push(total);
         let entries = parse_startuptime(&content);
-        let mut stats = aggregate_single_run(&entries, &cfg.plugins, &merged_s, &loader_s, &user_s);
+        let mut stats = aggregate_single_run(
+            &entries,
+            &cfg.plugins,
+            &merged_s,
+            &loader_s,
+            user_s.as_slice(),
+        );
 
         // phase / per-plugin marker を parse できれば stats に反映
         if let Some(mdir) = &marker_s {
@@ -850,7 +905,7 @@ times in msec
             &plugins,
             "/cache/merged",
             "/cache/loader.lua",
-            "/config",
+            &["/config".to_string()],
         );
         let foo = stats.get("foo").expect("foo should exist");
         assert_eq!(foo.file_count, 2);
@@ -886,7 +941,7 @@ times in msec
             &plugins,
             "/cache/merged",
             "/cache/loader.lua",
-            "/config",
+            &["/config".to_string()],
         );
         assert!(stats.contains_key(GROUP_MERGED));
         assert!(stats.contains_key(GROUP_RUNTIME));
@@ -911,7 +966,7 @@ times in msec
             &plugins,
             "/cache/merged",
             "/cache/loader.lua",
-            "/config",
+            &["/config".to_string()],
         );
         assert!(stats.contains_key("inner"));
         assert!(!stats.contains_key("outer"));
@@ -1090,6 +1145,103 @@ times in msec
         assert_eq!(pp["alpha"].1, 0.0, "alpha has no trig");
         assert!((pp["beta"].1 - 0.3).abs() < 1e-6, "beta trig_ms");
         assert_eq!(pp["beta"].0, 0.0, "beta has no init");
+    }
+
+    #[test]
+    fn aggregate_accepts_multiple_user_config_roots() {
+        // Neovim の ~/.config/nvim と rvpm の ~/.config/rvpm の両方で [user config] にする
+        let entries = vec![
+            SourceEntry {
+                path: "/home/me/.config/nvim/init.lua".into(),
+                self_ms: 5.0,
+                sourced_ms: 5.0,
+            },
+            SourceEntry {
+                path: "/home/me/.config/rvpm/nvim/before.lua".into(),
+                self_ms: 2.0,
+                sourced_ms: 2.0,
+            },
+        ];
+        let stats = aggregate_single_run(
+            &entries,
+            &[],
+            "/cache/merged",
+            "/cache/loader.lua",
+            &[
+                "/home/me/.config/nvim".to_string(),
+                "/home/me/.config/rvpm/nvim".to_string(),
+            ],
+        );
+        let u = stats
+            .get(GROUP_USER)
+            .expect("should bucket under [user config]");
+        assert_eq!(u.file_count, 2);
+        assert!(!stats.contains_key(GROUP_RUNTIME));
+    }
+
+    #[test]
+    fn aggregate_strips_prefix_case_insensitive_on_windows_paths() {
+        // Windows drive letter を大文字で emit、plugin root を小文字で emit する実データ
+        // を想定。以前は `/c:/users/...` (rel に prefix 丸ごと残る) になっていた。
+        let entries = vec![SourceEntry {
+            path: "C:/Users/me/plugin/foo.lua".into(),
+            self_ms: 1.0,
+            sourced_ms: 1.0,
+        }];
+        let plugins = vec![PluginPathEntry {
+            name: "foo".into(),
+            root: "c:/users/me".into(),
+            lazy: false,
+        }];
+        let stats = aggregate_single_run(
+            &entries,
+            &plugins,
+            "/cache/merged",
+            "/cache/loader.lua",
+            &[],
+        );
+        let foo = stats.get("foo").expect("should match case-insensitive");
+        assert_eq!(foo.top_files[0].relative_path, "plugin/foo.lua");
+    }
+
+    #[test]
+    fn average_stats_aggregates_top_files_across_runs() {
+        // 同じ plugin が 2 runs に亘って登場し、同じ file を両方で source したとき、
+        // top_files の self_ms が単一 run 丸ごとじゃなく、平均 (合計 / runs) になるか。
+        let make_stats = |self_ms: f64| {
+            let mut m = HashMap::new();
+            m.insert(
+                "plug".to_string(),
+                PluginStats {
+                    name: "plug".into(),
+                    total_self_ms: self_ms,
+                    total_sourced_ms: self_ms,
+                    file_count: 1,
+                    top_files: vec![FileStat {
+                        relative_path: "plugin/x.lua".into(),
+                        self_ms,
+                        sourced_ms: self_ms,
+                    }],
+                    is_managed: true,
+                    lazy: false,
+                    init_ms: 0.0,
+                    load_ms: 0.0,
+                    trig_ms: 0.0,
+                },
+            );
+            m
+        };
+        let avg = average_stats(vec![make_stats(10.0), make_stats(20.0)], 2);
+        assert_eq!(avg.len(), 1);
+        let plug = &avg[0];
+        assert!((plug.total_self_ms - 15.0).abs() < 1e-6);
+        assert_eq!(plug.top_files.len(), 1);
+        // (10 + 20) / 2 = 15 — 以前のバグでは 10/2 = 5 になっていた
+        assert!(
+            (plug.top_files[0].self_ms - 15.0).abs() < 1e-6,
+            "got {}",
+            plug.top_files[0].self_ms
+        );
     }
 
     #[test]
