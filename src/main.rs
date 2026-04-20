@@ -750,13 +750,19 @@ async fn run_sync(
                 .await;
             let repo = Repo::new(&plugin.url, &dst_path, effective_rev.as_deref());
             // sync 実行判定:
-            //   want_fetch=true              → full flow (git fetch + checkout)
-            //   want_fetch=false, fast path OK → no-op (effective_rev を local 解決して HEAD 一致)
-            //   want_fetch=false, fast path NG → hard_skip なら error、それ以外は full flow
+            //   want_fetch=true                         → full flow (git fetch + checkout)
+            //   want_fetch=false, HEAD == target        → no-op fast path
+            //   want_fetch=false, local checkout 可能    → fast path (fetch なし checkout だけ)
+            //   want_fetch=false, local で満たせない     → hard_skip なら error、それ以外は full flow
             //
-            // effective_rev が branch/tag の場合でも local DB で SHA に解決してから
-            // 比較するので、`rev = "main"` / `rev = "v1.2.3"` 系でも fast path が効く。
-            // None (pin 無し) の場合は「HEAD 自体を target とみなす」= no-op ですませる。
+            // effective_rev が branch/tag でも local DB で SHA に解決してから比較
+            // するので `rev = "main"` / `rev = "v1.2.3"` 系でも fast path が効く。
+            // None (pin 無し) は「HEAD 自体を target」として no-op 扱い。
+            //
+            // HEAD != target でも commit が local にあれば、fetch せず checkout
+            // だけで満たせる (最近の window 内で別 rev へ切替えたケースなど) ので
+            // `checkout_locally` を試して成功すれば fast path 継続、失敗したら
+            // full flow に fall through する。
             let mut fetched = false;
             let res: Result<Option<crate::git::GitChange>> = if want_fetch {
                 fetched = true;
@@ -771,12 +777,31 @@ async fn run_sync(
                     None => head_now.clone(),
                     Some(rev) => repo.resolve_revision_locally(rev).await.ok().flatten(),
                 };
-                let can_fast_path = head_now.is_some() && head_now == target_sha;
-                if can_fast_path {
+                if head_now.is_some() && head_now == target_sha {
                     Ok(None)
+                } else if let Some(rev) = effective_rev.as_deref().filter(|_| dst_path.exists()) {
+                    // HEAD != target だけど clone はある → local-only checkout を試す。
+                    // 成功 = commit が local DB にあって切替えできた (fetched=false のまま)。
+                    // 失敗 = commit が local に無い → full flow か error。
+                    match repo.checkout_locally(rev).await {
+                        Ok(change) => Ok(change),
+                        Err(e) => {
+                            if hard_skip {
+                                Err(anyhow::anyhow!(
+                                    "{}: --no-refresh cannot be satisfied locally (rev '{}' not in local object DB: {})",
+                                    plugin.display_name(),
+                                    rev,
+                                    e,
+                                ))
+                            } else {
+                                fetched = true;
+                                repo.sync().await
+                            }
+                        }
+                    }
                 } else if hard_skip {
                     Err(anyhow::anyhow!(
-                        "{}: --no-refresh cannot be satisfied locally (need fetch for clone or rev change)",
+                        "{}: --no-refresh cannot be satisfied (plugin not cloned)",
                         plugin.display_name()
                     ))
                 } else {
