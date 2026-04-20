@@ -85,7 +85,7 @@ nvim_rc = "~/.config/nvim/rc"
 
 [options]
 # Parallel git operations limit (default: 13)
-concurrency = 10
+concurrency = 16
 
 # Auto-prune plugin dirs no longer referenced by config.toml on every
 # sync / generate. Default: false. Equivalent to always passing --prune.
