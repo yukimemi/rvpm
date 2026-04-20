@@ -75,6 +75,37 @@ impl<'a> Repo<'a> {
             .map_err(|e| anyhow::anyhow!("head_commit task panicked: {}", e))?
     }
 
+    /// 既存 clone に対して **fetch せず** `rev` を checkout する。fetch cache の
+    /// fast-path で「HEAD を effective_rev に揃えたいが window 内なので fetch は
+    /// したくない」ケースに使う。rev が local DB に無ければエラーを返すので、
+    /// caller は full sync にフォールバック (または `--no-refresh` なら error)
+    /// する。`sync()` と同じく `Option<GitChange>` で HEAD 差分を返す。
+    pub async fn checkout_locally(&self, rev: &str) -> Result<Option<GitChange>> {
+        let dst = self.dst.to_path_buf();
+        let rev = rev.to_string();
+        tokio::task::spawn_blocking(move || checkout_local_impl(&dst, &rev))
+            .await
+            .map_err(|e| anyhow::anyhow!("checkout_locally task panicked: {}", e))?
+    }
+
+    /// `rev` (commit SHA / branch / tag) をローカルリポジトリで解決し、対応する
+    /// commit SHA を返す。network を打たない。
+    ///
+    /// fetch cache の fast-path で「effective_rev (branch 名など) と local HEAD が
+    /// 同じ commit を指してるか」を判定するために使う。commit SHA 同士の直接
+    /// 比較だと `rev = "main"` / `rev = "v1.2.3"` 系をフォローできず、fast path
+    /// の恩恵が失われるため。
+    ///
+    /// 未 clone / rev が local DB に無い / パースエラー → `Ok(None)` (caller は
+    /// fast path 不適用として full flow に fall through する)。
+    pub async fn resolve_revision_locally(&self, rev: &str) -> Result<Option<String>> {
+        let dst = self.dst.to_path_buf();
+        let rev = rev.to_string();
+        tokio::task::spawn_blocking(move || resolve_revision_impl(&dst, &rev))
+            .await
+            .map_err(|e| anyhow::anyhow!("resolve_revision task panicked: {}", e))?
+    }
+
     /// fetch 後の remote tracking branch の tip commit を返す。HEAD は動かさない。
     ///
     /// lockfile pin (rev なしで lockfile commit に寄せられているケース) が remote の
@@ -173,6 +204,46 @@ fn read_head(dst: &Path) -> Result<String> {
     let repo = gix::open(dst)?;
     let head = repo.head_commit()?;
     Ok(head.id().to_string())
+}
+
+/// 既存 clone に対して fetch せず `rev` を checkout する。
+/// rev が local DB に無い場合は `gix_checkout` がエラーを返す (caller で fallback)。
+fn checkout_local_impl(dst: &Path, rev: &str) -> Result<Option<GitChange>> {
+    if !dst.exists() {
+        anyhow::bail!("Plugin not installed: {}", dst.display());
+    }
+    let before = read_head(dst).ok();
+    gix_checkout(dst, rev)?;
+    let after = read_head(dst)?;
+    Ok(build_change(dst, before, after))
+}
+
+/// `rev` を local DB で解決して **commit の** SHA 文字列を返す。
+/// 未 clone / 未解決は `None`。
+///
+/// `rev_parse_single` 単独では annotated tag のときに tag object の SHA が返って
+/// くる (commit SHA ではない)。そのまま local HEAD の commit SHA と比較すると
+/// 常に不一致になり fast path が無効化されるので、git の `<rev>^{commit}` 記法で
+/// tag chain を peel して commit に落とす。lightweight tag / branch / 生 SHA
+/// ではこの記法は no-op なので副作用なし。
+fn resolve_revision_impl(dst: &Path, rev: &str) -> Result<Option<String>> {
+    if !dst.exists() {
+        return Ok(None);
+    }
+    let repo = match gix::open(dst) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    let peeled = format!("{}^{{commit}}", rev);
+    if let Ok(id) = repo.rev_parse_single(&peeled[..]) {
+        return Ok(Some(id.detach().to_string()));
+    }
+    // `^{commit}` が効かない edge case (gix が記法非対応の revision 形式等) の
+    // 保険: plain parse を試す。
+    match repo.rev_parse_single(rev) {
+        Ok(id) => Ok(Some(id.detach().to_string())),
+        Err(_) => Ok(None),
+    }
 }
 
 /// remote tracking branch の tip を読み取る。HEAD は動かさない。
@@ -816,6 +887,183 @@ mod tests {
             "remote_head must report the fetched remote tip, not HEAD"
         );
         assert_ne!(rh.as_deref(), Some(initial.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_revision_locally_handles_sha_branch_tag_and_missing() {
+        // Fast-path comparison depends on being able to resolve branch/tag
+        // refs to SHAs locally without hitting the network. Exercise all
+        // four cases (full SHA / branch / tag / bogus) from a single repo.
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("a.txt"), "seed").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        git_cmd(&src)
+            .args(["tag", "v1.0.0"])
+            .output()
+            .await
+            .unwrap();
+        let head_sha = git_head(&src).await;
+        let branch = {
+            let out = git_cmd(&src)
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .output()
+                .await
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        repo.sync().await.unwrap();
+
+        // Full SHA round-trips.
+        assert_eq!(
+            repo.resolve_revision_locally(&head_sha).await.unwrap(),
+            Some(head_sha.clone()),
+        );
+        // Branch name resolves to the same SHA.
+        assert_eq!(
+            repo.resolve_revision_locally(&branch).await.unwrap(),
+            Some(head_sha.clone()),
+        );
+        // Tag name resolves to the same SHA.
+        assert_eq!(
+            repo.resolve_revision_locally("v1.0.0").await.unwrap(),
+            Some(head_sha.clone()),
+        );
+        // Nonexistent rev degrades to None (caller falls through to full sync).
+        assert_eq!(
+            repo.resolve_revision_locally("no-such-rev").await.unwrap(),
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_revision_locally_returns_none_on_missing_clone() {
+        let root = tempdir().unwrap();
+        let dst = root.path().join("never-cloned");
+        let repo = Repo::new("dummy", &dst, None);
+        assert_eq!(repo.resolve_revision_locally("HEAD").await.unwrap(), None,);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_revision_locally_peels_annotated_tag_to_commit() {
+        // Annotated tags are backed by their own tag object whose SHA differs
+        // from the commit they point at. Plain `rev_parse_single` returns the
+        // tag-object SHA, which would never match HEAD and silently disable
+        // the fast path. Verify we peel to the underlying commit.
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("a.txt"), "seed").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        git_cmd(&src)
+            .args(["tag", "-a", "v2.0.0", "-m", "annotated"])
+            .output()
+            .await
+            .unwrap();
+        let head_sha = git_head(&src).await;
+
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        repo.sync().await.unwrap();
+
+        assert_eq!(
+            repo.resolve_revision_locally("v2.0.0").await.unwrap(),
+            Some(head_sha),
+            "annotated tag must resolve to the target commit SHA",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkout_locally_moves_head_to_existing_commit() {
+        // --no-refresh path: HEAD at commit B, user wants A, and A is already
+        // in the local object DB. `checkout_locally` must move HEAD without
+        // talking to the network. We build the DB directly with `git init` +
+        // two commits in dst, bypassing `repo.sync()` — sync uses a shallow
+        // (depth-1) clone that would not keep the older commit locally and
+        // would mask the exact code path we want to exercise.
+        let root = tempdir().unwrap();
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&dst).unwrap();
+        git_cmd(&dst).args(["init"]).output().await.unwrap();
+        fs::write(dst.join("a.txt"), "v1").unwrap();
+        git_cmd(&dst).args(["add", "."]).output().await.unwrap();
+        git_cmd(&dst)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        let first = git_head(&dst).await;
+        fs::write(dst.join("a.txt"), "v2").unwrap();
+        git_cmd(&dst).args(["add", "."]).output().await.unwrap();
+        git_cmd(&dst)
+            .args(["commit", "-m", "bump"])
+            .output()
+            .await
+            .unwrap();
+        let second = git_head(&dst).await;
+
+        let repo = Repo::new("dummy", &dst, None);
+        assert_eq!(repo.head_commit().await.unwrap(), second);
+
+        let change = repo.checkout_locally(&first).await.unwrap();
+        assert!(
+            change.is_some(),
+            "HEAD should have moved, expected a GitChange"
+        );
+        assert_eq!(repo.head_commit().await.unwrap(), first);
+
+        // Re-checkout of the same rev is a no-op (None GitChange).
+        let change = repo.checkout_locally(&first).await.unwrap();
+        assert!(change.is_none(), "re-checkout of same rev should be no-op");
+    }
+
+    #[tokio::test]
+    async fn test_checkout_locally_errors_when_rev_not_present() {
+        // The commit isn't in the local object DB → error. Caller uses this
+        // signal to fall through to full sync (or surface under --no-refresh).
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("a.txt"), "only").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        repo.sync().await.unwrap();
+
+        let result = repo
+            .checkout_locally("ffffffffffffffffffffffffffffffffffffffff")
+            .await;
+        assert!(
+            result.is_err(),
+            "unknown rev must error, not silently succeed"
+        );
     }
 
     #[tokio::test]

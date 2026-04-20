@@ -4,6 +4,7 @@ mod chezmoi;
 mod config;
 mod doctor;
 mod external_render;
+mod fetch_state;
 mod git;
 mod helptags;
 mod link;
@@ -79,6 +80,17 @@ enum Commands {
         /// need to rerun e.g. `:TSUpdate` or a manual rebuild step.
         #[arg(long)]
         rebuild: bool,
+        /// Force-refresh every plugin's git state regardless of the fetch
+        /// cache (`options.fetch_interval`). Useful before checking for
+        /// held-back plugins when you want a guaranteed fresh remote read.
+        #[arg(long, conflicts_with = "no_refresh")]
+        refresh: bool,
+        /// Skip git fetch for every plugin regardless of the fetch cache
+        /// (offline mode). Plugins whose local HEAD already matches the
+        /// effective rev complete instantly; others fall through to a local
+        /// checkout that errors if the commit isn't already available.
+        #[arg(long, conflicts_with = "refresh")]
+        no_refresh: bool,
     },
 
     /// Regenerate loader.lua only (no git)
@@ -298,8 +310,10 @@ async fn main() -> Result<()> {
             frozen,
             no_lock,
             rebuild,
+            refresh,
+            no_refresh,
         } => {
-            run_sync(prune, frozen, no_lock, rebuild).await?;
+            run_sync(prune, frozen, no_lock, rebuild, refresh, no_refresh).await?;
         }
         Commands::Generate => {
             run_generate().await?;
@@ -525,7 +539,14 @@ fn classify_held_back(
     }
 }
 
-async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Result<()> {
+async fn run_sync(
+    prune: bool,
+    frozen: bool,
+    no_lock: bool,
+    rebuild: bool,
+    refresh: bool,
+    no_refresh: bool,
+) -> Result<()> {
     // `--frozen` は lockfile に依存した strict check、`--no-lock` は lockfile を
     // 完全無視する escape hatch。両方立つと「strict のつもりが silently latest を
     // pull する」矛盾状態になるので、fail fast させる (CI の思い込みを防ぐ)。
@@ -534,6 +555,18 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Re
             "--frozen cannot be combined with --no-lock (they contradict: one requires the lockfile, the other ignores it)"
         );
     }
+    // `--refresh` / `--no-refresh` は clap 側の `conflicts_with` で既に弾かれて
+    // いるが念のため。
+    if refresh && no_refresh {
+        anyhow::bail!("--refresh cannot be combined with --no-refresh");
+    }
+    let refresh_mode = if refresh {
+        crate::fetch_state::RefreshMode::Force
+    } else if no_refresh {
+        crate::fetch_state::RefreshMode::Skip
+    } else {
+        crate::fetch_state::RefreshMode::Auto
+    };
 
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)
@@ -603,6 +636,47 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Re
             .collect()
     };
 
+    // fetch cache: per-plugin 最終 fetch 時刻を読み込んで、staleness window 内の
+    // プラグインの fetch をスキップするための判定テーブルを作る。
+    // - state の場所は `<cache_root>/fetch_state.json`
+    // - `options.fetch_interval` でウィンドウサイズ、CLI の `--refresh` / `--no-refresh`
+    //   で上書き可能
+    // - state 読み込みは lockfile と同じく malformed 時は empty fallback (resilience)
+    let fetch_state_path = resolve_fetch_state_path(&cache_root);
+    let mut fetch_state = crate::fetch_state::FetchState::load(&fetch_state_path);
+    let fetch_interval =
+        crate::fetch_state::resolve_fetch_interval(config.options.fetch_interval.as_deref());
+    let now_sys = std::time::SystemTime::now();
+    // name → &FetchEntry の lookup map を先に組んで、plugin ごとの find を O(1) に
+    // する (fetch_state.find は線形スキャンなので、200+ plugin 構成で pre-compute
+    // 全体が O(N^2) になってしまう)。URL 不一致 (= 同じ name で別リポジトリに
+    // 差し替えられた等) は lockfile と同じく「未管理」扱いにして last_fetched を
+    // 無視する — 旧 URL のタイムスタンプで fetch を省略して、新 URL の fetch を
+    // 取りこぼすのを防ぐ。
+    let fetch_lookup: std::collections::HashMap<&str, &crate::fetch_state::FetchEntry> =
+        fetch_state
+            .entries
+            .iter()
+            .map(|e| (e.name.as_str(), e))
+            .collect();
+    let fetch_decisions: std::collections::HashMap<String, bool> = config
+        .plugins
+        .iter()
+        .filter(|p| !p.dev)
+        .map(|p| {
+            let name = p.display_name();
+            let last = fetch_lookup
+                .get(name.as_str())
+                .filter(|e| urls_match(&e.url, &p.url))
+                .map(|e| e.last_fetched.as_str());
+            (
+                name,
+                crate::fetch_state::should_fetch(last, now_sys, fetch_interval, refresh_mode),
+            )
+        })
+        .collect();
+    let is_hard_skip = refresh_mode == crate::fetch_state::RefreshMode::Skip;
+
     if merged_dir.exists() {
         let _ = std::fs::remove_dir_all(&merged_dir);
     }
@@ -658,6 +732,12 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Re
                 .map(|e| e.commit.clone())
         });
 
+        // pre-computed fetch decision: true なら通常フロー、false なら fast-path
+        // 候補。clone 欠損 or HEAD != effective_rev で fast-path が使えないときは、
+        // `--no-refresh` (is_hard_skip) なら error、それ以外なら full flow にフォール。
+        let want_fetch = *fetch_decisions.get(&plugin.display_name()).unwrap_or(&true);
+        let hard_skip = is_hard_skip;
+
         let config_for_build = config.clone();
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
@@ -669,7 +749,66 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Re
                 ))
                 .await;
             let repo = Repo::new(&plugin.url, &dst_path, effective_rev.as_deref());
-            let res = repo.sync().await;
+            // sync 実行判定:
+            //   want_fetch=true                         → full flow (git fetch + checkout)
+            //   want_fetch=false, HEAD == target        → no-op fast path
+            //   want_fetch=false, local checkout 可能    → fast path (fetch なし checkout だけ)
+            //   want_fetch=false, local で満たせない     → hard_skip なら error、それ以外は full flow
+            //
+            // effective_rev が branch/tag でも local DB で SHA に解決してから比較
+            // するので `rev = "main"` / `rev = "v1.2.3"` 系でも fast path が効く。
+            // None (pin 無し) は「HEAD 自体を target」として no-op 扱い。
+            //
+            // HEAD != target でも commit が local にあれば、fetch せず checkout
+            // だけで満たせる (最近の window 内で別 rev へ切替えたケースなど) ので
+            // `checkout_locally` を試して成功すれば fast path 継続、失敗したら
+            // full flow に fall through する。
+            let mut fetched = false;
+            let res: Result<Option<crate::git::GitChange>> = if want_fetch {
+                fetched = true;
+                repo.sync().await
+            } else {
+                let head_now = if dst_path.exists() {
+                    repo.head_commit().await.ok()
+                } else {
+                    None
+                };
+                let target_sha: Option<String> = match effective_rev.as_deref() {
+                    None => head_now.clone(),
+                    Some(rev) => repo.resolve_revision_locally(rev).await.ok().flatten(),
+                };
+                if head_now.is_some() && head_now == target_sha {
+                    Ok(None)
+                } else if let Some(rev) = effective_rev.as_deref().filter(|_| dst_path.exists()) {
+                    // HEAD != target だけど clone はある → local-only checkout を試す。
+                    // 成功 = commit が local DB にあって切替えできた (fetched=false のまま)。
+                    // 失敗 = commit が local に無い → full flow か error。
+                    match repo.checkout_locally(rev).await {
+                        Ok(change) => Ok(change),
+                        Err(e) => {
+                            if hard_skip {
+                                Err(anyhow::anyhow!(
+                                    "{}: --no-refresh cannot be satisfied locally (rev '{}' not in local object DB: {})",
+                                    plugin.display_name(),
+                                    rev,
+                                    e,
+                                ))
+                            } else {
+                                fetched = true;
+                                repo.sync().await
+                            }
+                        }
+                    }
+                } else if hard_skip {
+                    Err(anyhow::anyhow!(
+                        "{}: --no-refresh cannot be satisfied (plugin not cloned)",
+                        plugin.display_name()
+                    ))
+                } else {
+                    fetched = true;
+                    repo.sync().await
+                }
+            };
             match res {
                 Ok(change) => {
                     // build は HEAD が動いたとき (= fresh clone or pull で新 commit を
@@ -709,26 +848,36 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Re
                     // held-back 判定用に remote tracking tip を読む (HEAD は動かさない)。
                     // 失敗時は None → classify_held_back 側で「判定不能」扱いになり、
                     // 結果として held_back リストには積まれない (resilience)。
+                    //
+                    // fast-path (fetched = false) で分類すると local の remote tracking
+                    // ref が stale なので、window 中に上流が動いたケースで false positive
+                    // を出す。fast path では一律 None にして、window 超過で full fetch
+                    // したタイミングで再評価する。
+                    //
                     // 分類が None 確定の前提条件 (explicit rev / lockfile 寄与なし) では
                     // gix open 自体をスキップして 200+ プラグイン構成の I/O を減らす。
-                    let remote_head = if plugin.rev.is_none() && effective_rev.is_some() {
-                        repo.remote_head().await.ok().flatten()
+                    let held_back = if fetched {
+                        let remote_head = if plugin.rev.is_none() && effective_rev.is_some() {
+                            repo.remote_head().await.ok().flatten()
+                        } else {
+                            None
+                        };
+                        classify_held_back(
+                            plugin.rev.as_deref(),
+                            effective_rev.as_deref(),
+                            head_commit.as_deref(),
+                            remote_head.as_deref(),
+                        )
+                        .map(|(pinned, remote)| HeldBackPin {
+                            name: plugin.display_name(),
+                            pinned,
+                            remote,
+                        })
                     } else {
                         None
                     };
-                    let held_back = classify_held_back(
-                        plugin.rev.as_deref(),
-                        effective_rev.as_deref(),
-                        head_commit.as_deref(),
-                        remote_head.as_deref(),
-                    )
-                    .map(|(pinned, remote)| HeldBackPin {
-                        name: plugin.display_name(),
-                        pinned,
-                        remote,
-                    });
                     let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
-                    Ok((plugin, dst_path, build_warn, change, head_commit, held_back))
+                    Ok((plugin, dst_path, build_warn, change, head_commit, held_back, fetched))
                 }
                 Err(e) => {
                     let _ = tx
@@ -790,7 +939,7 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Re
             Some((url, status)) = rx.recv() => { tui_state.update_status(&url, status); }
             Some(res) = set.join_next() => {
                 finished_tasks += 1;
-                if let Ok(Ok((plugin, dst_path, build_warn, git_change, head_commit, pin))) = res {
+                if let Ok(Ok((plugin, dst_path, build_warn, git_change, head_commit, pin, fetched))) = res {
                     if let Some(warn) = build_warn {
                         build_warnings.push((plugin.url.clone(), warn));
                     }
@@ -799,6 +948,16 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Re
                     }
                     if let Some(p) = pin {
                         held_back.push(p);
+                    }
+                    // fetch を実行したプラグインだけ last_fetched を更新する。
+                    // fast-path で素通ししたプラグインは元のタイムスタンプを保つ
+                    // ので次回も window 判定に同じ起点を使う。
+                    if fetched {
+                        fetch_state.upsert(crate::fetch_state::FetchEntry {
+                            name: plugin.display_name(),
+                            url: plugin.url.clone(),
+                            last_fetched: crate::fetch_state::now_rfc3339(),
+                        });
                     }
                     // lockfile 更新: sync 完了後の現 HEAD を pin として記録。
                     // `--no-lock` 時もこの in-memory 更新は行うが、terminal save は飛ばすので
@@ -1014,6 +1173,25 @@ async fn run_sync(prune: bool, frozen: bool, no_lock: bool, rebuild: bool) -> Re
         } else {
             chezmoi::apply(&wp, &lockfile_path).await;
         }
+    }
+
+    // fetch cache の永続化は lockfile とは独立。`--no-lock` でも保存する
+    // (ephemeral cache は dotfile 管理の reproducibility と無関係で、ユーザー
+    // マシン単位のローカル最適化だけの話なので)。config.toml から外された
+    // プラグインの entry は drop する。
+    let active_names: std::collections::HashSet<String> = config
+        .plugins
+        .iter()
+        .filter(|p| !p.dev)
+        .map(|p| p.display_name())
+        .collect();
+    fetch_state.retain_by_names(&active_names);
+    if let Err(e) = fetch_state.save(&fetch_state_path) {
+        eprintln!(
+            "\u{26a0} failed to save {}: {} (fetch cache may be stale)",
+            fetch_state_path.display(),
+            e
+        );
     }
 
     print_init_lua_hint_if_missing(&config);
@@ -1638,13 +1816,13 @@ async fn run_list(no_tui: bool) -> Result<bool> {
                 }
                 crossterm::event::KeyCode::Char('S') => {
                     leave_tui(&mut terminal)?;
-                    let _ = run_sync(false, false, false, false).await;
+                    let _ = run_sync(false, false, false, false, false, false).await;
                     wait_for_keypress("\nPress any key to return to list...")?;
                     reload!();
                 }
                 crossterm::event::KeyCode::Char('R') => {
                     leave_tui(&mut terminal)?;
-                    let _ = run_sync(false, false, false, true).await;
+                    let _ = run_sync(false, false, false, true, false, false).await;
                     wait_for_keypress("\nPress any key to return to list...")?;
                     reload!();
                 }
@@ -3143,6 +3321,12 @@ fn resolve_update_log_path(cache_root: &Path) -> PathBuf {
 /// `<cache_root>/merge_conflicts.json` 固定 (`update_log.json` と同じ場所)。
 fn resolve_merge_conflicts_path(cache_root: &Path) -> PathBuf {
     cache_root.join("merge_conflicts.json")
+}
+
+/// プラグイン単位の最終 fetch 時刻キャッシュ。
+/// `<cache_root>/fetch_state.json` 固定 (update_log / merge_conflicts と同じ場所)。
+fn resolve_fetch_state_path(cache_root: &Path) -> PathBuf {
+    cache_root.join("fetch_state.json")
 }
 
 /// `Plugin` + `GitChange` から永続化向けの `ChangeRecord` を組み立てる小ヘルパー。

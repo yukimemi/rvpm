@@ -1306,6 +1306,7 @@ mod tests {
                 auto_helptags: false,
                 url_style: UrlStyle::Short,
                 browse: BrowseOptions::default(),
+                fetch_interval: None,
             },
             plugins,
         }
