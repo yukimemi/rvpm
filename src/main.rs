@@ -602,23 +602,25 @@ fn classify_held_back(
 
 /// 現在の plugin が `--rebuild [QUERY]` のスコープに入るか判定する。
 ///
-/// - `rebuild_filter = None` (フラグ未指定) → 常に false (build 強制しない)
-/// - `rebuild_filter = Some("")` (フラグのみ、値無し) → 常に true (全 plugin)
-/// - `rebuild_filter = Some(q)` (フラグ + query) → plugin の url / name の
-///   いずれかに q (小文字化後) が含まれれば true
-fn matches_rebuild_filter(plugin: &crate::config::Plugin, rebuild_filter: Option<&str>) -> bool {
-    match rebuild_filter {
+/// `rebuild_filter_lc` は **呼び出し側で小文字化済み** の前提。`run_sync` は N
+/// プラグインを回すので、N 回同じ query を lowercase するコストを避けるため
+/// 事前正規化を外側に持たせている。
+///
+/// - `None` (フラグ未指定) → 常に false (build 強制しない)
+/// - `Some("")` (フラグのみ、値無し) → 常に true (全 plugin)
+/// - `Some(q)` (フラグ + query) → plugin の url / name の
+///   いずれかに q が含まれれば true。url 側で決着すれば name の lowercase
+///   allocation は走らない (短絡評価)。
+fn matches_rebuild_filter(plugin: &crate::config::Plugin, rebuild_filter_lc: Option<&str>) -> bool {
+    match rebuild_filter_lc {
         None => false,
         Some("") => true,
-        Some(q) => {
-            let qlc = q.to_ascii_lowercase();
-            let url_lc = plugin.url.to_ascii_lowercase();
-            let name_lc = plugin
-                .name
-                .as_deref()
-                .map(|n| n.to_ascii_lowercase())
-                .unwrap_or_default();
-            url_lc.contains(&qlc) || name_lc.contains(&qlc)
+        Some(qlc) => {
+            plugin.url.to_ascii_lowercase().contains(qlc)
+                || plugin
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| n.to_ascii_lowercase().contains(qlc))
         }
     }
 }
@@ -782,6 +784,11 @@ async fn run_sync(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
     let mut set = JoinSet::new();
 
+    // `--rebuild [QUERY]` のクエリは plugin 数だけループで照合するので、
+    // ここで 1 回だけ lowercase して per-plugin の再計算を避ける。
+    // `None` / `Some("")` はそのまま、`Some(q)` は `Some(q.to_lowercase())`。
+    let rebuild_filter_lc: Option<String> = rebuild.as_deref().map(|q| q.to_ascii_lowercase());
+
     for plugin in config.plugins.iter() {
         // dev プラグインは sync をスキップ (ローカル開発中のためリセットしない)
         if plugin.dev {
@@ -824,7 +831,8 @@ async fn run_sync(
 
         // --rebuild [QUERY] のスコープ判定は closure 外で済ませて bool を move する
         // (`rebuild_filter: &Option<String>` のライフタイムを async move に引き込まない)。
-        let force_rebuild = matches_rebuild_filter(&plugin, rebuild.as_deref());
+        // query は外側で lowercase 済み (`rebuild_filter_lc`)。
+        let force_rebuild = matches_rebuild_filter(&plugin, rebuild_filter_lc.as_deref());
 
         let config_for_build = config.clone();
         set.spawn(async move {
@@ -5206,10 +5214,21 @@ mod tests {
 
     #[test]
     fn test_rebuild_filter_substring_matches_url() {
+        // 呼び出し側で lowercase 済みの query を渡す契約。
         let p = mk_plugin("nvim-treesitter/nvim-treesitter", None);
         assert!(matches_rebuild_filter(&p, Some("treesitter")));
-        assert!(matches_rebuild_filter(&p, Some("TREESITTER"))); // case-insensitive
         assert!(!matches_rebuild_filter(&p, Some("telescope")));
+    }
+
+    #[test]
+    fn test_rebuild_filter_requires_caller_to_lowercase_query() {
+        // 契約: caller が lowercase してから渡す。大文字混じりは一致しない
+        // (run_sync 側で事前正規化する理由)。
+        let p = mk_plugin("nvim-treesitter/nvim-treesitter", None);
+        assert!(
+            !matches_rebuild_filter(&p, Some("TREESITTER")),
+            "case-insensitivity is the caller's responsibility"
+        );
     }
 
     #[test]
