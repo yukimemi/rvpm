@@ -206,11 +206,17 @@ pub fn expected_markers(scripts: &[PluginScripts]) -> Vec<String> {
 }
 
 /// marker の source 命令を emit する helper。profile が有効な場合のみ動作。
+///
+/// marker_dir にスペースや `%` などの Vim ex-command で特殊扱いされる文字が
+/// 入っていても壊れないよう、Lua 側で `vim.fn.fnameescape()` を掛ける。
+/// Windows の tmp dir は通常 `C:\Users\<name>\AppData\Local\Temp\...` だが、
+/// `<name>` に空白を含むアカウント (例: "John Doe") が実在するので対策必須。
 fn emit_marker(lua: &mut String, profile: Option<&ProfileOptions>, event: &str) {
     if let Some(p) = profile {
+        let path = format!("{}/{}.vim", p.marker_dir.trim_end_matches('/'), event);
         lua.push_str(&format!(
-            "vim.cmd(\"source {}/{}.vim\")\n",
-            p.marker_dir, event
+            "vim.cmd(\"source \" .. vim.fn.fnameescape({}))\n",
+            lua_quote(&path)
         ));
     }
 }
@@ -374,19 +380,9 @@ end
         if let Some(init) = &s.init {
             let safe = sanitize_name(&s.name);
             let mut body = String::new();
-            if let Some(p) = profile {
-                body.push_str(&format!(
-                    "vim.cmd(\"source {}/init-{}-begin.vim\")\n",
-                    p.marker_dir, safe
-                ));
-            }
+            emit_marker(&mut body, profile, &format!("init-{}-begin", safe));
             body.push_str(&format!("dofile(\"{}\")\n", init.replace('\\', "/")));
-            if let Some(p) = profile {
-                body.push_str(&format!(
-                    "vim.cmd(\"source {}/init-{}-end.vim\")\n",
-                    p.marker_dir, safe
-                ));
-            }
+            emit_marker(&mut body, profile, &format!("init-{}-end", safe));
             push_with_cond(&mut lua, &s.cond, &body);
         }
     }
@@ -475,12 +471,9 @@ end
             continue;
         }
         let path = s.path.replace('\\', "/");
-        if let Some(p) = profile {
+        if profile.is_some() {
             let safe = sanitize_name(&s.name);
-            lua.push_str(&format!(
-                "vim.cmd(\"source {}/trig-{}-begin.vim\")\n",
-                p.marker_dir, safe
-            ));
+            emit_marker(&mut lua, profile, &format!("trig-{}-begin", safe));
         }
         let before = s
             .before
@@ -731,12 +724,9 @@ end
         }
 
         body.push_str("end\n");
-        if let Some(p) = profile {
+        if profile.is_some() {
             let safe = sanitize_name(&s.name);
-            body.push_str(&format!(
-                "vim.cmd(\"source {}/trig-{}-end.vim\")\n",
-                p.marker_dir, safe
-            ));
+            emit_marker(&mut body, profile, &format!("trig-{}-end", safe));
         }
         push_with_cond(&mut lua, &s.cond, &body);
     }

@@ -193,7 +193,7 @@ fn run_loop(
     state: &mut ProfileTuiState,
 ) -> Result<()> {
     loop {
-        terminal.draw(|f| draw(f, state))?;
+        terminal.draw(|f| draw(f, state))?; // state は &mut で渡す (ratatui の state mutation を失わないため)
         if event::poll(std::time::Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
         {
@@ -215,7 +215,7 @@ fn run_loop(
     }
 }
 
-fn draw(f: &mut Frame, state: &ProfileTuiState) {
+fn draw(f: &mut Frame, state: &mut ProfileTuiState) {
     let area = f.area();
     let has_timeline = state.report.phase_timeline.is_some();
     let timeline_h = if has_timeline { 4 } else { 0 };
@@ -235,6 +235,10 @@ fn draw(f: &mut Frame, state: &ProfileTuiState) {
     if has_timeline {
         draw_phase_timeline(f, chunks[1], state);
     }
+    // plugin table のみ state を mutate する (ratatui の render_stateful_widget が
+    // TableState.offset を更新するため)。TableState は Copy 実装なので単純 copy
+    // すると描画後の offset 更新が破棄され、大量の plugin がある時にスクロール
+    // 位置が伝わらない。
     draw_plugin_table(f, chunks[2], state);
     draw_detail(f, chunks[3], state);
     draw_footer(f, chunks[4], state);
@@ -375,7 +379,7 @@ fn phase_label(name: &str) -> String {
     }
 }
 
-fn draw_plugin_table(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
+fn draw_plugin_table(f: &mut Frame, area: Rect, state: &mut ProfileTuiState) {
     let vis = state.visible_indices();
     // バー幅計算用の最大 (選んでいる sort key に揃える)
     let max_for_sort = vis
@@ -532,8 +536,10 @@ fn draw_plugin_table(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
     )
     .highlight_symbol("\u{25b6} ");
 
-    let mut ts = state.table_state;
-    f.render_stateful_widget(table, area, &mut ts);
+    // `&mut state.table_state` を直接渡す — TableState は Copy だが、copy を渡すと
+    // render_stateful_widget による offset 更新が捨てられて大量 plugin のスクロール
+    // が機能しない。
+    f.render_stateful_widget(table, area, &mut state.table_state);
 
     if vis.len() > area.height.saturating_sub(3) as usize {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)

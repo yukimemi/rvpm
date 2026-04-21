@@ -311,9 +311,16 @@ fn resolve_owner(
 
 /// `path` が `prefix` で始まり、かつ prefix の直後が `/` or EOL であることを確認。
 /// 単純な starts_with だと `/foo/barbaz` が prefix `/foo/bar` にマッチしてしまう。
+///
+/// `prefix` に末尾 `/` が含まれていれば、その時点でセグメント境界が保証されている
+/// ので追加チェック不要。そうでないとき `path[prefix.len()..]` が `/` 区切りか
+/// EOL であるかを確認する。
 fn path_starts_with(path: &str, prefix: &str) -> bool {
     if !path.starts_with(prefix) {
         return false;
+    }
+    if prefix.ends_with('/') {
+        return true;
     }
     let rest = &path[prefix.len()..];
     rest.is_empty() || rest.starts_with('/')
@@ -437,8 +444,14 @@ pub struct MarkerEvent {
 /// `sourcing <marker_dir>/<name>.vim` という形の行を検出し、
 /// event 名 (拡張子除く) と clock 値を取り出す。
 /// marker_dir は forward-slash 正規化済みの絶対パス前提。
+///
+/// 境界チェックは `path_starts_with` を使い、`/tmp/markers` が `/tmp/markers-old/...`
+/// に誤マッチしないようセグメント区切りまで揃えて比較する。
 pub fn parse_marker_events(content: &str, marker_dir_normalized: &str) -> Vec<MarkerEvent> {
-    let prefix_lc = marker_dir_normalized.to_ascii_lowercase();
+    let prefix = normalize_path(marker_dir_normalized)
+        .trim_end_matches('/')
+        .to_string();
+    let prefix_lc = prefix.to_ascii_lowercase();
     let mut events = Vec::new();
     for line in content.lines() {
         let Some((head, tail)) = line.split_once(':') else {
@@ -456,11 +469,10 @@ pub fn parse_marker_events(content: &str, marker_dir_normalized: &str) -> Vec<Ma
         };
         let path = normalize_path(rest.trim());
         let path_lc = path.to_ascii_lowercase();
-        // prefix match with trailing slash to avoid adjacency collisions
-        if !path_lc.starts_with(&prefix_lc) {
+        if !path_starts_with(&path_lc, &prefix_lc) {
             continue;
         }
-        let rest_after = &path[prefix_lc.len()..];
+        let rest_after = &path[prefix.len()..];
         let rest_after = rest_after.trim_start_matches('/');
         // `.vim` 拡張子を除いて event 名として取り出す
         let name = rest_after.trim_end_matches(".vim").to_string();
@@ -714,6 +726,14 @@ pub async fn run_profile(cfg: ProfileRunConfig) -> anyhow::Result<ProfileReport>
             user_s.as_slice(),
         );
 
+        // eager プラグインの load_ms は instrumentation の有無に関わらず
+        // sourcing 合計で近似できるので、marker_s != None 条件の外で先に書く。
+        for s in stats.values_mut() {
+            if s.is_managed && !s.lazy {
+                s.load_ms = s.total_self_ms;
+            }
+        }
+
         // phase / per-plugin marker を parse できれば stats に反映
         if let Some(mdir) = &marker_s {
             let markers = parse_marker_events(&content, mdir);
@@ -743,17 +763,17 @@ pub async fn run_profile(cfg: ProfileRunConfig) -> anyhow::Result<ProfileReport>
                 }
             }
 
+            // `cfg.plugins.iter().find` を掛けると O(N²) になるので、s.name を
+            // 直接 sanitize して per_plugin から引くだけの O(N) に留める。
+            // PluginStats は既に is_managed / lazy を保持済みなので追加の lookup は不要。
             for s in stats.values_mut() {
-                if let Some(plugin) = cfg.plugins.iter().find(|p| p.name == s.name) {
-                    let safe = crate::loader::sanitize_name(&plugin.name);
-                    if let Some((init, trig)) = per_plugin.get(&safe) {
-                        s.init_ms = *init;
-                        s.trig_ms = *trig;
-                    }
+                if !s.is_managed {
+                    continue;
                 }
-                // eager プラグインの load_ms は sourcing 合計で近似
-                if s.is_managed && !s.lazy {
-                    s.load_ms = s.total_self_ms;
+                let safe = crate::loader::sanitize_name(&s.name);
+                if let Some((init, trig)) = per_plugin.get(&safe) {
+                    s.init_ms = *init;
+                    s.trig_ms = *trig;
                 }
             }
             phase_timelines.push(phases);

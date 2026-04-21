@@ -4213,9 +4213,26 @@ impl Drop for LoaderSwapGuard {
 }
 
 /// 起動時に前回 crash 由来の `loader.lua.bak` があれば検出して復元する。
+///
+/// ただし現在の loader.lua が `rvpm-profile-markers-` を含まない (= 既にクリーン
+/// な generate で上書き済み) ケースでは、戻すべきでない古い bak を捨てる。
+/// これをしないと「crash 後にユーザが `rvpm generate` で loader を更新 → 次の
+/// profile 起動で古い bak が上書きしてロールバックしてしまう」事故が起きる。
 fn recover_stale_loader_backup(loader_path: &Path) {
     let backup_path = loader_path.with_extension("lua.bak");
     if !backup_path.exists() {
+        return;
+    }
+    // 現状の loader.lua が instrumented なら bak は生きた退避、そうでなければ
+    // generate/sync で再生成済み → bak は不要。
+    let current_is_instrumented = std::fs::read_to_string(loader_path)
+        .map(|s| s.contains("rvpm-profile-markers-"))
+        .unwrap_or(false);
+    if !current_is_instrumented {
+        eprintln!(
+            "\u{26a0} rvpm: removing stale loader.lua.bak (current loader.lua is already clean)"
+        );
+        let _ = std::fs::remove_file(&backup_path);
         return;
     }
     eprintln!(
@@ -4250,6 +4267,15 @@ async fn run_profile(
     no_instrument: bool,
 ) -> Result<()> {
     let runs = runs.clamp(1, 20);
+
+    // `--no-merge` は loader 側の force_unmerge に乗せる設計なので、instrumented
+    // 版の loader.lua が生成されないと効かない。silent に無視すると「計測結果が
+    // merged のままなのに no_merge=true で表示される」矛盾になるので fail fast。
+    if no_merge && no_instrument {
+        anyhow::bail!(
+            "--no-merge requires loader instrumentation (it is applied at generate time); remove --no-instrument to use --no-merge"
+        );
+    }
 
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)
@@ -4294,21 +4320,19 @@ async fn run_profile(
         })
         .collect();
 
-    // instrumented loader を書き出す (no_instrument 時は skip)
+    // instrumented loader を書き出す (no_instrument 時は skip)。
+    // marker_dir は `tempfile::TempDir` で取る — panic / early return / Ctrl-C で
+    // 自動削除されるので、手動 remove_dir_all の漏れで tmp が汚染されない。
+    let mut marker_dir_guard: Option<tempfile::TempDir> = None;
     let mut marker_dir: Option<PathBuf> = None;
     let mut swap_guard: Option<LoaderSwapGuard> = None;
 
     if !no_instrument {
-        let tmp = std::env::temp_dir().join(format!(
-            "rvpm-profile-markers-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&tmp)
-            .with_context(|| format!("failed to create marker dir {}", tmp.display()))?;
+        let tmp = tempfile::Builder::new()
+            .prefix("rvpm-profile-markers-")
+            .tempdir()
+            .context("failed to create marker dir")?;
+        let tmp_path = tmp.path().to_path_buf();
 
         let config_root = resolve_config_root(config.options.config_root.as_deref());
         let mut plugin_scripts = Vec::new();
@@ -4322,21 +4346,22 @@ async fn run_profile(
         // marker .vim 空ファイルを事前作成
         let expected = crate::loader::expected_markers(&plugin_scripts);
         for name in &expected {
-            let f = tmp.join(format!("{}.vim", name));
+            let f = tmp_path.join(format!("{}.vim", name));
             std::fs::write(&f, b"")
                 .with_context(|| format!("failed to create marker {}", f.display()))?;
         }
 
         let guard = LoaderSwapGuard::create(loader_path.clone())?;
         let profile_opts = crate::loader::ProfileOptions {
-            marker_dir: tmp.to_string_lossy().replace('\\', "/"),
+            marker_dir: tmp_path.to_string_lossy().replace('\\', "/"),
             force_unmerge: no_merge,
         };
         let mut loader_opts = build_loader_options(&config_root);
         loader_opts.profile = Some(profile_opts);
         write_loader_to_path(&merged_dir, &plugin_scripts, &loader_path, &loader_opts)?;
         swap_guard = Some(guard);
-        marker_dir = Some(tmp);
+        marker_dir = Some(tmp_path);
+        marker_dir_guard = Some(tmp);
     }
 
     if !json && !no_tui {
@@ -4365,17 +4390,33 @@ async fn run_profile(
         no_merge,
         no_instrument,
     };
-    let report = crate::profile::run_profile(cfg)
-        .await
-        .context("profile run failed")?;
+
+    // Ctrl-C 対応: profile 実行中にユーザが中断したら、Drop を待たず明示的に
+    // swap_guard を commit して loader.lua を戻す。tokio::signal::ctrl_c は
+    // SIGINT を tokio runtime 内で捕まえるため、panic!=unwind にならない環境
+    // (release --abort=abort) でも Drop が走らないので、この手動 cleanup が必要。
+    let report = tokio::select! {
+        res = crate::profile::run_profile(cfg) => {
+            res.context("profile run failed")?
+        }
+        _ = tokio::signal::ctrl_c() => {
+            if let Some(g) = swap_guard.take() {
+                let _ = g.commit();
+            }
+            drop(marker_dir_guard.take());
+            anyhow::bail!("profile interrupted (Ctrl-C)");
+        }
+    };
 
     // 計測完了 → 原本復元を手動で commit (drop より前に明示的に行う)
     if let Some(g) = swap_guard.take() {
         g.commit()?;
     }
-    if let Some(dir) = marker_dir {
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // marker_dir_guard (TempDir) の drop で自動削除されるので、旧 remove_dir_all
+    // の明示呼び出しは不要。marker_dir の PathBuf は値を保持するだけの
+    // 副作用なし変数。
+    drop(marker_dir_guard.take());
+    let _ = marker_dir;
 
     if json {
         // `--top` は plain / JSON 両方に適用したいので、JSON 側でも truncate して
