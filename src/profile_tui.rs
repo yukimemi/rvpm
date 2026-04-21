@@ -30,6 +30,7 @@ use ratatui::{
         ScrollbarState, Table, TableState,
     },
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// プラグインテーブルのソート軸。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -665,7 +666,7 @@ fn draw_detail(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(
-                truncate(&file.relative_path, 34),
+                pad_truncate(&file.relative_path, 34),
                 Style::default().fg(Color::Gray),
             ),
             Span::styled(
@@ -830,13 +831,43 @@ fn startup_color(total_ms: f64) -> Color {
     }
 }
 
+/// 表示幅 (`unicode-width`) が `max` を超える場合に末尾を U+2026 (`…`) に置き換えて
+/// 切り詰める。全角文字を含む文字列でも ms 値やバーの開始列が揃うよう、codepoint
+/// 数ではなくターミナル上の表示幅で判定する。`browse_tui.rs` の列幅計算と同じ方針。
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if UnicodeWidthStr::width(s) <= max {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
     out.push('\u{2026}');
     out
+}
+
+/// `truncate` で上限表示幅に揃えた上で、短ければ末尾をスペースでパディングして
+/// **必ず表示幅 `width` ぴったり**にする。Paragraph 内で後続の Span (ms 値やバー)
+/// の開始列を揃えるのに使う (Table の Cell と違って Paragraph は自動パディング
+/// しない)。`format!("{:<width$}")` は codepoint 数でパディングするので全角文字
+/// だと幅が合わず、unicode-width ベースに揃える必要がある。
+fn pad_truncate(s: &str, width: usize) -> String {
+    let truncated = truncate(s, width);
+    let w = UnicodeWidthStr::width(truncated.as_str());
+    if w < width {
+        let mut out = truncated;
+        out.extend(std::iter::repeat_n(' ', width - w));
+        out
+    } else {
+        truncated
+    }
 }
 
 /// `--no-tui` 用 plain text 出力 (phase timeline + plugin table)。
@@ -910,5 +941,58 @@ pub fn print_plain(report: &ProfileReport, top: Option<usize>) {
             p.total_self_ms,
             p.file_count,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn pad_truncate_pads_short_strings_to_exact_display_width() {
+        // 短い文字列はスペースパディングで幅ぴったり。detail panel のバー開始列を
+        // 揃えるのに必須 (短いパスでも ms 値 / バーが同じ列から始まらないと
+        // 行ごとにズレて見える)。
+        let out = pad_truncate("plugin/denops.vim", 34);
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 34);
+        assert!(out.starts_with("plugin/denops.vim"));
+        assert!(out.ends_with(' '));
+    }
+
+    #[test]
+    fn pad_truncate_truncates_long_strings_to_exact_display_width() {
+        let long = "autoload/denops/_internal/very/deep/nested/file.vim";
+        let out = pad_truncate(long, 34);
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 34);
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn pad_truncate_preserves_exact_width_input() {
+        let exact: String = "x".repeat(34);
+        let out = pad_truncate(&exact, 34);
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 34);
+        assert_eq!(out, exact);
+    }
+
+    #[test]
+    fn pad_truncate_measures_full_width_chars_by_display_width() {
+        // 全角文字は 1 codepoint = 2 display columns。chars().count() ベースだと
+        // パディング幅を誤って出力列がズレる (例: 全角 10 文字を width=20 だと
+        // 本来ピッタリなのに char count=10 で更に 10 spaces パディングしてしまう)。
+        let jp = "日本語プラグイン.vim"; // 全角 9 文字 + ".vim" = 18 + 4 = 22 columns
+        let out = pad_truncate(jp, 34);
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 34);
+        assert!(out.starts_with(jp));
+    }
+
+    #[test]
+    fn truncate_respects_display_width_when_clipping_full_width_chars() {
+        // 全角文字 3 個 = 6 columns を width=5 に切り詰めると、収まるのは
+        // 2 文字 (4 columns) + ellipsis (1 column) = 5 columns。
+        let out = truncate("日本語", 5);
+        assert_eq!(UnicodeWidthStr::width(out.as_str()), 5);
+        assert!(out.ends_with('\u{2026}'));
     }
 }
