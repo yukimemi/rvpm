@@ -9,7 +9,9 @@
 # Flow:
 #   1. init --write
 #   2. seed a handful of plugins and sync (so profile has something to measure)
-#   3. rvpm profile --runs 2         (instrumented, TUI opens automatically)
+#      — Show is held back until after the sync completes so the GIF opens on
+#        the profile command instead of clone chatter
+#   3. rvpm profile                  (instrumented, TUI opens automatically)
 #   4. TUI tour: j/k navigate, s cycle sort, h hide groups, ? help, q
 #
 # The profile TUI needs enough rows for banner(3) + timeline(9) + table(min 6)
@@ -36,7 +38,6 @@ Sleep 200ms
 Type "rm -rf ~/.config/rvpm/rvpm-profile-demo ~/.cache/rvpm/rvpm-profile-demo ~/.config/rvpm-profile-demo 2>/dev/null; clear"
 Enter
 Sleep 500ms
-Show
 
 # ── 1. init ──
 Sleep 500ms
@@ -63,7 +64,6 @@ Sleep 300ms
 Type "clear"
 Enter
 Sleep 200ms
-Show
 
 Type "rvpm sync"
 Sleep 500ms
@@ -73,15 +73,14 @@ Sleep 12s
 Type "clear"
 Enter
 Sleep 500ms
+Show
 
 # ── 3. run profile (instrumented by default, opens TUI) ──
-# --runs 2 keeps it under ~6 seconds per measurement round while still giving
-# a stable average; the default is 3.
-Type "rvpm profile --runs 2"
+Type "rvpm profile"
 Sleep 500ms
 Enter
-# nvim --headless --startuptime runs 2x (instrumented) — each run ~2-3s on
-# a sandbox clone. Wait long enough for the TUI to open.
+# rvpm profile launches nvim --headless --startuptime N times (default 3) — each
+# run ~2-3s on a sandbox clone. Wait long enough for the TUI to open.
 Sleep 8s
 
 # ── 4. TUI tour ──

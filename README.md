@@ -16,6 +16,12 @@ sources everything without any runtime glob cost.
 
 ![rvpm](vhs/demo.gif)
 
+### Startup profile
+
+**`rvpm profile`** — per-plugin phase breakdown in a TUI: banner + phase timeline + plugin table + selected-plugin file detail. Keys: `j/k` navigate · `g/G` top/bottom · `s` cycle sort · `h` hide groups · `?` help · `q` quit.
+
+![profile](vhs/profile.gif)
+
 ## Why rvpm?
 
 - **CLI-first** — manage plugins from your terminal, not from inside Neovim
