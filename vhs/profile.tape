@@ -48,28 +48,16 @@ Sleep 2s
 # ── 2. seed a realistic plugin set, then sync ──
 # mixing eager + lazy + a couple of bigger plugins gives the profile timeline
 # and distribution bars something interesting to show.
+# NOTE: vhs only parses Type/Enter/Sleep on separate lines — a bash here-doc
+# would make vhs try to interpret the body as its own commands. Use single-line
+# printf append instead (mirrors the pattern in demo.tape).
 Hide
-Type `cat >> ~/.config/rvpm/$RVPM_APPNAME/config.toml <<'TOML'
-
-[[plugins]]
-url = "folke/snacks.nvim"
-
-[[plugins]]
-url = "nvim-lua/plenary.nvim"
-
-[[plugins]]
-url = "stevearc/oil.nvim"
-
-[[plugins]]
-url = "lewis6991/gitsigns.nvim"
-
-[[plugins]]
-url = "nvim-treesitter/nvim-treesitter"
-
-[[plugins]]
-url = "nvim-telescope/telescope.nvim"
-on_cmd = ["Telescope"]
-TOML`
+Type `printf '\n[[plugins]]\nurl = "%s"\n' folke/snacks.nvim nvim-lua/plenary.nvim stevearc/oil.nvim lewis6991/gitsigns.nvim nvim-treesitter/nvim-treesitter >> ~/.config/rvpm/$RVPM_APPNAME/config.toml`
+Enter
+Sleep 300ms
+# telescope with on_cmd — appended as a separate block so `rvpm list` shows a
+# lazy trigger in the profile output too.
+Type `printf '\n[[plugins]]\nurl = "nvim-telescope/telescope.nvim"\non_cmd = ["Telescope"]\n' >> ~/.config/rvpm/$RVPM_APPNAME/config.toml`
 Enter
 Sleep 300ms
 Type "clear"
