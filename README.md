@@ -174,6 +174,7 @@ integration, and the external README renderer — see
 | `rvpm browse` | TUI plugin browser over the GitHub `neovim-plugin` topic |
 | `rvpm doctor` | Diagnose config, state, Neovim wiring, and external tools. Exit codes: `0` ok / `1` error / `2` warn |
 | `rvpm log [query] [--last N] [--full] [--diff]` | Show what commits landed on recent `sync` / `update` / `add`. `--diff` embeds README / CHANGELOG / `doc/` patches; `⚠ BREAKING` highlight for Conventional Commits |
+| `rvpm profile [--runs N] [--top N] [--json] [--no-tui] [--no-merge] [--no-instrument]` | Profile Neovim startup per plugin. By default temporarily swaps in an instrumented `loader.lua` to emit phase markers (P3 before / P4 init / P5 rtp / P6 eager / P7 lazy-reg / P8 colorscheme / P9 after) and per-plugin init / trig boundaries. `--no-merge` forces every plugin out of `merged/` for per-plugin attribution; `--no-instrument` skips the swap (raw `--startuptime` only). Original `loader.lua` is always restored (RAII guard + crash recovery). `--runs` is `1..=20`; `--json` and `--no-tui` are mutually exclusive |
 
 Run `rvpm <command> --help` for flag-level details. TUI key bindings and
 more example invocations are in [Advanced](#advanced).
