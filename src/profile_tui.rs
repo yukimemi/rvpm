@@ -665,7 +665,7 @@ fn draw_detail(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(
-                truncate(&file.relative_path, 34),
+                pad_truncate(&file.relative_path, 34),
                 Style::default().fg(Color::Gray),
             ),
             Span::styled(
@@ -839,6 +839,21 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// 幅 `width` に切り詰めつつ、短い場合はスペースでパディングして **必ず `width`
+/// 文字ぴったり**にする。Paragraph 内で後続の Span (ms 値やバー) の開始列を
+/// 揃えるのに使う (Table の Cell と違って Paragraph は自動パディングしない)。
+fn pad_truncate(s: &str, width: usize) -> String {
+    let truncated = truncate(s, width);
+    let len = truncated.chars().count();
+    if len < width {
+        let mut out = truncated;
+        out.extend(std::iter::repeat_n(' ', width - len));
+        out
+    } else {
+        truncated
+    }
+}
+
 /// `--no-tui` 用 plain text 出力 (phase timeline + plugin table)。
 pub fn print_plain(report: &ProfileReport, top: Option<usize>) {
     println!("# rvpm profile");
@@ -910,5 +925,37 @@ pub fn print_plain(report: &ProfileReport, top: Option<usize>) {
             p.total_self_ms,
             p.file_count,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pad_truncate_pads_short_strings_to_exact_width() {
+        // 短い文字列はスペースパディングで幅ぴったり。detail panel のバー開始列を
+        // 揃えるのに必須 (短いパスでも ms 値 / バーが同じ列から始まらないと
+        // 行ごとにズレて見える)。
+        let out = pad_truncate("plugin/denops.vim", 34);
+        assert_eq!(out.chars().count(), 34);
+        assert!(out.starts_with("plugin/denops.vim"));
+        assert!(out.ends_with(' '));
+    }
+
+    #[test]
+    fn pad_truncate_truncates_long_strings_to_exact_width() {
+        let long = "autoload/denops/_internal/very/deep/nested/file.vim";
+        let out = pad_truncate(long, 34);
+        assert_eq!(out.chars().count(), 34);
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn pad_truncate_preserves_exact_width_input() {
+        let exact: String = "x".repeat(34);
+        let out = pad_truncate(&exact, 34);
+        assert_eq!(out.chars().count(), 34);
+        assert_eq!(out, exact);
     }
 }
