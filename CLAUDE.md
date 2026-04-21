@@ -394,7 +394,7 @@ merge 戦略がファイル単位 hard link に切り替わって以降、Window
 
 | コマンド | 関数 | 説明 |
 |---------|------|------|
-| `sync [--prune] [--frozen] [--no-lock] [--rebuild]` | `run_sync()` | clone/pull + merged + loader.lua 生成。`--prune` で未使用プラグインディレクトリも削除。無指定でも未使用があれば末尾で警告表示。lockfile (`<config_root>/rvpm.lock`) を読み込んで pin された commit に寄せ、sync 完了後に新 HEAD を書き戻す。`--frozen` で未登録プラグインがあれば即エラー (CI / fresh machine)、`--no-lock` で完全スキップ。**build 実行は git HEAD が動いたときのみ** (no-op pull で `:TSUpdate` 等を毎回回さない高速化)、`--rebuild` で常に build する従来挙動に戻す |
+| `sync [--prune] [--frozen] [--no-lock] [--rebuild [QUERY]]` | `run_sync()` | clone/pull + merged + loader.lua 生成。`--prune` で未使用プラグインディレクトリも削除。無指定でも未使用があれば末尾で警告表示。lockfile (`<config_root>/rvpm.lock`) を読み込んで pin された commit に寄せ、sync 完了後に新 HEAD を書き戻す。`--frozen` で未登録プラグインがあれば即エラー (CI / fresh machine)、`--no-lock` で完全スキップ。**build 実行は git HEAD が動いたときのみ** (no-op pull で `:TSUpdate` 等を毎回回さない高速化)、`--rebuild` で常に build する従来挙動に戻す。`--rebuild <QUERY>` で rebuild スコープを url / name 部分一致のプラグインに絞る (build コマンド試行錯誤中の単一プラグイン rebuild 用) — `matches_rebuild_filter` で判定、closure spawn 前に bool に解決して async move に引き込まない |
 | `generate` | `run_generate()` | loader.lua のみ再生成 |
 | `clean` | `run_clean()` | config.toml から外したプラグインの `{cache_root}/plugins/repos/<host>/<owner>/<repo>/` を削除。git 操作なしで `sync --prune` より高速 (200+ プラグインでの所要時間対策)。共有ヘルパー `prune_unused_repos()` を `sync --prune` と共用 |
 | `add <repo>` | `run_add()` | TOML 追加 + 当該プラグインだけ clone + generate。重複検出は `installed_full_name` で正規化 (https / owner/repo / ssh / 大文字小文字 / `.git` / 末尾 `/` の揺れを吸収し、`rvpm browse` の installed マークと同じロジックを共用)。書き込み URL 形式は `options.url_style` (`short` / `full`) に従う |

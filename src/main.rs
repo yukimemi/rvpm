@@ -80,8 +80,15 @@ enum Commands {
         /// By default `sync` skips build for plugins whose pull was a no-op,
         /// which makes "nothing changed" syncs much faster. Use this when you
         /// need to rerun e.g. `:TSUpdate` or a manual rebuild step.
-        #[arg(long)]
-        rebuild: bool,
+        ///
+        /// Accepts an optional query to limit rebuild scope to plugins whose
+        /// `url` or `name` contains the substring. Useful when iterating on a
+        /// single plugin's `build` command:
+        ///
+        ///   rvpm sync --rebuild                    # all plugins
+        ///   rvpm sync --rebuild nvim-treesitter    # only matching ones
+        #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "QUERY")]
+        rebuild: Option<String>,
         /// Force-refresh every plugin's git state regardless of the fetch
         /// cache (`options.fetch_interval`). Useful before checking for
         /// held-back plugins when you want a guaranteed fresh remote read.
@@ -593,11 +600,34 @@ fn classify_held_back(
     }
 }
 
+/// 現在の plugin が `--rebuild [QUERY]` のスコープに入るか判定する。
+///
+/// - `rebuild_filter = None` (フラグ未指定) → 常に false (build 強制しない)
+/// - `rebuild_filter = Some("")` (フラグのみ、値無し) → 常に true (全 plugin)
+/// - `rebuild_filter = Some(q)` (フラグ + query) → plugin の url / name の
+///   いずれかに q (小文字化後) が含まれれば true
+fn matches_rebuild_filter(plugin: &crate::config::Plugin, rebuild_filter: Option<&str>) -> bool {
+    match rebuild_filter {
+        None => false,
+        Some("") => true,
+        Some(q) => {
+            let qlc = q.to_ascii_lowercase();
+            let url_lc = plugin.url.to_ascii_lowercase();
+            let name_lc = plugin
+                .name
+                .as_deref()
+                .map(|n| n.to_ascii_lowercase())
+                .unwrap_or_default();
+            url_lc.contains(&qlc) || name_lc.contains(&qlc)
+        }
+    }
+}
+
 async fn run_sync(
     prune: bool,
     frozen: bool,
     no_lock: bool,
-    rebuild: bool,
+    rebuild: Option<String>,
     refresh: bool,
     no_refresh: bool,
 ) -> Result<()> {
@@ -792,6 +822,10 @@ async fn run_sync(
         let want_fetch = *fetch_decisions.get(&plugin.display_name()).unwrap_or(&true);
         let hard_skip = is_hard_skip;
 
+        // --rebuild [QUERY] のスコープ判定は closure 外で済ませて bool を move する
+        // (`rebuild_filter: &Option<String>` のライフタイムを async move に引き込まない)。
+        let force_rebuild = matches_rebuild_filter(&plugin, rebuild.as_deref());
+
         let config_for_build = config.clone();
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
@@ -870,7 +904,8 @@ async fn run_sync(
                     // 200+ プラグイン構成では体感で遅い。`--rebuild` で従来挙動 (常に
                     // 全 build プラグインで実行) に戻せるので、`:TSUpdate` 等を強制
                     // 走らせたいときの逃げ道は確保。
-                    let should_build = plugin.build.is_some() && (rebuild || change.is_some());
+                    let should_build =
+                        plugin.build.is_some() && (force_rebuild || change.is_some());
                     let build_warn = if should_build {
                         let _ = tx
                             .send((
@@ -1870,13 +1905,14 @@ async fn run_list(no_tui: bool) -> Result<bool> {
                 }
                 crossterm::event::KeyCode::Char('S') => {
                     leave_tui(&mut terminal)?;
-                    let _ = run_sync(false, false, false, false, false, false).await;
+                    let _ = run_sync(false, false, false, None, false, false).await;
                     wait_for_keypress("\nPress any key to return to list...")?;
                     reload!();
                 }
                 crossterm::event::KeyCode::Char('R') => {
                     leave_tui(&mut terminal)?;
-                    let _ = run_sync(false, false, false, true, false, false).await;
+                    // list TUI の `R` キーは全プラグイン rebuild。Some("") が "all" を意味する。
+                    let _ = run_sync(false, false, false, Some(String::new()), false, false).await;
                     wait_for_keypress("\nPress any key to return to list...")?;
                     reload!();
                 }
@@ -5140,6 +5176,55 @@ mod tests {
         let got = resolve_plugin_dst(&plugin, &cache_root);
         // repos_dir は `{cache_root}/plugins/repos`
         assert!(got.starts_with(cache_root.join("plugins/repos")));
+    }
+
+    // ─── matches_rebuild_filter ─────────────────────────────────────────
+    // `--rebuild [QUERY]` のスコープ判定を 3 分岐で押さえる:
+    //   None        → 常に false (フラグ未指定、従来デフォルト)
+    //   Some("")    → 常に true (フラグだけ、従来の `--rebuild` 挙動)
+    //   Some("q")   → url / name に q を含めば true
+
+    fn mk_plugin(url: &str, name: Option<&str>) -> Plugin {
+        Plugin {
+            url: url.to_string(),
+            name: name.map(|s| s.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_rebuild_filter_none_never_matches() {
+        let p = mk_plugin("nvim-treesitter/nvim-treesitter", None);
+        assert!(!matches_rebuild_filter(&p, None));
+    }
+
+    #[test]
+    fn test_rebuild_filter_empty_always_matches() {
+        let p = mk_plugin("folke/snacks.nvim", None);
+        assert!(matches_rebuild_filter(&p, Some("")));
+    }
+
+    #[test]
+    fn test_rebuild_filter_substring_matches_url() {
+        let p = mk_plugin("nvim-treesitter/nvim-treesitter", None);
+        assert!(matches_rebuild_filter(&p, Some("treesitter")));
+        assert!(matches_rebuild_filter(&p, Some("TREESITTER"))); // case-insensitive
+        assert!(!matches_rebuild_filter(&p, Some("telescope")));
+    }
+
+    #[test]
+    fn test_rebuild_filter_matches_explicit_name() {
+        // URL と name が独立: name 側で hit させたいケース
+        let p = mk_plugin("owner/repo", Some("my-alias"));
+        assert!(matches_rebuild_filter(&p, Some("alias")));
+    }
+
+    #[test]
+    fn test_rebuild_filter_no_false_match_without_name() {
+        // name = None のとき、url にだけマッチングが走る (name 側で空文字との
+        // 意図せぬ contains が起きないこと)
+        let p = mk_plugin("foo/bar", None);
+        assert!(!matches_rebuild_filter(&p, Some("baz")));
     }
 
     #[test]
