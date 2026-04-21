@@ -218,7 +218,9 @@ fn run_loop(
 fn draw(f: &mut Frame, state: &mut ProfileTuiState) {
     let area = f.area();
     let has_timeline = state.report.phase_timeline.is_some();
-    let timeline_h = if has_timeline { 4 } else { 0 };
+    // 6 phases × 1 row + 2 rows for the rounded block border = 8。
+    // 以前は 4 にしていて phase-5 以降が隠れていた。
+    let timeline_h = if has_timeline { 8 } else { 0 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
