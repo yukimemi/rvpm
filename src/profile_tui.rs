@@ -218,9 +218,8 @@ fn run_loop(
 fn draw(f: &mut Frame, state: &mut ProfileTuiState) {
     let area = f.area();
     let has_timeline = state.report.phase_timeline.is_some();
-    // 6 phases × 1 row + 2 rows for the rounded block border = 8。
-    // 以前は 4 にしていて phase-5 以降が隠れていた。
-    let timeline_h = if has_timeline { 8 } else { 0 };
+    // 7 phases (3/4/5/6/7/8/9) × 1 row + 2 rows for the rounded block border = 9。
+    let timeline_h = if has_timeline { 9 } else { 0 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -376,6 +375,7 @@ fn phase_label(name: &str) -> String {
         "phase-5" => "P5 rtp".into(),
         "phase-6" => "P6 eager".into(),
         "phase-7" => "P7 lazy reg".into(),
+        "phase-8" => "P8 colorscheme".into(),
         "phase-9" => "P9 after".into(),
         _ => name.to_string(),
     }

@@ -183,9 +183,10 @@ pub struct ProfileOptions {
 /// (その代わり phase-6 全体の開始/終了だけ記録)。
 pub fn expected_markers(scripts: &[PluginScripts]) -> Vec<String> {
     let mut names = Vec::new();
-    // phase 境界マーカー (phase 3/4/5/6/7/9 の begin + 全体 end)
+    // phase 境界マーカー。CLAUDE.md の 9 phase model に合わせ、ColorSchemePre handler
+    // 登録 (phase 8) もタイムライン上で独立させる。
     for p in [
-        "phase-3", "phase-4", "phase-5", "phase-6", "phase-7", "phase-9",
+        "phase-3", "phase-4", "phase-5", "phase-6", "phase-7", "phase-8", "phase-9",
     ] {
         names.push(format!("{}-begin", p));
         names.push(format!("{}-end", p));
@@ -731,8 +732,12 @@ end
         push_with_cond(&mut lua, &s.cond, &body);
     }
 
+    // phase-7 は「lazy trigger 登録」なので、ColorSchemePre handler は別フェーズ扱い。
+    emit_marker(&mut lua, profile, "phase-7-end");
+    emit_marker(&mut lua, profile, "phase-8-begin");
+
     // ======================================================
-    // ColorSchemePre handler (lazy colorscheme 自動ロード)
+    // ColorSchemePre handler (lazy colorscheme 自動ロード) — Phase 8
     // lazy plugin の colors/ に含まれるカラースキーム名をマップ化し、
     // `:colorscheme <name>` 実行時に対応プラグインをロードする
     // ======================================================
@@ -792,7 +797,7 @@ end
         }
     }
 
-    emit_marker(&mut lua, profile, "phase-7-end");
+    emit_marker(&mut lua, profile, "phase-8-end");
     emit_marker(&mut lua, profile, "phase-9-begin");
 
     // ======================================================
@@ -1267,7 +1272,7 @@ mod tests {
         let opts = profile_opts("/tmp/markers", false);
         let lua = generate_loader(Path::new("/merged"), &[], &opts);
         for phase in [
-            "phase-3", "phase-4", "phase-5", "phase-6", "phase-7", "phase-9",
+            "phase-3", "phase-4", "phase-5", "phase-6", "phase-7", "phase-8", "phase-9",
         ] {
             assert!(
                 lua.contains(&format!("/tmp/markers/{}-begin.vim", phase)),
@@ -1366,6 +1371,10 @@ mod tests {
         s2.on_cmd = Some(vec!["Beta".to_string()]);
         let names = expected_markers(&[s1, s2]);
         assert!(names.iter().any(|n| n == "phase-3-begin"));
+        assert!(
+            names.iter().any(|n| n == "phase-8-begin"),
+            "phase-8 (ColorSchemePre) must be a distinct timeline entry"
+        );
         assert!(names.iter().any(|n| n == "phase-9-end"));
         assert!(names.iter().any(|n| n == "init-alpha-begin"));
         assert!(names.iter().any(|n| n == "init-alpha-end"));

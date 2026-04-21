@@ -503,7 +503,7 @@ pub fn compute_phase_times(events: &[MarkerEvent]) -> Vec<PhaseTime> {
         }
     }
     let order = [
-        "phase-3", "phase-4", "phase-5", "phase-6", "phase-7", "phase-9",
+        "phase-3", "phase-4", "phase-5", "phase-6", "phase-7", "phase-8", "phase-9",
     ];
     let mut out = Vec::new();
     for phase in order {
@@ -626,6 +626,10 @@ pub async fn run_single_startuptime(extra_args: &[&str]) -> anyhow::Result<(Stri
     let tmp_path = tmp.path().to_path_buf();
 
     let mut cmd = tokio::process::Command::new("nvim");
+    // `tokio::time::timeout` が発火しても tokio 側は spawn 済み子 process を kill
+    // してくれない (hung nvim が orphan になる)。最大 20 runs を回す関係で、stuck
+    // が連続すると残骸が溜まるので kill_on_drop で Drop 時に SIGKILL を送る。
+    cmd.kill_on_drop(true);
     cmd.arg("--headless")
         .arg("--startuptime")
         .arg(&tmp_path)
@@ -666,9 +670,10 @@ pub async fn run_single_startuptime(extra_args: &[&str]) -> anyhow::Result<(Stri
 /// `nvim --version` の 1 行目を取得 (resilience: 取れなければ None)。
 pub async fn probe_nvim_version() -> Option<String> {
     let timeout = std::time::Duration::from_secs(2);
-    let cmd = tokio::process::Command::new("nvim")
-        .arg("--version")
-        .output();
+    let mut builder = tokio::process::Command::new("nvim");
+    // timeout elapsed → Drop で自動 kill するため (orphan 防止)
+    builder.kill_on_drop(true);
+    let cmd = builder.arg("--version").output();
     let out = tokio::time::timeout(timeout, cmd).await.ok()?.ok()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     stdout.lines().next().map(|s| s.trim().to_string())
