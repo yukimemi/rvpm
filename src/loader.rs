@@ -88,7 +88,7 @@ fn lua_str_list(items: &[String]) -> String {
 /// backslash はまず `/` に正規化し (Windows path separator)、
 /// 残った特殊文字 (double quote, backslash, CR/LF, TAB) をエスケープする。
 /// これで generate path に空白や特殊文字が混ざっても安全に emit できる。
-fn lua_quote(s: &str) -> String {
+pub(crate) fn lua_quote(s: &str) -> String {
     let normalized = s.replace('\\', "/");
     let mut out = String::with_capacity(normalized.len() + 2);
     out.push('"');
