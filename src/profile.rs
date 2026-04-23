@@ -109,8 +109,7 @@ impl RequireNode {
     #[allow(dead_code)] // used via `parse_require_trace` in PR 2 (loader-side tracer hookup)
     fn from_raw(raw: RawRequireNode) -> Self {
         let sourced_ms = raw.time as f64 / 1e6;
-        let children: Vec<RequireNode> =
-            raw.children.into_iter().map(Self::from_raw).collect();
+        let children: Vec<RequireNode> = raw.children.into_iter().map(Self::from_raw).collect();
         let children_sum: f64 = children.iter().map(|c| c.sourced_ms).sum();
         let self_ms = (sourced_ms - children_sum).max(0.0);
         RequireNode {
