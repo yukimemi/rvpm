@@ -390,6 +390,17 @@ impl ProfileTuiState {
         self.tree_cursor = new;
     }
 
+    /// `G` / End 相当: cursor を tree の末尾行にセット。`usize::MAX` の sentinel
+    /// 方式より、実際の行数を解決してから入れる方が state の不変条件が崩れにくい。
+    fn tree_go_bottom(&mut self) {
+        let Some(rows) = self.current_require_rows() else {
+            return;
+        };
+        if !rows.is_empty() {
+            self.tree_cursor = rows.len() - 1;
+        }
+    }
+
     /// `h` (collapse=true) / `l` (collapse=false) の共通処理。
     /// cursor が指すノードの module 名を tree_collapsed セットに追加/削除する。
     /// 同名モジュールを別経路で require している場合はまとめて影響する (意図的な単純化)。
@@ -488,7 +499,7 @@ fn run_loop(
                 },
                 KeyCode::Char('G') | KeyCode::End => match state.focus {
                     Focus::Table => state.go_bottom(),
-                    Focus::Detail => state.tree_cursor = usize::MAX, // draw 側で clamp
+                    Focus::Detail => state.tree_go_bottom(),
                 },
                 // lazy.nvim / nvim-tree 系の操作感: h は collapse、l は expand。
                 // Detail focus 時のみ有効。Table focus 時は no-op (誤爆防止)。
