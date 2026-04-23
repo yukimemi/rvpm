@@ -67,6 +67,25 @@ impl SortKey {
     }
 }
 
+/// 現在どちらの pane が操作対象か。`Tab` で toggle。lazy.nvim の split-view
+/// と同じで、focus が当たってる方の枠色を強調し、j/k/g/G を focus pane へ送る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    /// プラグインテーブル (デフォルト)
+    Table,
+    /// detail pane — require tree スクロール + expand/collapse
+    Detail,
+}
+
+impl Focus {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Table => Self::Detail,
+            Self::Detail => Self::Table,
+        }
+    }
+}
+
 /// `[user config]` の require tree を detail pane に描画するときの並び順。
 /// lazy.nvim の Profile view と同じ 2 モード: 時間順 / 登場順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,12 +134,19 @@ fn next_require_threshold(current: f64) -> f64 {
 /// `RequireNode.module` を借用する。row は render-time に毎 frame 作るため、
 /// `String::clone` を避けて借用にしたい (lazy.nvim の lifetime-free 構造と違い
 /// 我々の RequireNode tree は render loop 中は動かないので borrow 可能)。
+///
+/// `has_children` / `is_collapsed` は renderer の icon 判定用:
+///   - leaf (children 無し): `●`
+///   - expanded (children 有り かつ collapsed セット外): `▼`
+///   - collapsed (children 有り かつ collapsed セット): `▶`
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequireRow<'a> {
     pub depth: usize,
     pub module: &'a str,
     pub self_ms: f64,
     pub sourced_ms: f64,
+    pub has_children: bool,
+    pub is_collapsed: bool,
 }
 
 /// RequireNode 木を pre-order DFS で 1 列に flatten する。`threshold_ms` 未満の
@@ -136,20 +162,32 @@ pub fn flatten_require_tree<'a>(
     threshold_ms: f64,
     sort: RequireTreeSort,
     max_rows: usize,
+    collapsed: &std::collections::HashSet<String>,
 ) -> Vec<RequireRow<'a>> {
     // max_rows は pane の残り行から来る自然な上限 (典型的には 10〜50)。
     // pre-allocate してフレーム毎の re-alloc を回避。
     let mut out = Vec::with_capacity(max_rows);
-    walk(root, 0, threshold_ms, sort, max_rows, &mut out, true);
+    walk(
+        root,
+        0,
+        threshold_ms,
+        sort,
+        max_rows,
+        collapsed,
+        &mut out,
+        true,
+    );
     out
 }
 
+#[allow(clippy::too_many_arguments)] // 再帰ヘルパなので context struct に切る価値が薄い
 fn walk<'a>(
     node: &'a RequireNode,
     depth: usize,
     threshold: f64,
     sort: RequireTreeSort,
     max_rows: usize,
+    collapsed: &std::collections::HashSet<String>,
     out: &mut Vec<RequireRow<'a>>,
     is_root: bool,
 ) {
@@ -160,12 +198,20 @@ fn walk<'a>(
     if !is_root && node.sourced_ms < threshold {
         return;
     }
+    let has_children = !node.children.is_empty();
+    let is_collapsed = has_children && collapsed.contains(node.module.as_str());
     out.push(RequireRow {
         depth,
         module: &node.module,
         self_ms: node.self_ms,
         sourced_ms: node.sourced_ms,
+        has_children,
+        is_collapsed,
     });
+    if is_collapsed {
+        // 子孫は表示スキップ。node は出すが展開はしない (折りたたみ UX)。
+        return;
+    }
     // ByTime は並び替えが必要なので一度 Vec<&RequireNode> に集めて sort。
     // Chronological は insertion order のままで良いので直接 iterate して
     // 毎 frame の allocation を避ける。
@@ -181,7 +227,16 @@ fn walk<'a>(
                 if out.len() >= max_rows {
                     break;
                 }
-                walk(c, depth + 1, threshold, sort, max_rows, out, false);
+                walk(
+                    c,
+                    depth + 1,
+                    threshold,
+                    sort,
+                    max_rows,
+                    collapsed,
+                    out,
+                    false,
+                );
             }
         }
         RequireTreeSort::Chronological => {
@@ -189,7 +244,16 @@ fn walk<'a>(
                 if out.len() >= max_rows {
                     break;
                 }
-                walk(c, depth + 1, threshold, sort, max_rows, out, false);
+                walk(
+                    c,
+                    depth + 1,
+                    threshold,
+                    sort,
+                    max_rows,
+                    collapsed,
+                    out,
+                    false,
+                );
             }
         }
     }
@@ -206,6 +270,13 @@ struct ProfileTuiState {
     require_tree_threshold_ms: f64,
     /// require tree 表示時の兄弟ソート方針。`c` でトグル。
     require_tree_sort: RequireTreeSort,
+    /// 操作対象 pane。`Tab` で Table ↔ Detail を切替。
+    focus: Focus,
+    /// require tree 内のカーソル位置 (flatten 後の行 index)。focus = Detail 時の j/k 対象。
+    tree_cursor: usize,
+    /// 折りたたまれた require モジュール名。module 名でのみ識別するので、同名モジュールが
+    /// 複数カ所で require されているとまとめて折りたたむ扱い (シンプルさ優先)。
+    tree_collapsed: std::collections::HashSet<String>,
 }
 
 impl ProfileTuiState {
@@ -228,6 +299,9 @@ impl ProfileTuiState {
             // 見える状態で start し、f キーで 0.5 / 0.0 ms に広げていく運用。
             require_tree_threshold_ms: 1.0,
             require_tree_sort: RequireTreeSort::ByTime,
+            focus: Focus::Table,
+            tree_cursor: 0,
+            tree_collapsed: std::collections::HashSet::new(),
         }
     }
 
@@ -281,6 +355,72 @@ impl ProfileTuiState {
         let len = self.visible_indices().len();
         if len > 0 {
             self.table_state.select(Some(len - 1));
+        }
+    }
+
+    /// 選択中の [user config] の require tree を flatten して返す (描画 + key
+    /// handler で共有)。該当しないプラグインでは None。flatten 結果のサイズは
+    /// tree 全体の可視ノード数になるので、cursor clamp もここ基準。
+    fn current_require_rows(&self) -> Option<Vec<RequireRow<'_>>> {
+        let idx = self.selected_plugin_index()?;
+        let p = &self.report.plugins[idx];
+        if p.name != GROUP_USER {
+            return None;
+        }
+        let tree = p.require_trace.as_ref()?;
+        Some(flatten_require_tree(
+            tree,
+            self.require_tree_threshold_ms,
+            self.require_tree_sort,
+            512,
+            &self.tree_collapsed,
+        ))
+    }
+
+    fn tree_cursor_move(&mut self, delta: isize) {
+        let Some(rows) = self.current_require_rows() else {
+            return;
+        };
+        let len = rows.len();
+        if len == 0 {
+            return;
+        }
+        let cur = self.tree_cursor.min(len - 1) as isize;
+        let new = (cur + delta).rem_euclid(len as isize) as usize;
+        self.tree_cursor = new;
+    }
+
+    /// `G` / End 相当: cursor を tree の末尾行にセット。`usize::MAX` の sentinel
+    /// 方式より、実際の行数を解決してから入れる方が state の不変条件が崩れにくい。
+    fn tree_go_bottom(&mut self) {
+        let Some(rows) = self.current_require_rows() else {
+            return;
+        };
+        if !rows.is_empty() {
+            self.tree_cursor = rows.len() - 1;
+        }
+    }
+
+    /// `h` (collapse=true) / `l` (collapse=false) の共通処理。
+    /// cursor が指すノードの module 名を tree_collapsed セットに追加/削除する。
+    /// 同名モジュールを別経路で require している場合はまとめて影響する (意図的な単純化)。
+    fn tree_toggle_at_cursor(&mut self, collapse: bool) {
+        let Some(rows) = self.current_require_rows() else {
+            return;
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let cur = self.tree_cursor.min(rows.len() - 1);
+        let row = &rows[cur];
+        if !row.has_children {
+            return;
+        }
+        let name = row.module.to_string();
+        if collapse {
+            self.tree_collapsed.insert(name);
+        } else {
+            self.tree_collapsed.remove(&name);
         }
     }
 }
@@ -339,10 +479,36 @@ fn run_loop(
             }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                KeyCode::Char('j') | KeyCode::Down => state.move_by(1),
-                KeyCode::Char('k') | KeyCode::Up => state.move_by(-1),
-                KeyCode::Char('g') | KeyCode::Home => state.go_top(),
-                KeyCode::Char('G') | KeyCode::End => state.go_bottom(),
+                // Tab で pane focus を切り替え。Detail focus は [user config] を選んで
+                // require_trace がある時だけ意味を持つが、key 自体はいつでも受け付ける
+                // (focus 状態を保ったまま別 plugin を選んでも混乱しないように)。
+                KeyCode::Tab => state.focus = state.focus.toggle(),
+                // focus 別に j/k/g/G を分岐。Detail 時は tree の cursor を動かし、
+                // Table 時は従来通り plugin 行を選ぶ。
+                KeyCode::Char('j') | KeyCode::Down => match state.focus {
+                    Focus::Table => state.move_by(1),
+                    Focus::Detail => state.tree_cursor_move(1),
+                },
+                KeyCode::Char('k') | KeyCode::Up => match state.focus {
+                    Focus::Table => state.move_by(-1),
+                    Focus::Detail => state.tree_cursor_move(-1),
+                },
+                KeyCode::Char('g') | KeyCode::Home => match state.focus {
+                    Focus::Table => state.go_top(),
+                    Focus::Detail => state.tree_cursor = 0,
+                },
+                KeyCode::Char('G') | KeyCode::End => match state.focus {
+                    Focus::Table => state.go_bottom(),
+                    Focus::Detail => state.tree_go_bottom(),
+                },
+                // lazy.nvim / nvim-tree 系の操作感: h は collapse、l は expand。
+                // Detail focus 時のみ有効。Table focus 時は no-op (誤爆防止)。
+                KeyCode::Char('l') | KeyCode::Right if state.focus == Focus::Detail => {
+                    state.tree_toggle_at_cursor(false);
+                }
+                KeyCode::Char('h') | KeyCode::Left if state.focus == Focus::Detail => {
+                    state.tree_toggle_at_cursor(true);
+                }
                 KeyCode::Char('s') => state.sort_key = state.sort_key.next(),
                 KeyCode::Char('h') => state.hide_groups = !state.hide_groups,
                 KeyCode::Char('?') => state.show_help = !state.show_help,
@@ -373,7 +539,7 @@ fn draw(f: &mut Frame, state: &mut ProfileTuiState) {
             Constraint::Length(3),          // banner
             Constraint::Length(timeline_h), // phase timeline (条件付き)
             Constraint::Min(6),             // plugin table
-            Constraint::Length(9),          // detail
+            Constraint::Length(14),         // detail — 9→14 で require tree を広く見せる
             Constraint::Length(3),          // footer
         ])
         .split(area);
@@ -764,31 +930,47 @@ fn draw_require_tree_detail(
     plugin: &crate::profile::PluginStats,
     tree: &RequireNode,
 ) {
-    // pane 内部で使える行数 (banner 1 行 + border 2 行を引く)
+    // pane 内部で使える行数 (banner 1 行 + border 2 行を引く)。
+    // banner が 1 行占めるので tree 描画行数は inner_h - 1。
     let inner_h = area.height.saturating_sub(3) as usize;
+    let body_h = inner_h.saturating_sub(1).max(1);
+    // flatten 時点では全 tree を取り、後段の描画ループで cursor 位置を中心に
+    // スクロールさせる。上限 512 はどんなに require 連鎖が深くても処理を
+    // 終わらせるための cap。
     let rows = flatten_require_tree(
         tree,
         state.require_tree_threshold_ms,
         state.require_tree_sort,
-        inner_h.max(1),
+        512,
+        &state.tree_collapsed,
     );
 
     // bar は sourced_ms 基準 (「全体の実時間にどれだけ食われてるか」を見るため)。
-    // RequireNode の性質上、親 sourced_ms = self + Σchildren.sourced_ms (clamp
-    // 前の値)、つまり `flatten_require_tree` が root を必ず先頭に置くので
-    // rows[0] は常に最大値。iterate するコストを省いて rows.first() を取る。
+    // rows[0] = root = sourced_ms の最大 (parent >= descendants 不変量)。
     let max_sourced = rows.first().map(|r| r.sourced_ms).unwrap_or(0.0).max(1e-6);
     let bar_w = (area.width.saturating_sub(60) as usize).max(4);
 
-    let mut lines: Vec<Line> = Vec::with_capacity(rows.len() + 1);
+    // cursor を可視範囲に保つようスクロール offset を計算。cursor を window
+    // 中央付近に置き、両端では clamp。
+    let cursor = state.tree_cursor.min(rows.len().saturating_sub(1));
+    let scroll = if rows.len() <= body_h {
+        0
+    } else {
+        let half = body_h / 2;
+        cursor.saturating_sub(half).min(rows.len() - body_h)
+    };
+    let visible_end = (scroll + body_h).min(rows.len());
+    let focused = state.focus == Focus::Detail;
+
+    let mut lines: Vec<Line> = Vec::with_capacity(body_h + 1);
     let total_nodes = count_require_nodes(tree);
-    let shown = rows.len();
     lines.push(Line::from(vec![
         Span::styled(" require tree ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!(
-                "(showing {} of {} · threshold {:.1} ms · sort {})",
-                shown,
+                "({}-{} of {} · threshold {:.1} ms · sort {})",
+                scroll + 1,
+                visible_end,
                 total_nodes,
                 state.require_tree_threshold_ms,
                 state.require_tree_sort.label(),
@@ -797,8 +979,18 @@ fn draw_require_tree_detail(
         ),
     ]));
 
-    for row in &rows {
-        let icon = require_tree_icon(row.depth);
+    for (idx, row) in rows[scroll..visible_end].iter().enumerate() {
+        let row_idx = scroll + idx;
+        let is_cursor = focused && row_idx == cursor;
+        let icon = if row.has_children {
+            if row.is_collapsed {
+                '\u{25b6}'
+            } else {
+                '\u{25bc}'
+            } // ▶ / ▼
+        } else {
+            require_tree_icon(row.depth) // ●/○/◉
+        };
         let indent: String = "  ".repeat(row.depth);
         let filled = ((row.sourced_ms / max_sourced) * bar_w as f64).round() as usize;
         let bar: String = std::iter::repeat_n('\u{2588}', filled)
@@ -809,15 +1001,24 @@ fn draw_require_tree_detail(
             .collect();
         let color = bar_color(row.sourced_ms, max_sourced);
         let name_width = 34usize.saturating_sub(row.depth * 2).max(8);
+        let cursor_marker = if is_cursor { '\u{25b6}' } else { ' ' }; // ▶ selection
+        let name_style = if is_cursor {
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
         lines.push(Line::from(vec![
             Span::styled(
-                format!(" {}{} ", indent, icon),
-                Style::default().fg(Color::DarkGray),
+                format!("{}{}{} ", cursor_marker, indent, icon),
+                Style::default().fg(if is_cursor {
+                    Color::Magenta
+                } else {
+                    Color::DarkGray
+                }),
             ),
-            Span::styled(
-                pad_truncate(row.module, name_width),
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled(pad_truncate(row.module, name_width), name_style),
             Span::styled(
                 format!("  {:>6.2} ms  ", row.sourced_ms),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -843,12 +1044,18 @@ fn draw_require_tree_detail(
         ),
         Span::styled(summary, Style::default().fg(Color::Gray)),
     ]);
+    // focus が当たってる時は枠を Magenta に (どちらの pane を操作してるか一目瞭然)。
+    let border_color = if focused {
+        Color::Magenta
+    } else {
+        Color::DarkGray
+    };
     let widget = Paragraph::new(lines).block(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_style(Style::default().fg(border_color)),
     );
     f.render_widget(widget, area);
 }
@@ -977,10 +1184,9 @@ fn draw_footer(f: &mut Frame, area: Rect, _state: &ProfileTuiState) {
     for (k, d) in [
         ("j/k", "move"),
         ("g/G", "top/bot"),
-        ("s", "sort"),
-        ("h", "hide groups"),
-        ("f", "tree threshold"),
-        ("c", "tree sort"),
+        ("Tab", "focus"),
+        ("h/l", "collapse"),
+        ("s/c/f", "sort/thresh"),
         ("?", "help"),
         ("q", "quit"),
     ] {
@@ -1011,8 +1217,9 @@ fn key_hint(key: &'static str, desc: &'static str) -> Vec<Span<'static>> {
 }
 
 fn draw_help_overlay(f: &mut Frame, area: Rect) {
-    let w = 60.min(area.width.saturating_sub(4));
-    let h = 18.min(area.height.saturating_sub(4));
+    // 元は 60x18 だったが require tree 用のキー説明が右端に溢れるので 76x24 に拡張。
+    let w = 76.min(area.width.saturating_sub(4));
+    let h = 24.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -1027,11 +1234,27 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from("  j / k / ↑ / ↓   move selection"),
         Line::from("  g / G           jump to top / bottom"),
         Line::from("  s               cycle sort (load → init → trig → …)"),
+        Line::from(" Tab              toggle focus (plugin table ↔ require tree)"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  plugin table (default focus)",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
         Line::from("  h               toggle [merged]/[runtime] group rows"),
-        Line::from("  f               [user config] require-tree threshold cycle"),
-        Line::from("                  (1.0 → 0.5 → 0.0 ms)"),
-        Line::from("  c               [user config] require-tree sort toggle"),
-        Line::from("                  (by time ↔ chronological)"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  require tree ([user config], focus = Detail)",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from("  h / ←           collapse subtree at cursor"),
+        Line::from("  l / →           expand subtree at cursor"),
+        Line::from("  f               threshold cycle (1.0 → 0.5 → 0.0 ms)"),
+        Line::from("  c               sort toggle (by time ↔ chronological)"),
+        Line::from(""),
         Line::from("  ?               toggle this help"),
         Line::from("  q / Esc         quit"),
         Line::from(""),
@@ -1318,7 +1541,13 @@ mod tests {
     #[test]
     fn flatten_require_tree_includes_root_with_depth_0() {
         let tree = sample_tree();
-        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::ByTime, 99);
+        let rows = flatten_require_tree(
+            &tree,
+            0.0,
+            RequireTreeSort::ByTime,
+            99,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(rows[0].depth, 0);
         assert_eq!(rows[0].module, "init.lua");
     }
@@ -1326,7 +1555,13 @@ mod tests {
     #[test]
     fn flatten_require_tree_sorts_siblings_by_sourced_ms_desc() {
         let tree = sample_tree();
-        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::ByTime, 99);
+        let rows = flatten_require_tree(
+            &tree,
+            0.0,
+            RequireTreeSort::ByTime,
+            99,
+            &std::collections::HashSet::new(),
+        );
         // init.lua → A (7) → A1 (5) → A2 (1) → C (2) → B (0.4)
         let modules: Vec<&str> = rows.iter().map(|r| r.module).collect();
         assert_eq!(modules, vec!["init.lua", "A", "A1", "A2", "C", "B"]);
@@ -1335,7 +1570,13 @@ mod tests {
     #[test]
     fn flatten_require_tree_keeps_insertion_order_under_chronological() {
         let tree = sample_tree();
-        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::Chronological, 99);
+        let rows = flatten_require_tree(
+            &tree,
+            0.0,
+            RequireTreeSort::Chronological,
+            99,
+            &std::collections::HashSet::new(),
+        );
         // init.lua → A → A1 → A2 → B → C (Chronological では source 順)
         let modules: Vec<&str> = rows.iter().map(|r| r.module).collect();
         assert_eq!(modules, vec!["init.lua", "A", "A1", "A2", "B", "C"]);
@@ -1346,7 +1587,13 @@ mod tests {
         let tree = sample_tree();
         // threshold=1.0 は sourced_ms < 1.0 をカット。B (0.4) は消える。
         // A2 (1.0) はちょうど閾値なので残る (< ではなく >= で判定)。
-        let rows = flatten_require_tree(&tree, 1.0, RequireTreeSort::ByTime, 99);
+        let rows = flatten_require_tree(
+            &tree,
+            1.0,
+            RequireTreeSort::ByTime,
+            99,
+            &std::collections::HashSet::new(),
+        );
         let modules: Vec<&str> = rows.iter().map(|r| r.module).collect();
         assert!(!modules.contains(&"B"));
         assert!(modules.contains(&"A2")); // 境界値は残す
@@ -1363,7 +1610,13 @@ mod tests {
             sourced_ms: 0.1,
             children: vec![],
         };
-        let rows = flatten_require_tree(&tiny, 1.0, RequireTreeSort::ByTime, 99);
+        let rows = flatten_require_tree(
+            &tiny,
+            1.0,
+            RequireTreeSort::ByTime,
+            99,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].module, "init.lua");
     }
@@ -1371,7 +1624,13 @@ mod tests {
     #[test]
     fn flatten_require_tree_respects_max_rows() {
         let tree = sample_tree();
-        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::ByTime, 3);
+        let rows = flatten_require_tree(
+            &tree,
+            0.0,
+            RequireTreeSort::ByTime,
+            3,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(rows.len(), 3);
         // 早い順に 3 行: init.lua / A / A1
         assert_eq!(rows[0].module, "init.lua");
@@ -1384,13 +1643,67 @@ mod tests {
         // bar 描画側が使うフィールド (self_ms / sourced_ms / depth) が正しく
         // 渡されること。色分け用に self と sourced の両方が必要。
         let tree = sample_tree();
-        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::ByTime, 99);
+        let rows = flatten_require_tree(
+            &tree,
+            0.0,
+            RequireTreeSort::ByTime,
+            99,
+            &std::collections::HashSet::new(),
+        );
         let a = rows.iter().find(|r| r.module == "A").unwrap();
         assert_eq!(a.depth, 1);
         assert!((a.sourced_ms - 7.0).abs() < 1e-9);
         assert!((a.self_ms - 1.0).abs() < 1e-9);
         let a1 = rows.iter().find(|r| r.module == "A1").unwrap();
         assert_eq!(a1.depth, 2);
+    }
+
+    #[test]
+    fn flatten_require_tree_marks_has_children_for_renderer() {
+        // renderer が `▶` (collapsed) / `▼` (expanded) / `●` (leaf) を出し分けるため、
+        // 行に has_children フラグが必要。
+        let tree = sample_tree();
+        let rows = flatten_require_tree(
+            &tree,
+            0.0,
+            RequireTreeSort::ByTime,
+            99,
+            &std::collections::HashSet::new(),
+        );
+        let root = &rows[0];
+        assert!(root.has_children, "init.lua は 3 children あり");
+        assert!(!root.is_collapsed);
+        let b = rows.iter().find(|r| r.module == "B").unwrap();
+        assert!(!b.has_children, "B は leaf");
+        let a1 = rows.iter().find(|r| r.module == "A1").unwrap();
+        assert!(!a1.has_children, "A1 も leaf");
+    }
+
+    #[test]
+    fn flatten_require_tree_hides_children_of_collapsed_nodes() {
+        // collapsed set に "A" があれば、A は出すが A1 / A2 は出さない。
+        let tree = sample_tree();
+        let mut collapsed = std::collections::HashSet::new();
+        collapsed.insert("A".to_string());
+        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::ByTime, 99, &collapsed);
+        let modules: Vec<&str> = rows.iter().map(|r| r.module).collect();
+        assert!(modules.contains(&"A"));
+        assert!(!modules.contains(&"A1"));
+        assert!(!modules.contains(&"A2"));
+        // A は collapsed 状態で、has_children も true のまま
+        let a = rows.iter().find(|r| r.module == "A").unwrap();
+        assert!(a.has_children);
+        assert!(a.is_collapsed);
+    }
+
+    // ── focus + tree cursor ────────────────────────────────────────────────
+    // Tab で pane 間 focus を切り替え、detail pane focus 時に tree の行を選べる。
+    // focus = Table → j/k はテーブル選択、focus = Detail → j/k は tree 行選択。
+
+    #[test]
+    fn focus_toggles_between_table_and_detail() {
+        assert_eq!(Focus::Table.toggle(), Focus::Detail);
+        assert_eq!(Focus::Detail.toggle(), Focus::Table);
     }
 
     // ── require-tree state keybindings ──────────────────────────────────────
