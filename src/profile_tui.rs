@@ -110,10 +110,15 @@ fn next_require_threshold(current: f64) -> f64 {
 }
 
 /// `flatten_require_tree` が返す 1 行分のデータ。
+///
+/// `module` は source ツリー (`ProfileReport.plugins[...].require_trace`) の
+/// `RequireNode.module` を借用する。row は render-time に毎 frame 作るため、
+/// `String::clone` を避けて借用にしたい (lazy.nvim の lifetime-free 構造と違い
+/// 我々の RequireNode tree は render loop 中は動かないので borrow 可能)。
 #[derive(Debug, Clone, PartialEq)]
-pub struct RequireRow {
+pub struct RequireRow<'a> {
     pub depth: usize,
-    pub module: String,
+    pub module: &'a str,
     pub self_ms: f64,
     pub sourced_ms: f64,
 }
@@ -126,12 +131,12 @@ pub struct RequireRow {
 ///   - Chronological: insertion order のまま (init.lua 内の require 呼び出し順)
 ///
 /// max_rows: 可視領域の行数上限。下位の行は切り詰め。
-pub fn flatten_require_tree(
-    root: &RequireNode,
+pub fn flatten_require_tree<'a>(
+    root: &'a RequireNode,
     threshold_ms: f64,
     sort: RequireTreeSort,
     max_rows: usize,
-) -> Vec<RequireRow> {
+) -> Vec<RequireRow<'a>> {
     // max_rows は pane の残り行から来る自然な上限 (典型的には 10〜50)。
     // pre-allocate してフレーム毎の re-alloc を回避。
     let mut out = Vec::with_capacity(max_rows);
@@ -139,13 +144,13 @@ pub fn flatten_require_tree(
     out
 }
 
-fn walk(
-    node: &RequireNode,
+fn walk<'a>(
+    node: &'a RequireNode,
     depth: usize,
     threshold: f64,
     sort: RequireTreeSort,
     max_rows: usize,
-    out: &mut Vec<RequireRow>,
+    out: &mut Vec<RequireRow<'a>>,
     is_root: bool,
 ) {
     if out.len() >= max_rows {
@@ -157,7 +162,7 @@ fn walk(
     }
     out.push(RequireRow {
         depth,
-        module: node.module.clone(),
+        module: &node.module,
         self_ms: node.self_ms,
         sourced_ms: node.sourced_ms,
     });
@@ -810,7 +815,7 @@ fn draw_require_tree_detail(
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(
-                pad_truncate(&row.module, name_width),
+                pad_truncate(row.module, name_width),
                 Style::default().fg(Color::Gray),
             ),
             Span::styled(
@@ -1211,6 +1216,42 @@ pub fn print_plain(report: &ProfileReport, top: Option<usize>) {
             p.file_count,
         );
     }
+
+    // [user config] に require_trace があれば require tree を追加出力する。
+    // plain text 出力は pipe / grep 友好的なので threshold は設けず全ノード
+    // 出す方針 (TUI と違って隠す動機が薄い)。sort は TUI のデフォルトと同じ
+    // ByTime で、自動化用途 (ログ収集) でも読みやすい順序になる。
+    if let Some(user_cfg) = report
+        .plugins
+        .iter()
+        .find(|p| p.name == crate::profile::GROUP_USER)
+        && let Some(tree) = user_cfg.require_trace.as_ref()
+    {
+        println!();
+        let nodes = count_require_nodes(tree);
+        println!(
+            "## require tree ({} nodes, sourced {:.2} ms, self {:.2} ms)",
+            nodes, tree.sourced_ms, tree.self_ms
+        );
+        print_require_tree_plain(tree, 0);
+    }
+}
+
+fn print_require_tree_plain(node: &RequireNode, depth: usize) {
+    let indent: String = "  ".repeat(depth);
+    println!(
+        "  {}{:<40}  sourced {:>7.2} ms · self {:>7.2} ms",
+        indent, node.module, node.sourced_ms, node.self_ms,
+    );
+    let mut children: Vec<&RequireNode> = node.children.iter().collect();
+    children.sort_by(|a, b| {
+        b.sourced_ms
+            .partial_cmp(&a.sourced_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for c in children {
+        print_require_tree_plain(c, depth + 1);
+    }
 }
 
 #[cfg(test)]
@@ -1287,7 +1328,7 @@ mod tests {
         let tree = sample_tree();
         let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::ByTime, 99);
         // init.lua → A (7) → A1 (5) → A2 (1) → C (2) → B (0.4)
-        let modules: Vec<&str> = rows.iter().map(|r| r.module.as_str()).collect();
+        let modules: Vec<&str> = rows.iter().map(|r| r.module).collect();
         assert_eq!(modules, vec!["init.lua", "A", "A1", "A2", "C", "B"]);
     }
 
@@ -1296,7 +1337,7 @@ mod tests {
         let tree = sample_tree();
         let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::Chronological, 99);
         // init.lua → A → A1 → A2 → B → C (Chronological では source 順)
-        let modules: Vec<&str> = rows.iter().map(|r| r.module.as_str()).collect();
+        let modules: Vec<&str> = rows.iter().map(|r| r.module).collect();
         assert_eq!(modules, vec!["init.lua", "A", "A1", "A2", "B", "C"]);
     }
 
@@ -1306,7 +1347,7 @@ mod tests {
         // threshold=1.0 は sourced_ms < 1.0 をカット。B (0.4) は消える。
         // A2 (1.0) はちょうど閾値なので残る (< ではなく >= で判定)。
         let rows = flatten_require_tree(&tree, 1.0, RequireTreeSort::ByTime, 99);
-        let modules: Vec<&str> = rows.iter().map(|r| r.module.as_str()).collect();
+        let modules: Vec<&str> = rows.iter().map(|r| r.module).collect();
         assert!(!modules.contains(&"B"));
         assert!(modules.contains(&"A2")); // 境界値は残す
     }

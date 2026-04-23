@@ -18,7 +18,9 @@ sources everything without any runtime glob cost.
 
 ### Startup profile
 
-**`rvpm profile`** — per-plugin phase breakdown in a TUI: banner + phase timeline + plugin table + selected-plugin file detail. Keys: `j/k` navigate · `g/G` top/bottom · `s` cycle sort · `h` hide groups · `?` help · `q` quit.
+**`rvpm profile`** — per-plugin phase breakdown in a TUI: banner + phase timeline + plugin table + selected-plugin file detail. Keys: `j/k` navigate · `g/G` top/bottom · `s` cycle sort · `h` hide groups · `f` require-tree threshold · `c` require-tree sort · `?` help · `q` quit.
+
+Selecting the `[user config]` pseudo-plugin swaps the detail pane for a **require tree** of your `init.lua`: a stack-based tracer wraps `_G.require` for the run, captures `vim.uv.hrtime()` deltas per module, and renders the result depth-indented in the pane. Useful when `[user config]` is one of the heaviest rows and you want to find the offending `require(...)`.
 
 ![profile](vhs/profile.gif)
 
@@ -795,6 +797,65 @@ rvpm list
 rvpm list --no-tui
 rvpm list --no-tui | grep Missing
 ```
+
+</details>
+
+<details>
+<summary><b><code>rvpm profile --json</code> schema</b></summary>
+
+```json
+{
+  "total_startup_ms": 761.8,
+  "runs": 3,
+  "nvim_version": "NVIM v0.13.0-dev-...",
+  "no_merge": false,
+  "no_instrument": false,
+  "phase_timeline": [
+    { "name": "phase-3", "duration_ms": 22.19 },
+    { "name": "phase-6", "duration_ms": 387.92 }
+  ],
+  "plugins": [
+    {
+      "name": "[user config]",
+      "total_self_ms": 111.97,
+      "total_sourced_ms": 705.40,
+      "init_ms": 0.0,
+      "load_ms": 0.0,
+      "trig_ms": 0.0,
+      "file_count": 1,
+      "is_managed": false,
+      "lazy": false,
+      "top_files": [
+        { "path": "init.lua", "self_ms": 111.97, "sourced_ms": 705.40 }
+      ],
+      "require_trace": {
+        "module": "init.lua",
+        "self_ms": 112.0,
+        "sourced_ms": 705.4,
+        "children": [
+          {
+            "module": "user.plugins",
+            "self_ms": 73.12,
+            "sourced_ms": 425.12,
+            "children": [
+              { "module": "user.lsp.servers", "self_ms": 85.34, "sourced_ms": 85.34, "children": [] }
+            ]
+          },
+          { "module": "user.keymaps", "self_ms": 42.11, "sourced_ms": 42.11, "children": [] }
+        ]
+      }
+    }
+  ]
+}
+```
+
+**Key notes:**
+
+- `phase_timeline` is present only when the run was instrumented (absent under `--no-instrument`).
+- Every plugin has `top_files` (up to 10 heaviest `self_ms` files).
+- `require_trace` is present only on the `[user config]` pseudo-plugin and only when the require tracer ran — `--no-instrument` suppresses it.
+- `require_trace.sourced_ms` is wall-clock time including descendants; `self_ms = sourced_ms - Σ children.sourced_ms`, clamped to `0.0`.
+- All `*_ms` fields are f64 milliseconds averaged across `runs`.
 
 </details>
 
