@@ -904,7 +904,10 @@ pub async fn run_profile(cfg: ProfileRunConfig) -> anyhow::Result<ProfileReport>
         let extra_args: Vec<String> = if let Some((tracer_path, _)) = tracer_paths.as_ref() {
             vec![
                 "--cmd".into(),
-                format!("luafile {}", tracer_path.to_string_lossy().replace('\\', "/")),
+                format!(
+                    "luafile {}",
+                    tracer_path.to_string_lossy().replace('\\', "/")
+                ),
             ]
         } else {
             Vec::new()
