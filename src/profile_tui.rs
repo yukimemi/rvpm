@@ -12,7 +12,7 @@
 //   - グラデーション: 速い = Green → Cyan → Yellow → Red = 遅い
 //   - 擬似グループ ([merged] / [runtime] 等): DarkGray で控えめ
 
-use crate::profile::{PhaseTime, ProfileReport, is_group_name};
+use crate::profile::{GROUP_USER, PhaseTime, ProfileReport, RequireNode, is_group_name};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -67,6 +67,129 @@ impl SortKey {
     }
 }
 
+/// `[user config]` の require tree を detail pane に描画するときの並び順。
+/// lazy.nvim の Profile view と同じ 2 モード: 時間順 / 登場順。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequireTreeSort {
+    /// sourced_ms 降順 (デフォルト) — 重い require を上に寄せる
+    ByTime,
+    /// init.lua での `require(...)` 呼び出し順 — 依存の流れを追う用
+    Chronological,
+}
+
+impl RequireTreeSort {
+    fn toggle(self) -> Self {
+        match self {
+            Self::ByTime => Self::Chronological,
+            Self::Chronological => Self::ByTime,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ByTime => "by time",
+            Self::Chronological => "chrono",
+        }
+    }
+}
+
+/// require tree の threshold cycle: 1.0 → 0.5 → 0.0 → 1.0 (wrap)。
+/// 3 段階に絞る理由は lazy.nvim の Profile view と同様、細かい刻みは
+/// UX 的に迷うだけで価値が薄いから。
+fn next_require_threshold(current: f64) -> f64 {
+    if (current - 1.0).abs() < f64::EPSILON {
+        0.5
+    } else if (current - 0.5).abs() < f64::EPSILON {
+        0.0
+    } else if current.abs() < f64::EPSILON {
+        1.0
+    } else {
+        // 端数 state からの復帰先 — 一番フィルタ強めで戻す
+        1.0
+    }
+}
+
+/// `flatten_require_tree` が返す 1 行分のデータ。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequireRow {
+    pub depth: usize,
+    pub module: String,
+    pub self_ms: f64,
+    pub sourced_ms: f64,
+}
+
+/// RequireNode 木を pre-order DFS で 1 列に flatten する。`threshold_ms` 未満の
+/// ノード (およびその子孫) は skip。root だけは必ず残す (pane が空になるのを防ぐ)。
+///
+/// sort:
+///   - ByTime: 兄弟を sourced_ms 降順 (重い require が上)
+///   - Chronological: insertion order のまま (init.lua 内の require 呼び出し順)
+///
+/// max_rows: 可視領域の行数上限。下位の行は切り詰め。
+pub fn flatten_require_tree(
+    root: &RequireNode,
+    threshold_ms: f64,
+    sort: RequireTreeSort,
+    max_rows: usize,
+) -> Vec<RequireRow> {
+    // max_rows は pane の残り行から来る自然な上限 (典型的には 10〜50)。
+    // pre-allocate してフレーム毎の re-alloc を回避。
+    let mut out = Vec::with_capacity(max_rows);
+    walk(root, 0, threshold_ms, sort, max_rows, &mut out, true);
+    out
+}
+
+fn walk(
+    node: &RequireNode,
+    depth: usize,
+    threshold: f64,
+    sort: RequireTreeSort,
+    max_rows: usize,
+    out: &mut Vec<RequireRow>,
+    is_root: bool,
+) {
+    if out.len() >= max_rows {
+        return;
+    }
+    // root は threshold で切らない (空 pane 防止)
+    if !is_root && node.sourced_ms < threshold {
+        return;
+    }
+    out.push(RequireRow {
+        depth,
+        module: node.module.clone(),
+        self_ms: node.self_ms,
+        sourced_ms: node.sourced_ms,
+    });
+    // ByTime は並び替えが必要なので一度 Vec<&RequireNode> に集めて sort。
+    // Chronological は insertion order のままで良いので直接 iterate して
+    // 毎 frame の allocation を避ける。
+    match sort {
+        RequireTreeSort::ByTime => {
+            let mut children: Vec<&RequireNode> = node.children.iter().collect();
+            children.sort_by(|a, b| {
+                b.sourced_ms
+                    .partial_cmp(&a.sourced_ms)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for c in children {
+                if out.len() >= max_rows {
+                    break;
+                }
+                walk(c, depth + 1, threshold, sort, max_rows, out, false);
+            }
+        }
+        RequireTreeSort::Chronological => {
+            for c in &node.children {
+                if out.len() >= max_rows {
+                    break;
+                }
+                walk(c, depth + 1, threshold, sort, max_rows, out, false);
+            }
+        }
+    }
+}
+
 /// TUI の内部状態。
 struct ProfileTuiState {
     report: ProfileReport,
@@ -74,6 +197,10 @@ struct ProfileTuiState {
     hide_groups: bool,
     table_state: TableState,
     show_help: bool,
+    /// require tree 表示時の sourced_ms 閾値 (ms)。`f` でサイクル。
+    require_tree_threshold_ms: f64,
+    /// require tree 表示時の兄弟ソート方針。`c` でトグル。
+    require_tree_sort: RequireTreeSort,
 }
 
 impl ProfileTuiState {
@@ -92,6 +219,10 @@ impl ProfileTuiState {
             hide_groups: false,
             table_state: ts,
             show_help: false,
+            // 1.0 ms 未満の require は細かすぎてノイズ。まずは bold な top-level だけ
+            // 見える状態で start し、f キーで 0.5 / 0.0 ms に広げていく運用。
+            require_tree_threshold_ms: 1.0,
+            require_tree_sort: RequireTreeSort::ByTime,
         }
     }
 
@@ -210,6 +341,15 @@ fn run_loop(
                 KeyCode::Char('s') => state.sort_key = state.sort_key.next(),
                 KeyCode::Char('h') => state.hide_groups = !state.hide_groups,
                 KeyCode::Char('?') => state.show_help = !state.show_help,
+                // require tree detail pane 専用キー ([user config] 選択中のみ意味あり)。
+                // 他のプラグイン選択時は値が変わるだけで描画に影響しないので安全。
+                KeyCode::Char('f') => {
+                    state.require_tree_threshold_ms =
+                        next_require_threshold(state.require_tree_threshold_ms);
+                }
+                KeyCode::Char('c') => {
+                    state.require_tree_sort = state.require_tree_sort.toggle();
+                }
                 _ => {}
             }
         }
@@ -608,11 +748,134 @@ fn plugin_badge(p: &crate::profile::PluginStats) -> (&'static str, Color) {
     }
 }
 
+/// [user config] 選択時の detail pane — init.lua からの require tree を
+/// 木構造で縦一列に並べる。`f` で threshold (1.0/0.5/0.0 ms) サイクル、
+/// `c` で sort (ByTime ↔ Chronological) トグル。lazy.nvim の Profile
+/// view と同じ操作感。
+fn draw_require_tree_detail(
+    f: &mut Frame,
+    area: Rect,
+    state: &ProfileTuiState,
+    plugin: &crate::profile::PluginStats,
+    tree: &RequireNode,
+) {
+    // pane 内部で使える行数 (banner 1 行 + border 2 行を引く)
+    let inner_h = area.height.saturating_sub(3) as usize;
+    let rows = flatten_require_tree(
+        tree,
+        state.require_tree_threshold_ms,
+        state.require_tree_sort,
+        inner_h.max(1),
+    );
+
+    // bar は sourced_ms 基準 (「全体の実時間にどれだけ食われてるか」を見るため)。
+    // RequireNode の性質上、親 sourced_ms = self + Σchildren.sourced_ms (clamp
+    // 前の値)、つまり `flatten_require_tree` が root を必ず先頭に置くので
+    // rows[0] は常に最大値。iterate するコストを省いて rows.first() を取る。
+    let max_sourced = rows.first().map(|r| r.sourced_ms).unwrap_or(0.0).max(1e-6);
+    let bar_w = (area.width.saturating_sub(60) as usize).max(4);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(rows.len() + 1);
+    let total_nodes = count_require_nodes(tree);
+    let shown = rows.len();
+    lines.push(Line::from(vec![
+        Span::styled(" require tree ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(
+                "(showing {} of {} · threshold {:.1} ms · sort {})",
+                shown,
+                total_nodes,
+                state.require_tree_threshold_ms,
+                state.require_tree_sort.label(),
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+
+    for row in &rows {
+        let icon = require_tree_icon(row.depth);
+        let indent: String = "  ".repeat(row.depth);
+        let filled = ((row.sourced_ms / max_sourced) * bar_w as f64).round() as usize;
+        let bar: String = std::iter::repeat_n('\u{2588}', filled)
+            .chain(std::iter::repeat_n(
+                '\u{2591}',
+                bar_w.saturating_sub(filled),
+            ))
+            .collect();
+        let color = bar_color(row.sourced_ms, max_sourced);
+        let name_width = 34usize.saturating_sub(row.depth * 2).max(8);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {}{} ", indent, icon),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                pad_truncate(&row.module, name_width),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                format!("  {:>6.2} ms  ", row.sourced_ms),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(bar, Style::default().fg(color)),
+        ]));
+    }
+
+    let summary = format!(
+        "  self {:.2}  sourced {:.2}  /  total {:.2} ms",
+        tree.self_ms, tree.sourced_ms, plugin.total_self_ms
+    );
+    let title = Line::from(vec![
+        Span::styled(
+            format!(" {} ", plugin.name),
+            Style::default()
+                .fg(Color::Black)
+                .bg(bar_color(
+                    plugin.total_self_ms,
+                    state.report.total_startup_ms.max(1.0),
+                ))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(summary, Style::default().fg(Color::Gray)),
+    ]);
+    let widget = Paragraph::new(lines).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    f.render_widget(widget, area);
+}
+
+fn require_tree_icon(depth: usize) -> char {
+    // lazy.nvim の list icon と同じ雰囲気: 深さに応じて黒丸 → 白丸 → 二重丸 と
+    // 階層がつくループ。
+    match depth % 3 {
+        0 => '\u{25cf}', // ●
+        1 => '\u{25cb}', // ○
+        _ => '\u{25c9}', // ◉
+    }
+}
+
+fn count_require_nodes(node: &RequireNode) -> usize {
+    1 + node.children.iter().map(count_require_nodes).sum::<usize>()
+}
+
 fn draw_detail(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
     let Some(idx) = state.selected_plugin_index() else {
         return;
     };
     let p = &state.report.plugins[idx];
+
+    // `[user config]` で require_trace が populate されているなら、top_files の
+    // 代わりに require tree を描画する (#77 PR 3)。
+    if p.name == GROUP_USER
+        && let Some(tree) = p.require_trace.as_ref()
+    {
+        draw_require_tree_detail(f, area, state, p, tree);
+        return;
+    }
 
     let max_file_ms = p
         .top_files
@@ -711,6 +974,8 @@ fn draw_footer(f: &mut Frame, area: Rect, _state: &ProfileTuiState) {
         ("g/G", "top/bot"),
         ("s", "sort"),
         ("h", "hide groups"),
+        ("f", "tree threshold"),
+        ("c", "tree sort"),
         ("?", "help"),
         ("q", "quit"),
     ] {
@@ -758,6 +1023,10 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from("  g / G           jump to top / bottom"),
         Line::from("  s               cycle sort (load → init → trig → …)"),
         Line::from("  h               toggle [merged]/[runtime] group rows"),
+        Line::from("  f               [user config] require-tree threshold cycle"),
+        Line::from("                  (1.0 → 0.5 → 0.0 ms)"),
+        Line::from("  c               [user config] require-tree sort toggle"),
+        Line::from("                  (by time ↔ chronological)"),
         Line::from("  ?               toggle this help"),
         Line::from("  q / Esc         quit"),
         Line::from(""),
@@ -947,7 +1216,167 @@ pub fn print_plain(report: &ProfileReport, top: Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::RequireNode;
     use unicode_width::UnicodeWidthStr;
+
+    // ── require-tree flattening for detail pane ────────────────────────────
+    // [user config] を選んだとき、require_trace を行単位に flatten して
+    // detail pane に縦一列で並べる。引数で threshold / sort / max_rows を受け、
+    // 描画ループに渡す行を決める。
+    //
+    // * `threshold_ms`: sourced_ms がこれ未満のノードとその子孫をカット。
+    //   1.0 / 0.5 / 0.0 の 3 段階を `f` キーでサイクル。
+    // * `sort`: 兄弟をどの順で並べるか。ByTime (sourced_ms desc) が default。
+    //   `c` で Chronological (insertion order) に切り替え、lazy.nvim の
+    //   Profile view と同じ 2 モード。
+    // * `max_rows`: pane の残り行数を超えたら切り詰める。
+
+    fn sample_tree() -> RequireNode {
+        // init.lua 10ms, children: [A 7ms (A1 5ms, A2 1ms), B 0.4ms, C 2ms]
+        // threshold=1.0 で B (0.4ms) 全体カット、A2 (1ms, sourced) はボーダー。
+        RequireNode {
+            module: "init.lua".into(),
+            self_ms: 0.6,
+            sourced_ms: 10.0,
+            children: vec![
+                RequireNode {
+                    module: "A".into(),
+                    self_ms: 1.0,
+                    sourced_ms: 7.0,
+                    children: vec![
+                        RequireNode {
+                            module: "A1".into(),
+                            self_ms: 5.0,
+                            sourced_ms: 5.0,
+                            children: vec![],
+                        },
+                        RequireNode {
+                            module: "A2".into(),
+                            self_ms: 1.0,
+                            sourced_ms: 1.0,
+                            children: vec![],
+                        },
+                    ],
+                },
+                RequireNode {
+                    module: "B".into(),
+                    self_ms: 0.4,
+                    sourced_ms: 0.4,
+                    children: vec![],
+                },
+                RequireNode {
+                    module: "C".into(),
+                    self_ms: 2.0,
+                    sourced_ms: 2.0,
+                    children: vec![],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn flatten_require_tree_includes_root_with_depth_0() {
+        let tree = sample_tree();
+        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::ByTime, 99);
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[0].module, "init.lua");
+    }
+
+    #[test]
+    fn flatten_require_tree_sorts_siblings_by_sourced_ms_desc() {
+        let tree = sample_tree();
+        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::ByTime, 99);
+        // init.lua → A (7) → A1 (5) → A2 (1) → C (2) → B (0.4)
+        let modules: Vec<&str> = rows.iter().map(|r| r.module.as_str()).collect();
+        assert_eq!(modules, vec!["init.lua", "A", "A1", "A2", "C", "B"]);
+    }
+
+    #[test]
+    fn flatten_require_tree_keeps_insertion_order_under_chronological() {
+        let tree = sample_tree();
+        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::Chronological, 99);
+        // init.lua → A → A1 → A2 → B → C (Chronological では source 順)
+        let modules: Vec<&str> = rows.iter().map(|r| r.module.as_str()).collect();
+        assert_eq!(modules, vec!["init.lua", "A", "A1", "A2", "B", "C"]);
+    }
+
+    #[test]
+    fn flatten_require_tree_skips_subtrees_below_threshold() {
+        let tree = sample_tree();
+        // threshold=1.0 は sourced_ms < 1.0 をカット。B (0.4) は消える。
+        // A2 (1.0) はちょうど閾値なので残る (< ではなく >= で判定)。
+        let rows = flatten_require_tree(&tree, 1.0, RequireTreeSort::ByTime, 99);
+        let modules: Vec<&str> = rows.iter().map(|r| r.module.as_str()).collect();
+        assert!(!modules.contains(&"B"));
+        assert!(modules.contains(&"A2")); // 境界値は残す
+    }
+
+    #[test]
+    fn flatten_require_tree_never_cuts_root_even_below_threshold() {
+        // root (init.lua) の sourced_ms が threshold 未満でも、少なくとも root は
+        // 表示する。そうしないと detail pane が空になって "何が選ばれてるのか"
+        // 分からなくなる。
+        let tiny = RequireNode {
+            module: "init.lua".into(),
+            self_ms: 0.1,
+            sourced_ms: 0.1,
+            children: vec![],
+        };
+        let rows = flatten_require_tree(&tiny, 1.0, RequireTreeSort::ByTime, 99);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].module, "init.lua");
+    }
+
+    #[test]
+    fn flatten_require_tree_respects_max_rows() {
+        let tree = sample_tree();
+        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::ByTime, 3);
+        assert_eq!(rows.len(), 3);
+        // 早い順に 3 行: init.lua / A / A1
+        assert_eq!(rows[0].module, "init.lua");
+        assert_eq!(rows[1].module, "A");
+        assert_eq!(rows[2].module, "A1");
+    }
+
+    #[test]
+    fn flatten_require_tree_carries_sourced_and_self_ms_and_depth() {
+        // bar 描画側が使うフィールド (self_ms / sourced_ms / depth) が正しく
+        // 渡されること。色分け用に self と sourced の両方が必要。
+        let tree = sample_tree();
+        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::ByTime, 99);
+        let a = rows.iter().find(|r| r.module == "A").unwrap();
+        assert_eq!(a.depth, 1);
+        assert!((a.sourced_ms - 7.0).abs() < 1e-9);
+        assert!((a.self_ms - 1.0).abs() < 1e-9);
+        let a1 = rows.iter().find(|r| r.module == "A1").unwrap();
+        assert_eq!(a1.depth, 2);
+    }
+
+    // ── require-tree state keybindings ──────────────────────────────────────
+
+    #[test]
+    fn require_tree_threshold_cycles_through_three_steps() {
+        // f キー用: 1.0 → 0.5 → 0.0 → 1.0 (wrap)。3 段階に絞る理由は
+        // lazy.nvim の Profile view が同様の離散ステップで、細かすぎる
+        // 刻みは UX 的に迷うだけのため。
+        assert_eq!(next_require_threshold(1.0), 0.5);
+        assert_eq!(next_require_threshold(0.5), 0.0);
+        assert_eq!(next_require_threshold(0.0), 1.0);
+        // 端数は次の刻みに丸められる (壊れた state からの復帰)
+        assert_eq!(next_require_threshold(0.123), 1.0);
+    }
+
+    #[test]
+    fn require_tree_sort_toggles_between_two_modes() {
+        assert_eq!(
+            RequireTreeSort::ByTime.toggle(),
+            RequireTreeSort::Chronological
+        );
+        assert_eq!(
+            RequireTreeSort::Chronological.toggle(),
+            RequireTreeSort::ByTime
+        );
+    }
 
     #[test]
     fn pad_truncate_pads_short_strings_to_exact_display_width() {
