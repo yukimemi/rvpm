@@ -140,8 +140,7 @@ pub fn expand_cmd_patterns(patterns: &[String], defined: &[String], scope: &str)
         if let Some(re_src) = body {
             match regex::Regex::new(re_src) {
                 Ok(re) => {
-                    let matches: Vec<&String> =
-                        defined.iter().filter(|d| re.is_match(d)).collect();
+                    let matches: Vec<&String> = defined.iter().filter(|d| re.is_match(d)).collect();
                     if matches.is_empty() {
                         eprintln!(
                             "\u{26a0} on_cmd regex {pat:?} matched no commands for {scope}; \
@@ -950,19 +949,14 @@ mod tests {
         // zero match なら元のパターンを literal として残す。stub 登録はされるが
         // `/^NoSuch/` は Vim command 名として無効なので実行時に発火しない。user が
         // warn で気づく。
-        let out = expand_cmd_patterns(
-            &["/^NoSuch/".to_string()],
-            &["Other".to_string()],
-            "plugin",
-        );
+        let out = expand_cmd_patterns(&["/^NoSuch/".to_string()], &["Other".to_string()], "plugin");
         assert_eq!(out, vec!["/^NoSuch/"]);
     }
 
     #[test]
     fn expand_cmd_patterns_invalid_regex_falls_back_to_literal() {
         // bad regex (unmatched paren) → literal として残し warn。crash しない。
-        let out =
-            expand_cmd_patterns(&["/(unclosed/".to_string()], &["Foo".to_string()], "plugin");
+        let out = expand_cmd_patterns(&["/(unclosed/".to_string()], &["Foo".to_string()], "plugin");
         assert_eq!(out, vec!["/(unclosed/"]);
     }
 

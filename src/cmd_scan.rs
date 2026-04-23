@@ -51,7 +51,9 @@ pub fn scan_source(src: &str) -> Vec<String> {
             // `-foo=<arg>` でも間に空白が入らないので単純に `-` で始まる token を
             // 次の空白まで skip すれば OK。
             while let Some(remaining) = rest.strip_prefix('-') {
-                let end = remaining.find(char::is_whitespace).unwrap_or(remaining.len());
+                let end = remaining
+                    .find(char::is_whitespace)
+                    .unwrap_or(remaining.len());
                 rest = remaining[end..].trim_start();
             }
             if let Some(name) = extract_ident(rest)
