@@ -25,8 +25,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **監視ストップ条件**: **最後の actionable コメントから 30 分** 新しい指摘が来なかったら監視ループを抜けて、リポジトリオーナーに「bot が quiet になったので merge 判断お願いします」と報告する。30 分は「bot が review cycle を一巡させるのに十分で、人間を待たせすぎない」ライン。短すぎ (<10 分) だと遅延投稿を取りこぼし、長すぎ (>1 時間) だと merge が無意味に遅れる。
 - **Merge gating.** 以下の **両方** を満たすまで merge しない:
   1. レビュー bot (Gemini / CodeRabbit) が新しい actionable コメントを出さなくなった — fix → @-mention → 沈黙、のサイクルを回し続ける。
+     Bot からの "Understood" / "Thank you" のような ack のみの返信はその thread の quiet pass とみなす。新しい actionable な指摘が来たら loop を再開。
   2. リポジトリオーナー (@yukimemi) が明示的に merge を承認している。
-  Bot からの "Understood" / "Thank you" のような ack のみの返信はその thread の quiet pass とみなす。新しい actionable な指摘が来たら loop を再開。
 - **例外: bot-authored PR (Renovate, Dependabot).** Gemini と CodeRabbit はデフォルトでこれらを skip するので、"bot review を待つ" gate は適用しない。CI が green で owner 承認があれば merge OK。
 
 ## Development Commands
