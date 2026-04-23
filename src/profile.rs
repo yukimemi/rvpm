@@ -176,7 +176,11 @@ pub fn build_require_tracer_script(trace_path: &str) -> String {
 local ok_setup, err_setup = pcall(function()
   local trace_path = {path}
   local hrtime = (vim.uv or vim.loop).hrtime
-  local root = {{ module = "init.lua", time = hrtime(), children = {{}} }}
+  -- "(startup)" で測定スコープの広さ (`--cmd luafile` ロード時点から
+  -- `VimLeavePre` まで、nvim runtime の pre-init.lua 分も含む) を明示する。
+  -- 以前は "init.lua" というラベルだったが、startuptime の init.lua sourcing 行
+  -- (ユーザ init.lua 自体の self 経過時間) と値が噛み合わず混乱を招いた。
+  local root = {{ module = "(startup)", time = hrtime(), children = {{}} }}
   local stack = {{ root }}
   local orig_require = _G.require
   _G.require = function(modname)

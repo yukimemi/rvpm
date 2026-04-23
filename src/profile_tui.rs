@@ -841,7 +841,11 @@ fn draw_plugin_table(f: &mut Frame, area: Rect, state: &mut ProfileTuiState) {
             .title(title)
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_style(Style::default().fg(if state.focus == Focus::Table {
+                Color::Magenta
+            } else {
+                Color::DarkGray
+            })),
     )
     .row_highlight_style(
         Style::default()
@@ -1027,8 +1031,14 @@ fn draw_require_tree_detail(
         ]));
     }
 
+    // tree の self/sourced は tracer スコープ (--cmd luafile から VimLeavePre まで
+    // の全期間) の値。config self は `aggregate_single_run` が [user config]
+    // 擬似プラグインに振り分けた全ファイル (init.lua + global before.lua +
+    // global after.lua など) の startuptime self_ms の合計で、Lua require の
+    // 内訳は含まない。スコープが違うので並べて表示する際は「何を指した数字か」
+    // を明示する。
     let summary = format!(
-        "  self {:.2}  sourced {:.2}  /  total {:.2} ms",
+        "  tree self {:.2} ms · sourced {:.2} ms · config self {:.2} ms",
         tree.self_ms, tree.sourced_ms, plugin.total_self_ms
     );
     let title = Line::from(vec![
@@ -1169,12 +1179,19 @@ fn draw_detail(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
         ),
         Span::styled(summary, Style::default().fg(Color::Gray)),
     ]);
+    // Tab で focus が Detail に来たとき、[user config] 以外の plugin でも枠色で
+    // フィードバックする。そうしないと「Tab 押したのに何も起きてない」に見える。
+    let border_color = if state.focus == Focus::Detail {
+        Color::Magenta
+    } else {
+        Color::DarkGray
+    };
     let widget = Paragraph::new(lines).block(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_style(Style::default().fg(border_color)),
     );
     f.render_widget(widget, area);
 }
