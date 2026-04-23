@@ -1211,6 +1211,45 @@ pub fn print_plain(report: &ProfileReport, top: Option<usize>) {
             p.file_count,
         );
     }
+
+    // [user config] に require_trace があれば require tree を追加出力する。
+    // plain text 出力は pipe / grep 友好的なので threshold は設けず全ノード
+    // 出す方針 (TUI と違って隠す動機が薄い)。sort は TUI のデフォルトと同じ
+    // ByTime で、自動化用途 (ログ収集) でも読みやすい順序になる。
+    if let Some(user_cfg) = report
+        .plugins
+        .iter()
+        .find(|p| p.name == crate::profile::GROUP_USER)
+        && let Some(tree) = user_cfg.require_trace.as_ref()
+    {
+        println!();
+        let nodes = count_require_nodes(tree);
+        println!(
+            "## require tree ({} nodes, sourced {:.2} ms, self {:.2} ms)",
+            nodes, tree.sourced_ms, tree.self_ms
+        );
+        print_require_tree_plain(tree, 0);
+    }
+}
+
+fn print_require_tree_plain(node: &RequireNode, depth: usize) {
+    let indent: String = "  ".repeat(depth);
+    println!(
+        "  {}{:<40}  sourced {:>7.2} ms · self {:>7.2} ms",
+        indent,
+        node.module,
+        node.sourced_ms,
+        node.self_ms,
+    );
+    let mut children: Vec<&RequireNode> = node.children.iter().collect();
+    children.sort_by(|a, b| {
+        b.sourced_ms
+            .partial_cmp(&a.sourced_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for c in children {
+        print_require_tree_plain(c, depth + 1);
+    }
 }
 
 #[cfg(test)]
