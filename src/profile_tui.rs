@@ -765,10 +765,7 @@ fn draw_require_tree_detail(
     let total_nodes = count_require_nodes(tree);
     let shown = rows.len();
     lines.push(Line::from(vec![
-        Span::styled(
-            " require tree ",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(" require tree ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!(
                 "(showing {} of {} · threshold {:.1} ms · sort {})",
@@ -1283,8 +1280,7 @@ mod tests {
     #[test]
     fn flatten_require_tree_keeps_insertion_order_under_chronological() {
         let tree = sample_tree();
-        let rows =
-            flatten_require_tree(&tree, 0.0, RequireTreeSort::Chronological, 99);
+        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::Chronological, 99);
         // init.lua → A → A1 → A2 → B → C (Chronological では source 順)
         let modules: Vec<&str> = rows.iter().map(|r| r.module.as_str()).collect();
         assert_eq!(modules, vec!["init.lua", "A", "A1", "A2", "B", "C"]);
@@ -1358,8 +1354,14 @@ mod tests {
 
     #[test]
     fn require_tree_sort_toggles_between_two_modes() {
-        assert_eq!(RequireTreeSort::ByTime.toggle(), RequireTreeSort::Chronological);
-        assert_eq!(RequireTreeSort::Chronological.toggle(), RequireTreeSort::ByTime);
+        assert_eq!(
+            RequireTreeSort::ByTime.toggle(),
+            RequireTreeSort::Chronological
+        );
+        assert_eq!(
+            RequireTreeSort::Chronological.toggle(),
+            RequireTreeSort::ByTime
+        );
     }
 
     #[test]
