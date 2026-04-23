@@ -930,18 +930,18 @@ pub async fn run_profile(cfg: ProfileRunConfig) -> anyhow::Result<ProfileReport>
         // require tracer が trace.json を吐いていれば [user config] に attach。
         // tracer は VimLeavePre で JSON を書き出すので `+qa` による quit 中に発火する
         // (VimEnter は headless + +qa 構成だと取りこぼすため採用しない)。
+        //
+        // 順序: 先に or_insert_with で空エントリを確定 → post-insert で is_none()
+        // ガードして trace を載せる。and_modify + or_insert_with を併用すると
+        // update 側と insert 側で構造違い (trace のみ / PluginStats 全体) の
+        // 分岐が必要で、`tree.clone()` も強いられるため avoid。average_stats で
+        // 採用した first-populated-wins パターンと同型。
         if let Some((_, trace_path)) = tracer_paths.as_ref()
             && let Ok(raw) = std::fs::read_to_string(trace_path)
             && let Ok(tree) = parse_require_trace(&raw)
         {
-            stats
-                .entry(GROUP_USER.to_string())
-                .and_modify(|s| {
-                    if s.require_trace.is_none() {
-                        s.require_trace = Some(tree.clone());
-                    }
-                })
-                .or_insert_with(|| PluginStats {
+            let user_stats = stats.entry(GROUP_USER.to_string()).or_insert_with(|| {
+                PluginStats {
                     name: GROUP_USER.to_string(),
                     total_self_ms: 0.0,
                     total_sourced_ms: 0.0,
@@ -952,8 +952,12 @@ pub async fn run_profile(cfg: ProfileRunConfig) -> anyhow::Result<ProfileReport>
                     init_ms: 0.0,
                     load_ms: 0.0,
                     trig_ms: 0.0,
-                    require_trace: Some(tree),
-                });
+                    require_trace: None,
+                }
+            });
+            if user_stats.require_trace.is_none() {
+                user_stats.require_trace = Some(tree);
+            }
         }
 
         // eager プラグインの load_ms は instrumentation の有無に関わらず
