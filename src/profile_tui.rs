@@ -132,7 +132,9 @@ pub fn flatten_require_tree(
     sort: RequireTreeSort,
     max_rows: usize,
 ) -> Vec<RequireRow> {
-    let mut out = Vec::new();
+    // max_rows は pane の残り行から来る自然な上限 (典型的には 10〜50)。
+    // pre-allocate してフレーム毎の re-alloc を回避。
+    let mut out = Vec::with_capacity(max_rows);
     walk(root, 0, threshold_ms, sort, max_rows, &mut out, true);
     out
 }
@@ -159,19 +161,32 @@ fn walk(
         self_ms: node.self_ms,
         sourced_ms: node.sourced_ms,
     });
-    let mut children: Vec<&RequireNode> = node.children.iter().collect();
-    if matches!(sort, RequireTreeSort::ByTime) {
-        children.sort_by(|a, b| {
-            b.sourced_ms
-                .partial_cmp(&a.sourced_ms)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    }
-    for c in children {
-        if out.len() >= max_rows {
-            break;
+    // ByTime は並び替えが必要なので一度 Vec<&RequireNode> に集めて sort。
+    // Chronological は insertion order のままで良いので直接 iterate して
+    // 毎 frame の allocation を避ける。
+    match sort {
+        RequireTreeSort::ByTime => {
+            let mut children: Vec<&RequireNode> = node.children.iter().collect();
+            children.sort_by(|a, b| {
+                b.sourced_ms
+                    .partial_cmp(&a.sourced_ms)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for c in children {
+                if out.len() >= max_rows {
+                    break;
+                }
+                walk(c, depth + 1, threshold, sort, max_rows, out, false);
+            }
         }
-        walk(c, depth + 1, threshold, sort, max_rows, out, false);
+        RequireTreeSort::Chronological => {
+            for c in &node.children {
+                if out.len() >= max_rows {
+                    break;
+                }
+                walk(c, depth + 1, threshold, sort, max_rows, out, false);
+            }
+        }
     }
 }
 
@@ -753,12 +768,11 @@ fn draw_require_tree_detail(
         inner_h.max(1),
     );
 
-    // bar は sourced_ms 基準 (「全体の実時間にどれだけ食われてるか」を見るため)
-    let max_sourced = rows
-        .iter()
-        .map(|r| r.sourced_ms)
-        .fold(0.0_f64, f64::max)
-        .max(1e-6);
+    // bar は sourced_ms 基準 (「全体の実時間にどれだけ食われてるか」を見るため)。
+    // RequireNode の性質上、親 sourced_ms = self + Σchildren.sourced_ms (clamp
+    // 前の値)、つまり `flatten_require_tree` が root を必ず先頭に置くので
+    // rows[0] は常に最大値。iterate するコストを省いて rows.first() を取る。
+    let max_sourced = rows.first().map(|r| r.sourced_ms).unwrap_or(0.0).max(1e-6);
     let bar_w = (area.width.saturating_sub(60) as usize).max(4);
 
     let mut lines: Vec<Line> = Vec::with_capacity(rows.len() + 1);
