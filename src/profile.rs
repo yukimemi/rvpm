@@ -20,6 +20,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use serde::Deserialize;
+
 /// `nvim --startuptime` 1 行分の「ファイル sourcing」エントリ。
 /// event 行 (`--- NVIM STARTING ---` 等) は対象外。
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +57,9 @@ pub struct PluginStats {
     pub load_ms: f64,
     /// Phase 7 (lazy trigger 登録) 所要時間 (ms)。eager は 0。
     pub trig_ms: f64,
+    /// `[user config]` の init.lua 起点 require tree (#77)。instrumented loader の
+    /// `_G.require` ラッパが集めた結果で、他のプラグインでは常に None。
+    pub require_trace: Option<RequireNode>,
 }
 
 /// プラグイン内の 1 ファイルの統計。
@@ -64,6 +69,65 @@ pub struct FileStat {
     pub relative_path: String,
     pub self_ms: f64,
     pub sourced_ms: f64,
+}
+
+/// `[user config]` の init.lua が起点の `require()` 連鎖を木構造で保持する。
+///
+/// Lua 側 (instrumented loader.lua に埋め込んだ `_G.require` ラッパ) が
+/// lazy.nvim の `util.track()` と同じ stack-based tracer で tree を作り、
+/// `UIEnter` 時点で JSON として marker ファイルへ吐く。Rust 側はそれを
+/// `parse_require_trace` で復元する。
+///
+/// 時間計算:
+/// - `sourced_ms` は `vim.uv.hrtime()` の差分 (ns) を ms 変換したもの
+/// - `self_ms` = `sourced_ms - Σ children.sourced_ms` (子を引いた純粋な自身の処理)
+/// - 負値 (hrtime 非単調性 / 計測オーバーヘッドで起きうる) は 0.0 にクランプ
+///
+/// `nvim --startuptime` では `require()` 経由の Lua モジュールは entry を
+/// 出さないので、profile の `[user config]` は `init.lua` 1 行に潰れていた。
+/// この tree があると「init.lua の sourced 時間がどの require に吸われたか」
+/// を辿れる (#77 の動機)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequireNode {
+    pub module: String,
+    pub self_ms: f64,
+    pub sourced_ms: f64,
+    pub children: Vec<RequireNode>,
+}
+
+/// Lua 側が吐く JSON そのままの中間表現。`time` は nanoseconds。
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // used via `parse_require_trace` in PR 2 (loader-side tracer hookup)
+struct RawRequireNode {
+    module: String,
+    time: u64,
+    #[serde(default)]
+    children: Vec<RawRequireNode>,
+}
+
+impl RequireNode {
+    #[allow(dead_code)] // used via `parse_require_trace` in PR 2 (loader-side tracer hookup)
+    fn from_raw(raw: RawRequireNode) -> Self {
+        let sourced_ms = raw.time as f64 / 1e6;
+        let children: Vec<RequireNode> =
+            raw.children.into_iter().map(Self::from_raw).collect();
+        let children_sum: f64 = children.iter().map(|c| c.sourced_ms).sum();
+        let self_ms = (sourced_ms - children_sum).max(0.0);
+        RequireNode {
+            module: raw.module,
+            self_ms,
+            sourced_ms,
+            children,
+        }
+    }
+}
+
+/// instrumented loader.lua が吐いた require trace JSON を `RequireNode` tree に復元。
+#[allow(dead_code)] // wired into run_profile in PR 2 (loader-side tracer hookup)
+pub fn parse_require_trace(json: &str) -> anyhow::Result<RequireNode> {
+    let raw: RawRequireNode = serde_json::from_str(json)
+        .map_err(|e| anyhow::anyhow!("failed to parse require trace JSON: {}", e))?;
+    Ok(RequireNode::from_raw(raw))
 }
 
 /// 1 フェーズ分の所要時間 (平均値)。
@@ -235,6 +299,7 @@ pub fn aggregate_single_run(
                 load_ms: 0.0,
                 trig_ms: 0.0,
                 lazy,
+                require_trace: None,
             });
         s.total_self_ms += entry.self_ms;
         s.total_sourced_ms += entry.sourced_ms;
@@ -373,6 +438,7 @@ pub fn average_stats(
                 init_ms: 0.0,
                 load_ms: 0.0,
                 trig_ms: 0.0,
+                require_trace: None,
             });
             entry.total_self_ms += s.total_self_ms;
             entry.total_sourced_ms += s.total_sourced_ms;
@@ -763,6 +829,7 @@ pub async fn run_profile(cfg: ProfileRunConfig) -> anyhow::Result<ProfileReport>
                             init_ms: 0.0,
                             load_ms: 0.0,
                             trig_ms: 0.0,
+                            require_trace: None,
                         },
                     );
                 }
@@ -844,13 +911,114 @@ pub fn report_to_json(report: &ProfileReport) -> serde_json::Value {
                 "self_ms": f.self_ms,
                 "sourced_ms": f.sourced_ms,
             })).collect::<Vec<_>>(),
+            "require_trace": p.require_trace.as_ref().map(require_node_to_json),
         })).collect::<Vec<_>>(),
+    })
+}
+
+/// `RequireNode` ツリーを JSON に再帰変換。`report_to_json` から呼ばれる。
+fn require_node_to_json(node: &RequireNode) -> serde_json::Value {
+    serde_json::json!({
+        "module": node.module,
+        "self_ms": node.self_ms,
+        "sourced_ms": node.sourced_ms,
+        "children": node.children.iter().map(require_node_to_json).collect::<Vec<_>>(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── require trace parser ────────────────────────────────────────────────
+    // lazy.nvim の util.track() で作った tree を instrumented loader.lua が
+    // UIEnter で JSON に吐き、Rust 側はそれを RequireNode tree に復元する。
+    // JSON の `time` は nanoseconds (vim.uv.hrtime() の単位に合わせる)。
+    //
+    // self_ms = sourced_ms - Σ children.sourced_ms  (children が完全にカバー
+    // できていない分が自分のコード)。負になるケース (hrtime の非単調性 / 計測
+    // オーバーヘッド) は 0 にクランプする。
+
+    #[test]
+    fn parse_require_trace_leaf_node() {
+        // time = 1_234_567 ns → 1.234567 ms、children 空は省略可能 (serde default)
+        let json = r#"{"module":"user.options","time":1234567}"#;
+        let node = parse_require_trace(json).unwrap();
+        assert_eq!(node.module, "user.options");
+        assert!((node.sourced_ms - 1.234567).abs() < 1e-9);
+        // leaf なので self_ms = sourced_ms
+        assert!((node.self_ms - 1.234567).abs() < 1e-9);
+        assert!(node.children.is_empty());
+    }
+
+    #[test]
+    fn parse_require_trace_computes_self_ms_as_parent_minus_children() {
+        // 親 10 ms、子 2 個 (3 ms + 4 ms) → self_ms = 3 ms
+        let json = r#"{
+            "module": "init.lua",
+            "time": 10000000,
+            "children": [
+                {"module": "user.plugins", "time": 3000000},
+                {"module": "user.keymaps", "time": 4000000}
+            ]
+        }"#;
+        let node = parse_require_trace(json).unwrap();
+        assert!((node.sourced_ms - 10.0).abs() < 1e-9);
+        assert!((node.self_ms - 3.0).abs() < 1e-9);
+        assert_eq!(node.children.len(), 2);
+        assert_eq!(node.children[0].module, "user.plugins");
+        assert!((node.children[0].sourced_ms - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_require_trace_deep_nesting() {
+        // 親 100 ms → 子 A 60 ms (孫 A1 40 ms) + 子 B 10 ms
+        // → 親 self = 100 - 60 - 10 = 30、子 A self = 60 - 40 = 20
+        let json = r#"{
+            "module": "init.lua",
+            "time": 100000000,
+            "children": [
+                {
+                    "module": "user.plugins",
+                    "time": 60000000,
+                    "children": [
+                        {"module": "user.lsp.servers", "time": 40000000}
+                    ]
+                },
+                {"module": "user.keymaps", "time": 10000000}
+            ]
+        }"#;
+        let node = parse_require_trace(json).unwrap();
+        assert!((node.self_ms - 30.0).abs() < 1e-9);
+        assert!((node.children[0].self_ms - 20.0).abs() < 1e-9);
+        assert!((node.children[0].children[0].self_ms - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_require_trace_clamps_negative_self_to_zero() {
+        // 子の合計が親を超えるケース (hrtime の非単調性 / 計測オーバーヘッド)
+        // → 実害のない 0.0 にクランプ。負の self_ms を UI に出したくないため。
+        let json = r#"{
+            "module": "init.lua",
+            "time": 5000000,
+            "children": [
+                {"module": "user.plugins", "time": 3000000},
+                {"module": "user.keymaps", "time": 4000000}
+            ]
+        }"#;
+        let node = parse_require_trace(json).unwrap();
+        assert_eq!(node.self_ms, 0.0);
+    }
+
+    #[test]
+    fn parse_require_trace_rejects_malformed_json() {
+        assert!(parse_require_trace("").is_err());
+        assert!(parse_require_trace("not json").is_err());
+        // module field 欠落は schema violation
+        assert!(parse_require_trace(r#"{"time":1000}"#).is_err());
+    }
+
+    // ── existing parser tests ───────────────────────────────────────────────
 
     #[test]
     fn parse_skips_header_and_events() {
@@ -1025,6 +1193,7 @@ times in msec
                 init_ms: 0.0,
                 load_ms: 0.0,
                 trig_ms: 0.0,
+                require_trace: None,
             },
         );
         run1.insert(
@@ -1040,6 +1209,7 @@ times in msec
                 init_ms: 0.0,
                 load_ms: 0.0,
                 trig_ms: 0.0,
+                require_trace: None,
             },
         );
         let mut run2 = HashMap::new();
@@ -1056,6 +1226,7 @@ times in msec
                 init_ms: 0.0,
                 load_ms: 0.0,
                 trig_ms: 0.0,
+                require_trace: None,
             },
         );
         // b は run2 には無い (0 ms として扱う)
@@ -1252,6 +1423,7 @@ times in msec
                     init_ms: 0.0,
                     load_ms: 0.0,
                     trig_ms: 0.0,
+                    require_trace: None,
                 },
             );
             m
