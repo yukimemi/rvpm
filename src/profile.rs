@@ -439,6 +439,15 @@ pub fn average_stats(
                 trig_ms: 0.0,
                 require_trace: None,
             });
+            // require_trace は木構造なので ms 系のように単純平均できない。
+            // 「最初に populate された run の値」を採用する方針:
+            //   - entry が未設定 (None) かつ今回の run が Some なら採用
+            //   - 既に Some が入っていたら上書きしない
+            // or_insert_with は entry 作成時しか走らないので、subsequent run で
+            // populate されるケースをここで拾う必要がある。
+            if entry.require_trace.is_none() {
+                entry.require_trace = s.require_trace.clone();
+            }
             entry.total_self_ms += s.total_self_ms;
             entry.total_sourced_ms += s.total_sourced_ms;
             entry.init_ms += s.init_ms;
@@ -1236,6 +1245,58 @@ times in msec
         assert!((avg[0].total_self_ms - 20.0).abs() < 1e-6);
         assert_eq!(avg[1].name, "a");
         assert!((avg[1].total_self_ms - 15.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn average_preserves_require_trace_from_first_populated_run() {
+        // average_stats が require_trace を drop しないこと (regression: #78 review).
+        // run1 は trace を持たず、run2 が [user config] の trace を持つ想定。
+        // averaging 後に trace が失われなければ OK。
+        let trace = RequireNode {
+            module: "init.lua".into(),
+            self_ms: 5.0,
+            sourced_ms: 20.0,
+            children: vec![RequireNode {
+                module: "user.plugins".into(),
+                self_ms: 15.0,
+                sourced_ms: 15.0,
+                children: vec![],
+            }],
+        };
+
+        let mk = |trace: Option<RequireNode>, ms: f64| -> HashMap<String, PluginStats> {
+            let mut m = HashMap::new();
+            m.insert(
+                "[user config]".into(),
+                PluginStats {
+                    name: "[user config]".into(),
+                    total_self_ms: ms,
+                    total_sourced_ms: ms,
+                    file_count: 1,
+                    top_files: vec![],
+                    is_managed: false,
+                    lazy: false,
+                    init_ms: 0.0,
+                    load_ms: 0.0,
+                    trig_ms: 0.0,
+                    require_trace: trace,
+                },
+            );
+            m
+        };
+
+        let avg = average_stats(vec![mk(None, 100.0), mk(Some(trace.clone()), 120.0)], 2);
+        let entry = avg.iter().find(|p| p.name == "[user config]").unwrap();
+        assert_eq!(
+            entry.require_trace.as_ref(),
+            Some(&trace),
+            "trace from the 2nd run should be preserved when the 1st had None"
+        );
+
+        // 逆順 (trace が最初の run) でも同様に保持される
+        let avg2 = average_stats(vec![mk(Some(trace.clone()), 120.0), mk(None, 100.0)], 2);
+        let entry2 = avg2.iter().find(|p| p.name == "[user config]").unwrap();
+        assert_eq!(entry2.require_trace.as_ref(), Some(&trace));
     }
 
     #[test]
