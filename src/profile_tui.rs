@@ -1236,10 +1236,7 @@ fn print_require_tree_plain(node: &RequireNode, depth: usize) {
     let indent: String = "  ".repeat(depth);
     println!(
         "  {}{:<40}  sourced {:>7.2} ms · self {:>7.2} ms",
-        indent,
-        node.module,
-        node.sourced_ms,
-        node.self_ms,
+        indent, node.module, node.sourced_ms, node.self_ms,
     );
     let mut children: Vec<&RequireNode> = node.children.iter().collect();
     children.sort_by(|a, b| {
