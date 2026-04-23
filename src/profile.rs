@@ -940,8 +940,9 @@ pub async fn run_profile(cfg: ProfileRunConfig) -> anyhow::Result<ProfileReport>
             && let Ok(raw) = std::fs::read_to_string(trace_path)
             && let Ok(tree) = parse_require_trace(&raw)
         {
-            let user_stats = stats.entry(GROUP_USER.to_string()).or_insert_with(|| {
-                PluginStats {
+            let user_stats = stats
+                .entry(GROUP_USER.to_string())
+                .or_insert_with(|| PluginStats {
                     name: GROUP_USER.to_string(),
                     total_self_ms: 0.0,
                     total_sourced_ms: 0.0,
@@ -953,8 +954,7 @@ pub async fn run_profile(cfg: ProfileRunConfig) -> anyhow::Result<ProfileReport>
                     load_ms: 0.0,
                     trig_ms: 0.0,
                     require_trace: None,
-                }
-            });
+                });
             if user_stats.require_trace.is_none() {
                 user_stats.require_trace = Some(tree);
             }
