@@ -122,11 +122,111 @@ impl RequireNode {
 }
 
 /// instrumented loader.lua が吐いた require trace JSON を `RequireNode` tree に復元。
-#[allow(dead_code)] // wired into run_profile in PR 2 (loader-side tracer hookup)
 pub fn parse_require_trace(json: &str) -> anyhow::Result<RequireNode> {
     let raw: RawRequireNode = serde_json::from_str(json)
         .map_err(|e| anyhow::anyhow!("failed to parse require trace JSON: {}", e))?;
     Ok(RequireNode::from_raw(raw))
+}
+
+/// tracer Lua + 出力先 JSON を `marker_dir` 配下に書き出して (tracer_path, trace_path) を返す。
+///
+/// run ごとに suffix を変える (`tracer_<i>.lua` / `trace_<i>.json`) ので、多 runs で
+/// 前の run の残骸と衝突しない。`nvim --cmd "luafile <tracer_path>"` で使う前提。
+/// 失敗 (ディスクフル等) は呼び出し側で `Err` を捨てて trace なしの通常 profile に fall back。
+pub fn install_require_tracer(
+    marker_dir: &std::path::Path,
+    run_index: usize,
+) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let tracer_path = marker_dir.join(format!("require_tracer_{}.lua", run_index));
+    let trace_path = marker_dir.join(format!("require_trace_{}.json", run_index));
+    let trace_path_str = normalize_path(&trace_path.to_string_lossy());
+    let script = build_require_tracer_script(&trace_path_str);
+    std::fs::write(&tracer_path, script)?;
+    Ok((tracer_path, trace_path))
+}
+
+/// `rvpm profile` 用 require tracer の Lua スクリプトを組み立てる。
+///
+/// lazy.nvim の [`util.track()`](https://github.com/folke/lazy.nvim/blob/main/lua/lazy/core/util.lua)
+/// と同じ stack-based tracer を `_G.require` にかぶせて、first-time require のみ
+/// 木構造で記録。`VimLeavePre` autocmd で JSON (`vim.json.encode`) に serialize して
+/// `trace_path` に書き出す。
+///
+/// `nvim --cmd "luafile <this script>" ...` として init.lua より前に実行する前提。
+/// そうしないと init.lua の冒頭の `require(...)` を取りこぼす。
+///
+/// 空の `children` は **省略** して emit する — `vim.json.encode({})` は `{}`
+/// (object) を吐くが、Rust 側の `RawRequireNode.children` は `#[serde(default)]`
+/// で missing field に耐える。`children: {}` (object) で送ると parse が失敗するので、
+/// そもそも field を書かない方が安全。
+///
+/// autocmd choice: `VimEnter` は `nvim --headless ... +qa` 構成だと fire されない。
+/// `+qa` で quit コマンドが VimEnter より前に処理されて exit してしまう。`VimLeavePre`
+/// なら `:qa` 処理中に必ず fire するので、どの init 構成でも dump が走る。
+///
+/// resilience: tracer が panic/error しても init.lua 本体の実行を止めない (pcall
+/// で包む)。trace ファイルを開けない (権限なし / ディスクフル) ときは silently skip。
+pub fn build_require_tracer_script(trace_path: &str) -> String {
+    let escaped = crate::loader::lua_quote(trace_path);
+    format!(
+        r#"-- rvpm require tracer (auto-generated; do not edit)
+-- Wraps _G.require with a stack-based timer so the profile TUI can
+-- surface user-init.lua's require chain. Ported from lazy.nvim's
+-- util.track(). Dumps a JSON tree on VimLeavePre.
+local ok_setup, err_setup = pcall(function()
+  local trace_path = {path}
+  local hrtime = (vim.uv or vim.loop).hrtime
+  local root = {{ module = "init.lua", time = hrtime(), children = {{}} }}
+  local stack = {{ root }}
+  local orig_require = _G.require
+  _G.require = function(modname)
+    if package.loaded[modname] ~= nil then
+      return orig_require(modname)
+    end
+    local entry = {{ module = modname, time = hrtime(), children = {{}} }}
+    table.insert(stack[#stack].children, entry)
+    table.insert(stack, entry)
+    local ok, ret = pcall(orig_require, modname)
+    local e = table.remove(stack)
+    e.time = hrtime() - e.time
+    if not ok then error(ret) end
+    return ret
+  end
+  local function to_payload(entry)
+    local out = {{ module = entry.module, time = entry.time }}
+    if #entry.children > 0 then
+      local c = {{}}
+      for i, child in ipairs(entry.children) do
+        c[i] = to_payload(child)
+      end
+      out.children = c
+    end
+    return out
+  end
+  vim.api.nvim_create_autocmd("VimLeavePre", {{
+    once = true,
+    callback = function()
+      root.time = hrtime() - root.time
+      local ok_dump, err_dump = pcall(function()
+        local json = vim.json.encode(to_payload(root))
+        local fh = io.open(trace_path, "w")
+        if fh then
+          fh:write(json)
+          fh:close()
+        end
+      end)
+      if not ok_dump then
+        vim.notify("rvpm require tracer: dump failed: " .. tostring(err_dump), vim.log.levels.WARN)
+      end
+    end,
+  }})
+end)
+if not ok_setup then
+  vim.notify("rvpm require tracer: setup failed: " .. tostring(err_setup), vim.log.levels.WARN)
+end
+"#,
+        path = escaped
+    )
 }
 
 /// 1 フェーズ分の所要時間 (平均値)。
@@ -792,7 +892,26 @@ pub async fn run_profile(cfg: ProfileRunConfig) -> anyhow::Result<ProfileReport>
     let mut phase_timelines: Vec<Vec<PhaseTime>> = Vec::new();
 
     for i in 0..cfg.runs {
-        let (content, total) = run_single_startuptime(&[])
+        // require tracer: instrumentation 有効時のみ。marker_dir 配下に
+        // run ごとに別の tracer.lua / trace.json を作り、`--cmd "luafile ..."`
+        // で init.lua より前に読み込ませる。そうしないと init.lua 冒頭の
+        // `require(...)` を取りこぼすため。ファイル I/O 失敗は resilience で
+        // 無視して通常の profile run に進む。
+        let tracer_paths = cfg
+            .marker_dir
+            .as_ref()
+            .and_then(|mdir| install_require_tracer(mdir, i).ok());
+        let extra_args: Vec<String> = if let Some((tracer_path, _)) = tracer_paths.as_ref() {
+            vec![
+                "--cmd".into(),
+                format!("luafile {}", tracer_path.to_string_lossy().replace('\\', "/")),
+            ]
+        } else {
+            Vec::new()
+        };
+        let extra_ref: Vec<&str> = extra_args.iter().map(|s| s.as_str()).collect();
+
+        let (content, total) = run_single_startuptime(&extra_ref)
             .await
             .map_err(|e| anyhow::anyhow!("profile run {}/{} failed: {}", i + 1, cfg.runs, e))?;
         totals.push(total);
@@ -804,6 +923,35 @@ pub async fn run_profile(cfg: ProfileRunConfig) -> anyhow::Result<ProfileReport>
             &loader_s,
             user_s.as_slice(),
         );
+
+        // require tracer が trace.json を吐いていれば [user config] に attach。
+        // tracer は VimLeavePre で JSON を書き出すので `+qa` による quit 中に発火する
+        // (VimEnter は headless + +qa 構成だと取りこぼすため採用しない)。
+        if let Some((_, trace_path)) = tracer_paths.as_ref()
+            && let Ok(raw) = std::fs::read_to_string(trace_path)
+            && let Ok(tree) = parse_require_trace(&raw)
+        {
+            stats
+                .entry(GROUP_USER.to_string())
+                .and_modify(|s| {
+                    if s.require_trace.is_none() {
+                        s.require_trace = Some(tree.clone());
+                    }
+                })
+                .or_insert_with(|| PluginStats {
+                    name: GROUP_USER.to_string(),
+                    total_self_ms: 0.0,
+                    total_sourced_ms: 0.0,
+                    file_count: 0,
+                    top_files: Vec::new(),
+                    is_managed: false,
+                    lazy: false,
+                    init_ms: 0.0,
+                    load_ms: 0.0,
+                    trig_ms: 0.0,
+                    require_trace: Some(tree),
+                });
+        }
 
         // eager プラグインの load_ms は instrumentation の有無に関わらず
         // sourcing 合計で近似できるので、marker_s != None 条件の外で先に書く。
@@ -1016,6 +1164,57 @@ mod tests {
         }"#;
         let node = parse_require_trace(json).unwrap();
         assert_eq!(node.self_ms, 0.0);
+    }
+
+    // ── tracer script builder ───────────────────────────────────────────────
+
+    #[test]
+    fn build_tracer_embeds_escaped_output_path() {
+        // Windows の tmp path (スペース含む) が入っても Lua 文字列として安全に
+        // emit されるか。backslash は forward slash に正規化される。
+        let script = build_require_tracer_script(r#"C:\Users\John Doe\AppData\trace.json"#);
+        // 正規化 + 引用後の形
+        assert!(script.contains(r#""C:/Users/John Doe/AppData/trace.json""#));
+        // 未正規化の backslash が残ってないこと
+        assert!(!script.contains(r"C:\Users"));
+    }
+
+    #[test]
+    fn build_tracer_contains_key_hooks() {
+        // tracer の骨格 (require wrap + VimLeavePre dump + package.loaded cache skip
+        // + lazy.nvim 由来の stack-based push/pop) が含まれていること。
+        // VimEnter は headless + +qa で取りこぼすので使わない。
+        let script = build_require_tracer_script("/tmp/trace.json");
+        assert!(script.contains("_G.require = function"));
+        assert!(script.contains("package.loaded[modname]"));
+        assert!(script.contains("VimLeavePre"));
+        assert!(!script.contains("VimEnter"));
+        assert!(script.contains("vim.json.encode"));
+        // hrtime は vim.uv 優先 (0.10+)、fallback で vim.loop
+        assert!(script.contains("vim.uv or vim.loop"));
+    }
+
+    #[test]
+    fn build_tracer_wraps_everything_in_pcall_for_resilience() {
+        // tracer 自身の setup 失敗 / JSON dump 失敗が init.lua の実行を止めない
+        // こと (CLAUDE.md の resilience 原則)。
+        let script = build_require_tracer_script("/tmp/trace.json");
+        // 外側 pcall (setup 全体)
+        assert!(script.contains("ok_setup, err_setup = pcall"));
+        // 内側 pcall (VimEnter dump)
+        assert!(script.contains("ok_dump, err_dump = pcall"));
+        // 失敗時は vim.notify だけで終了
+        assert!(script.contains("vim.notify"));
+    }
+
+    #[test]
+    fn build_tracer_omits_empty_children_to_appease_json_encode() {
+        // vim.json.encode は空 Lua table を `{}` (object) として吐くため、
+        // children が空のノードはフィールド自体を省略する (RawRequireNode の
+        // `#[serde(default)]` で missing 扱いになる)。
+        let script = build_require_tracer_script("/tmp/trace.json");
+        assert!(script.contains("if #entry.children > 0 then"));
+        assert!(script.contains("out.children = c"));
     }
 
     #[test]
