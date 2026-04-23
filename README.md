@@ -855,7 +855,7 @@ rvpm list --no-tui | grep Missing
 - Every plugin has `top_files` (up to 10 heaviest `self_ms` files).
 - `require_trace` is present only on the `[user config]` pseudo-plugin and only when the require tracer ran — `--no-instrument` suppresses it.
 - `require_trace.sourced_ms` is wall-clock time including descendants; `self_ms = sourced_ms - Σ children.sourced_ms`, clamped to `0.0`.
-- `require_trace.module == "(startup)"` at the root — the tracer is installed via `--cmd luafile`, so the root covers the whole span from Neovim process start to `VimLeavePre`, not just user `init.lua`. Plugin-table `total` for `[user config]` is a different scope (just the `sourcing init.lua` entry from `--startuptime`), so the two numbers won't match and that's expected.
+- `require_trace.module == "(startup)"` at the root — the tracer is installed via `--cmd luafile`, so the root covers the whole span from Neovim process start to `VimLeavePre`, not just user `init.lua`. Plugin-table `total` for `[user config]` is a different scope (the sum of `--startuptime` `sourcing` entries for every file rvpm attributes to the config roots, typically `init.lua` plus the global `before.lua` / `after.lua` hooks), so the two numbers won't match and that's expected.
 - All `*_ms` fields are f64 milliseconds averaged across `runs`.
 
 </details>

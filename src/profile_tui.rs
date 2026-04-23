@@ -1032,11 +1032,13 @@ fn draw_require_tree_detail(
     }
 
     // tree の self/sourced は tracer スコープ (--cmd luafile から VimLeavePre まで
-    // の全期間) の値、init.lua は startuptime が報告する init.lua ファイル自身の
-    // self_ms (Lua require の内訳は含まない)。スコープが違うので並べて表示する
-    // 際は「何を指した数字か」を明示する。
+    // の全期間) の値。config self は `aggregate_single_run` が [user config]
+    // 擬似プラグインに振り分けた全ファイル (init.lua + global before.lua +
+    // global after.lua など) の startuptime self_ms の合計で、Lua require の
+    // 内訳は含まない。スコープが違うので並べて表示する際は「何を指した数字か」
+    // を明示する。
     let summary = format!(
-        "  tree self {:.2} ms · sourced {:.2} ms · init.lua file {:.2} ms",
+        "  tree self {:.2} ms · sourced {:.2} ms · config self {:.2} ms",
         tree.self_ms, tree.sourced_ms, plugin.total_self_ms
     );
     let title = Line::from(vec![
