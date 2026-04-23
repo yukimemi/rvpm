@@ -167,7 +167,16 @@ pub fn flatten_require_tree<'a>(
     // max_rows は pane の残り行から来る自然な上限 (典型的には 10〜50)。
     // pre-allocate してフレーム毎の re-alloc を回避。
     let mut out = Vec::with_capacity(max_rows);
-    walk(root, 0, threshold_ms, sort, max_rows, collapsed, &mut out, true);
+    walk(
+        root,
+        0,
+        threshold_ms,
+        sort,
+        max_rows,
+        collapsed,
+        &mut out,
+        true,
+    );
     out
 }
 
@@ -218,7 +227,16 @@ fn walk<'a>(
                 if out.len() >= max_rows {
                     break;
                 }
-                walk(c, depth + 1, threshold, sort, max_rows, collapsed, out, false);
+                walk(
+                    c,
+                    depth + 1,
+                    threshold,
+                    sort,
+                    max_rows,
+                    collapsed,
+                    out,
+                    false,
+                );
             }
         }
         RequireTreeSort::Chronological => {
@@ -226,7 +244,16 @@ fn walk<'a>(
                 if out.len() >= max_rows {
                     break;
                 }
-                walk(c, depth + 1, threshold, sort, max_rows, collapsed, out, false);
+                walk(
+                    c,
+                    depth + 1,
+                    threshold,
+                    sort,
+                    max_rows,
+                    collapsed,
+                    out,
+                    false,
+                );
             }
         }
     }
@@ -945,7 +972,11 @@ fn draw_require_tree_detail(
         let row_idx = scroll + idx;
         let is_cursor = focused && row_idx == cursor;
         let icon = if row.has_children {
-            if row.is_collapsed { '\u{25b6}' } else { '\u{25bc}' } // ▶ / ▼
+            if row.is_collapsed {
+                '\u{25b6}'
+            } else {
+                '\u{25bc}'
+            } // ▶ / ▼
         } else {
             require_tree_icon(row.depth) // ●/○/◉
         };
@@ -1196,13 +1227,17 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(Span::styled(
             "  plugin table (default focus)",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from("  h               toggle [merged]/[runtime] group rows"),
         Line::from(""),
         Line::from(Span::styled(
             "  require tree ([user config], focus = Detail)",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from("  h / ←           collapse subtree at cursor"),
         Line::from("  l / →           expand subtree at cursor"),
@@ -1495,7 +1530,13 @@ mod tests {
     #[test]
     fn flatten_require_tree_includes_root_with_depth_0() {
         let tree = sample_tree();
-        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::ByTime, 99, &std::collections::HashSet::new());
+        let rows = flatten_require_tree(
+            &tree,
+            0.0,
+            RequireTreeSort::ByTime,
+            99,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(rows[0].depth, 0);
         assert_eq!(rows[0].module, "init.lua");
     }
@@ -1503,7 +1544,13 @@ mod tests {
     #[test]
     fn flatten_require_tree_sorts_siblings_by_sourced_ms_desc() {
         let tree = sample_tree();
-        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::ByTime, 99, &std::collections::HashSet::new());
+        let rows = flatten_require_tree(
+            &tree,
+            0.0,
+            RequireTreeSort::ByTime,
+            99,
+            &std::collections::HashSet::new(),
+        );
         // init.lua → A (7) → A1 (5) → A2 (1) → C (2) → B (0.4)
         let modules: Vec<&str> = rows.iter().map(|r| r.module).collect();
         assert_eq!(modules, vec!["init.lua", "A", "A1", "A2", "C", "B"]);
@@ -1512,7 +1559,13 @@ mod tests {
     #[test]
     fn flatten_require_tree_keeps_insertion_order_under_chronological() {
         let tree = sample_tree();
-        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::Chronological, 99, &std::collections::HashSet::new());
+        let rows = flatten_require_tree(
+            &tree,
+            0.0,
+            RequireTreeSort::Chronological,
+            99,
+            &std::collections::HashSet::new(),
+        );
         // init.lua → A → A1 → A2 → B → C (Chronological では source 順)
         let modules: Vec<&str> = rows.iter().map(|r| r.module).collect();
         assert_eq!(modules, vec!["init.lua", "A", "A1", "A2", "B", "C"]);
@@ -1523,7 +1576,13 @@ mod tests {
         let tree = sample_tree();
         // threshold=1.0 は sourced_ms < 1.0 をカット。B (0.4) は消える。
         // A2 (1.0) はちょうど閾値なので残る (< ではなく >= で判定)。
-        let rows = flatten_require_tree(&tree, 1.0, RequireTreeSort::ByTime, 99, &std::collections::HashSet::new());
+        let rows = flatten_require_tree(
+            &tree,
+            1.0,
+            RequireTreeSort::ByTime,
+            99,
+            &std::collections::HashSet::new(),
+        );
         let modules: Vec<&str> = rows.iter().map(|r| r.module).collect();
         assert!(!modules.contains(&"B"));
         assert!(modules.contains(&"A2")); // 境界値は残す
@@ -1540,7 +1599,13 @@ mod tests {
             sourced_ms: 0.1,
             children: vec![],
         };
-        let rows = flatten_require_tree(&tiny, 1.0, RequireTreeSort::ByTime, 99, &std::collections::HashSet::new());
+        let rows = flatten_require_tree(
+            &tiny,
+            1.0,
+            RequireTreeSort::ByTime,
+            99,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].module, "init.lua");
     }
@@ -1548,7 +1613,13 @@ mod tests {
     #[test]
     fn flatten_require_tree_respects_max_rows() {
         let tree = sample_tree();
-        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::ByTime, 3, &std::collections::HashSet::new());
+        let rows = flatten_require_tree(
+            &tree,
+            0.0,
+            RequireTreeSort::ByTime,
+            3,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(rows.len(), 3);
         // 早い順に 3 行: init.lua / A / A1
         assert_eq!(rows[0].module, "init.lua");
@@ -1561,7 +1632,13 @@ mod tests {
         // bar 描画側が使うフィールド (self_ms / sourced_ms / depth) が正しく
         // 渡されること。色分け用に self と sourced の両方が必要。
         let tree = sample_tree();
-        let rows = flatten_require_tree(&tree, 0.0, RequireTreeSort::ByTime, 99, &std::collections::HashSet::new());
+        let rows = flatten_require_tree(
+            &tree,
+            0.0,
+            RequireTreeSort::ByTime,
+            99,
+            &std::collections::HashSet::new(),
+        );
         let a = rows.iter().find(|r| r.module == "A").unwrap();
         assert_eq!(a.depth, 1);
         assert!((a.sourced_ms - 7.0).abs() < 1e-9);
