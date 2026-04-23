@@ -17,6 +17,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - ブランチ名は変更内容を端的に表す (例: `feat/add-only-sync-new-plugin`)。
 - **PR のタイトル・本文は英語で書く。** コミットメッセージも英語。
 
+### PR レビューサイクル
+
+- 全 PR で **Gemini Code Assist** と **CodeRabbit** がレビューを走らせる。両 bot の投稿を待ち、コメントに対処 (fix を PR branch に push) して、フィードバックが解消してからマージする。
+- **fix を push したらレビュアーに返信する。** 対応した review comment のスレッドに、**@-mention (`@gemini-code-assist` / `@coderabbitai`)** 付きで reply する。silent な fix はレビュアーから見えず、盲目的に re-review されて監査トレイル (どの fix がどの指摘に応じたか) も失われる。
+- **Merge gating.** 以下の **両方** を満たすまで merge しない:
+  1. レビュー bot (Gemini / CodeRabbit) が新しい actionable コメントを出さなくなった — fix → @-mention → 沈黙、のサイクルを回し続ける。
+  2. リポジトリオーナー (@yukimemi) が明示的に merge を承認している。
+  Bot からの "Understood" / "Thank you" のような ack のみの返信はその thread の quiet pass とみなす。新しい actionable な指摘が来たら loop を再開。
+- **例外: bot-authored PR (Renovate, Dependabot).** Gemini と CodeRabbit はデフォルトでこれらを skip するので、"bot review を待つ" gate は適用しない。CI が green で owner 承認があれば merge OK。
+
 ## Development Commands
 
 ```bash
