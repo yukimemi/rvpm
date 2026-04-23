@@ -17,6 +17,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - ブランチ名は変更内容を端的に表す (例: `feat/add-only-sync-new-plugin`)。
 - **PR のタイトル・本文は英語で書く。** コミットメッセージも英語。
 
+### PR レビューサイクル
+
+- 全 PR で **Gemini Code Assist** と **CodeRabbit** がレビューを走らせる。両 bot の投稿を待ち、コメントに対処 (fix を PR branch に push) して、フィードバックが解消してからマージする。
+- **fix を push したらレビュアーに返信する。** 対応した review comment のスレッドに、**@-mention (`@gemini-code-assist` / `@coderabbitai`)** 付きで reply する。silent な fix はレビュアーから見えず、盲目的に re-review されて監査トレイル (どの fix がどの指摘に応じたか) も失われる。
+- **fix + reply を送ったらそこで止まらず、能動的に bot の再発言を監視する。** 数分おき (目安 5 分程度) に `gh pr view` / `gh api .../pulls/<n>/comments` を叩いて bot の返答を確認。新しい actionable コメントが来ていれば即 fix → @-mention → 監視再開、の loop を回す。Agent 環境なら `/loop` や `ScheduleWakeup` で自動化してよい。
+- **スレッド settle の判定**: 1 つの review thread は、**最新の bot 返信が ack-only** ("Thank you" / "Understood" / "Acknowledged" / 新指摘なしの re-review サマリなど) になった時点で settle。`--diff` の再指摘や追加の actionable コメントが来たら未 settle に戻す。
+- **監視ストップ条件**:
+  1. **すべての open thread が settle** → その PR は quiet。両 PR (or 対象 PR 全部) が quiet になった瞬間にループを抜けてオーナーに merge 判断を仰ぐ。bot が素早く ack を返した場合、30 分待つ必要はない。
+  2. **bot が返信を返さないまま最後の actionable コメントから 30 分経過** → timeout としてその thread を settle 扱いにする。bot が静かに諦めるケース (actionable を止めて何も返さないモード) を拾う fallback。短すぎ (<10 分) だと遅延投稿を取りこぼし、長すぎ (>1 時間) だと merge が無意味に遅れる。
+- **Merge gating.** 以下の **両方** を満たすまで merge しない:
+  1. レビュー bot (Gemini / CodeRabbit) が新しい actionable コメントを出さなくなった — fix → @-mention → 沈黙、のサイクルを回し続ける。
+     Bot からの "Understood" / "Thank you" のような ack のみの返信はその thread の quiet pass とみなす。新しい actionable な指摘が来たら loop を再開。
+  2. リポジトリオーナー (@yukimemi) が明示的に merge を承認している。
+- **例外: bot-authored PR (Renovate, Dependabot).** Gemini と CodeRabbit はデフォルトでこれらを skip するので、"bot review を待つ" gate は適用しない。CI が green で owner 承認があれば merge OK。
+
 ## Development Commands
 
 ```bash
