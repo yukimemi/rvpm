@@ -121,8 +121,15 @@ pub(crate) fn lua_quote(s: &str) -> String {
 ///
 /// 判定:
 ///   - 2 文字以上 `/` 始まりかつ `/` 終わり → 中身を regex として compile
-///   - compile 失敗 / zero match → 元の entry を literal として残し stderr に warn
-///     (壊れないが user が気づける)
+///   - compile 失敗 / zero match → stderr に warn して **entry を drop**
+///
+/// なぜ drop するか:
+///   以前の fallback (literal として残す) は `"/^NoSuch/"` のような文字列を
+///   `nvim_create_user_command("{cmd}", ...)` にそのまま渡すことになり、Vim
+///   のコマンド名規則 `[A-Z][A-Za-z0-9_]*` 違反で **`E183` が発生 → loader.lua
+///   全体が top-level で中断** する。phase 7/8/9 (lazy trigger / ColorSchemePre
+///   / global after.lua) が巻き添えで無効化される致命的バグ。warn を出した上で
+///   drop すれば user は気付けるし、残りの plugin は正常にロードされる。
 ///
 /// `scope` は warn 出力時のラベル (plugin 名など)。
 ///
@@ -140,17 +147,17 @@ pub fn expand_cmd_patterns(patterns: &[String], defined: &[String], scope: &str)
         if let Some(re_src) = body {
             match regex::Regex::new(re_src) {
                 Ok(re) => {
-                    let matches: Vec<&String> = defined.iter().filter(|d| re.is_match(d)).collect();
-                    if matches.is_empty() {
+                    // collect せず peekable で空判定 → 可能ならそのまま iterate。
+                    let mut matches = defined.iter().filter(|d| re.is_match(d)).peekable();
+                    if matches.peek().is_none() {
                         eprintln!(
                             "\u{26a0} on_cmd regex {pat:?} matched no commands for {scope}; \
-                             the pattern will be kept as a literal user command name (probably \
-                             won't trigger). Consider writing the command names explicitly or \
-                             checking the plugin's plugin/ directory for dynamic definitions."
+                             entry dropped from the generated loader (emitting the pattern \
+                             literally would violate Vim's command name rule [A-Z][A-Za-z0-9_]* \
+                             and raise E183 at startup, aborting loader.lua). Write the exact \
+                             command names or check the plugin's plugin/ directory for dynamic \
+                             definitions."
                         );
-                        if seen.insert(pat.clone()) {
-                            out.push(pat.clone());
-                        }
                     } else {
                         for m in matches {
                             if seen.insert(m.clone()) {
@@ -162,11 +169,9 @@ pub fn expand_cmd_patterns(patterns: &[String], defined: &[String], scope: &str)
                 Err(e) => {
                     eprintln!(
                         "\u{26a0} on_cmd regex {pat:?} for {scope} failed to compile: {e}. \
-                         Kept as literal user command name."
+                         Entry dropped from the generated loader (literal emission would \
+                         violate Vim's command name rule and abort loader.lua at startup)."
                     );
-                    if seen.insert(pat.clone()) {
-                        out.push(pat.clone());
-                    }
                 }
             }
         } else if seen.insert(pat.clone()) {
@@ -945,19 +950,36 @@ mod tests {
     }
 
     #[test]
-    fn expand_cmd_patterns_zero_regex_match_keeps_literal() {
-        // zero match なら元のパターンを literal として残す。stub 登録はされるが
-        // `/^NoSuch/` は Vim command 名として無効なので実行時に発火しない。user が
-        // warn で気づく。
+    fn expand_cmd_patterns_zero_regex_match_drops_entry() {
+        // regex がどれにもマッチしない場合、literal として emit すると Vim の
+        // コマンド名規則 [A-Z][A-Za-z0-9_]* に違反して起動時 E183 で loader.lua
+        // が top-level 中断する致命バグ (PR #86 review で CodeRabbit が指摘)。
+        // warn のみ出して drop が正解。
         let out = expand_cmd_patterns(&["/^NoSuch/".to_string()], &["Other".to_string()], "plugin");
-        assert_eq!(out, vec!["/^NoSuch/"]);
+        assert!(out.is_empty());
     }
 
     #[test]
-    fn expand_cmd_patterns_invalid_regex_falls_back_to_literal() {
-        // bad regex (unmatched paren) → literal として残し warn。crash しない。
+    fn expand_cmd_patterns_invalid_regex_drops_entry() {
+        // 不正な regex (compile error) も同じ理由で drop + warn。
         let out = expand_cmd_patterns(&["/(unclosed/".to_string()], &["Foo".to_string()], "plugin");
-        assert_eq!(out, vec!["/(unclosed/"]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn expand_cmd_patterns_drop_does_not_affect_valid_entries() {
+        // drop されるのは該当 regex entry のみ — 他の exact / 有効な regex は
+        // 通常通り出力される。
+        let out = expand_cmd_patterns(
+            &[
+                "/^NoSuch/".to_string(),
+                "Exact".to_string(),
+                "/^Foo/".to_string(),
+            ],
+            &["FooBar".to_string()],
+            "plugin",
+        );
+        assert_eq!(out, vec!["Exact", "FooBar"]);
     }
 
     #[test]

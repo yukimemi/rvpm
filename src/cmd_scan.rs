@@ -21,21 +21,33 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// Lua / Vim-script のソース文字列からコマンド名を抽出して重複除去した Vec を返す。
-/// 出現順は保持する (入力ファイルの並び順 = 呼び出し側の出力安定性のため)。
+/// Lua / Vim-script のソース文字列からコマンド名を抽出する。
+/// 出現順は保持する。**重複除去は行わない** — 呼び出し側 (`scan_files` 等) で
+/// どうせ集約時に dedup するので、ここでは HashSet 作成コストを省いて結果を
+/// そのまま返す (PR #86 review で Gemini が指摘)。
 pub fn scan_source(src: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
 
     for line in src.lines() {
         // Lua: vim.api.nvim_create_user_command("Foo", ...)
-        if let Some(off) = line.find("nvim_create_user_command") {
-            let rest = &line[off..];
+        //
+        // `-- comment` 以降は Lua コメントなので切り捨てる。切らないと
+        //   -- example: vim.api.nvim_create_user_command("Example", ...)
+        // のような行から偽のコマンド名を拾い、存在しない "Example" が stub
+        // として emit されて他 plugin の実 "Example" を shadow する可能性
+        // (PR #86 review で CodeRabbit が指摘)。
+        // 文字列リテラル内の `--` を誤って切る恐れはあるが、scan 対象は
+        // `nvim_create_user_command("Foo", ...)` という明確な形なので、
+        // `--` を含むユーザ入力が `"..."` の前に現れるケースは事実上ない。
+        //
+        // Vim script 側は `" comment` なので strip_prefix("command!") /
+        // strip_prefix("command ") の両方に落ちず自然に除外される。
+        let lua_code = line.find("--").map_or(line, |i| &line[..i]);
+        if let Some(off) = lua_code.find("nvim_create_user_command") {
+            let rest = &lua_code[off..];
             if let Some(open) = rest.find('(') {
                 let after = rest[open + 1..].trim_start();
-                if let Some(name) = extract_quoted_ident(after)
-                    && seen.insert(name.clone())
-                {
+                if let Some(name) = extract_quoted_ident(after) {
                     out.push(name);
                 }
             }
@@ -56,9 +68,7 @@ pub fn scan_source(src: &str) -> Vec<String> {
                     .unwrap_or(remaining.len());
                 rest = remaining[end..].trim_start();
             }
-            if let Some(name) = extract_ident(rest)
-                && seen.insert(name.clone())
-            {
+            if let Some(name) = extract_ident(rest) {
                 out.push(name);
             }
         }
@@ -205,14 +215,45 @@ vim.api.nvim_create_user_command("Foo", function() end)
     }
 
     #[test]
-    fn scan_source_dedups_duplicates() {
-        // 同じ command を複数の define 行から見つけたら 1 回だけ。
+    fn scan_source_ignores_lua_comment_out_definitions() {
+        // コメントアウトされた `nvim_create_user_command` 呼び出しは拾ってはいけない。
+        // 拾うと存在しない command が stub 登録され、他 plugin の同名コマンドを
+        // shadow する可能性がある (PR #86 review 起点の regression test)。
+        let src = r#"
+-- example: vim.api.nvim_create_user_command("Example", function() end)
+vim.api.nvim_create_user_command("Real", function() end, {})
+"#;
+        assert_eq!(scan_source(src), vec!["Real"]);
+    }
+
+    #[test]
+    fn scan_source_preserves_duplicates() {
+        // `scan_source` は dedup しない — 重複除去は `scan_files` / caller 側の責務
+        // (PR #86 review で Gemini が指摘、scan_files で必ず dedup されるため scan_source
+        // の HashSet コストが二重になっていた)。
         let src = r#"
 vim.api.nvim_create_user_command("Foo", function() end)
 command! Foo echo 'same name'
 vim.api.nvim_create_user_command("Foo", function() end)
 "#;
-        assert_eq!(scan_source(src), vec!["Foo"]);
+        assert_eq!(scan_source(src), vec!["Foo", "Foo", "Foo"]);
+    }
+
+    #[test]
+    fn scan_files_dedups_across_sources() {
+        // dedup は集約層 (scan_files) で行う。同一ファイル内の重複 + ファイル間の
+        // 重複の両方をまとめて除去する。
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.lua");
+        let b = tmp.path().join("b.vim");
+        std::fs::write(
+            &a,
+            "vim.api.nvim_create_user_command('Foo', function() end)\n\
+             vim.api.nvim_create_user_command('Foo', function() end)",
+        )
+        .unwrap();
+        std::fs::write(&b, "command! Foo echo 'b'").unwrap();
+        assert_eq!(scan_files(&[a, b]), vec!["Foo"]);
     }
 
     #[test]
