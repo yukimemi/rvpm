@@ -21,6 +21,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - 全 PR で **Gemini Code Assist** と **CodeRabbit** がレビューを走らせる。両 bot の投稿を待ち、コメントに対処 (fix を PR branch に push) して、フィードバックが解消してからマージする。
 - **fix を push したらレビュアーに返信する。** 対応した review comment のスレッドに、**@-mention (`@gemini-code-assist` / `@coderabbitai`)** 付きで reply する。silent な fix はレビュアーから見えず、盲目的に re-review されて監査トレイル (どの fix がどの指摘に応じたか) も失われる。
+- **fix + reply を送ったらそこで止まらず、能動的に bot の再発言を監視する。** 数分おき (目安 5 分程度) に `gh pr view` / `gh api .../pulls/<n>/comments` を叩いて新しい actionable コメントが来てないか確認。来ていれば即 fix → @-mention → 監視再開、の loop を回す。Agent 環境なら `/loop` や `ScheduleWakeup` で自動化してよい。放置して「bot が次に話しかけてきたら起きる」運用は、bot が静かに諦めてしまう (actionable コメントを止めて ack だけ返すモードに入る) ケースを拾えない。
+- **監視ストップ条件**: **最後の actionable コメントから 30 分** 新しい指摘が来なかったら監視ループを抜けて、リポジトリオーナーに「bot が quiet になったので merge 判断お願いします」と報告する。30 分は「bot が review cycle を一巡させるのに十分で、人間を待たせすぎない」ライン。短すぎ (<10 分) だと遅延投稿を取りこぼし、長すぎ (>1 時間) だと merge が無意味に遅れる。
 - **Merge gating.** 以下の **両方** を満たすまで merge しない:
   1. レビュー bot (Gemini / CodeRabbit) が新しい actionable コメントを出さなくなった — fix → @-mention → 沈黙、のサイクルを回し続ける。
   2. リポジトリオーナー (@yukimemi) が明示的に merge を承認している。
