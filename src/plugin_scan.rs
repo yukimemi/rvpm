@@ -159,10 +159,8 @@ fn scan_commands_in_line(code: &str, out: &mut Vec<String>) {
 fn vim_map_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r"^\s*(?P<prefix>[nvxiocstl]?)(?P<kind>noremap|map)(?P<bang>!?)\s+(?P<rest>.+)$",
-        )
-        .unwrap()
+        Regex::new(r"^\s*(?P<prefix>[nvxiocstl]?)(?P<kind>noremap|map)(?P<bang>!?)\s+(?P<rest>.+)$")
+            .unwrap()
     })
 }
 
@@ -364,8 +362,14 @@ command! Foo echo 'same name'
         assert_eq!(
             maps,
             vec![
-                UserMap { lhs: "gc".into(), modes: vec!["n".into()] },
-                UserMap { lhs: "gcc".into(), modes: vec!["n".into()] },
+                UserMap {
+                    lhs: "gc".into(),
+                    modes: vec!["n".into()]
+                },
+                UserMap {
+                    lhs: "gcc".into(),
+                    modes: vec!["n".into()]
+                },
             ]
         );
     }
@@ -376,7 +380,10 @@ command! Foo echo 'same name'
         let maps = scan_source(src).user_maps;
         assert_eq!(
             maps,
-            vec![UserMap { lhs: "gc".into(), modes: vec!["n".into()] }]
+            vec![UserMap {
+                lhs: "gc".into(),
+                modes: vec!["n".into()]
+            }]
         );
     }
 
@@ -386,7 +393,10 @@ command! Foo echo 'same name'
         let maps = scan_source(src).user_maps;
         assert_eq!(
             maps,
-            vec![UserMap { lhs: "gc".into(), modes: vec!["n".into()] }]
+            vec![UserMap {
+                lhs: "gc".into(),
+                modes: vec!["n".into()]
+            }]
         );
     }
 
@@ -401,10 +411,22 @@ cnoremap gc :echo 'cmdline'<CR>";
         assert_eq!(
             maps,
             vec![
-                UserMap { lhs: "gc".into(), modes: vec!["v".into()] },
-                UserMap { lhs: "gi".into(), modes: vec!["i".into()] },
-                UserMap { lhs: "gx".into(), modes: vec!["x".into()] },
-                UserMap { lhs: "gc".into(), modes: vec!["c".into()] },
+                UserMap {
+                    lhs: "gc".into(),
+                    modes: vec!["v".into()]
+                },
+                UserMap {
+                    lhs: "gi".into(),
+                    modes: vec!["i".into()]
+                },
+                UserMap {
+                    lhs: "gx".into(),
+                    modes: vec!["x".into()]
+                },
+                UserMap {
+                    lhs: "gc".into(),
+                    modes: vec!["c".into()]
+                },
             ]
         );
     }
@@ -441,7 +463,10 @@ cnoremap gc :echo 'cmdline'<CR>";
         let maps = scan_source(src).user_maps;
         assert_eq!(
             maps,
-            vec![UserMap { lhs: "gc".into(), modes: vec!["n".into()] }]
+            vec![UserMap {
+                lhs: "gc".into(),
+                modes: vec!["n".into()]
+            }]
         );
     }
 
@@ -451,7 +476,10 @@ cnoremap gc :echo 'cmdline'<CR>";
         let maps = scan_source(src).user_maps;
         assert_eq!(
             maps,
-            vec![UserMap { lhs: "gv".into(), modes: vec!["v".into()] }]
+            vec![UserMap {
+                lhs: "gv".into(),
+                modes: vec!["v".into()]
+            }]
         );
     }
 
@@ -499,7 +527,10 @@ cnoremap gc :echo 'cmdline'<CR>";
         assert_eq!(result.commands, vec!["Foo"]);
         assert_eq!(
             result.user_maps,
-            vec![UserMap { lhs: "gc".into(), modes: vec!["n".into()] }]
+            vec![UserMap {
+                lhs: "gc".into(),
+                modes: vec!["n".into()]
+            }]
         );
     }
 
@@ -536,5 +567,4 @@ cnoremap gc :echo 'cmdline'<CR>";
         out.sort();
         assert_eq!(out, vec!["AfterB", "FtRust", "PluginA", "Setupd"]);
     }
-
 }

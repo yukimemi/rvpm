@@ -1,7 +1,6 @@
 mod browse;
 mod browse_tui;
 mod chezmoi;
-mod plugin_scan;
 mod config;
 mod doctor;
 mod external_render;
@@ -12,6 +11,7 @@ mod link;
 mod loader;
 mod lockfile;
 mod merge_conflicts;
+mod plugin_scan;
 mod profile;
 mod profile_tui;
 mod tui;
