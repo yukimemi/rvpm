@@ -2270,7 +2270,9 @@ fn patch_plugin_entry_triggers(
     stored_url: &str,
     applied: &AddTriggerSuggestion,
 ) {
-    let Some(plugins) = doc.get_mut("plugins").and_then(|p| p.as_array_of_tables_mut())
+    let Some(plugins) = doc
+        .get_mut("plugins")
+        .and_then(|p| p.as_array_of_tables_mut())
     else {
         return;
     };
@@ -2289,8 +2291,10 @@ fn patch_plugin_entry_triggers(
         if !applied.on_map.is_empty() {
             // 全 entry が default mode (n) なら string 配列、それ以外なら table 配列。
             // MapSpec::mode の default は ["n"]。modes が `["n"]` ジャストなら string で十分。
-            let all_default =
-                applied.on_map.iter().all(|m| m.mode == vec!["n".to_string()]);
+            let all_default = applied
+                .on_map
+                .iter()
+                .all(|m| m.mode == vec!["n".to_string()]);
             if all_default {
                 let mut arr = toml_edit::Array::new();
                 for m in &applied.on_map {
@@ -2315,7 +2319,6 @@ fn patch_plugin_entry_triggers(
         break;
     }
 }
-
 
 #[allow(clippy::too_many_arguments)]
 async fn run_add(

@@ -810,10 +810,7 @@ vim.api.nvim_exec_autocmds("User", {
 
     #[test]
     fn suggest_two_commands_with_shared_prefix_cluster_as_regex() {
-        let out = suggest_cmd_triggers_smart(
-            &["ChezmoiEdit".into(), "ChezmoiList".into()],
-            3,
-        );
+        let out = suggest_cmd_triggers_smart(&["ChezmoiEdit".into(), "ChezmoiList".into()], 3);
         assert_eq!(out, vec!["/^Chezmoi/"]);
     }
 
@@ -833,12 +830,7 @@ vim.api.nvim_exec_autocmds("User", {
     #[test]
     fn suggest_two_clusters_both_become_regex() {
         let out = suggest_cmd_triggers_smart(
-            &[
-                "Foo".into(),
-                "FooOne".into(),
-                "Bar".into(),
-                "BarOne".into(),
-            ],
+            &["Foo".into(), "FooOne".into(), "Bar".into(), "BarOne".into()],
             3,
         );
         assert_eq!(out, vec!["/^Bar/", "/^Foo/"]);
@@ -859,29 +851,21 @@ vim.api.nvim_exec_autocmds("User", {
 
     #[test]
     fn suggest_mixed_cluster_and_singleton() {
-        let out = suggest_cmd_triggers_smart(
-            &["Foo".into(), "FooOne".into(), "Standalone".into()],
-            3,
-        );
+        let out =
+            suggest_cmd_triggers_smart(&["Foo".into(), "FooOne".into(), "Standalone".into()], 3);
         assert_eq!(out, vec!["/^Foo/", "Standalone"]);
     }
 
     #[test]
     fn suggest_staircase_keeps_as_singletons() {
         // A, AB, ABC では LCP が順に A (1), AB (2) で 3 字閾値を満たせない
-        let out = suggest_cmd_triggers_smart(
-            &["A".into(), "AB".into(), "ABC".into()],
-            3,
-        );
+        let out = suggest_cmd_triggers_smart(&["A".into(), "AB".into(), "ABC".into()], 3);
         assert_eq!(out, vec!["A", "AB", "ABC"]);
     }
 
     #[test]
     fn suggest_dedups_duplicate_commands() {
-        let out = suggest_cmd_triggers_smart(
-            &["Foo".into(), "Foo".into(), "FooBar".into()],
-            3,
-        );
+        let out = suggest_cmd_triggers_smart(&["Foo".into(), "Foo".into(), "FooBar".into()], 3);
         assert_eq!(out, vec!["/^Foo/"]);
     }
 
@@ -890,10 +874,7 @@ vim.api.nvim_exec_autocmds("User", {
         // マルチバイト文字が含まれると len() (byte) と chars().count() (char) で
         // 差が出るので、LCP 判定は char 基準。実用上 Vim command 名は ASCII のみ
         // だがガードとして確認。
-        let out = suggest_cmd_triggers_smart(
-            &["日本Foo".into(), "日本Bar".into()],
-            3,
-        );
+        let out = suggest_cmd_triggers_smart(&["日本Foo".into(), "日本Bar".into()], 3);
         // LCP = "日本" (2 chars、byte 数は 6) → threshold=3 未満 → enumerate
         assert_eq!(out, vec!["日本Bar", "日本Foo"]);
     }
