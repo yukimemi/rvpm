@@ -399,6 +399,73 @@ fn is_valid_command_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+// ── auto-suggest helpers (#87) ──────────────────────────────────────────
+//
+// コマンド名リストを sort → 隣接 LCP クラスタ化して、各クラスタを
+// `/^<LCP>/` regex に、singleton / 短すぎる LCP は exact 名のままにして
+// "lazy trigger 提案" のコア出力を作る。
+//
+// 閾値 `min_prefix` は「プレフィクスが何文字以上あれば regex 化する価値が
+// あるか」。短すぎると他プラグインの command を誤爆するので 3 文字推奨
+// (`/^F/` は危険、`/^Foo/` は十分 specific)。
+
+/// コマンド名リストから lazy trigger の提案リストを作る。
+///
+///   - 共通プレフィクス ≥ `min_prefix` のクラスタを `/^<LCP>/` にまとめる
+///   - クラスタにならない (singleton / LCP 不足) は exact 名のまま残す
+///   - 入力空なら空 Vec
+///
+/// 出力はソート済み順 (呼び出し側の UI で安定表示するため)。
+pub fn suggest_cmd_triggers_smart(commands: &[String], min_prefix: usize) -> Vec<String> {
+    if commands.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<&str> = commands.iter().map(|s| s.as_str()).collect();
+    sorted.sort();
+    sorted.dedup();
+
+    let mut out = Vec::new();
+    let mut cluster_start = 0usize;
+    let mut cluster_lcp: &str = sorted[0];
+
+    for i in 1..sorted.len() {
+        let new_lcp = common_prefix(cluster_lcp, sorted[i]);
+        if new_lcp.chars().count() >= min_prefix {
+            cluster_lcp = new_lcp;
+        } else {
+            emit_cluster(&sorted[cluster_start..i], cluster_lcp, min_prefix, &mut out);
+            cluster_start = i;
+            cluster_lcp = sorted[i];
+        }
+    }
+    emit_cluster(&sorted[cluster_start..], cluster_lcp, min_prefix, &mut out);
+    out
+}
+
+fn emit_cluster(cluster: &[&str], lcp: &str, min_prefix: usize, out: &mut Vec<String>) {
+    if cluster.len() >= 2 && lcp.chars().count() >= min_prefix {
+        out.push(format!("/^{}/", regex::escape(lcp)));
+    } else {
+        // singleton もしくは LCP 不足 → exact 名で enumerate
+        for c in cluster {
+            out.push((*c).to_string());
+        }
+    }
+}
+
+/// 2 文字列の共通プレフィクス。UTF-8 境界を意識して char 単位で比較。
+fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
+    let mut end = 0;
+    for (ac, bc) in a.chars().zip(b.chars()) {
+        if ac == bc {
+            end += ac.len_utf8();
+        } else {
+            break;
+        }
+    }
+    &a[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +793,109 @@ vim.api.nvim_exec_autocmds("User", {
         // Vim scan は元の line に対して行うべき。
         let src = r#"command! -bang Foo echo '--'"#;
         assert_eq!(scan_source(src).commands, vec!["Foo"]);
+    }
+
+    // ── suggest_cmd_triggers_smart (#87) ──────────────────────────
+
+    #[test]
+    fn suggest_empty_returns_empty() {
+        assert!(suggest_cmd_triggers_smart(&[], 3).is_empty());
+    }
+
+    #[test]
+    fn suggest_single_command_returns_exact_name() {
+        let out = suggest_cmd_triggers_smart(&["Foo".into()], 3);
+        assert_eq!(out, vec!["Foo"]);
+    }
+
+    #[test]
+    fn suggest_two_commands_with_shared_prefix_cluster_as_regex() {
+        let out = suggest_cmd_triggers_smart(
+            &["ChezmoiEdit".into(), "ChezmoiList".into()],
+            3,
+        );
+        assert_eq!(out, vec!["/^Chezmoi/"]);
+    }
+
+    #[test]
+    fn suggest_two_commands_short_lcp_enumerates() {
+        // LCP が閾値未満なら enumerate のみ。
+        let out = suggest_cmd_triggers_smart(&["Foo".into(), "Fox".into()], 3);
+        assert_eq!(out, vec!["Foo", "Fox"]);
+    }
+
+    #[test]
+    fn suggest_two_unrelated_commands_enumerate() {
+        let out = suggest_cmd_triggers_smart(&["Foo".into(), "Bar".into()], 3);
+        assert_eq!(out, vec!["Bar", "Foo"]); // sort order
+    }
+
+    #[test]
+    fn suggest_two_clusters_both_become_regex() {
+        let out = suggest_cmd_triggers_smart(
+            &[
+                "Foo".into(),
+                "FooOne".into(),
+                "Bar".into(),
+                "BarOne".into(),
+            ],
+            3,
+        );
+        assert_eq!(out, vec!["/^Bar/", "/^Foo/"]);
+    }
+
+    #[test]
+    fn suggest_three_commands_shared_prefix_single_regex() {
+        let out = suggest_cmd_triggers_smart(
+            &[
+                "GrugFar".into(),
+                "GrugFarVisual".into(),
+                "GrugFarWithin".into(),
+            ],
+            3,
+        );
+        assert_eq!(out, vec!["/^GrugFar/"]);
+    }
+
+    #[test]
+    fn suggest_mixed_cluster_and_singleton() {
+        let out = suggest_cmd_triggers_smart(
+            &["Foo".into(), "FooOne".into(), "Standalone".into()],
+            3,
+        );
+        assert_eq!(out, vec!["/^Foo/", "Standalone"]);
+    }
+
+    #[test]
+    fn suggest_staircase_keeps_as_singletons() {
+        // A, AB, ABC では LCP が順に A (1), AB (2) で 3 字閾値を満たせない
+        let out = suggest_cmd_triggers_smart(
+            &["A".into(), "AB".into(), "ABC".into()],
+            3,
+        );
+        assert_eq!(out, vec!["A", "AB", "ABC"]);
+    }
+
+    #[test]
+    fn suggest_dedups_duplicate_commands() {
+        let out = suggest_cmd_triggers_smart(
+            &["Foo".into(), "Foo".into(), "FooBar".into()],
+            3,
+        );
+        assert_eq!(out, vec!["/^Foo/"]);
+    }
+
+    #[test]
+    fn suggest_lcp_uses_char_count_not_byte_count() {
+        // マルチバイト文字が含まれると len() (byte) と chars().count() (char) で
+        // 差が出るので、LCP 判定は char 基準。実用上 Vim command 名は ASCII のみ
+        // だがガードとして確認。
+        let out = suggest_cmd_triggers_smart(
+            &["日本Foo".into(), "日本Bar".into()],
+            3,
+        );
+        // LCP = "日本" (2 chars、byte 数は 6) → threshold=3 未満 → enumerate
+        assert_eq!(out, vec!["日本Bar", "日本Foo"]);
     }
 
     // ── file / plugin aggregation ──────────────────────────────────

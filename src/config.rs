@@ -86,6 +86,28 @@ pub struct Options {
     /// `git fetch` をスキップする。CLI からは `rvpm sync --refresh` / `--no-refresh`
     /// で上書き可能。
     pub fetch_interval: Option<String>,
+    /// `rvpm add` のスキャン後 auto-lazy 提案ポリシー (#87)。
+    ///
+    /// - `"ask"` (default): TTY なら対話プロンプトを出す、非 TTY なら skip。
+    /// - `"always"`: scan で何か見つかれば無条件で採用 (非 TTY script 向け)。
+    /// - `"never"`: scan 自体を skip、eager add。
+    ///
+    /// CLI の `--auto-lazy` / `--no-lazy` で per-call 上書き可能。
+    #[serde(default)]
+    pub auto_lazy: AutoLazyPolicy,
+}
+
+/// `options.auto_lazy` が取る 3 値。
+#[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoLazyPolicy {
+    /// TTY なら対話プロンプト、非 TTY なら skip (default)。
+    #[default]
+    Ask,
+    /// scan 結果があれば無条件で採用。
+    Always,
+    /// scan 自体を skip。
+    Never,
 }
 
 impl Default for Options {
@@ -104,6 +126,7 @@ impl Default for Options {
             url_style: UrlStyle::default(),
             browse: BrowseOptions::default(),
             fetch_interval: None,
+            auto_lazy: AutoLazyPolicy::default(),
         }
     }
 }

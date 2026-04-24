@@ -1307,6 +1307,7 @@ mod tests {
                 url_style: UrlStyle::Short,
                 browse: BrowseOptions::default(),
                 fetch_interval: None,
+                auto_lazy: crate::config::AutoLazyPolicy::Ask,
             },
             plugins,
         }
