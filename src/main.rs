@@ -2281,14 +2281,17 @@ fn patch_plugin_entry_triggers(
         if url != stored_url {
             continue;
         }
-        if !applied.on_cmd.is_empty() {
+        // 既存 on_cmd / on_map がある場合は user が CLI フラグ (`--on-cmd …`) で
+        // 明示指定した or 過去の add / 手編集で既に書いていたもの。scan 結果で
+        // 上書きすると user 設定を破壊するので skip (PR #91 review 指摘)。
+        if !applied.on_cmd.is_empty() && t.get("on_cmd").is_none() {
             let mut arr = toml_edit::Array::new();
             for s in &applied.on_cmd {
                 arr.push(s.as_str());
             }
             t["on_cmd"] = value(arr);
         }
-        if !applied.on_map.is_empty() {
+        if !applied.on_map.is_empty() && t.get("on_map").is_none() {
             // 全 entry が default mode (n) なら string 配列、それ以外なら table 配列。
             // MapSpec::mode の default は ["n"]。modes が `["n"]` ジャストなら string で十分。
             let all_default = applied
@@ -2475,8 +2478,16 @@ async fn run_add(
                 // clone 直後、generate 前の隙間で plugin の plugin/ 配下を scan して、
                 // 対象コマンド / keymap が見つかれば user のポリシーに沿って
                 // config.toml の [[plugins]] entry に on_cmd / on_map を追記する。
+                //
+                // user が `--lazy false` で明示的に eager 指示した時は scan skip。
+                // 「eager で入れたい」と言ってるのに "accept (lazy-load)" を提案するのは
+                // 余計な摩擦 (PR #91 review 指摘)。`lazy_raw == Some(true)` (明示的
+                // lazy 指示) は逆に scan する (triggers 候補を広げる)、`None` (未指定、
+                // 自動推論) は policy に従う。
                 let policy = resolve_add_lazy_policy(policy_override, &config_data);
-                if !matches!(policy, crate::config::AutoLazyPolicy::Never)
+                let skip_for_explicit_eager = plugin.lazy_raw == Some(false);
+                if !skip_for_explicit_eager
+                    && !matches!(policy, crate::config::AutoLazyPolicy::Never)
                     && let Some(suggestion) =
                         build_add_suggestion(&crate::plugin_scan::scan_plugin(&dst_path))
                     && let Some(applied) =
@@ -5215,6 +5226,64 @@ mod tests {
     use crate::loader::PluginScripts;
     use tempfile::tempdir;
     use toml_edit::DocumentMut;
+
+    // ── patch_plugin_entry_triggers regression: respect existing user fields ──
+
+    #[test]
+    fn patch_plugin_entry_triggers_does_not_overwrite_existing_on_cmd() {
+        // user が `--on-cmd MyCmd` で明示指定した / 手編集で既に書いた entry は
+        // scan 結果で上書きしてはいけない (PR #91 review 指摘)。
+        let initial = r#"[[plugins]]
+url = "owner/repo"
+on_cmd = ["MyCmd"]
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let applied = AddTriggerSuggestion {
+            on_cmd: vec!["ScannedFoo".into(), "ScannedBar".into()],
+            on_map: vec![],
+        };
+        patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
+        let out = doc.to_string();
+        assert!(out.contains(r#"on_cmd = ["MyCmd"]"#), "existing on_cmd must be preserved, got:\n{out}");
+        assert!(!out.contains("ScannedFoo"), "scan result must not be written");
+    }
+
+    #[test]
+    fn patch_plugin_entry_triggers_does_not_overwrite_existing_on_map() {
+        let initial = r#"[[plugins]]
+url = "owner/repo"
+on_map = [{lhs = "<leader>x", mode = ["n", "x"], desc = "custom"}]
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let applied = AddTriggerSuggestion {
+            on_cmd: vec![],
+            on_map: vec![MapSpec {
+                lhs: "gc".into(),
+                mode: vec!["n".into()],
+                desc: None,
+            }],
+        };
+        patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
+        let out = doc.to_string();
+        assert!(out.contains("<leader>x"), "existing on_map must be preserved:\n{out}");
+        assert!(!out.contains("gc"), "scan result must not be written");
+    }
+
+    #[test]
+    fn patch_plugin_entry_triggers_writes_when_field_absent() {
+        // 既存 entry に on_cmd が無ければ scan 結果を書く (通常パス)。
+        let initial = r#"[[plugins]]
+url = "owner/repo"
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let applied = AddTriggerSuggestion {
+            on_cmd: vec!["ScannedFoo".into()],
+            on_map: vec![],
+        };
+        patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
+        let out = doc.to_string();
+        assert!(out.contains("ScannedFoo"));
+    }
 
     fn write_file(path: &Path, content: &str) {
         if let Some(parent) = path.parent() {
