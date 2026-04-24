@@ -5244,8 +5244,14 @@ on_cmd = ["MyCmd"]
         };
         patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
         let out = doc.to_string();
-        assert!(out.contains(r#"on_cmd = ["MyCmd"]"#), "existing on_cmd must be preserved, got:\n{out}");
-        assert!(!out.contains("ScannedFoo"), "scan result must not be written");
+        assert!(
+            out.contains(r#"on_cmd = ["MyCmd"]"#),
+            "existing on_cmd must be preserved, got:\n{out}"
+        );
+        assert!(
+            !out.contains("ScannedFoo"),
+            "scan result must not be written"
+        );
     }
 
     #[test]
@@ -5265,7 +5271,10 @@ on_map = [{lhs = "<leader>x", mode = ["n", "x"], desc = "custom"}]
         };
         patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
         let out = doc.to_string();
-        assert!(out.contains("<leader>x"), "existing on_map must be preserved:\n{out}");
+        assert!(
+            out.contains("<leader>x"),
+            "existing on_map must be preserved:\n{out}"
+        );
         assert!(!out.contains("gc"), "scan result must not be written");
     }
 
