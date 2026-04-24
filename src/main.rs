@@ -159,8 +159,10 @@ enum Commands {
         #[arg(long, conflicts_with = "no_lazy")]
         auto_lazy: bool,
 
-        /// Skip the auto-scan entirely, do a plain eager add.
+        /// Skip the auto-scan entirely for this invocation.
         /// Overrides `options.auto_lazy` for this call (== "never").
+        /// This does not override explicit `--lazy` / `--on-*` flags —
+        /// if the plugin is lazy via those, it stays lazy.
         #[arg(long)]
         no_lazy: bool,
     },
