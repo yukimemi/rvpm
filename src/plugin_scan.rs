@@ -93,19 +93,99 @@ pub fn scan_source(src: &str, dialect: Dialect) -> ScanResult {
     out
 }
 
-/// Lua 行コメント (`-- …`) を行末まで削る。block comment (`--[[ … ]]`) は
-/// 対象外 (プラグイン `plugin/`/`lua/` での使用は稀なので YAGNI)。
-/// 改行は残すので行番号・multiline マッチ位置は維持される。
+/// Lua のコメントを削る。
+///
+/// 対象:
+///   - 行コメント `-- …` — 行末まで削る。**文字列内の `--` は保護**する
+///     (neorg の `"--- Quitting ---"` のような docstring 風 label で強制切断すると
+///     string が未閉にズレ、後続の paren balance が狂って buffer-local 検出が壊れる)。
+///   - ブロックコメント `--[[ … ]]` / `--[=*[ … ]=*]` — 複数行対応。
+///     neorg や obsidian.nvim の header docstring (markdown を埋め込んだもの) が
+///     この形式で書かれており、内部に live code に見える `vim.keymap.set(...)` の
+///     example が埋まっている。削らないと user_maps に誤検出される。
+///
+/// `\n` は原則保持 (行番号・multiline regex マッチ位置を維持) するが、ブロック
+/// コメント内の改行は削られる (空白 1 文字に置換)。regex は `\s*` を使うので
+/// 内容が実コードと癒着する心配はない。
 fn strip_lua_line_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
     let mut out = String::with_capacity(src.len());
-    for (i, line) in src.lines().enumerate() {
-        if i > 0 {
-            out.push('\n');
+    let mut in_str: Option<u8> = None;
+    let mut escape = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = in_str {
+            // 文字列内: そのまま出力、閉じ引用符まで現状維持
+            out.push(c as char);
+            if escape {
+                escape = false;
+            } else if c == b'\\' {
+                escape = true;
+            } else if c == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
         }
-        let code = line.find("--").map_or(line, |i| &line[..i]);
-        out.push_str(code);
+        // 非文字列: `--[[` / `--[=*[` か `-- …` をまず確認
+        if c == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            let after_dashes = i + 2;
+            // `--[=*[` の開始判定
+            if after_dashes < bytes.len() && bytes[after_dashes] == b'[' {
+                let mut level = 0usize;
+                let mut j = after_dashes + 1;
+                while j < bytes.len() && bytes[j] == b'=' {
+                    level += 1;
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'[' {
+                    // `--[=^level[` 発見。対応する `]=^level]` まで skip
+                    let start = j + 1;
+                    let end = find_long_bracket_close(bytes, start, level);
+                    let slice_end = end.unwrap_or(bytes.len());
+                    // 空白 1 文字に置換 (regex ヒットしないように隔離)
+                    out.push(' ');
+                    i = slice_end;
+                    continue;
+                }
+            }
+            // 単純な行コメント `-- …` — 行末まで skip、`\n` は保持
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // 文字列開始?
+        if c == b'"' || c == b'\'' {
+            in_str = Some(c);
+        }
+        out.push(c as char);
+        i += 1;
     }
     out
+}
+
+/// Lua の long bracket `]=^level]` の終了位置 (最後の `]` の index) を返す。
+/// 見つからなければ `None` (unterminated block comment → EOF 扱いで全部 skip)。
+fn find_long_bracket_close(bytes: &[u8], from: usize, level: usize) -> Option<usize> {
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] == b']' {
+            // `]=^level]` パターンにマッチするか?
+            let mut j = i + 1;
+            let mut eq_count = 0usize;
+            while j < bytes.len() && bytes[j] == b'=' {
+                eq_count += 1;
+                j += 1;
+            }
+            if eq_count == level && j < bytes.len() && bytes[j] == b']' {
+                return Some(j + 1);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// ファイルパスのリストを読み込んで集約 + dedup した ScanResult を返す。
@@ -1089,5 +1169,86 @@ vim.keymap.set("n", "q", "<cmd>close<CR>", {
         let mut out = scan_plugin(root).commands;
         out.sort();
         assert_eq!(out, vec!["AfterB", "FtRust", "PluginA", "Setupd"]);
+    }
+
+    // ── block comment stripping (neorg false positive) ───────────────────
+
+    #[test]
+    fn scan_source_skips_keymap_set_inside_block_comment() {
+        // neorg の keybinds/module.lua は header docstring を `--[[ … ]]` ブロック
+        // コメントで書いており、内部に example として `vim.keymap.set(…)` が
+        // 埋まっている。live code ではないので拾ってはいけない。
+        let src = r#"
+--[[
+    Example user keybind:
+    vim.keymap.set("n", "my-key-here", "<Plug>(neorg.foo)", {})
+    vim.keymap.set("n", "<up>", "<Plug>(neorg.bar)", {})
+--]]
+
+vim.keymap.set("n", "real", "<Plug>(plugin.action)", {})
+"#;
+        let maps = scan_source(src, Dialect::Lua).user_maps;
+        assert_eq!(
+            maps,
+            vec![UserMap {
+                lhs: "real".into(),
+                modes: vec!["n".into()],
+            }],
+            "block comment body must not produce user_maps entries"
+        );
+    }
+
+    #[test]
+    fn scan_source_handles_long_bracket_level_in_block_comment() {
+        // `--[===[ … ]===]` も block comment として機能する (Lua の long bracket level)。
+        let src = r#"
+--[==[
+    vim.keymap.set("n", "must-be-skipped", "<Plug>(x)")
+]==]
+vim.keymap.set("n", "kept", "<Plug>(y)")
+"#;
+        let maps = scan_source(src, Dialect::Lua).user_maps;
+        assert_eq!(
+            maps,
+            vec![UserMap {
+                lhs: "kept".into(),
+                modes: vec!["n".into()],
+            }]
+        );
+    }
+
+    // ── line-comment stripper preserves strings containing `--` ──────────
+
+    #[test]
+    fn scan_source_preserves_string_with_double_dash_inside() {
+        // neorg calendar の `{ "--- Quitting ---", "@text.title" }` のような label は
+        // 文字列内の `--` なのでコメント扱いしてはいけない。以前は強制切断で
+        // 後続の paren balance が狂い、buffer-local 判定が失敗していた。
+        let src = r#"
+vim.keymap.set("n", "?", lib.wrap(display_help, {
+    { "--- Quitting ---", "@text.title" },
+    { "--- Date Syntax ---", "@text.title" },
+}), { buffer = bufnr })
+"#;
+        // buffer-local なので拾わない。文字列内の `--` が保護されて paren が正しく
+        // 閉じ、has_buffer_option が `{ buffer = bufnr }` を見つけられる。
+        assert!(scan_source(src, Dialect::Lua).user_maps.is_empty());
+    }
+
+    #[test]
+    fn scan_source_still_strips_real_line_comment_with_code_after() {
+        // 実際の `-- …` 行コメントは従来どおり削る。
+        let src = r#"
+-- vim.keymap.set("n", "commented-out", …)
+vim.keymap.set("n", "live", "<Plug>(x)")
+"#;
+        let maps = scan_source(src, Dialect::Lua).user_maps;
+        assert_eq!(
+            maps,
+            vec![UserMap {
+                lhs: "live".into(),
+                modes: vec!["n".into()],
+            }]
+        );
     }
 }
