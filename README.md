@@ -47,11 +47,18 @@ Selecting the `[user config]` pseudo-plugin swaps the detail pane for a **requir
 
 ```sh
 # From crates.io
-cargo install rvpm
+cargo install rvpm --locked
 
 # Or from source (latest main)
-cargo install --git https://github.com/yukimemi/rvpm
+cargo install --git https://github.com/yukimemi/rvpm --locked
+
+# Or from a local clone (same as `cargo make install`)
+cargo install --path . --locked
 ```
+
+`--locked` pins the dependency versions recorded in `Cargo.lock`. Without it,
+`cargo install` re-resolves transitively and can pull mutually-incompatible
+`gix-*` / `winnow` versions that fail to compile.
 
 Pre-built binaries are also on the
 [Releases](https://github.com/yukimemi/rvpm/releases) page for Linux

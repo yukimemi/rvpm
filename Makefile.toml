@@ -25,6 +25,11 @@ description = "Run all tests"
 command = "cargo"
 args = ["test"]
 
+[tasks.install]
+description = "Install rvpm from local source (respects Cargo.lock via --locked)"
+command = "cargo"
+args = ["install", "--path", ".", "--locked"]
+
 [tasks.publish-dry]
 description = "Dry-run crates.io publish"
 command = "cargo"
