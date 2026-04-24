@@ -1,6 +1,7 @@
 mod browse;
 mod browse_tui;
 mod chezmoi;
+mod cmd_scan;
 mod config;
 mod doctor;
 mod external_render;
@@ -3959,6 +3960,10 @@ fn build_plugin_scripts(
         depends: plugin.depends.clone(),
         colorschemes: collect_colorschemes(plugin_path),
         denops_plugins: collect_denops_plugins(plugin_path),
+        // on_cmd の /regex/ 展開用にコマンド名を静的スキャン (#85)。対象が
+        // plugin/, ftplugin/, after/plugin/ 配下の .vim / .lua のみで、load
+        // 経路に影響しないので dead plugin でもコストは小さい。
+        defined_commands: crate::cmd_scan::scan_plugin_commands(plugin_path),
         cond: plugin.cond.clone(),
     }
 }

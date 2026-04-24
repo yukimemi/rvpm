@@ -40,6 +40,11 @@ pub struct PluginScripts {
     /// 事前コンパイル: `denops/<name>/main.{ts,js}` から検出した denops プラグイン。
     /// lazy load 時に `denops#plugin#load(name, main_script)` を発行する。
     pub denops_plugins: Vec<DenopsPlugin>,
+    /// 事前コンパイル: `plugin/**/*.{vim,lua}` / `ftplugin/**/*` / `after/plugin/**/*` を
+    /// スキャンして得た、プラグインが静的に定義するユーザコマンド名のリスト (#85)。
+    /// `on_cmd = ["/regex/"]` の展開ソースとして使う。空 Vec なら「スキャンして 0 件」
+    /// (動的定義のみのプラグインなど) — 展開パスは literal として素通す。
+    pub defined_commands: Vec<String>,
     pub cond: Option<String>,
 }
 
@@ -67,6 +72,7 @@ impl PluginScripts {
             depends: None,
             colorschemes: Vec::new(),
             denops_plugins: Vec::new(),
+            defined_commands: Vec::new(),
             cond: None,
         }
     }
@@ -103,6 +109,75 @@ pub(crate) fn lua_quote(s: &str) -> String {
         }
     }
     out.push('"');
+    out
+}
+
+/// `on_cmd` の `/regex/` 区切り entry を、プラグインが静的に定義する具体コマンド名
+/// (`defined`) と照合して展開する。非 regex entry (exact name) はそのまま通す。
+///
+/// 構文:
+///   - `"Foo"`     — exact match (従来通り、後方互換)
+///   - `"/^Foo/"`  — 正規表現、`defined` 内の一致するコマンド名を展開
+///
+/// 判定:
+///   - 2 文字以上 `/` 始まりかつ `/` 終わり → 中身を regex として compile
+///   - compile 失敗 / zero match → stderr に warn して **entry を drop**
+///
+/// なぜ drop するか:
+///   以前の fallback (literal として残す) は `"/^NoSuch/"` のような文字列を
+///   `nvim_create_user_command("{cmd}", ...)` にそのまま渡すことになり、Vim
+///   のコマンド名規則 `[A-Z][A-Za-z0-9_]*` 違反で **`E183` が発生 → loader.lua
+///   全体が top-level で中断** する。phase 7/8/9 (lazy trigger / ColorSchemePre
+///   / global after.lua) が巻き添えで無効化される致命的バグ。warn を出した上で
+///   drop すれば user は気付けるし、残りの plugin は正常にロードされる。
+///
+/// `scope` は warn 出力時のラベル (plugin 名など)。
+///
+/// 重複は順序保持の dedup で除去 — 同じコマンドを複数回 `nvim_create_user_command`
+/// で登録すると Neovim が警告を吐くので、user が `["/^Foo/", "FooOne"]` のように
+/// 冗長に書いても 1 回だけ emit される。
+pub fn expand_cmd_patterns(patterns: &[String], defined: &[String], scope: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(patterns.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for pat in patterns {
+        let body = pat
+            .strip_prefix('/')
+            .and_then(|s| s.strip_suffix('/'))
+            .filter(|s| !s.is_empty());
+        if let Some(re_src) = body {
+            match regex::Regex::new(re_src) {
+                Ok(re) => {
+                    // collect せず peekable で空判定 → 可能ならそのまま iterate。
+                    let mut matches = defined.iter().filter(|d| re.is_match(d)).peekable();
+                    if matches.peek().is_none() {
+                        eprintln!(
+                            "\u{26a0} on_cmd regex {pat:?} matched no commands for {scope}; \
+                             entry dropped from the generated loader (emitting the pattern \
+                             literally would violate Vim's command name rule [A-Z][A-Za-z0-9_]* \
+                             and raise E183 at startup, aborting loader.lua). Write the exact \
+                             command names or check the plugin's plugin/ directory for dynamic \
+                             definitions."
+                        );
+                    } else {
+                        for m in matches {
+                            if seen.insert(m.clone()) {
+                                out.push(m.clone());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "\u{26a0} on_cmd regex {pat:?} for {scope} failed to compile: {e}. \
+                         Entry dropped from the generated loader (literal emission would \
+                         violate Vim's command name rule and abort loader.lua at startup)."
+                    );
+                }
+            }
+        } else if seen.insert(pat.clone()) {
+            out.push(pat.clone());
+        }
+    }
     out
 }
 
@@ -567,8 +642,13 @@ end
         // ---- on_cmd: lazy.nvim 方式 ----
         // bang/range/count/mods/args を event から復元して vim.cmd(table) で dispatch
         // complete callback は plugin をロードしてから vim.fn.getcompletion に委譲
+        //
+        // `/regex/` 記法 (#85) はここで expand_cmd_patterns を挟んで defined_commands
+        // に対して展開する。展開後は従来と完全に同じ exact-match emit path なので
+        // runtime コストは追加ゼロ (AOT で展開済みなぶんだけ stub 登録数が増える)。
         if let Some(cmds) = &s.on_cmd {
-            for cmd in cmds {
+            let expanded = expand_cmd_patterns(cmds, &s.defined_commands, &s.name);
+            for cmd in &expanded {
                 body.push_str(&format!(
                     "vim.api.nvim_create_user_command(\"{cmd}\", function(event)\n\
                      \x20 pcall(vim.api.nvim_del_user_command, \"{cmd}\")\n\
@@ -816,6 +896,104 @@ end
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================
+    // on_cmd regex 展開 (#85)
+    // `/regex/` 区切りのパターンは、プラグインが静的に定義するコマンド名に対して
+    // regex match して展開される。展開結果は既存 exact-match の emit パスに流れるので
+    // runtime コストはゼロ。
+    // ========================================================
+
+    #[test]
+    fn expand_cmd_patterns_passes_exact_names_through() {
+        let out = expand_cmd_patterns(
+            &["Foo".to_string(), "Bar".to_string()],
+            &["FooOne".to_string(), "Ignored".to_string()],
+            "plugin",
+        );
+        assert_eq!(out, vec!["Foo", "Bar"]);
+    }
+
+    #[test]
+    fn expand_cmd_patterns_regex_matches_defined_commands() {
+        let out = expand_cmd_patterns(
+            &["/^Foo/".to_string()],
+            &[
+                "FooOne".to_string(),
+                "FooTwo".to_string(),
+                "Bar".to_string(),
+            ],
+            "plugin",
+        );
+        assert_eq!(out, vec!["FooOne", "FooTwo"]);
+    }
+
+    #[test]
+    fn expand_cmd_patterns_mixes_regex_and_exact() {
+        let out = expand_cmd_patterns(
+            &["/^Foo/".to_string(), "ExtraDyn".to_string()],
+            &["FooOne".to_string(), "FooTwo".to_string()],
+            "plugin",
+        );
+        assert_eq!(out, vec!["FooOne", "FooTwo", "ExtraDyn"]);
+    }
+
+    #[test]
+    fn expand_cmd_patterns_dedups_when_regex_and_exact_overlap() {
+        // `["/^Foo/", "FooOne"]` で FooOne が両方から出る → 1 回だけ。
+        let out = expand_cmd_patterns(
+            &["/^Foo/".to_string(), "FooOne".to_string()],
+            &["FooOne".to_string(), "FooTwo".to_string()],
+            "plugin",
+        );
+        assert_eq!(out, vec!["FooOne", "FooTwo"]);
+    }
+
+    #[test]
+    fn expand_cmd_patterns_zero_regex_match_drops_entry() {
+        // regex がどれにもマッチしない場合、literal として emit すると Vim の
+        // コマンド名規則 [A-Z][A-Za-z0-9_]* に違反して起動時 E183 で loader.lua
+        // が top-level 中断する致命バグ (PR #86 review で CodeRabbit が指摘)。
+        // warn のみ出して drop が正解。
+        let out = expand_cmd_patterns(&["/^NoSuch/".to_string()], &["Other".to_string()], "plugin");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn expand_cmd_patterns_invalid_regex_drops_entry() {
+        // 不正な regex (compile error) も同じ理由で drop + warn。
+        let out = expand_cmd_patterns(&["/(unclosed/".to_string()], &["Foo".to_string()], "plugin");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn expand_cmd_patterns_drop_does_not_affect_valid_entries() {
+        // drop されるのは該当 regex entry のみ — 他の exact / 有効な regex は
+        // 通常通り出力される。
+        let out = expand_cmd_patterns(
+            &[
+                "/^NoSuch/".to_string(),
+                "Exact".to_string(),
+                "/^Foo/".to_string(),
+            ],
+            &["FooBar".to_string()],
+            "plugin",
+        );
+        assert_eq!(out, vec!["Exact", "FooBar"]);
+    }
+
+    #[test]
+    fn expand_cmd_patterns_single_slash_is_not_regex() {
+        // `"/"` (2 文字未満) や `"/foo"` (終わり `/` なし) は regex ではなく
+        // そのまま literal として通す — 普通は Vim command 名として不正だが、
+        // 展開ロジックの守備範囲外なので touch しない。
+        let out = expand_cmd_patterns(
+            &["/".to_string(), "/foo".to_string(), "foo/".to_string()],
+            &[],
+            "plugin",
+        );
+        assert_eq!(out, vec!["/", "/foo", "foo/"]);
+    }
 
     // ========================================================
     // 新モデル: lazy.nvim 方式 + merge optimization + 事前コンパイル

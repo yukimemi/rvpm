@@ -247,7 +247,7 @@ same plugin they are OR-ed: **any one** firing loads the plugin.
 
 | Key | Type | Accepts | Description |
 |---|---|---|---|
-| `on_cmd` | `string \| string[]` | `"Foo"` or `["Foo", "Bar"]` | Load when the user runs `:Foo`. Supports bang, range, count, completion |
+| `on_cmd` | `string \| string[]` | `"Foo"`, `["Foo", "Bar"]`, or `"/^Foo/"` (regex) | Load when the user runs `:Foo`. Supports bang, range, count, completion. `/regex/` entries are expanded at `rvpm generate` time against commands rvpm statically scans from the plugin's `plugin/`, `ftplugin/`, and `after/plugin/` files — runtime cost matches exact-name listing, `:Prefix<Tab>` completion stays intact |
 | `on_ft` | `string \| string[]` | `"rust"` or `["rust", "toml"]` | Load on `FileType`, then re-trigger so `ftplugin/` fires |
 | `on_event` | `string \| string[]` | `"BufReadPre"` or `["BufReadPre", "User LazyDone"]` | Load on Neovim event. `"User Xxx"` shorthand creates a User autocmd with `pattern = "Xxx"` |
 | `on_path` | `string \| string[]` | `"*.rs"` or `["*.rs", "Cargo.toml"]` | Load on `BufRead` / `BufNewFile` matching the glob pattern |
