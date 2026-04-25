@@ -568,6 +568,12 @@ async fn execute_build_command(
     config: &crate::config::Config,
     cache_root: &Path,
 ) -> Option<String> {
+    // 早期 return: build step が一つも無ければ rtp 計算自体スキップ (Gemini #99
+    // 指摘の short-circuit。大きな depends グラフでの無駄走査を避ける)。
+    if plugin.build.is_none() && plugin.build_lua.is_none() {
+        return None;
+    }
+
     let rtp_dirs = collect_build_rtp(plugin, dst_path, config, cache_root);
 
     // 1. shell コマンド (従来挙動)。失敗時は即 return。
@@ -677,14 +683,18 @@ async fn run_build_lua(
     script.push_str(lua_code);
     script.push('\n');
 
-    let tmp_path = std::env::temp_dir().join(format!(
-        "rvpm-build-{}-{}.lua",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    // tempfile crate に temp ファイル管理を委ねる (Gemini #99 指摘): manual な
+    // SystemTime + process::id 組立ては、process が中断された場合にゴミが残る。
+    // `NamedTempFile` は drop で自動削除 + プラットフォームに合った安全な命名を行う。
+    let tmp_file = match tempfile::Builder::new()
+        .prefix("rvpm-build-")
+        .suffix(".lua")
+        .tempfile()
+    {
+        Ok(f) => f,
+        Err(e) => return Some(format!("build_lua: failed to create temp script: {e}")),
+    };
+    let tmp_path = tmp_file.path().to_path_buf();
     if let Err(e) = std::fs::write(&tmp_path, &script) {
         return Some(format!("build_lua: failed to write temp script: {e}"));
     }
@@ -696,11 +706,14 @@ async fn run_build_lua(
         .current_dir(dst_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // tokio Command の default は `kill_on_drop = false` なので、timeout 時に
+        // future が drop されても child の nvim は走り続けてしまう (Gemini High
+        // 指摘の resource leak)。`true` で drop = kill 連動させる。
+        .kill_on_drop(true)
         .spawn()
     {
         Ok(c) => c,
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp_path);
             return Some(format!(
                 "build_lua: failed to spawn `nvim --headless` ({e}); install nvim or remove `build_lua` from this plugin"
             ));
@@ -708,7 +721,8 @@ async fn run_build_lua(
     };
 
     let wait_result = tokio::time::timeout(build_timeout, child.wait_with_output()).await;
-    let _ = std::fs::remove_file(&tmp_path);
+    // tmp_file は scope を抜ける時 drop で自動削除されるので明示削除は不要。
+    drop(tmp_file);
 
     match wait_result {
         Ok(Ok(out)) if !out.status.success() => {
