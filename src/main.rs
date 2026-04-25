@@ -662,17 +662,28 @@ async fn run_build_shell(
 /// user は lazy.nvim の `build = function() require(...).build():wait(...) end` から
 /// 流用しがちなので、その形を検出して body へ unwrap する。
 ///
-/// 検出は trim 後の文字列が `"function()"` (or `"function ()"`) で始まり、`"end"`
-/// で終わる場合のみ。strip_suffix は最後の 3 文字 "end" を比較するだけなので、
-/// 識別子末尾の "end" (例: `local end_var = 1`) を誤って切ることは無い (Rust の
-/// `strip_suffix` は exact suffix match)。
+/// **対応する記述**:
+/// - 1 行 / 複数行どちらも (regex `(?s)` で `.` が改行マッチ)
+/// - `function()` 直後・`end` 直前の任意の空白/改行
+/// - `end` の後ろの trailing line コメント (`-- ...`) と空白
+/// - 入れ子の `function() ... end` は body 内に **そのまま保持** (lazy quantifier
+///   `.*?` + 末尾 anchor `$` で「最後の一番外の `end`」を拾うため)
+///
+/// **マッチしない**:
+/// - `function name() ... end` (named function 宣言は valid statement なので unwrap 不要)
+/// - 末尾に statement や `;` が続くケース (lazy.nvim 流ではない)
 fn unwrap_anonymous_lua_function(code: &str) -> Option<String> {
-    let trimmed = code.trim();
-    let after_func = trimmed
-        .strip_prefix("function()")
-        .or_else(|| trimmed.strip_prefix("function ()"))?;
-    let body = after_func.trim_end().strip_suffix("end")?;
-    Some(body.trim().to_string())
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // (?s): . が \n にマッチする dot-all モード。
+        // (.*?): lazy match で末尾 anchor `$` と組み合わせて「最後の `end`」を拾う。
+        // 末尾の trailing line コメント (`-- ...`) は optional。
+        Regex::new(r"(?s)^\s*function\s*\(\s*\)\s*(.*?)\s*end\s*(?:--[^\n\r]*)?\s*$").unwrap()
+    });
+    re.captures(code)
+        .map(|c| c.get(1).map_or("", |m| m.as_str()).trim().to_string())
 }
 
 /// Lua callable `build_lua` を実行する (#97)。
@@ -7187,11 +7198,62 @@ lazy = false"#;
 
     #[test]
     fn unwrap_anonymous_lua_function_preserves_inner_function_blocks() {
-        // 入れ子の `function() ... end` は inner 側を保持する (strip_suffix は
-        // 最後の "end" だけ落とす)。
+        // 入れ子の `function() ... end` は inner 側を保持する (lazy `.*?` + 末尾
+        // anchor で「最後の一番外の end」だけを落とす)。
         let r =
             unwrap_anonymous_lua_function("function() local f = function() return 1 end; f() end");
         assert_eq!(r.as_deref(), Some("local f = function() return 1 end; f()"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_handles_multiline_body() {
+        // 改行を含む typical な複数行 build_lua。
+        let code = "function()\n  local cmp = require('blink.cmp')\n  cmp.build():wait(60000)\n  vim.print('done')\nend";
+        let r = unwrap_anonymous_lua_function(code);
+        let body = r.expect("multiline function() should unwrap");
+        assert!(body.contains("local cmp = require('blink.cmp')"));
+        assert!(body.contains("cmp.build():wait(60000)"));
+        assert!(body.contains("vim.print('done')"));
+        assert!(!body.contains("function()"));
+        // 末尾に余分な end が残ってないこと
+        assert!(!body.ends_with("end"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_handles_complex_multiline_with_nested_function() {
+        // 複雑な複数行: ローカル関数定義入り。inner の function() ... end は保持。
+        let code = "function()\n  local helper = function(x)\n    return x * 2\n  end\n  print(helper(21))\nend";
+        let r = unwrap_anonymous_lua_function(code);
+        let body = r.expect("complex multiline should unwrap outer only");
+        assert!(body.contains("local helper = function(x)"));
+        assert!(body.contains("return x * 2"));
+        assert!(body.contains("print(helper(21))"));
+        // inner の helper 定義 end が残ってる
+        assert!(
+            body.matches("end").count() >= 1,
+            "inner helper end should remain, body: {body}"
+        );
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_tolerates_trailing_line_comment() {
+        // `end` の後に行コメントが付くケース (regex で末尾 `(?:--[^\n]*)?` 許容)。
+        let r = unwrap_anonymous_lua_function("function() vim.print('hi') end -- post-build hook");
+        assert_eq!(r.as_deref(), Some("vim.print('hi')"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_tolerates_whitespace_inside_parens() {
+        // `function ( )` のような余分な空白も許容。
+        let r = unwrap_anonymous_lua_function("function(  )  print('x')  end");
+        assert_eq!(r.as_deref(), Some("print('x')"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_returns_none_when_function_takes_args() {
+        // `function(a, b)` のように引数があるものは触らない (匿名 zero-arity 専用)。
+        let r = unwrap_anonymous_lua_function("function(a, b) return a + b end");
+        assert!(r.is_none(), "function with args should not be unwrapped");
     }
 
     #[tokio::test]
