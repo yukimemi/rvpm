@@ -2536,9 +2536,7 @@ async fn run_add(
 
     let toml_content = doc.to_string();
     let chezmoi_enabled = read_chezmoi_flag(&config_path);
-    let wp = chezmoi::write_path(chezmoi_enabled, &config_path).await;
-    std::fs::write(&wp, &toml_content)?;
-    chezmoi::apply(&wp, &config_path).await;
+    chezmoi::write_routed(chezmoi_enabled, &config_path, &toml_content).await?;
     println!("Added plugin to config: {}", stored_url);
 
     // 追加したプラグインだけ clone + merge し、loader.lua を再生成する
@@ -2618,6 +2616,7 @@ async fn run_add(
                         &cfg_root,
                         &config_path,
                         &config_data.options.ai_language,
+                        config_data.options.chezmoi,
                     )
                     .await
                     {
@@ -2638,13 +2637,12 @@ async fn run_add(
                                         );
                                     } else {
                                         let patched = doc_patch.to_string();
-                                        let wp = chezmoi::write_path(
+                                        chezmoi::write_routed(
                                             config_data.options.chezmoi,
                                             &config_path,
+                                            &patched,
                                         )
-                                        .await;
-                                        std::fs::write(&wp, &patched)?;
-                                        chezmoi::apply(&wp, &config_path).await;
+                                        .await?;
                                         println!(
                                             "Applied AI-proposed config for {} ({} hook file(s) created).",
                                             plugin.display_name(),
@@ -3258,9 +3256,7 @@ async fn run_set(
 
     if modified {
         let chezmoi_enabled = read_chezmoi_flag(&config_path);
-        let wp = chezmoi::write_path(chezmoi_enabled, &config_path).await;
-        std::fs::write(&wp, doc.to_string())?;
-        chezmoi::apply(&wp, &config_path).await;
+        chezmoi::write_routed(chezmoi_enabled, &config_path, doc.to_string()).await?;
         println!("Updated config for: {}", selected_repo_url);
         return Ok(true);
     }
@@ -3407,9 +3403,7 @@ async fn run_remove(query: Option<String>) -> Result<()> {
     let mut doc = toml_content.parse::<DocumentMut>()?;
     remove_plugin_from_toml(&mut doc, &selected_url)?;
     let chezmoi_enabled = read_chezmoi_flag(&config_path);
-    let wp = chezmoi::write_path(chezmoi_enabled, &config_path).await;
-    std::fs::write(&wp, doc.to_string())?;
-    chezmoi::apply(&wp, &config_path).await;
+    chezmoi::write_routed(chezmoi_enabled, &config_path, doc.to_string()).await?;
     println!("Removed '{}' from config.", selected_url);
 
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());

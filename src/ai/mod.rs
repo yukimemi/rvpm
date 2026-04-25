@@ -272,10 +272,19 @@ pub async fn run_handoff(backend: Backend, prompt_text: &str) -> Result<()> {
 /// AI mode で生成された hook 内容を、呼び出し側で resolve 済みの per-plugin
 /// config dir (`<config_root>/plugins/<host>/<owner>/<repo>/`) に書き込む。
 ///
+/// `chezmoi_enabled` (`options.chezmoi`) が true のとき、書き込みは `chezmoi::write_path`
+/// 経由で source state に行い、`chezmoi::apply` で target に反映する。
+/// raw `fs::write` で target に直書きすると次の `chezmoi apply` で削除/drift 扱いになるため、
+/// `rvpm edit` 等の他コマンドと同じ規約に揃える。
+///
 /// path 解決は呼び出し側 (`run_add`) が `resolve_plugin_config_dir` 経由で行う。
 /// ここでホスト名や url 形式を再パースしないことで、GitLab / 他 host や
 /// `Plugin::canonical_path` の形式変更にも自動追従する。
-pub fn write_hook_files(plugin_dir: &Path, proposal: &Proposal) -> Result<Vec<PathBuf>> {
+pub async fn write_hook_files(
+    plugin_dir: &Path,
+    proposal: &Proposal,
+    chezmoi_enabled: bool,
+) -> Result<Vec<PathBuf>> {
     std::fs::create_dir_all(plugin_dir).with_context(|| {
         format!(
             "failed to create plugin config dir {}",
@@ -290,18 +299,19 @@ pub fn write_hook_files(plugin_dir: &Path, proposal: &Proposal) -> Result<Vec<Pa
         ("after.lua", proposal.after_lua.as_deref()),
     ] {
         let Some(body) = body else { continue };
-        let path = plugin_dir.join(name);
+        let target = plugin_dir.join(name);
         // 既存ファイルは上書きしない (user の手書き編集を尊重)。
-        if path.exists() {
+        if target.exists() {
             eprintln!(
                 "\u{26a0} {} already exists, skipping AI-generated content. Apply manually if desired.",
-                path.display()
+                target.display()
             );
             continue;
         }
-        std::fs::write(&path, format!("{}\n", body.trim_end()))
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        written.push(path);
+        crate::chezmoi::write_routed(chezmoi_enabled, &target, format!("{}\n", body.trim_end()))
+            .await
+            .with_context(|| format!("failed to write {}", target.display()))?;
+        written.push(target);
     }
     Ok(written)
 }
@@ -424,9 +434,10 @@ url = "c/d"
         assert!(validate_proposal_toml(toml_src).is_err());
     }
 
-    #[test]
-    fn write_hook_files_writes_only_present_lua_blocks() {
+    #[tokio::test]
+    async fn write_hook_files_writes_only_present_lua_blocks() {
         // 呼び出し側 (`run_add`) が plugin_dir を resolve 済みで渡す前提を確認。
+        // chezmoi_enabled=false で従来 path (raw fs::write 相当) と挙動一致するか。
         let tmp = tempfile::tempdir().unwrap();
         let plugin_dir = tmp
             .path()
@@ -443,7 +454,7 @@ url = "o/r""#
             after_lua: Some("require('o').setup({})".to_string()),
             explanation: "test".to_string(),
         };
-        let written = write_hook_files(&plugin_dir, &p).unwrap();
+        let written = write_hook_files(&plugin_dir, &p, false).await.unwrap();
         assert_eq!(written.len(), 2);
         assert!(plugin_dir.join("init.lua").exists());
         assert!(!plugin_dir.join("before.lua").exists());

@@ -36,6 +36,10 @@ pub enum ChatOutcome {
 ///   - `Ok(ChatOutcome::Skipped)` — user 取り消し。
 ///   - `Ok(ChatOutcome::HandedOff)` — Mode B エスケープ済み。
 ///   - `Err(_)` — CLI 不在 / network / parse 不能 等。
+// 引数数が clippy too_many_arguments の閾値超だが、各 path / flag は
+// caller (`run_add`) 文脈で意味が明確 (struct でまとめると逆に指示性が下がる)
+// なので個別 param で受ける。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ai_add(
     backend: Backend,
     plugin_url: &str,
@@ -44,6 +48,7 @@ pub async fn run_ai_add(
     config_root: &Path,
     user_config_toml_path: &Path,
     ai_language: &str,
+    chezmoi_enabled: bool,
 ) -> Result<AiAddOutcome> {
     ensure_cli_installed(backend)?;
 
@@ -76,7 +81,8 @@ pub async fn run_ai_add(
 
         match prompt_chat_action().await? {
             ChatAction::Apply => {
-                let written = write_hook_files(plugin_config_dir, &proposal)?;
+                let written =
+                    write_hook_files(plugin_config_dir, &proposal, chezmoi_enabled).await?;
                 return Ok(AiAddOutcome {
                     outcome: ChatOutcome::Applied {
                         written_hooks: written,

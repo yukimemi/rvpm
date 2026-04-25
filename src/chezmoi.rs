@@ -182,6 +182,34 @@ pub async fn apply(wrote_to: &Path, target: &Path) {
     }
 }
 
+/// `write_path` + `fs::write` + `apply` をまとめた一発書き込み helper。
+///
+/// `enabled = false` (chezmoi 無効) なら target に直接書く。
+/// `enabled = true` なら source state へ書いて `chezmoi apply` で target へ反映する。
+///
+/// 親ディレクトリは存在しなければ自動作成する (chezmoi の source state 側に親が
+/// 無いケースに対応)。
+///
+/// ほとんどの呼び出し点で繰り返されていた以下のパターンを 1 行に短縮できる:
+/// ```ignore
+/// let wp = chezmoi::write_path(enabled, &target).await;
+/// std::fs::write(&wp, content)?;
+/// chezmoi::apply(&wp, &target).await;
+/// ```
+pub async fn write_routed(
+    enabled: bool,
+    target: &Path,
+    content: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    let wrote_to = write_path(enabled, target).await;
+    if let Some(parent) = wrote_to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&wrote_to, content)?;
+    apply(&wrote_to, target).await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +294,26 @@ mod tests {
             res.is_ok(),
             "write_path must return within 10s even when chezmoi is missing or slow"
         );
+    }
+
+    #[tokio::test]
+    async fn write_routed_disabled_writes_directly_to_target() {
+        // chezmoi 無効時は target に直接書く。親 dir も自動作成される。
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("sub").join("nested").join("file.toml");
+        write_routed(false, &target, "hello = 1\n").await.unwrap();
+        let read = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(read, "hello = 1\n");
+    }
+
+    #[tokio::test]
+    async fn write_routed_disabled_overwrites_existing_target() {
+        // 既存ファイルがあっても上書きできる (chezmoi 経由しないので raw write 相当)。
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("file.toml");
+        std::fs::write(&target, "old = 1").unwrap();
+        write_routed(false, &target, "new = 2").await.unwrap();
+        let read = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(read, "new = 2");
     }
 }
