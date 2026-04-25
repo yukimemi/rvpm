@@ -429,7 +429,9 @@ fn clone_impl(url: &str, dst: &Path) -> Result<()> {
 
     // clone 直後に refspec を全 branch に正規化しておくと、user が `rev = "v1"`
     // 等の非デフォルト branch を指定したケースで次回 fetch から拾える。
-    let _ = ensure_all_branches_refspec(dst);
+    // エラーを `?` で伝播 (Gemini #99 指摘): silent 握り潰しだと clone は成功した
+    // のに後続 fetch で謎の "rev not found" になり原因究明が困難。
+    ensure_all_branches_refspec(dst)?;
 
     Ok(())
 }
@@ -479,15 +481,43 @@ fn ensure_all_branches_refspec(dst: &Path) -> Result<()> {
     }
     // `[remote "origin"]` セクション内の `fetch = ...` 行を全 branch refspec に置換。
     // セクション境界は次の `[...]` 行か EOF。
+    //
+    // 旧実装は append 経路で「`replaced = false` なら末尾に追記」していたが、
+    // `[remote "origin"]` の後に他のセクションが続いていると新 fetch 行が誤って
+    // 末尾セクション (例: `[branch "main"]`) の所属になっていた (Gemini High 指摘)。
+    // → 今は **iterate 中に origin セクションのスコープを追跡し、フェッチ行が
+    //   無いまま origin が閉じる瞬間に注入する**。EOF までに見つからなければ
+    //   末尾に origin セクションごと追加する。
     let mut new_content = String::with_capacity(content.len() + 64);
     let mut in_origin_section = false;
     let mut replaced = false;
+    let mut pending_origin_fetch_inject = false;
+    let leading_ws_default = "\t"; // git config の慣習
     for line in content.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with('[') {
+        let starts_section = trimmed.starts_with('[');
+
+        // 既に origin セクション内で fetch 行未発見、かつ次のセクション開始 →
+        // ここで fetch 行を origin の所属として注入してから次セクションへ進む。
+        if starts_section && pending_origin_fetch_inject {
+            new_content.push_str(leading_ws_default);
+            new_content.push_str("fetch = ");
+            new_content.push_str(want);
+            new_content.push('\n');
+            pending_origin_fetch_inject = false;
+            replaced = true;
+        }
+
+        if starts_section {
             // 新しいセクション開始
             in_origin_section = trimmed.starts_with("[remote \"origin\"]")
                 || trimmed.starts_with("[remote 'origin']");
+            if in_origin_section {
+                // origin に入った瞬間に「fetch 行を注入したい」状態に入れる。
+                // この後の行で `fetch = ...` が見つかれば置換に切り替えて
+                // pending を解除する。
+                pending_origin_fetch_inject = true;
+            }
         } else if in_origin_section
             && let Some(idx) = trimmed.find("fetch")
             && trimmed[idx..]
@@ -502,18 +532,28 @@ fn ensure_all_branches_refspec(dst: &Path) -> Result<()> {
             new_content.push_str(want);
             new_content.push('\n');
             replaced = true;
+            pending_origin_fetch_inject = false;
             continue;
         }
         new_content.push_str(line);
         new_content.push('\n');
     }
-    // [remote "origin"] セクションそのものが無い (or fetch 行が無い) ケースでは
-    // 末尾に追記する。普通の clone なら必ずあるはずだがガード。
-    if !replaced {
-        if !new_content.contains("[remote \"origin\"]") {
-            new_content.push_str("[remote \"origin\"]\n");
-        }
-        new_content.push_str("\tfetch = ");
+    // EOF までに origin セクション内で fetch 行を一度も見ていない場合 (= origin が
+    // 最後のセクションで `fetch = ...` 自体が無いケース)。pending_origin_fetch_inject
+    // が立っていれば末尾に挿入。
+    if pending_origin_fetch_inject {
+        new_content.push_str(leading_ws_default);
+        new_content.push_str("fetch = ");
+        new_content.push_str(want);
+        new_content.push('\n');
+        replaced = true;
+    }
+    // origin セクションそのものが無いケース (rvpm が clone した直後なら必ずあるが、
+    // .git/config が手動で壊された等のガード)。末尾に新規セクションを足す。
+    if !replaced && !new_content.contains("[remote \"origin\"]") {
+        new_content.push_str("[remote \"origin\"]\n");
+        new_content.push_str(leading_ws_default);
+        new_content.push_str("fetch = ");
         new_content.push_str(want);
         new_content.push('\n');
     }
@@ -556,9 +596,10 @@ fn gix_checkout(dst: &Path, rev: &str) -> Result<()> {
     // で自動 tracking branch を作るのと同じ振る舞い)。
     let branch_ref = format!("refs/heads/{}", rev);
     let local_branch_exists = repo.find_reference(&branch_ref).is_ok();
-    let should_set_branch = local_branch_exists
-        || matches!(source, DirectOrRemote::FromRemote)
-        || matches!(source, DirectOrRemote::Direct) && repo.find_reference(&branch_ref).is_ok();
+    // local branch が既にあれば必ず symbolic HEAD で track。それが無くても
+    // remote から拾った場合は新規作成する (`git checkout` の auto-tracking 相当)。
+    // `Direct && exists` のチェックは `local_branch_exists` に内包されるので冗長 (Gemini 指摘)。
+    let should_set_branch = local_branch_exists || matches!(source, DirectOrRemote::FromRemote);
 
     if should_set_branch {
         let head_path = repo.git_dir().join("HEAD");
@@ -1214,6 +1255,38 @@ mod tests {
             after.contains("+refs/heads/*:refs/remotes/origin/*"),
             "origin should be normalized: {after}"
         );
+    }
+
+    #[test]
+    fn ensure_all_branches_refspec_inserts_into_origin_when_origin_is_not_last_section() {
+        // 旧実装は `replaced = false` 経路で末尾に append していたが、`[remote "origin"]`
+        // が中間にある config だと新 fetch 行が **後続セクション** (例: `[branch "main"]`)
+        // の所属になっていた (Gemini High 指摘 #99)。
+        // 修正後: origin スコープを iterate 中に追跡し、次セクション開始 or EOF 直前に
+        // 注入する。
+        let tmp = tempdir().unwrap();
+        let dst = tmp.path();
+        fs::create_dir_all(dst.join(".git")).unwrap();
+        // origin セクションには fetch 行が **無い**、後続に branch セクション。
+        let initial = "[remote \"origin\"]\n\turl = https://github.com/foo/bar\n[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n";
+        fs::write(dst.join(".git/config"), initial).unwrap();
+
+        ensure_all_branches_refspec(dst).unwrap();
+
+        let after = fs::read_to_string(dst.join(".git/config")).unwrap();
+        // fetch 行は origin セクション内 (= branch セクションの **前**) にあるべき
+        let fetch_pos = after
+            .find("fetch = +refs/heads/*")
+            .expect("fetch line written");
+        let branch_pos = after
+            .find("[branch \"main\"]")
+            .expect("branch section preserved");
+        assert!(
+            fetch_pos < branch_pos,
+            "fetch line must be inside [remote \"origin\"], i.e. BEFORE [branch \"main\"]:\n{after}"
+        );
+        // branch セクションの内容が壊れていないこと
+        assert!(after.contains("merge = refs/heads/main"));
     }
 
     #[tokio::test]
