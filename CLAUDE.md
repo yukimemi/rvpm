@@ -91,6 +91,15 @@ concurrency = 16
 #   "always"        — scan 結果を無条件採用 (スクリプト用)
 #   "never"         — scan skip、eager add
 # auto_lazy = "ask"
+# `rvpm add` を AI CLI に委譲する場合のバックエンド (#93)。
+#   "off" (default) — 静的 scan + auto_lazy フローを使う
+#   "claude" / "gemini" / "codex" — 該当 CLI を subprocess で起動
+# CLI が未インストールならエラー。`auto_lazy` は無視される。
+# CLI flag `--ai claude` / `--no-ai` で per-call 上書き可能。
+# ai = "claude"
+# AI 出力の自然言語 (explanation 本文 + chat 応答)。default "en"。
+# XML tag 構造そのものは英語固定 (parse 安定性のため)。
+# ai_language = "ja"
 
 [options.browse]
 # README 表示を外部コマンドに委譲する (browse TUI 専用)。

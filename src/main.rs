@@ -1,3 +1,4 @@
+mod ai;
 mod browse;
 mod browse_tui;
 mod chezmoi;
@@ -165,6 +166,17 @@ enum Commands {
         /// if the plugin is lazy via those, it stays lazy.
         #[arg(long)]
         no_lazy: bool,
+
+        /// AI backend for this `add`. Replaces the static-scan + auto-lazy path:
+        /// the chosen CLI (`claude` / `gemini` / `codex`) reads the plugin's
+        /// README + your config and proposes the full `[[plugins]]` block plus
+        /// any per-plugin hook files. Overrides `options.ai` for this call.
+        #[arg(long, value_enum, conflicts_with = "no_ai")]
+        ai: Option<crate::config::AiBackend>,
+
+        /// Force the static-scan path even if `options.ai` is set in config.
+        #[arg(long)]
+        no_ai: bool,
     },
 
     /// Edit per-plugin or global hook files in $EDITOR
@@ -397,6 +409,8 @@ async fn main() -> Result<()> {
             rev,
             auto_lazy,
             no_lazy,
+            ai,
+            no_ai,
         } => {
             let policy_override = if auto_lazy {
                 Some(crate::config::AutoLazyPolicy::Always)
@@ -404,6 +418,13 @@ async fn main() -> Result<()> {
                 Some(crate::config::AutoLazyPolicy::Never)
             } else {
                 None
+            };
+            // `--no-ai` は config の `ai` を打ち消して Off に固定。`--ai <backend>` は
+            // 明示指定 (Off 含む)。両方無指定 (None) なら config 値を使う。
+            let ai_override = if no_ai {
+                Some(crate::config::AiBackend::Off)
+            } else {
+                ai
             };
             run_add(
                 repo,
@@ -415,6 +436,7 @@ async fn main() -> Result<()> {
                 on_event,
                 rev,
                 policy_override,
+                ai_override,
             )
             .await?;
         }
@@ -2265,6 +2287,75 @@ fn decide_add_lazy_apply(
     }
 }
 
+/// AI mode 用 (#93): AI が返した `[[plugins]]` ブロック (1 entry のみ) を、既存
+/// stub entry に **in-place マージ** する。
+///
+/// 設計ポイント:
+///   - **stub entry の文書中の位置 / 装飾 (改行・空白) を保つ** — `remove + insert`
+///     方式は toml_edit が新 entry を `[vars]` の直後など想定外の位置にレンダリング
+///     してしまう (user 報告: 既存 [[plugins]] の末尾ではなく `[vars]` 直後に配置される)。
+///   - **user の明示 CLI flag を尊重** — `preserved_keys` に挙げたキーは AI 提案で
+///     上書きしない (`rvpm add owner/repo --rev v1.0 --ai claude` で `--rev` を残す)。
+///     `url` は `stored_url` に強制リセット (canonical 化)。
+fn replace_plugin_entry_with_ai_toml(
+    doc: &mut DocumentMut,
+    stored_url: &str,
+    proposal_toml: &str,
+    preserved_keys: &[&str],
+) -> anyhow::Result<()> {
+    use anyhow::{Context, anyhow};
+
+    let proposal_doc: DocumentMut = proposal_toml
+        .parse::<DocumentMut>()
+        .context("AI proposal TOML failed to parse")?;
+    let proposal_plugins = proposal_doc
+        .get("plugins")
+        .and_then(|p| p.as_array_of_tables())
+        .ok_or_else(|| anyhow!("AI proposal missing [[plugins]] array"))?;
+    if proposal_plugins.len() != 1 {
+        return Err(anyhow!(
+            "AI proposal must contain exactly 1 plugin entry; got {}",
+            proposal_plugins.len()
+        ));
+    }
+    let new_entry = proposal_plugins.get(0).unwrap();
+
+    // 既存 doc の plugins 配列から url 一致を探して in-place マージ。
+    let plugins = doc
+        .get_mut("plugins")
+        .and_then(|p| p.as_array_of_tables_mut())
+        .ok_or_else(|| anyhow!("config.toml missing [[plugins]] array"))?;
+    for i in 0..plugins.len() {
+        let existing_url = plugins
+            .get(i)
+            .and_then(|t| t.get("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if existing_url != stored_url {
+            continue;
+        }
+        let existing = plugins.get_mut(i).unwrap();
+
+        // AI 提案の各キーを既存 entry に書き込む。
+        // ただし `preserved_keys` (user が CLI flag で明示したもの) は skip。
+        // url は最後に強制セット。
+        for (key, value_item) in new_entry.iter() {
+            if key == "url" {
+                continue;
+            }
+            if preserved_keys.contains(&key) {
+                continue;
+            }
+            existing[key] = value_item.clone();
+        }
+        existing["url"] = value(stored_url);
+        return Ok(());
+    }
+    Err(anyhow!(
+        "could not find stub [[plugins]] entry with url=`{stored_url}` in config.toml"
+    ))
+}
+
 /// 既存 config.toml 内の `[[plugins]]` のうち url が一致するエントリに
 /// `on_cmd` / `on_map` を書き込む。toml_edit で in-place patch。
 fn patch_plugin_entry_triggers(
@@ -2336,6 +2427,7 @@ async fn run_add(
     on_event: Option<String>,
     rev: Option<String>,
     policy_override: Option<crate::config::AutoLazyPolicy>,
+    ai_override: Option<crate::config::AiBackend>,
 ) -> Result<()> {
     let config_path = rvpm_config_path();
     ensure_config_exists(&config_path)?;
@@ -2378,6 +2470,35 @@ async fn run_add(
     }
     // 書き込み URL は options.url_style に従って整形 (GitHub 以外はそのまま)。
     let stored_url = format_plugin_url(&repo, url_style);
+
+    // user が明示的に CLI flag で指定したキー一覧 — AI mode 適用時はこれを尊重して
+    // 上書きしない (#95 review CodeRabbit Major)。`url` は常に保護 (canonical 化される)。
+    let preserved_keys: Vec<&'static str> = {
+        let mut k = vec!["url"];
+        if name.is_some() {
+            k.push("name");
+        }
+        if lazy.is_some() {
+            k.push("lazy");
+        }
+        if rev.is_some() {
+            k.push("rev");
+        }
+        if on_cmd.is_some() {
+            k.push("on_cmd");
+        }
+        if on_ft.is_some() {
+            k.push("on_ft");
+        }
+        if on_map.is_some() {
+            k.push("on_map");
+        }
+        if on_event.is_some() {
+            k.push("on_event");
+        }
+        k
+    };
+
     let mut new_plugin = table();
     new_plugin["url"] = value(&stored_url);
     if let Some(n) = name {
@@ -2415,9 +2536,7 @@ async fn run_add(
 
     let toml_content = doc.to_string();
     let chezmoi_enabled = read_chezmoi_flag(&config_path);
-    let wp = chezmoi::write_path(chezmoi_enabled, &config_path).await;
-    std::fs::write(&wp, &toml_content)?;
-    chezmoi::apply(&wp, &config_path).await;
+    chezmoi::write_routed(chezmoi_enabled, &config_path, &toml_content).await?;
     println!("Added plugin to config: {}", stored_url);
 
     // 追加したプラグインだけ clone + merge し、loader.lua を再生成する
@@ -2476,38 +2595,105 @@ async fn run_add(
                 // (旧実装はここで merge していたが run_generate に上書きされて冗長)
                 let _ = (&plugin, &dst_path, &merged_dir);
 
-                // ── auto-lazy scan + prompt (#87) ────────────────────────
-                // clone 直後、generate 前の隙間で plugin の plugin/ 配下を scan して、
-                // 対象コマンド / keymap が見つかれば user のポリシーに沿って
-                // config.toml の [[plugins]] entry に on_cmd / on_map を追記する。
-                //
-                // user が `--lazy false` で明示的に eager 指示した時は scan skip。
-                // 「eager で入れたい」と言ってるのに "accept (lazy-load)" を提案するのは
-                // 余計な摩擦 (PR #91 review 指摘)。`lazy_raw == Some(true)` (明示的
-                // lazy 指示) は逆に scan する (triggers 候補を広げる)、`None` (未指定、
-                // 自動推論) は policy に従う。
-                let policy = resolve_add_lazy_policy(policy_override, &config_data);
-                let skip_for_explicit_eager = plugin.lazy_raw == Some(false);
-                if !skip_for_explicit_eager
-                    && !matches!(policy, crate::config::AutoLazyPolicy::Never)
-                    && let Some(suggestion) =
-                        build_add_suggestion(&crate::plugin_scan::scan_plugin(&dst_path))
-                    && let Some(applied) =
-                        decide_add_lazy_apply(suggestion, policy, &plugin.display_name())
-                {
-                    // 同じ config.toml を再度 toml_edit で開いて patch (既に変更され
-                    // ているので doc を捨てて atomic read-modify-write)。
-                    let latest = std::fs::read_to_string(&config_path)?;
-                    let mut doc_patch = latest.parse::<DocumentMut>()?;
-                    patch_plugin_entry_triggers(&mut doc_patch, &stored_url, &applied);
-                    let patched = doc_patch.to_string();
-                    let wp = chezmoi::write_path(config_data.options.chezmoi, &config_path).await;
-                    std::fs::write(&wp, &patched)?;
-                    chezmoi::apply(&wp, &config_path).await;
-                    println!(
-                        "Recorded lazy triggers for {} in config.toml.",
-                        plugin.display_name()
-                    );
+                // ── ここで mode 分岐 ────────────────────────────
+                // AI 設定が `Off` 以外なら静的 scan を skip して AI 経路 (#93)。
+                // それ以外は従来の auto-lazy scan + prompt (#87) に流す。
+                let effective_ai = ai_override.unwrap_or(config_data.options.ai);
+                if !matches!(effective_ai, crate::config::AiBackend::Off) {
+                    let backend = match effective_ai {
+                        crate::config::AiBackend::Claude => crate::ai::Backend::Claude,
+                        crate::config::AiBackend::Gemini => crate::ai::Backend::Gemini,
+                        crate::config::AiBackend::Codex => crate::ai::Backend::Codex,
+                        crate::config::AiBackend::Off => unreachable!(),
+                    };
+                    let cfg_root = resolve_config_root(config_data.options.config_root.as_deref());
+                    let plugin_cfg_dir = resolve_plugin_config_dir(&cfg_root, &plugin);
+                    match crate::ai::run_ai_add(
+                        backend,
+                        &stored_url,
+                        &dst_path,
+                        &plugin_cfg_dir,
+                        &cfg_root,
+                        &config_path,
+                        &config_data.options.ai_language,
+                        config_data.options.chezmoi,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => match outcome.outcome {
+                            crate::ai::ChatOutcome::Applied { written_hooks } => {
+                                if let Some(prop) = outcome.proposal {
+                                    // AI 提案の `[[plugins]]` body で既存 stub entry を置換。
+                                    let latest = std::fs::read_to_string(&config_path)?;
+                                    let mut doc_patch = latest.parse::<DocumentMut>()?;
+                                    if let Err(e) = replace_plugin_entry_with_ai_toml(
+                                        &mut doc_patch,
+                                        &stored_url,
+                                        &prop.plugin_entry_toml,
+                                        &preserved_keys,
+                                    ) {
+                                        eprintln!(
+                                            "\u{26a0} failed to apply AI proposal: {e}. Stub entry remains."
+                                        );
+                                    } else {
+                                        let patched = doc_patch.to_string();
+                                        chezmoi::write_routed(
+                                            config_data.options.chezmoi,
+                                            &config_path,
+                                            &patched,
+                                        )
+                                        .await?;
+                                        println!(
+                                            "Applied AI-proposed config for {} ({} hook file(s) created).",
+                                            plugin.display_name(),
+                                            written_hooks.len()
+                                        );
+                                    }
+                                }
+                            }
+                            crate::ai::ChatOutcome::Skipped => {
+                                eprintln!(
+                                    "AI proposal skipped — stub entry kept in config.toml. \
+                                     Edit manually or rerun `rvpm add {repo} --no-ai` for static-scan mode."
+                                );
+                            }
+                            crate::ai::ChatOutcome::HandedOff => {
+                                eprintln!(
+                                    "Handed off to {} CLI. rvpm exits — that session controls config.toml from here.",
+                                    backend.label()
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!(
+                                "\u{26a0} AI add failed: {e}. Stub entry kept; rerun with `--no-ai` for static-scan mode."
+                            );
+                        }
+                    }
+                } else {
+                    // ── auto-lazy scan + prompt (#87) — 従来路 ──────────
+                    let policy = resolve_add_lazy_policy(policy_override, &config_data);
+                    let skip_for_explicit_eager = plugin.lazy_raw == Some(false);
+                    if !skip_for_explicit_eager
+                        && !matches!(policy, crate::config::AutoLazyPolicy::Never)
+                        && let Some(suggestion) =
+                            build_add_suggestion(&crate::plugin_scan::scan_plugin(&dst_path))
+                        && let Some(applied) =
+                            decide_add_lazy_apply(suggestion, policy, &plugin.display_name())
+                    {
+                        let latest = std::fs::read_to_string(&config_path)?;
+                        let mut doc_patch = latest.parse::<DocumentMut>()?;
+                        patch_plugin_entry_triggers(&mut doc_patch, &stored_url, &applied);
+                        let patched = doc_patch.to_string();
+                        let wp =
+                            chezmoi::write_path(config_data.options.chezmoi, &config_path).await;
+                        std::fs::write(&wp, &patched)?;
+                        chezmoi::apply(&wp, &config_path).await;
+                        println!(
+                            "Recorded lazy triggers for {} in config.toml.",
+                            plugin.display_name()
+                        );
+                    }
                 }
             }
         }
@@ -3070,9 +3256,7 @@ async fn run_set(
 
     if modified {
         let chezmoi_enabled = read_chezmoi_flag(&config_path);
-        let wp = chezmoi::write_path(chezmoi_enabled, &config_path).await;
-        std::fs::write(&wp, doc.to_string())?;
-        chezmoi::apply(&wp, &config_path).await;
+        chezmoi::write_routed(chezmoi_enabled, &config_path, doc.to_string()).await?;
         println!("Updated config for: {}", selected_repo_url);
         return Ok(true);
     }
@@ -3219,9 +3403,7 @@ async fn run_remove(query: Option<String>) -> Result<()> {
     let mut doc = toml_content.parse::<DocumentMut>()?;
     remove_plugin_from_toml(&mut doc, &selected_url)?;
     let chezmoi_enabled = read_chezmoi_flag(&config_path);
-    let wp = chezmoi::write_path(chezmoi_enabled, &config_path).await;
-    std::fs::write(&wp, doc.to_string())?;
-    chezmoi::apply(&wp, &config_path).await;
+    chezmoi::write_routed(chezmoi_enabled, &config_path, doc.to_string()).await?;
     println!("Removed '{}' from config.", selected_url);
 
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
@@ -5175,9 +5357,21 @@ async fn run_browse() -> Result<bool> {
                         // 多い — policy_override は渡さず、config `options.auto_lazy`
                         // (デフォルト `Ask`) に委ねる。browse は always TTY なので
                         // `Ask` なら対話プロンプトが自然に出る。
-                        let result =
-                            run_add(url.clone(), None, None, None, None, None, None, None, None)
-                                .await;
+                        // browse から add する場合も config の `options.ai` を尊重する
+                        // (user が AI mode を default にしてれば browse 経由でも AI 経路)。
+                        let result = run_add(
+                            url.clone(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
                         let added = result.is_ok();
                         match result {
                             Ok(_) => println!("Added {} successfully!", url),
@@ -5297,6 +5491,118 @@ url = "owner/repo"
         patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
         let out = doc.to_string();
         assert!(out.contains("ScannedFoo"));
+    }
+
+    // ─── replace_plugin_entry_with_ai_toml (#95) ─────────────────────────
+
+    #[test]
+    fn replace_plugin_entry_with_ai_toml_preserves_position_among_other_entries() {
+        // [vars] や既存 [[plugins]] の中に stub が並んでいるとき、in-place マージが
+        // entry の位置を維持することを確認 (user 報告: AI 提案が `[vars]` 直後に
+        // 飛んで配置される現象の回帰 test)。
+        let initial = r#"[vars]
+nvim_rc = "~/.config/nvim/rc"
+
+[[plugins]]
+url = "first/plugin"
+on_cmd = ["First"]
+
+[[plugins]]
+url = "second/stub"
+
+[[plugins]]
+url = "third/plugin"
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let proposal = r#"[[plugins]]
+url = "second/stub"
+on_event = ["BufReadPre"]
+"#;
+        replace_plugin_entry_with_ai_toml(&mut doc, "second/stub", proposal, &[]).unwrap();
+        let out = doc.to_string();
+        // first/plugin → second/stub → third/plugin の順序が維持される
+        let first_pos = out.find("first/plugin").unwrap();
+        let second_pos = out.find("second/stub").unwrap();
+        let third_pos = out.find("third/plugin").unwrap();
+        assert!(first_pos < second_pos);
+        assert!(second_pos < third_pos);
+        assert!(out.contains(r#"on_event = ["BufReadPre"]"#));
+    }
+
+    #[test]
+    fn replace_plugin_entry_with_ai_toml_preserves_user_specified_keys() {
+        // user の `--rev` / `--on-cmd` が既に stub に書かれている場合、AI 提案で
+        // 上書きしないことを確認 (CodeRabbit Major #95)。
+        let initial = r#"[[plugins]]
+url = "owner/repo"
+rev = "stable"
+on_cmd = ["ManualCmd"]
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let proposal = r#"[[plugins]]
+url = "owner/repo"
+rev = "main"
+on_cmd = ["AICmd"]
+on_map = ["<leader>x"]
+"#;
+        // user が --rev と --on-cmd を明示したシナリオ
+        let preserved = ["url", "rev", "on_cmd"];
+        replace_plugin_entry_with_ai_toml(&mut doc, "owner/repo", proposal, &preserved).unwrap();
+        let out = doc.to_string();
+        // user の rev / on_cmd が残る
+        assert!(
+            out.contains(r#"rev = "stable""#),
+            "user --rev must be preserved:\n{out}"
+        );
+        assert!(
+            out.contains(r#"on_cmd = ["ManualCmd"]"#),
+            "user --on-cmd must be preserved:\n{out}"
+        );
+        // AI が新規に追加した on_map は反映される
+        assert!(
+            out.contains("on_map"),
+            "AI-only field must be added:\n{out}"
+        );
+        // url は stored_url で正規化される
+        assert!(out.contains(r#"url = "owner/repo""#));
+    }
+
+    #[test]
+    fn replace_plugin_entry_with_ai_toml_writes_ai_keys_when_no_preservation() {
+        // preserved_keys が空 (user が CLI flag を出してない) なら AI 提案が全反映。
+        let initial = r#"[[plugins]]
+url = "owner/repo"
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let proposal = r#"[[plugins]]
+url = "different/url"
+on_cmd = ["AICmd"]
+"#;
+        replace_plugin_entry_with_ai_toml(&mut doc, "owner/repo", proposal, &[]).unwrap();
+        let out = doc.to_string();
+        // url は stored_url を維持 (AI が url を勘違いしても保護)
+        assert!(out.contains(r#"url = "owner/repo""#));
+        assert!(!out.contains("different/url"));
+        assert!(out.contains(r#"on_cmd = ["AICmd"]"#));
+    }
+
+    #[test]
+    fn replace_plugin_entry_with_ai_toml_rejects_proposal_with_zero_or_many_entries() {
+        let initial = r#"[[plugins]]
+url = "x/y"
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+
+        let zero = r#"name = "no plugins""#;
+        assert!(replace_plugin_entry_with_ai_toml(&mut doc, "x/y", zero, &[]).is_err());
+
+        let many = r#"[[plugins]]
+url = "a/b"
+
+[[plugins]]
+url = "c/d"
+"#;
+        assert!(replace_plugin_entry_with_ai_toml(&mut doc, "x/y", many, &[]).is_err());
     }
 
     fn write_file(path: &Path, content: &str) {

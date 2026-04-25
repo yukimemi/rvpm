@@ -33,6 +33,9 @@ regex = "1"
 toml = "1.1"
 toml_edit = "0.25"
 
+# CLI subprocess discovery (`claude` / `gemini` / `codex` on PATH for AI add #93).
+which = "8"
+
 # Markdown rendering (for store TUI README preview).
 # `highlight-code` brings in syntect + ansi-to-tui (~4 MB of syntax / theme
 # data) but is the only way to make fenced code blocks readable — without it

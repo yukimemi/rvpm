@@ -1308,6 +1308,8 @@ mod tests {
                 browse: BrowseOptions::default(),
                 fetch_interval: None,
                 auto_lazy: crate::config::AutoLazyPolicy::Ask,
+                ai: crate::config::AiBackend::Off,
+                ai_language: "en".to_string(),
             },
             plugins,
         }
