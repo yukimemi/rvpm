@@ -2247,9 +2247,13 @@ async fn run_list(no_tui: bool) -> Result<bool> {
                             continue;
                         }
                         leave_tui(&mut terminal)?;
-                        // ai_override=None で options.ai に従う。Off なら run_tune が
-                        // 案内 error を出して return するので TUI 側で握りつぶす必要なし。
-                        let _ = run_tune(Some(url), None).await;
+                        // `ai_override=None` で options.ai に従う。`run_tune` は AI=Off /
+                        // missing plugin dir などの早期失敗で `Err` を返すが eprintln せず
+                        // 抜けてくるので、ここで明示的に表示しないと user は「Press any
+                        // key…」だけ見せられて理由が分からない (Gemini PR #101 指摘)。
+                        if let Err(e) = run_tune(Some(url), None).await {
+                            eprintln!("\nError: {e}");
+                        }
                         wait_for_keypress("\nPress any key to return to list...")?;
                         reload!();
                     }
