@@ -33,9 +33,11 @@ cond = "vim.fn.has('win32') == 1"   # optional Lua expression; load only when tr
 
 ## Hook file conventions
 
-- `init.lua` — runs **before** RTP append. Use for `vim.g.<plugin>_setting = ...` global config.
-- `before.lua` — runs **after** RTP append, before `plugin/*` source. Use for `require('foo').setup(...)`.
-- `after.lua` — runs **after** `plugin/*` source. Use for keymaps and post-setup tweaks.
+- `init.lua` — runs **before** RTP append, before any plugin code is on `runtimepath`. Use for `vim.g.<plugin>_setting = ...` style global config that the plugin's `plugin/*` script reads at source time.
+- `before.lua` — runs **after** RTP append but **before** the plugin's `plugin/*` script is sourced. Use this **only** when the README explicitly says something must run before the plugin loads (e.g. "set this option before requiring the plugin"). Most plugins do **not** need before.lua.
+- `after.lua` — runs **after** the plugin's `plugin/*` script is sourced. **This is the default place for `require('foo').setup({...})`** and keymaps. Modern Lua plugins almost always document their setup as "call `require('foo').setup({...})`" with no ordering constraint — that means after.lua.
+
+**Default rule for `setup({...})`: put it in `after.lua`.** Only move it to `before.lua` when the README has an explicit "before" / "before sourcing" / "before the plugin loads" instruction. If the README is silent on ordering, the plugin's `plugin/*` is fine to run before your setup call — that's what every lazy-loader (lazy.nvim's `config = function() ... end`, packer's `config = ...`) does, and rvpm's `after.lua` is the equivalent slot.
 
 If the plugin needs no special hook, output `(none)` for that section. Don't invent hooks "just in case."
 
