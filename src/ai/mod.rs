@@ -35,6 +35,23 @@ pub enum Backend {
     Codex,
 }
 
+/// `crate::config::AiBackend` (Off を含む TOML 設定型) → 実行時 `Backend` 変換。
+///
+/// `AiBackend::Off` は AI 機能を使わない指示なので runtime backend には変換できず
+/// `Err(())` を返す。Caller (`run_add` / `run_tune`) は Off 判定を済ませた後に
+/// 呼び出すか、`Err` を見て non-AI 経路に分岐する。
+impl TryFrom<crate::config::AiBackend> for Backend {
+    type Error = ();
+    fn try_from(value: crate::config::AiBackend) -> std::result::Result<Self, ()> {
+        match value {
+            crate::config::AiBackend::Claude => Ok(Backend::Claude),
+            crate::config::AiBackend::Gemini => Ok(Backend::Gemini),
+            crate::config::AiBackend::Codex => Ok(Backend::Codex),
+            crate::config::AiBackend::Off => Err(()),
+        }
+    }
+}
+
 impl Backend {
     /// CLI 実行ファイル名 (PATH 上にあるべきもの)。
     pub fn cli_name(self) -> &'static str {
@@ -427,6 +444,15 @@ pub async fn write_hook_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_try_from_aibackend_maps_runtime_variants() {
+        use crate::config::AiBackend as Cfg;
+        assert_eq!(Backend::try_from(Cfg::Claude), Ok(Backend::Claude));
+        assert_eq!(Backend::try_from(Cfg::Gemini), Ok(Backend::Gemini));
+        assert_eq!(Backend::try_from(Cfg::Codex), Ok(Backend::Codex));
+        assert_eq!(Backend::try_from(Cfg::Off), Err(()));
+    }
 
     #[test]
     fn parse_proposal_extracts_required_tags() {

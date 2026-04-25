@@ -596,6 +596,39 @@ fn resolve_plugin_dst(plugin: &crate::config::Plugin, cache_root: &Path) -> Path
     }
 }
 
+/// `query` で url を fuzzy / 部分一致で 1 件選ぶ、または非対話なら FuzzySelect TUI を出す。
+///
+/// 戻り値:
+///   - `Ok(Some(url))` — 選択成功
+///   - `Ok(None)`     — interactive 選択で user が ESC キャンセルした
+///   - `Err(_)`       — `query` 指定時に該当 plugin が無かった (Plugin not found)
+///
+/// `run_remove` / `run_set` / `run_tune` に同じ if/else ブロックが散らばっていたのを
+/// 共通化したもの (Gemini PR #100 review 指摘)。caller 側でキャンセル時の戻り値が
+/// 違うので (`Ok(())` / `Ok(false)` / etc) `Option` で受けて呼び元が分岐する。
+fn select_plugin_url(
+    plugins: &[crate::config::Plugin],
+    query: Option<&str>,
+    prompt: &str,
+) -> Result<Option<String>> {
+    if let Some(q) = query {
+        let url = plugins
+            .iter()
+            .find(|p| p.url == q || p.url.contains(q))
+            .map(|p| p.url.clone())
+            .context("Plugin not found")?;
+        Ok(Some(url))
+    } else {
+        let urls: Vec<String> = plugins.iter().map(|p| p.url.clone()).collect();
+        let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt(prompt)
+            .default(0)
+            .items(&urls)
+            .interact_opt()?;
+        Ok(selection.map(|idx| urls[idx].clone()))
+    }
+}
+
 /// プラグインの build ステップを実行する。`build` (shell) と `build_lua` の両方が
 /// 設定されていれば、shell → lua の順に実行する。どちらか一方でも失敗したら
 /// 即座にエラー文字列を返す。両方未設定なら `None`。
@@ -2812,13 +2845,7 @@ async fn run_add(
                 // AI 設定が `Off` 以外なら静的 scan を skip して AI 経路 (#93)。
                 // それ以外は従来の auto-lazy scan + prompt (#87) に流す。
                 let effective_ai = ai_override.unwrap_or(config_data.options.ai);
-                if !matches!(effective_ai, crate::config::AiBackend::Off) {
-                    let backend = match effective_ai {
-                        crate::config::AiBackend::Claude => crate::ai::Backend::Claude,
-                        crate::config::AiBackend::Gemini => crate::ai::Backend::Gemini,
-                        crate::config::AiBackend::Codex => crate::ai::Backend::Codex,
-                        crate::config::AiBackend::Off => unreachable!(),
-                    };
+                if let Ok(backend) = crate::ai::Backend::try_from(effective_ai) {
                     let cfg_root = resolve_config_root(config_data.options.config_root.as_deref());
                     let plugin_cfg_dir = resolve_plugin_config_dir(&cfg_root, &plugin);
                     match crate::ai::run_ai_add(
@@ -3201,24 +3228,10 @@ async fn run_set(
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
 
-    let selected_repo_url = if let Some(q) = query.as_ref() {
-        config
-            .plugins
-            .iter()
-            .find(|p| &p.url == q || p.url.contains(q))
-            .map(|p| p.url.clone())
-            .context("Plugin not found")?
-    } else {
-        let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
-        let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
-            .with_prompt("Select plugin to set")
-            .default(0)
-            .items(&urls)
-            .interact_opt()?;
-        match selection {
-            Some(index) => urls[index].clone(),
-            None => return Ok(false),
-        }
+    let Some(selected_repo_url) =
+        select_plugin_url(&config.plugins, query.as_deref(), "Select plugin to set")?
+    else {
+        return Ok(false);
     };
 
     println!("\n>> Setting options for: {}", selected_repo_url);
@@ -3583,24 +3596,10 @@ async fn run_remove(query: Option<String>) -> Result<()> {
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
 
-    let selected_url = if let Some(q) = query.as_ref() {
-        config
-            .plugins
-            .iter()
-            .find(|p| p.url == *q || p.url.contains(q.as_str()))
-            .map(|p| p.url.clone())
-            .context("Plugin not found")?
-    } else {
-        let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
-        let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
-            .with_prompt("Select plugin to remove")
-            .default(0)
-            .items(&urls)
-            .interact_opt()?;
-        match selection {
-            Some(idx) => urls[idx].clone(),
-            None => return Ok(()),
-        }
+    let Some(selected_url) =
+        select_plugin_url(&config.plugins, query.as_deref(), "Select plugin to remove")?
+    else {
+        return Ok(());
     };
 
     let confirm = dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
@@ -3674,38 +3673,17 @@ async fn run_tune(
     // AI backend を解決。`--no-ai` (Off) や config が Off なら error
     // (tune は AI 専用 — non-AI 経路を提供する意味がない、`set` で代替できる)。
     let effective_ai = ai_override.unwrap_or(config.options.ai);
-    if matches!(effective_ai, crate::config::AiBackend::Off) {
-        return Err(anyhow::anyhow!(
+    let backend = crate::ai::Backend::try_from(effective_ai).map_err(|_| {
+        anyhow::anyhow!(
             "rvpm tune requires an AI backend. Set `options.ai` in config.toml \
              or pass `--ai <claude|gemini|codex>`."
-        ));
-    }
-    let backend = match effective_ai {
-        crate::config::AiBackend::Claude => crate::ai::Backend::Claude,
-        crate::config::AiBackend::Gemini => crate::ai::Backend::Gemini,
-        crate::config::AiBackend::Codex => crate::ai::Backend::Codex,
-        crate::config::AiBackend::Off => unreachable!(),
-    };
+        )
+    })?;
 
-    // プラグイン選択 — `run_remove` / `run_set` と同じ fuzzy/select パターン。
-    let selected_url = if let Some(q) = query.as_ref() {
-        config
-            .plugins
-            .iter()
-            .find(|p| p.url == *q || p.url.contains(q.as_str()))
-            .map(|p| p.url.clone())
-            .context("Plugin not found")?
-    } else {
-        let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
-        let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
-            .with_prompt("Select plugin to tune")
-            .default(0)
-            .items(&urls)
-            .interact_opt()?;
-        match selection {
-            Some(idx) => urls[idx].clone(),
-            None => return Ok(()),
-        }
+    let Some(selected_url) =
+        select_plugin_url(&config.plugins, query.as_deref(), "Select plugin to tune")?
+    else {
+        return Ok(());
     };
 
     let plugin = config
@@ -6026,6 +6004,53 @@ url = "only/one"
         let toml = "[options]\nai = \"claude\"\n";
         let doc = toml.parse::<DocumentMut>().unwrap();
         assert!(extract_plugin_entry_toml(&doc, "any/url").is_none());
+    }
+
+    // ─── select_plugin_url (rvpm tune / set / remove 共通) ───────────────
+
+    #[test]
+    fn select_plugin_url_query_exact_match_returns_url() {
+        use crate::config::Plugin;
+        let plugins = vec![
+            Plugin {
+                url: "owner/first".to_string(),
+                ..Default::default()
+            },
+            Plugin {
+                url: "owner/second".to_string(),
+                ..Default::default()
+            },
+        ];
+        let got = select_plugin_url(&plugins, Some("owner/second"), "select").unwrap();
+        assert_eq!(got, Some("owner/second".to_string()));
+    }
+
+    #[test]
+    fn select_plugin_url_query_substring_match_returns_first_match() {
+        use crate::config::Plugin;
+        let plugins = vec![
+            Plugin {
+                url: "alpha/foo".to_string(),
+                ..Default::default()
+            },
+            Plugin {
+                url: "beta/bar".to_string(),
+                ..Default::default()
+            },
+        ];
+        let got = select_plugin_url(&plugins, Some("beta"), "select").unwrap();
+        assert_eq!(got, Some("beta/bar".to_string()));
+    }
+
+    #[test]
+    fn select_plugin_url_query_no_match_errors() {
+        use crate::config::Plugin;
+        let plugins = vec![Plugin {
+            url: "owner/repo".to_string(),
+            ..Default::default()
+        }];
+        let err = select_plugin_url(&plugins, Some("nonexistent"), "select").unwrap_err();
+        assert!(err.to_string().contains("Plugin not found"));
     }
 
     fn write_file(path: &Path, content: &str) {

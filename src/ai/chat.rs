@@ -52,9 +52,8 @@ pub async fn run_ai_add(
 ) -> Result<AiAddOutcome> {
     ensure_cli_installed(backend)?;
 
-    let user_config_toml = std::fs::read_to_string(user_config_toml_path)
-        .with_context(|| format!("failed to read {}", user_config_toml_path.display()))?;
-    let user_plugins_tree = collect_plugins_tree(config_root);
+    let (user_config_toml, user_plugins_tree) =
+        collect_user_context(user_config_toml_path, config_root)?;
 
     let initial_prompt = build_initial_prompt(
         plugin_url,
@@ -100,9 +99,8 @@ pub async fn run_ai_tune(
 ) -> Result<AiAddOutcome> {
     ensure_cli_installed(backend)?;
 
-    let user_config_toml = std::fs::read_to_string(user_config_toml_path)
-        .with_context(|| format!("failed to read {}", user_config_toml_path.display()))?;
-    let user_plugins_tree = collect_plugins_tree(config_root);
+    let (user_config_toml, user_plugins_tree) =
+        collect_user_context(user_config_toml_path, config_root)?;
 
     let initial_prompt = crate::ai::prompt::build_tune_prompt(
         plugin_url,
@@ -127,6 +125,24 @@ pub async fn run_ai_tune(
         chezmoi_enabled,
     )
     .await
+}
+
+/// `run_ai_add` / `run_ai_tune` 共通の前処理: user の `config.toml` を読み出し、
+/// `<config_root>/plugins/` のツリー一覧を文字列化する。
+///
+/// 呼び出し側 (`run_add` / `run_tune`) は AI 起動 **直前** に config.toml を
+/// `chezmoi::write_routed` で書き換えているケースがある (例: `run_add` が stub
+/// `[[plugins]]` entry を append) ので、in-memory に持っている古い文字列ではなく
+/// 必ず disk から読み直す必要がある。Gemini の "pass it directly" 提案
+/// (PR #100 review) ではなく重複コード除去だけを採用しているのはこの理由。
+fn collect_user_context(
+    user_config_toml_path: &Path,
+    config_root: &Path,
+) -> Result<(String, String)> {
+    let toml = std::fs::read_to_string(user_config_toml_path)
+        .with_context(|| format!("failed to read {}", user_config_toml_path.display()))?;
+    let tree = collect_plugins_tree(config_root);
+    Ok((toml, tree))
 }
 
 /// AI との対話ループ本体。`run_ai_add` / `run_ai_tune` の共通中核。
