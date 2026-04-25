@@ -72,7 +72,7 @@ pub async fn run_ai_add(
     let mut proposal = parse_and_validate(&prior_response)?;
 
     loop {
-        print_proposal_preview(&proposal);
+        print_proposal_preview(&proposal, plugin_config_dir, user_config_toml_path);
 
         match prompt_chat_action().await? {
             ChatAction::Apply => {
@@ -178,49 +178,65 @@ fn parse_and_validate(response: &str) -> Result<Proposal> {
     Ok(proposal)
 }
 
-fn print_proposal_preview(p: &Proposal) {
+fn print_proposal_preview(p: &Proposal, plugin_config_dir: &Path, config_toml_path: &Path) {
+    let rule = "\u{2500}".repeat(60);
     eprintln!();
-    eprintln!("\u{1f4dd} Proposed [[plugins]] entry:");
     eprintln!(
-        "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}"
+        "\u{1f4dd} [[plugins]] entry to merge into {}:",
+        config_toml_path.display()
     );
+    eprintln!("{rule}");
     for line in p.plugin_entry_toml.lines() {
         eprintln!("  {line}");
     }
-    if let Some(init) = &p.init_lua {
-        eprintln!();
-        eprintln!("\u{1f4c4} Will create init.lua:");
-        for line in init.lines().take(20) {
-            eprintln!("  {line}");
-        }
-        if init.lines().count() > 20 {
-            eprintln!("  ...");
-        }
-    }
-    if let Some(before) = &p.before_lua {
-        eprintln!();
-        eprintln!("\u{1f4c4} Will create before.lua:");
-        for line in before.lines().take(20) {
-            eprintln!("  {line}");
-        }
-        if before.lines().count() > 20 {
-            eprintln!("  ...");
-        }
-    }
-    if let Some(after) = &p.after_lua {
-        eprintln!();
-        eprintln!("\u{1f4c4} Will create after.lua:");
-        for line in after.lines().take(20) {
-            eprintln!("  {line}");
-        }
-        if after.lines().count() > 20 {
-            eprintln!("  ...");
-        }
-    }
+
+    print_hook_section(p.init_lua.as_deref(), plugin_config_dir, "init.lua", &rule);
+    print_hook_section(
+        p.before_lua.as_deref(),
+        plugin_config_dir,
+        "before.lua",
+        &rule,
+    );
+    print_hook_section(
+        p.after_lua.as_deref(),
+        plugin_config_dir,
+        "after.lua",
+        &rule,
+    );
+
     eprintln!();
     eprintln!("\u{1f4ad} AI explanation:");
     for line in p.explanation.lines() {
         eprintln!("  {line}");
     }
     eprintln!();
+}
+
+fn print_hook_section(body: Option<&str>, plugin_dir: &Path, name: &str, rule: &str) {
+    let Some(body) = body else { return };
+    let path = plugin_dir.join(name);
+    let exists = path.exists();
+    let line_count = body.lines().count();
+
+    eprintln!();
+    if exists {
+        eprintln!(
+            "\u{1f4c4} {} already exists ({} line proposal will be skipped to preserve your edits):",
+            path.display(),
+            line_count,
+        );
+    } else {
+        eprintln!(
+            "\u{1f4c4} Will create {} ({} lines):",
+            path.display(),
+            line_count
+        );
+    }
+    eprintln!("{rule}");
+    for line in body.lines().take(20) {
+        eprintln!("  {line}");
+    }
+    if line_count > 20 {
+        eprintln!("  ... ({} more lines)", line_count - 20);
+    }
 }
