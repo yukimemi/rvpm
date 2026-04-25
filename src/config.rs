@@ -95,6 +95,29 @@ pub struct Options {
     /// CLI の `--auto-lazy` / `--no-lazy` で per-call 上書き可能。
     #[serde(default)]
     pub auto_lazy: AutoLazyPolicy,
+    /// AI-assisted `rvpm add` の backend (#93)。
+    ///
+    /// - `"off"` (default): 静的 scan + auto_lazy 路を従来通り使う。
+    /// - `"claude"` / `"gemini"` / `"codex"`: 該当 CLI を subprocess 起動して
+    ///   `[[plugins]]` 全体 + 必要な hook を設計させる。**`auto_lazy` は無視**
+    ///   される (AI が end-to-end で構成する)。
+    ///
+    /// CLI の `--ai <backend>` / `--no-ai` で per-call 上書き可能。
+    /// 該当 CLI が PATH に無ければ `rvpm add` はエラーで停止する (静的 scan に
+    /// 自動 fallback はしない — user の意図 = AI を使うが明示的なため)。
+    #[serde(default)]
+    pub ai: AiBackend,
+    /// AI 出力の自然言語 (#93)。`<rvpm:explanation>` の本文や、対話モードでの
+    /// 応答言語に反映される。XML tag 構造そのものは英語固定。
+    ///
+    /// デフォルト `"en"`。`"ja"` 等の BCP-47 風コード or 自由文字列を許す
+    /// (AI が自然言語名で受け付けてくれるので)。
+    #[serde(default = "default_ai_language")]
+    pub ai_language: String,
+}
+
+fn default_ai_language() -> String {
+    "en".to_string()
 }
 
 /// `options.auto_lazy` が取る 3 値。
@@ -108,6 +131,22 @@ pub enum AutoLazyPolicy {
     Always,
     /// scan 自体を skip。
     Never,
+}
+
+/// `options.ai` が取る値。`"off"` 以外を指定すると `rvpm add` は AI subprocess 路に
+/// 切り替わる (静的 scan + `auto_lazy` の路は完全に bypass)。
+#[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone, Copy, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum AiBackend {
+    /// 静的 scan + auto_lazy フローを使う (default)。
+    #[default]
+    Off,
+    /// `claude` CLI を subprocess 起動。
+    Claude,
+    /// `gemini` CLI を subprocess 起動。
+    Gemini,
+    /// `codex` CLI を subprocess 起動。
+    Codex,
 }
 
 impl Default for Options {
@@ -127,6 +166,8 @@ impl Default for Options {
             browse: BrowseOptions::default(),
             fetch_interval: None,
             auto_lazy: AutoLazyPolicy::default(),
+            ai: AiBackend::default(),
+            ai_language: default_ai_language(),
         }
     }
 }

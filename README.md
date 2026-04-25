@@ -159,7 +159,9 @@ for fully isolated test configs.
 | `auto_helptags` | `boolean` | `true` | `sync` / `generate` run `nvim --headless` once at the end to build helptags for every plugin's `doc/`. Skipped with a warning if `nvim` is missing |
 | `url_style` | `"short"` \| `"full"` | `"short"` | How `rvpm add` writes GitHub plugin URLs. Duplicate detection normalizes between styles |
 | `fetch_interval` | duration string (`"6h"`, `"30m"`, `"45s"`, `"1d"`, `"0"`) | `"6h"` | Per-plugin fetch cache window. `sync` skips `git fetch` for plugins pulled within the last *fetch_interval*. Accepted units: `s` / `m` / `h` / `d`. Set to `"0"` to disable caching (pre-v3.19 behavior). Override per-run with `rvpm sync --refresh` / `--no-refresh` |
-| `auto_lazy` | `"ask"` \| `"always"` \| `"never"` | `"ask"` | How `rvpm add` (and `rvpm browse → Enter`) handles the post-clone scan that looks for `nvim_create_user_command` / keymaps in the plugin's `plugin/` + `ftplugin/` + `after/plugin/` + `lua/` dirs. `"ask"` (default) prompts interactively on TTY and skips silently on non-TTY. `"always"` accepts the suggestion unconditionally. `"never"` skips the scan entirely. Per-call override via `--auto-lazy` / `--no-lazy` on `rvpm add`. Accepted suggestions cluster commands by 3-char LCP (3+ char shared prefix becomes `/^Prefix/` regex so future commands in that family auto-load) and enumerate keymaps (maps don't LCP well) |
+| `auto_lazy` | `"ask"` \| `"always"` \| `"never"` | `"ask"` | How `rvpm add` (and `rvpm browse → Enter`) handles the post-clone scan that looks for `nvim_create_user_command` / keymaps in the plugin's `plugin/` + `ftplugin/` + `after/plugin/` + `lua/` dirs. `"ask"` (default) prompts interactively on TTY and skips silently on non-TTY. `"always"` accepts the suggestion unconditionally. `"never"` skips the scan entirely. Per-call override via `--auto-lazy` / `--no-lazy` on `rvpm add`. Accepted suggestions cluster commands by 3-char LCP (3+ char shared prefix becomes `/^Prefix/` regex so future commands in that family auto-load) and enumerate keymaps (maps don't LCP well). **Ignored when `ai != "off"`** — the AI handles the design end-to-end |
+| `ai` | `"off"` \| `"claude"` \| `"gemini"` \| `"codex"` | `"off"` | Use an AI CLI to design the full `[[plugins]]` block (plus per-plugin hook files) on `rvpm add`. The chosen CLI must already be installed and authenticated (`claude login`, `gemini auth`, etc.) — rvpm doesn't manage API keys. When set, the static-scan + auto-lazy path is skipped entirely. After the AI proposes, you can apply, refine via chat, hand off to the native CLI for free-form follow-up, or skip. Per-call override via `--ai <backend>` / `--no-ai` on `rvpm add` |
+| `ai_language` | string | `"en"` | Natural language for the AI's `<rvpm:explanation>` body and chat replies. The XML tag structure itself is always English so parsing stays predictable. Accepts BCP-47-ish codes (`"en"`, `"ja"`, `"zh"`, `"de"`) or free-form names |
 
 > **💡 Leave `config_root` / `cache_root` unset.** Defaults are already
 > `<appname>`-aware. Setting a literal path (e.g. `cache_root = "~/dotfiles/rvpm"`)
@@ -287,6 +289,60 @@ on_map = [
 | `lhs` | `string` | **(required)** | Key sequence that triggers loading |
 | `mode` | `string \| string[]` | `"n"` | Vim mode(s) for the keymap (`"n"`, `"x"`, `"i"`, etc.) |
 | `desc` | `string` | none | Description shown in `:map` / which-key **before** the plugin is loaded |
+
+</details>
+
+<details>
+<summary><b>AI-powered <code>rvpm add</code> (claude / gemini / codex)</b></summary>
+
+Set `options.ai` to a CLI you have installed and authenticated, and `rvpm add`
+delegates the design of the `[[plugins]]` entry to the AI:
+
+```toml
+[options]
+ai = "claude"           # "off" (default) | "claude" | "gemini" | "codex"
+ai_language = "en"      # explanation language; structural output stays English
+```
+
+Or per-call: `rvpm add owner/repo --ai claude`. The flag overrides the config
+value for that one invocation; `--no-ai` forces the static-scan path.
+
+What it does:
+
+1. Clones the plugin (same as the regular path).
+2. Builds a prompt from rvpm's TOML schema, the plugin's `README` + `doc/`,
+   and your current `config.toml` + `plugins/` tree.
+3. Invokes the chosen CLI one-shot (`claude -p` / `gemini -p` / `codex exec`).
+4. Parses the response (XML tags `<rvpm:plugin_entry>`, `<rvpm:init_lua>`,
+   `<rvpm:before_lua>`, `<rvpm:after_lua>`, `<rvpm:explanation>`).
+5. Shows you the proposal and asks: **Apply / Chat / Hand off / Skip**.
+
+**Apply** writes the proposed entry to `config.toml` and creates the proposed
+hook files under `{config_root}/plugins/<host>/<owner>/<repo>/`. Existing
+hook files are never overwritten.
+
+**Chat** lets you give one-line feedback ("also add depends on plenary",
+"actually, I want this eager"); rvpm rebuilds the prompt with your message
+and the previous proposal, fetches an updated proposal, and re-prompts.
+
+**Hand off** spawns the chosen CLI in interactive mode with the same prompt
+preloaded. **rvpm exits at this point** — your subsequent conversation is
+between you and the CLI, and the CLI's own file-editing tools (Edit / Write
+in claude-code, etc.) are responsible for any further changes to
+`config.toml` or hook files. rvpm does not re-import the result.
+
+**Skip** discards the proposal but leaves the stub `[[plugins]]` entry that
+was written before the AI was invoked, so you can edit it manually.
+
+Requirements:
+
+- The chosen CLI must be on `PATH`.
+- It must be authenticated (rvpm doesn't manage API keys — it uses your
+  existing CLI session).
+- Network access for the CLI to talk to its provider.
+
+When AI mode is active, the `auto_lazy` setting and the `--auto-lazy` /
+`--no-lazy` flags are ignored — the AI handles trigger selection.
 
 </details>
 

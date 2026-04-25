@@ -1,3 +1,4 @@
+mod ai;
 mod browse;
 mod browse_tui;
 mod chezmoi;
@@ -165,6 +166,17 @@ enum Commands {
         /// if the plugin is lazy via those, it stays lazy.
         #[arg(long)]
         no_lazy: bool,
+
+        /// AI backend for this `add`. Replaces the static-scan + auto-lazy path:
+        /// the chosen CLI (`claude` / `gemini` / `codex`) reads the plugin's
+        /// README + your config and proposes the full `[[plugins]]` block plus
+        /// any per-plugin hook files. Overrides `options.ai` for this call.
+        #[arg(long, value_enum, conflicts_with = "no_ai")]
+        ai: Option<crate::config::AiBackend>,
+
+        /// Force the static-scan path even if `options.ai` is set in config.
+        #[arg(long)]
+        no_ai: bool,
     },
 
     /// Edit per-plugin or global hook files in $EDITOR
@@ -397,6 +409,8 @@ async fn main() -> Result<()> {
             rev,
             auto_lazy,
             no_lazy,
+            ai,
+            no_ai,
         } => {
             let policy_override = if auto_lazy {
                 Some(crate::config::AutoLazyPolicy::Always)
@@ -404,6 +418,13 @@ async fn main() -> Result<()> {
                 Some(crate::config::AutoLazyPolicy::Never)
             } else {
                 None
+            };
+            // `--no-ai` は config の `ai` を打ち消して Off に固定。`--ai <backend>` は
+            // 明示指定 (Off 含む)。両方無指定 (None) なら config 値を使う。
+            let ai_override = if no_ai {
+                Some(crate::config::AiBackend::Off)
+            } else {
+                ai
             };
             run_add(
                 repo,
@@ -415,6 +436,7 @@ async fn main() -> Result<()> {
                 on_event,
                 rev,
                 policy_override,
+                ai_override,
             )
             .await?;
         }
@@ -2265,6 +2287,57 @@ fn decide_add_lazy_apply(
     }
 }
 
+/// AI mode 用 (#93): AI が返した `[[plugins]]` ブロック (1 entry のみ) で、
+/// stub `[[plugins]]` 行 (url のみ書き込み済み) を全置換する。
+/// `url` は `stored_url` に強制リセット (AI が url_style を勘違いしても拾える)。
+fn replace_plugin_entry_with_ai_toml(
+    doc: &mut DocumentMut,
+    stored_url: &str,
+    proposal_toml: &str,
+) -> anyhow::Result<()> {
+    use anyhow::{Context, anyhow};
+
+    // 提案 TOML を仮 doc としてパースして `[[plugins]]` 配列を取り出す。
+    let proposal_doc: DocumentMut = proposal_toml
+        .parse::<DocumentMut>()
+        .context("AI proposal TOML failed to parse")?;
+    let proposal_plugins = proposal_doc
+        .get("plugins")
+        .and_then(|p| p.as_array_of_tables())
+        .ok_or_else(|| anyhow!("AI proposal missing [[plugins]] array"))?;
+    if proposal_plugins.len() != 1 {
+        return Err(anyhow!(
+            "AI proposal must contain exactly 1 plugin entry; got {}",
+            proposal_plugins.len()
+        ));
+    }
+    let mut new_entry = proposal_plugins.get(0).unwrap().clone();
+    // url は config 側の `stored_url` に揃える (AI が full/short を取り違える保険)
+    new_entry["url"] = value(stored_url);
+
+    // 既存 doc の plugins 配列から url 一致を探して in-place 差し替え。
+    let plugins = doc
+        .get_mut("plugins")
+        .and_then(|p| p.as_array_of_tables_mut())
+        .ok_or_else(|| anyhow!("config.toml missing [[plugins]] array"))?;
+    for i in 0..plugins.len() {
+        let existing_url = plugins
+            .get(i)
+            .and_then(|t| t.get("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if existing_url == stored_url {
+            // toml_edit には Vec.replace 相当が無いので remove + insert で置換。
+            plugins.remove(i);
+            plugins.insert(i, new_entry);
+            return Ok(());
+        }
+    }
+    Err(anyhow!(
+        "could not find stub [[plugins]] entry with url=`{stored_url}` in config.toml"
+    ))
+}
+
 /// 既存 config.toml 内の `[[plugins]]` のうち url が一致するエントリに
 /// `on_cmd` / `on_map` を書き込む。toml_edit で in-place patch。
 fn patch_plugin_entry_triggers(
@@ -2336,6 +2409,7 @@ async fn run_add(
     on_event: Option<String>,
     rev: Option<String>,
     policy_override: Option<crate::config::AutoLazyPolicy>,
+    ai_override: Option<crate::config::AiBackend>,
 ) -> Result<()> {
     let config_path = rvpm_config_path();
     ensure_config_exists(&config_path)?;
@@ -2476,38 +2550,102 @@ async fn run_add(
                 // (旧実装はここで merge していたが run_generate に上書きされて冗長)
                 let _ = (&plugin, &dst_path, &merged_dir);
 
-                // ── auto-lazy scan + prompt (#87) ────────────────────────
-                // clone 直後、generate 前の隙間で plugin の plugin/ 配下を scan して、
-                // 対象コマンド / keymap が見つかれば user のポリシーに沿って
-                // config.toml の [[plugins]] entry に on_cmd / on_map を追記する。
-                //
-                // user が `--lazy false` で明示的に eager 指示した時は scan skip。
-                // 「eager で入れたい」と言ってるのに "accept (lazy-load)" を提案するのは
-                // 余計な摩擦 (PR #91 review 指摘)。`lazy_raw == Some(true)` (明示的
-                // lazy 指示) は逆に scan する (triggers 候補を広げる)、`None` (未指定、
-                // 自動推論) は policy に従う。
-                let policy = resolve_add_lazy_policy(policy_override, &config_data);
-                let skip_for_explicit_eager = plugin.lazy_raw == Some(false);
-                if !skip_for_explicit_eager
-                    && !matches!(policy, crate::config::AutoLazyPolicy::Never)
-                    && let Some(suggestion) =
-                        build_add_suggestion(&crate::plugin_scan::scan_plugin(&dst_path))
-                    && let Some(applied) =
-                        decide_add_lazy_apply(suggestion, policy, &plugin.display_name())
-                {
-                    // 同じ config.toml を再度 toml_edit で開いて patch (既に変更され
-                    // ているので doc を捨てて atomic read-modify-write)。
-                    let latest = std::fs::read_to_string(&config_path)?;
-                    let mut doc_patch = latest.parse::<DocumentMut>()?;
-                    patch_plugin_entry_triggers(&mut doc_patch, &stored_url, &applied);
-                    let patched = doc_patch.to_string();
-                    let wp = chezmoi::write_path(config_data.options.chezmoi, &config_path).await;
-                    std::fs::write(&wp, &patched)?;
-                    chezmoi::apply(&wp, &config_path).await;
-                    println!(
-                        "Recorded lazy triggers for {} in config.toml.",
-                        plugin.display_name()
-                    );
+                // ── ここで mode 分岐 ────────────────────────────
+                // AI 設定が `Off` 以外なら静的 scan を skip して AI 経路 (#93)。
+                // それ以外は従来の auto-lazy scan + prompt (#87) に流す。
+                let effective_ai = ai_override.unwrap_or(config_data.options.ai);
+                if !matches!(effective_ai, crate::config::AiBackend::Off) {
+                    let backend = match effective_ai {
+                        crate::config::AiBackend::Claude => crate::ai::Backend::Claude,
+                        crate::config::AiBackend::Gemini => crate::ai::Backend::Gemini,
+                        crate::config::AiBackend::Codex => crate::ai::Backend::Codex,
+                        crate::config::AiBackend::Off => unreachable!(),
+                    };
+                    let cfg_root = resolve_config_root(config_data.options.config_root.as_deref());
+                    match crate::ai::run_ai_add(
+                        backend,
+                        &stored_url,
+                        &dst_path,
+                        &cfg_root,
+                        &config_path,
+                        &config_data.options.ai_language,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => match outcome.outcome {
+                            crate::ai::ChatOutcome::Applied { written_hooks } => {
+                                if let Some(prop) = outcome.proposal {
+                                    // AI 提案の `[[plugins]]` body で既存 stub entry を置換。
+                                    let latest = std::fs::read_to_string(&config_path)?;
+                                    let mut doc_patch = latest.parse::<DocumentMut>()?;
+                                    if let Err(e) = replace_plugin_entry_with_ai_toml(
+                                        &mut doc_patch,
+                                        &stored_url,
+                                        &prop.plugin_entry_toml,
+                                    ) {
+                                        eprintln!(
+                                            "\u{26a0} failed to apply AI proposal: {e}. Stub entry remains."
+                                        );
+                                    } else {
+                                        let patched = doc_patch.to_string();
+                                        let wp = chezmoi::write_path(
+                                            config_data.options.chezmoi,
+                                            &config_path,
+                                        )
+                                        .await;
+                                        std::fs::write(&wp, &patched)?;
+                                        chezmoi::apply(&wp, &config_path).await;
+                                        println!(
+                                            "Applied AI-proposed config for {} ({} hook file(s) created).",
+                                            plugin.display_name(),
+                                            written_hooks.len()
+                                        );
+                                    }
+                                }
+                            }
+                            crate::ai::ChatOutcome::Skipped => {
+                                eprintln!(
+                                    "AI proposal skipped — stub entry kept in config.toml. \
+                                     Edit manually or rerun `rvpm add {repo} --no-ai` for static-scan mode."
+                                );
+                            }
+                            crate::ai::ChatOutcome::HandedOff => {
+                                eprintln!(
+                                    "Handed off to {} CLI. rvpm exits — that session controls config.toml from here.",
+                                    backend.label()
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!(
+                                "\u{26a0} AI add failed: {e}. Stub entry kept; rerun with `--no-ai` for static-scan mode."
+                            );
+                        }
+                    }
+                } else {
+                    // ── auto-lazy scan + prompt (#87) — 従来路 ──────────
+                    let policy = resolve_add_lazy_policy(policy_override, &config_data);
+                    let skip_for_explicit_eager = plugin.lazy_raw == Some(false);
+                    if !skip_for_explicit_eager
+                        && !matches!(policy, crate::config::AutoLazyPolicy::Never)
+                        && let Some(suggestion) =
+                            build_add_suggestion(&crate::plugin_scan::scan_plugin(&dst_path))
+                        && let Some(applied) =
+                            decide_add_lazy_apply(suggestion, policy, &plugin.display_name())
+                    {
+                        let latest = std::fs::read_to_string(&config_path)?;
+                        let mut doc_patch = latest.parse::<DocumentMut>()?;
+                        patch_plugin_entry_triggers(&mut doc_patch, &stored_url, &applied);
+                        let patched = doc_patch.to_string();
+                        let wp =
+                            chezmoi::write_path(config_data.options.chezmoi, &config_path).await;
+                        std::fs::write(&wp, &patched)?;
+                        chezmoi::apply(&wp, &config_path).await;
+                        println!(
+                            "Recorded lazy triggers for {} in config.toml.",
+                            plugin.display_name()
+                        );
+                    }
                 }
             }
         }
@@ -5175,9 +5313,21 @@ async fn run_browse() -> Result<bool> {
                         // 多い — policy_override は渡さず、config `options.auto_lazy`
                         // (デフォルト `Ask`) に委ねる。browse は always TTY なので
                         // `Ask` なら対話プロンプトが自然に出る。
-                        let result =
-                            run_add(url.clone(), None, None, None, None, None, None, None, None)
-                                .await;
+                        // browse から add する場合も config の `options.ai` を尊重する
+                        // (user が AI mode を default にしてれば browse 経由でも AI 経路)。
+                        let result = run_add(
+                            url.clone(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
                         let added = result.is_ok();
                         match result {
                             Ok(_) => println!("Added {} successfully!", url),
