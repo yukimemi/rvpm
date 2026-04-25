@@ -45,6 +45,12 @@ pub struct PluginScripts {
     /// `on_cmd = ["/regex/"]` の展開ソースとして使う。空 Vec なら「スキャンして 0 件」
     /// (動的定義のみのプラグインなど) — 展開パスは literal として素通す。
     pub defined_commands: Vec<String>,
+    /// プラグインが定義する `<Plug>(...)` LHS 一覧 (#88)。
+    /// `on_map = ["/^<Plug>(Foo/"]` の展開ソース。
+    pub defined_plug_maps: Vec<String>,
+    /// プラグインが `nvim_exec_autocmds("User", { pattern = ... })` で発火する
+    /// User イベントの pattern 一覧 (#88)。`on_event = ["/User Foo.*/"]` の展開ソース。
+    pub defined_user_events: Vec<String>,
     pub cond: Option<String>,
 }
 
@@ -73,6 +79,8 @@ impl PluginScripts {
             colorschemes: Vec::new(),
             denops_plugins: Vec::new(),
             defined_commands: Vec::new(),
+            defined_plug_maps: Vec::new(),
+            defined_user_events: Vec::new(),
             cond: None,
         }
     }
@@ -112,31 +120,37 @@ pub(crate) fn lua_quote(s: &str) -> String {
     out
 }
 
-/// `on_cmd` の `/regex/` 区切り entry を、プラグインが静的に定義する具体コマンド名
-/// (`defined`) と照合して展開する。非 regex entry (exact name) はそのまま通す。
+/// `/regex/` 区切り entry を `defined` (プラグインの静的スキャン結果) と照合して展開する
+/// 汎用ヘルパー。非 regex entry はそのまま通す。`on_cmd` / `on_map` (lhs) / `on_event`
+/// で共有される。
 ///
 /// 構文:
-///   - `"Foo"`     — exact match (従来通り、後方互換)
-///   - `"/^Foo/"`  — 正規表現、`defined` 内の一致するコマンド名を展開
+///   - `"foo"`     — exact match (従来通り、後方互換)
+///   - `"/^foo/"`  — 正規表現、`defined` 内の一致を展開
 ///
-/// 判定:
-///   - 2 文字以上 `/` 始まりかつ `/` 終わり → 中身を regex として compile
+/// 判定 / Drop ポリシー:
+///   - 2 文字以上 `/` 始まり + `/` 終わり → 中身を regex compile
 ///   - compile 失敗 / zero match → stderr に warn して **entry を drop**
 ///
-/// なぜ drop するか:
-///   以前の fallback (literal として残す) は `"/^NoSuch/"` のような文字列を
-///   `nvim_create_user_command("{cmd}", ...)` にそのまま渡すことになり、Vim
-///   のコマンド名規則 `[A-Z][A-Za-z0-9_]*` 違反で **`E183` が発生 → loader.lua
-///   全体が top-level で中断** する。phase 7/8/9 (lazy trigger / ColorSchemePre
-///   / global after.lua) が巻き添えで無効化される致命的バグ。warn を出した上で
-///   drop すれば user は気付けるし、残りの plugin は正常にロードされる。
+/// なぜ drop するか (#86 で固まった選択):
+///   - `on_cmd`: `/^NoSuch/` を literal で残すと `nvim_create_user_command(...)` に
+///     渡って E183 (`[A-Z][A-Za-z0-9_]*` 違反) → loader.lua top-level で中断、
+///     phase 7/8/9 が巻き添えで無効化される致命的バグ。
+///   - `on_map`: `/regex/` を keymap LHS にすると stub keymap として登録される
+///     入口が壊れ (key を打って trigger を踏む経路が機能不全)、user は黙って
+///     plugin が起動しない症状にハマる。drop + warn で原因を顕在化。
+///   - `on_event`: `/regex/` を autocmd pattern にすると Neovim 側で literal pattern
+///     として扱われ (autocmd pattern は glob ベース)、当然マッチしないので静かに
+///     trigger 不発。同じく drop + warn が安全。
 ///
-/// `scope` は warn 出力時のラベル (plugin 名など)。
-///
-/// 重複は順序保持の dedup で除去 — 同じコマンドを複数回 `nvim_create_user_command`
-/// で登録すると Neovim が警告を吐くので、user が `["/^Foo/", "FooOne"]` のように
-/// 冗長に書いても 1 回だけ emit される。
-pub fn expand_cmd_patterns(patterns: &[String], defined: &[String], scope: &str) -> Vec<String> {
+/// `kind` は warn 文の冒頭ラベル (`"on_cmd"` 等)。`scope` は plugin 名。
+/// 順序保持の dedup を行う。
+pub fn expand_pattern_list(
+    patterns: &[String],
+    defined: &[String],
+    kind: &str,
+    scope: &str,
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(patterns.len());
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for pat in patterns {
@@ -147,16 +161,12 @@ pub fn expand_cmd_patterns(patterns: &[String], defined: &[String], scope: &str)
         if let Some(re_src) = body {
             match regex::Regex::new(re_src) {
                 Ok(re) => {
-                    // collect せず peekable で空判定 → 可能ならそのまま iterate。
                     let mut matches = defined.iter().filter(|d| re.is_match(d)).peekable();
                     if matches.peek().is_none() {
                         eprintln!(
-                            "\u{26a0} on_cmd regex {pat:?} matched no commands for {scope}; \
-                             entry dropped from the generated loader (emitting the pattern \
-                             literally would violate Vim's command name rule [A-Z][A-Za-z0-9_]* \
-                             and raise E183 at startup, aborting loader.lua). Write the exact \
-                             command names or check the plugin's plugin/ directory for dynamic \
-                             definitions."
+                            "\u{26a0} {kind} regex {pat:?} matched nothing for {scope}; \
+                             entry dropped from the generated loader. Write exact names or \
+                             check the plugin's plugin/ / lua/ directory for dynamic definitions."
                         );
                     } else {
                         for m in matches {
@@ -168,9 +178,8 @@ pub fn expand_cmd_patterns(patterns: &[String], defined: &[String], scope: &str)
                 }
                 Err(e) => {
                     eprintln!(
-                        "\u{26a0} on_cmd regex {pat:?} for {scope} failed to compile: {e}. \
-                         Entry dropped from the generated loader (literal emission would \
-                         violate Vim's command name rule and abort loader.lua at startup)."
+                        "\u{26a0} {kind} regex {pat:?} for {scope} failed to compile: {e}. \
+                         Entry dropped from the generated loader."
                     );
                 }
             }
@@ -179,6 +188,53 @@ pub fn expand_cmd_patterns(patterns: &[String], defined: &[String], scope: &str)
         }
     }
     out
+}
+
+/// `on_map` の MapSpec を **lhs-level の `/regex/` 展開** する (#88)。
+/// 元 spec の `mode` / `desc` は展開後の各エントリに継承する。
+/// exact lhs はそのまま通過。regex の zero-match / invalid は drop + warn (`expand_pattern_list` と同じポリシー)。
+pub fn expand_map_specs(
+    maps: &[crate::config::MapSpec],
+    defined_plug_maps: &[String],
+    scope: &str,
+) -> Vec<crate::config::MapSpec> {
+    let mut out: Vec<crate::config::MapSpec> = Vec::with_capacity(maps.len());
+    for m in maps {
+        // lhs を 1 entry の Vec として通すことで `expand_pattern_list` の
+        // dedup / drop / warn ロジックを再利用する。
+        let expanded = expand_pattern_list(
+            std::slice::from_ref(&m.lhs),
+            defined_plug_maps,
+            "on_map",
+            scope,
+        );
+        for lhs in expanded {
+            out.push(crate::config::MapSpec {
+                lhs,
+                mode: m.mode.clone(),
+                desc: m.desc.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// `on_event` の `/regex/` を **`User <name>` 形式のみ展開** する (#88)。
+/// 標準イベント (BufRead 等) は静的列挙不可なので展開せず literal 通過させる。
+/// regex は `defined_user_events` から `"User <name>"` を合成して match。
+pub fn expand_event_patterns(
+    events: &[String],
+    defined_user_events: &[String],
+    scope: &str,
+) -> Vec<String> {
+    // `defined_user_events` は pattern 名 (`"FooDone"`) のみを保持する。
+    // user の入力は `"User FooDone"` / `"BufRead"` / `"/User Foo.*/"` 等が想定される。
+    // → 比較対象を `"User <name>"` に揃えてから expand_pattern_list に渡す。
+    let synth: Vec<String> = defined_user_events
+        .iter()
+        .map(|n| format!("User {n}"))
+        .collect();
+    expand_pattern_list(events, &synth, "on_event", scope)
 }
 
 /// denops プラグイン list を Lua table literal に変換。
@@ -643,11 +699,11 @@ end
         // bang/range/count/mods/args を event から復元して vim.cmd(table) で dispatch
         // complete callback は plugin をロードしてから vim.fn.getcompletion に委譲
         //
-        // `/regex/` 記法 (#85) はここで expand_cmd_patterns を挟んで defined_commands
+        // `/regex/` 記法 (#85) はここで expand_pattern_list を挟んで defined_commands
         // に対して展開する。展開後は従来と完全に同じ exact-match emit path なので
         // runtime コストは追加ゼロ (AOT で展開済みなぶんだけ stub 登録数が増える)。
         if let Some(cmds) = &s.on_cmd {
-            let expanded = expand_cmd_patterns(cmds, &s.defined_commands, &s.name);
+            let expanded = expand_pattern_list(cmds, &s.defined_commands, "on_cmd", &s.name);
             for cmd in &expanded {
                 body.push_str(&format!(
                     "vim.api.nvim_create_user_command(\"{cmd}\", function(event)\n\
@@ -693,8 +749,12 @@ end
         }
 
         // ---- on_map: lhs + mode (+ desc) 対応、<Ignore> prefix で安全に replay ----
+        // `/regex/` 記法 (#88) は MapSpec 単位で expand_pattern_list を呼び、
+        // 1 spec を複数 spec に分解する。mode / desc は元 spec から継承
+        // (`<Plug>(Foo)` 系はだいたい同 mode で statically registered なので妥当)。
         if let Some(maps) = &s.on_map {
-            for m in maps {
+            let expanded_maps = expand_map_specs(maps, &s.defined_plug_maps, &s.name);
+            for m in &expanded_maps {
                 let modes = m.modes_or_default();
                 let modes_lua = lua_str_list(&modes);
                 let lhs = &m.lhs;
@@ -741,11 +801,17 @@ end
 
         // ---- on_event: ロード後に event を再発火 (buffer + data 保持) ----
         // "User Xxx" 形式は User autocmd + pattern="Xxx" として切り出し、
-        // それ以外のイベントはまとめて 1 つの autocmd にする
+        // それ以外のイベントはまとめて 1 つの autocmd にする。
+        //
+        // `/regex/` 記法 (#88) は **`/User …/` 形式のみ展開**: defined_user_events
+        // (プラグインが `nvim_exec_autocmds("User", ...)` で fire する pattern 一覧)
+        // に対し、`"User <name>"` 文字列を合成して regex match。標準イベント
+        // (BufRead 等) は静的列挙不可なので展開せず literal 通過。
         if let Some(events) = &s.on_event {
+            let expanded_events = expand_event_patterns(events, &s.defined_user_events, &s.name);
             let mut regular: Vec<String> = Vec::new();
             let mut user_patterns: Vec<String> = Vec::new();
-            for e in events {
+            for e in &expanded_events {
                 if let Some(pat) = e.strip_prefix("User ") {
                     user_patterns.push(pat.trim().to_string());
                 } else {
@@ -905,94 +971,270 @@ mod tests {
     // ========================================================
 
     #[test]
-    fn expand_cmd_patterns_passes_exact_names_through() {
-        let out = expand_cmd_patterns(
+    fn expand_pattern_list_passes_exact_names_through() {
+        let out = expand_pattern_list(
             &["Foo".to_string(), "Bar".to_string()],
             &["FooOne".to_string(), "Ignored".to_string()],
+            "on_cmd",
             "plugin",
         );
         assert_eq!(out, vec!["Foo", "Bar"]);
     }
 
     #[test]
-    fn expand_cmd_patterns_regex_matches_defined_commands() {
-        let out = expand_cmd_patterns(
+    fn expand_pattern_list_regex_matches_defined() {
+        let out = expand_pattern_list(
             &["/^Foo/".to_string()],
             &[
                 "FooOne".to_string(),
                 "FooTwo".to_string(),
                 "Bar".to_string(),
             ],
+            "on_cmd",
             "plugin",
         );
         assert_eq!(out, vec!["FooOne", "FooTwo"]);
     }
 
     #[test]
-    fn expand_cmd_patterns_mixes_regex_and_exact() {
-        let out = expand_cmd_patterns(
+    fn expand_pattern_list_mixes_regex_and_exact() {
+        let out = expand_pattern_list(
             &["/^Foo/".to_string(), "ExtraDyn".to_string()],
             &["FooOne".to_string(), "FooTwo".to_string()],
+            "on_cmd",
             "plugin",
         );
         assert_eq!(out, vec!["FooOne", "FooTwo", "ExtraDyn"]);
     }
 
     #[test]
-    fn expand_cmd_patterns_dedups_when_regex_and_exact_overlap() {
+    fn expand_pattern_list_dedups_when_regex_and_exact_overlap() {
         // `["/^Foo/", "FooOne"]` で FooOne が両方から出る → 1 回だけ。
-        let out = expand_cmd_patterns(
+        let out = expand_pattern_list(
             &["/^Foo/".to_string(), "FooOne".to_string()],
             &["FooOne".to_string(), "FooTwo".to_string()],
+            "on_cmd",
             "plugin",
         );
         assert_eq!(out, vec!["FooOne", "FooTwo"]);
     }
 
     #[test]
-    fn expand_cmd_patterns_zero_regex_match_drops_entry() {
+    fn expand_pattern_list_zero_regex_match_drops_entry() {
         // regex がどれにもマッチしない場合、literal として emit すると Vim の
         // コマンド名規則 [A-Z][A-Za-z0-9_]* に違反して起動時 E183 で loader.lua
         // が top-level 中断する致命バグ (PR #86 review で CodeRabbit が指摘)。
         // warn のみ出して drop が正解。
-        let out = expand_cmd_patterns(&["/^NoSuch/".to_string()], &["Other".to_string()], "plugin");
+        let out = expand_pattern_list(
+            &["/^NoSuch/".to_string()],
+            &["Other".to_string()],
+            "on_cmd",
+            "plugin",
+        );
         assert!(out.is_empty());
     }
 
     #[test]
-    fn expand_cmd_patterns_invalid_regex_drops_entry() {
+    fn expand_pattern_list_invalid_regex_drops_entry() {
         // 不正な regex (compile error) も同じ理由で drop + warn。
-        let out = expand_cmd_patterns(&["/(unclosed/".to_string()], &["Foo".to_string()], "plugin");
+        let out = expand_pattern_list(
+            &["/(unclosed/".to_string()],
+            &["Foo".to_string()],
+            "on_cmd",
+            "plugin",
+        );
         assert!(out.is_empty());
     }
 
     #[test]
-    fn expand_cmd_patterns_drop_does_not_affect_valid_entries() {
+    fn expand_pattern_list_drop_does_not_affect_valid_entries() {
         // drop されるのは該当 regex entry のみ — 他の exact / 有効な regex は
         // 通常通り出力される。
-        let out = expand_cmd_patterns(
+        let out = expand_pattern_list(
             &[
                 "/^NoSuch/".to_string(),
                 "Exact".to_string(),
                 "/^Foo/".to_string(),
             ],
             &["FooBar".to_string()],
+            "on_cmd",
             "plugin",
         );
         assert_eq!(out, vec!["Exact", "FooBar"]);
     }
 
     #[test]
-    fn expand_cmd_patterns_single_slash_is_not_regex() {
+    fn expand_pattern_list_single_slash_is_not_regex() {
         // `"/"` (2 文字未満) や `"/foo"` (終わり `/` なし) は regex ではなく
         // そのまま literal として通す — 普通は Vim command 名として不正だが、
         // 展開ロジックの守備範囲外なので touch しない。
-        let out = expand_cmd_patterns(
+        let out = expand_pattern_list(
             &["/".to_string(), "/foo".to_string(), "foo/".to_string()],
             &[],
+            "on_cmd",
             "plugin",
         );
         assert_eq!(out, vec!["/", "/foo", "foo/"]);
+    }
+
+    // ========================================================
+    // on_map regex 展開 (#88)
+    // MapSpec ベース。lhs が `/regex/` なら defined_plug_maps に対して展開し、
+    // 元 spec の mode / desc を継承して複数 spec に分解する。
+    // ========================================================
+
+    #[test]
+    fn expand_map_specs_passes_exact_lhs_through() {
+        let input = vec![crate::config::MapSpec {
+            lhs: "<Plug>(KeepExact)".into(),
+            mode: vec!["n".into()],
+            desc: None,
+        }];
+        let out = expand_map_specs(&input, &["<Plug>(Other)".into()], "plugin");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].lhs, "<Plug>(KeepExact)");
+    }
+
+    #[test]
+    fn expand_map_specs_regex_expands_to_multiple_specs() {
+        let input = vec![crate::config::MapSpec {
+            lhs: "/^<Plug>\\(Foo/".into(),
+            mode: vec!["n".into(), "x".into()],
+            desc: Some("Foo family".into()),
+        }];
+        let defined = vec![
+            "<Plug>(FooOne)".to_string(),
+            "<Plug>(FooTwo)".to_string(),
+            "<Plug>(BarOne)".to_string(),
+        ];
+        let out = expand_map_specs(&input, &defined, "plugin");
+        // 元 spec の mode / desc は各展開 entry に継承される。
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].lhs, "<Plug>(FooOne)");
+        assert_eq!(out[0].mode, vec!["n".to_string(), "x".to_string()]);
+        assert_eq!(out[0].desc, Some("Foo family".into()));
+        assert_eq!(out[1].lhs, "<Plug>(FooTwo)");
+        assert_eq!(out[1].mode, vec!["n".to_string(), "x".to_string()]);
+    }
+
+    #[test]
+    fn expand_map_specs_zero_match_drops_entry() {
+        let input = vec![crate::config::MapSpec {
+            lhs: "/^<Plug>\\(NoSuch/".into(),
+            mode: vec!["n".into()],
+            desc: None,
+        }];
+        let out = expand_map_specs(&input, &["<Plug>(Other)".into()], "plugin");
+        assert!(
+            out.is_empty(),
+            "zero-match regex must drop, not literal-emit"
+        );
+    }
+
+    #[test]
+    fn expand_map_specs_invalid_regex_drops_entry() {
+        let input = vec![crate::config::MapSpec {
+            lhs: "/(unclosed/".into(),
+            mode: vec!["n".into()],
+            desc: None,
+        }];
+        let out = expand_map_specs(&input, &["<Plug>(Foo)".into()], "plugin");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn expand_map_specs_mixed_regex_and_exact_each_keep_their_mode() {
+        // 元 spec のうち一部だけ regex の場合、それぞれの mode が独立に効く。
+        let input = vec![
+            crate::config::MapSpec {
+                lhs: "/^<Plug>\\(Foo/".into(),
+                mode: vec!["n".into()],
+                desc: None,
+            },
+            crate::config::MapSpec {
+                lhs: "<Plug>(Exact)".into(),
+                mode: vec!["v".into()],
+                desc: None,
+            },
+        ];
+        let defined = vec!["<Plug>(FooOne)".to_string()];
+        let out = expand_map_specs(&input, &defined, "plugin");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].lhs, "<Plug>(FooOne)");
+        assert_eq!(out[0].mode, vec!["n".to_string()]);
+        assert_eq!(out[1].lhs, "<Plug>(Exact)");
+        assert_eq!(out[1].mode, vec!["v".to_string()]);
+    }
+
+    // ========================================================
+    // on_event regex 展開 (#88)
+    // `/User Foo.*/` 形式で defined_user_events に対して展開する。
+    // 標準イベントは静的列挙不可なので literal 通過のみ。
+    // ========================================================
+
+    #[test]
+    fn expand_event_patterns_passes_standard_event_through() {
+        // 標準イベント (BufRead 等) は exact pass-through。
+        let out = expand_event_patterns(&["BufRead".into()], &[], "plugin");
+        assert_eq!(out, vec!["BufRead"]);
+    }
+
+    #[test]
+    fn expand_event_patterns_passes_exact_user_event_through() {
+        let out = expand_event_patterns(
+            &["User FooDone".into()],
+            &["FooDone".into(), "BarReady".into()],
+            "plugin",
+        );
+        assert_eq!(out, vec!["User FooDone"]);
+    }
+
+    #[test]
+    fn expand_event_patterns_regex_expands_against_synth_user_strings() {
+        // `defined_user_events` は pattern 名のみ — `"User <name>"` を内部で合成して match。
+        let out = expand_event_patterns(
+            &["/^User Chezmoi/".into()],
+            &[
+                "ChezmoiApplyDone".into(),
+                "ChezmoiEditStart".into(),
+                "OtherEvent".into(),
+            ],
+            "plugin",
+        );
+        assert_eq!(out, vec!["User ChezmoiApplyDone", "User ChezmoiEditStart"]);
+    }
+
+    #[test]
+    fn expand_event_patterns_zero_user_match_drops() {
+        // regex があっても User events に該当無し → drop + warn。
+        let out = expand_event_patterns(&["/^User NoSuch/".into()], &["FooDone".into()], "plugin");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn expand_event_patterns_regex_on_standard_event_drops() {
+        // 標準イベントを regex で書こうとしても synth User 文字列にしかマッチさせない。
+        // 結果ゼロ → drop + warn (literal `/^Buf/` を autocmd pattern にすると glob として
+        // 解釈されて結局発火しないので、drop の方が user に伝わりやすい)。
+        let out = expand_event_patterns(&["/^Buf/".into()], &["ChezmoiApplyDone".into()], "plugin");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn expand_event_patterns_mixed_exact_and_regex() {
+        let out = expand_event_patterns(
+            &[
+                "BufRead".into(),
+                "/^User Chezmoi/".into(),
+                "User Already".into(),
+            ],
+            &["ChezmoiApplyDone".into(), "Already".into()],
+            "plugin",
+        );
+        assert_eq!(
+            out,
+            vec!["BufRead", "User ChezmoiApplyDone", "User Already"]
+        );
     }
 
     // ========================================================

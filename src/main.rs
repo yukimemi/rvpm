@@ -4178,6 +4178,10 @@ fn build_plugin_scripts(
     plugin_path: &Path,
     plugin_config_dir: &Path,
 ) -> crate::loader::PluginScripts {
+    // on_cmd / on_map / on_event の /regex/ 展開用に 1 回だけ静的スキャン (#85, #88)。
+    // 対象は plugin/, ftplugin/, after/plugin/, lua/ 配下の .vim / .lua のみで、
+    // load 経路に影響しないので dead plugin でもコストは小さい。
+    let scan = crate::plugin_scan::scan_plugin(plugin_path);
     crate::loader::PluginScripts {
         name: plugin.display_name(),
         path: plugin_path.to_string_lossy().replace('\\', "/"),
@@ -4198,10 +4202,9 @@ fn build_plugin_scripts(
         depends: plugin.depends.clone(),
         colorschemes: collect_colorschemes(plugin_path),
         denops_plugins: collect_denops_plugins(plugin_path),
-        // on_cmd の /regex/ 展開用にコマンド名を静的スキャン (#85)。対象が
-        // plugin/, ftplugin/, after/plugin/ 配下の .vim / .lua のみで、load
-        // 経路に影響しないので dead plugin でもコストは小さい。
-        defined_commands: crate::plugin_scan::scan_plugin(plugin_path).commands,
+        defined_commands: scan.commands,
+        defined_plug_maps: scan.plug_maps,
+        defined_user_events: scan.user_events,
         cond: plugin.cond.clone(),
     }
 }
