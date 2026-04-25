@@ -70,6 +70,76 @@ pub async fn run_ai_add(
         plugin_url
     );
 
+    run_chat_loop(
+        backend,
+        initial_prompt,
+        plugin_config_dir,
+        user_config_toml_path,
+        chezmoi_enabled,
+    )
+    .await
+}
+
+/// AI tune モード (#97 への補完): 既存 plugin 設定の改善提案を求める。
+/// `rvpm tune` から呼ぶ。
+///
+/// `add` との違いは初期 prompt の組み方だけ — chat loop / preview / Apply 周りは
+/// 完全共通。AI には「現状の `[[plugins]]` entry をこう書いてる、改善して」と
+/// 投げ、出力フォーマット (XML tag) は同じ。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_ai_tune(
+    backend: Backend,
+    plugin_url: &str,
+    plugin_root: &Path,
+    plugin_config_dir: &Path,
+    config_root: &Path,
+    user_config_toml_path: &Path,
+    current_entry_toml: &str,
+    ai_language: &str,
+    chezmoi_enabled: bool,
+) -> Result<AiAddOutcome> {
+    ensure_cli_installed(backend)?;
+
+    let user_config_toml = std::fs::read_to_string(user_config_toml_path)
+        .with_context(|| format!("failed to read {}", user_config_toml_path.display()))?;
+    let user_plugins_tree = collect_plugins_tree(config_root);
+
+    let initial_prompt = crate::ai::prompt::build_tune_prompt(
+        plugin_url,
+        plugin_root,
+        current_entry_toml,
+        &user_config_toml,
+        &user_plugins_tree,
+        ai_language,
+    )?;
+
+    eprintln!(
+        "\u{1f916} Asking {} to tune {} (this may take a moment)...",
+        backend.label(),
+        plugin_url
+    );
+
+    run_chat_loop(
+        backend,
+        initial_prompt,
+        plugin_config_dir,
+        user_config_toml_path,
+        chezmoi_enabled,
+    )
+    .await
+}
+
+/// AI との対話ループ本体。`run_ai_add` / `run_ai_tune` の共通中核。
+///
+/// `initial_prompt` を最初に投げ、Apply / Chat / HandOff / Skip の選択を loop し、
+/// Apply で `Proposal` を返す。
+async fn run_chat_loop(
+    backend: Backend,
+    initial_prompt: String,
+    plugin_config_dir: &Path,
+    user_config_toml_path: &Path,
+    chezmoi_enabled: bool,
+) -> Result<AiAddOutcome> {
     // chat 履歴を反映して handoff に渡せるよう、最後に AI に投げた prompt を覚えておく。
     // 1 turn 目は initial_prompt そのもの、follow-up が走ったらそれで上書き。
     let mut last_prompt = initial_prompt.clone();

@@ -182,6 +182,7 @@ integration, and the external README renderer — see
 | `rvpm generate` | Regenerate `loader.lua` only (skip git operations) |
 | `rvpm clean` | Delete plugin directories no longer referenced by `config.toml` (no git, faster than `sync --prune` on 200+ plugins) |
 | `rvpm add <repo>` | Add a plugin and sync (records the new plugin's commit to `rvpm.lock`) |
+| `rvpm tune [query] [--ai <backend>]` | Re-run the AI chat loop against an **already-configured** plugin to refine its `[[plugins]]` block + hook files. AI-only |
 | `rvpm update [query]` | `git pull` installed plugins and write new HEADs back to `rvpm.lock` |
 | `rvpm remove [query]` | Remove a plugin from `config.toml` and delete its directory |
 | `rvpm edit [query] [--init\|--before\|--after] [--global]` | Edit per-plugin Lua hooks in `$EDITOR`. With `--global`: `--init` opens Neovim's own `init.lua`, `--before` / `--after` open `<config_root>/before.lua` / `after.lua` |
@@ -353,6 +354,29 @@ Requirements:
 
 When AI mode is active, the `auto_lazy` setting and the `--auto-lazy` /
 `--no-lazy` flags are ignored — the AI handles trigger selection.
+
+### Tuning existing plugins (`rvpm tune`)
+
+`rvpm add --ai` only fires when you first install a plugin. For plugins
+**already in `config.toml`**, use `rvpm tune` to apply the same chat-loop
+flow to an existing entry:
+
+```bash
+rvpm tune                       # interactive picker
+rvpm tune telescope             # fuzzy match on URL
+rvpm tune folke/snacks.nvim --ai gemini
+```
+
+The AI sees your **current `[[plugins]]` block** plus the cloned plugin's
+README/doc and proposes an improved entry — adjusted lazy triggers,
+trimmed redundant fields, refined hook files, etc. The proposal is free
+to overwrite any field of the existing entry; if you want a particular
+field left alone, tell the AI in **Chat** ("don't change `rev`"). The
+chat / apply / hand-off / skip actions are identical to `add --ai`, and
+existing per-plugin hook files are still never overwritten.
+
+`tune` is AI-only — `--no-ai` errors out. Use `rvpm set` for
+non-AI tweaks.
 
 </details>
 

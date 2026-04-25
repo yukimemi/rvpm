@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 mod chat;
 mod prompt;
 
-pub use chat::{ChatOutcome, run_ai_add};
+pub use chat::{ChatOutcome, run_ai_add, run_ai_tune};
 
 /// 利用可能な AI CLI ツール。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]

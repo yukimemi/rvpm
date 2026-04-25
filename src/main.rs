@@ -179,6 +179,32 @@ enum Commands {
         no_ai: bool,
     },
 
+    /// Tune an existing plugin's config with the AI backend
+    ///
+    /// Like `add --ai`, but for plugins **already configured** in
+    /// `config.toml`. Picks one entry (by `[query]` fuzzy match or
+    /// interactive select), feeds the current `[[plugins]]` block plus
+    /// the cloned plugin's README/doc to the AI CLI, and lets the AI
+    /// propose an improved entry + per-plugin hook files.
+    ///
+    /// The AI proposal can overwrite any field of the existing entry
+    /// (use the `Chat` action to tell the AI to leave a particular
+    /// field alone). Existing per-plugin hook files are never
+    /// overwritten — they're shown as `[SKIPPED]` in the preview.
+    Tune {
+        /// Fuzzy match plugin url (omit to pick interactively)
+        query: Option<String>,
+
+        /// AI backend for this `tune`. Overrides `options.ai` for this call.
+        #[arg(long, value_enum, conflicts_with = "no_ai")]
+        ai: Option<crate::config::AiBackend>,
+
+        /// Force-disable AI for this call. `tune` is AI-only, so this
+        /// effectively errors out — provided for symmetry with `add`.
+        #[arg(long)]
+        no_ai: bool,
+    },
+
     /// Edit per-plugin or global hook files in $EDITOR
     ///
     /// Without flags, prompts which plugin and file to edit.
@@ -439,6 +465,17 @@ async fn main() -> Result<()> {
                 ai_override,
             )
             .await?;
+        }
+        Commands::Tune { query, ai, no_ai } => {
+            // `--no-ai` は config の `ai` を打ち消して Off に固定。`--ai <backend>` は
+            // 明示指定。両方無指定 (None) なら config 値を使う。
+            // tune は AI 専用なので Off に解決した場合は run_tune 内で error する。
+            let ai_override = if no_ai {
+                Some(crate::config::AiBackend::Off)
+            } else {
+                ai
+            };
+            run_tune(query, ai_override).await?;
         }
         Commands::Edit {
             query,
@@ -3600,6 +3637,168 @@ async fn run_remove(query: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// 既存 config.toml の DocumentMut から、指定 url の `[[plugins]]` entry を
+/// **TOML テキストとして** 抜き出す (AI tune の prompt に貼るため)。
+///
+/// 単純に `existing.to_string()` だと `[[plugins]]` ヘッダが付かないので、
+/// `[[plugins]]\n` を頭に明示的に貼って、その後に table の各 key/value を
+/// 通常レンダリングで連結する。toml_edit が table 内の元 formatting (空白 /
+/// 改行 / コメント) をできる限り保つので、user が手で書いた config の見た目を
+/// AI に正しく見せられる。
+fn extract_plugin_entry_toml(doc: &DocumentMut, url: &str) -> Option<String> {
+    let plugins = doc.get("plugins").and_then(|p| p.as_array_of_tables())?;
+    let entry = plugins
+        .iter()
+        .find(|t| t.get("url").and_then(|v| v.as_str()) == Some(url))?;
+    // `[[plugins]]` header を含めて build。
+    let mut out = String::from("[[plugins]]\n");
+    out.push_str(&entry.to_string());
+    Some(out)
+}
+
+async fn run_tune(
+    query: Option<String>,
+    ai_override: Option<crate::config::AiBackend>,
+) -> Result<()> {
+    let config_path = rvpm_config_path();
+    ensure_config_exists(&config_path)?;
+    let toml_content = std::fs::read_to_string(&config_path)?;
+    let config = parse_config(&toml_content)?;
+
+    if config.plugins.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No plugins in config.toml. Use `rvpm add <repo>` first."
+        ));
+    }
+
+    // AI backend を解決。`--no-ai` (Off) や config が Off なら error
+    // (tune は AI 専用 — non-AI 経路を提供する意味がない、`set` で代替できる)。
+    let effective_ai = ai_override.unwrap_or(config.options.ai);
+    if matches!(effective_ai, crate::config::AiBackend::Off) {
+        return Err(anyhow::anyhow!(
+            "rvpm tune requires an AI backend. Set `options.ai` in config.toml \
+             or pass `--ai <claude|gemini|codex>`."
+        ));
+    }
+    let backend = match effective_ai {
+        crate::config::AiBackend::Claude => crate::ai::Backend::Claude,
+        crate::config::AiBackend::Gemini => crate::ai::Backend::Gemini,
+        crate::config::AiBackend::Codex => crate::ai::Backend::Codex,
+        crate::config::AiBackend::Off => unreachable!(),
+    };
+
+    // プラグイン選択 — `run_remove` / `run_set` と同じ fuzzy/select パターン。
+    let selected_url = if let Some(q) = query.as_ref() {
+        config
+            .plugins
+            .iter()
+            .find(|p| p.url == *q || p.url.contains(q.as_str()))
+            .map(|p| p.url.clone())
+            .context("Plugin not found")?
+    } else {
+        let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
+        let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt("Select plugin to tune")
+            .default(0)
+            .items(&urls)
+            .interact_opt()?;
+        match selection {
+            Some(idx) => urls[idx].clone(),
+            None => return Ok(()),
+        }
+    };
+
+    let plugin = config
+        .plugins
+        .iter()
+        .find(|p| p.url == selected_url)
+        .cloned()
+        .context("plugin disappeared after selection")?;
+
+    let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
+    let dst_path = resolve_plugin_dst(&plugin, &cache_root);
+    if !dst_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Plugin directory does not exist: {}. Run `rvpm sync` first so the AI can read the README/doc.",
+            dst_path.display()
+        ));
+    }
+
+    // 現在の `[[plugins]]` entry を TOML テキストとして抜き出す。
+    let doc = toml_content.parse::<DocumentMut>()?;
+    let current_entry_toml = extract_plugin_entry_toml(&doc, &selected_url).ok_or_else(|| {
+        anyhow::anyhow!("could not extract current entry for `{selected_url}` from config.toml")
+    })?;
+
+    let config_root = resolve_config_root(config.options.config_root.as_deref());
+    let plugin_cfg_dir = resolve_plugin_config_dir(&config_root, &plugin);
+
+    println!(
+        "\u{1f527} Tuning {} with {} ...",
+        plugin.display_name(),
+        backend.label()
+    );
+
+    match crate::ai::run_ai_tune(
+        backend,
+        &selected_url,
+        &dst_path,
+        &plugin_cfg_dir,
+        &config_root,
+        &config_path,
+        &current_entry_toml,
+        &config.options.ai_language,
+        config.options.chezmoi,
+    )
+    .await
+    {
+        Ok(outcome) => match outcome.outcome {
+            crate::ai::ChatOutcome::Applied { written_hooks } => {
+                if let Some(prop) = outcome.proposal {
+                    let latest = std::fs::read_to_string(&config_path)?;
+                    let mut doc_patch = latest.parse::<DocumentMut>()?;
+                    // Option A: AI 提案で **全 field 上書き** (`preserved_keys` は空)。
+                    // user は Chat ループ中に "X は触らないで" と言えば AI 側で field を保持する。
+                    if let Err(e) = replace_plugin_entry_with_ai_toml(
+                        &mut doc_patch,
+                        &selected_url,
+                        &prop.plugin_entry_toml,
+                        &[],
+                    ) {
+                        eprintln!(
+                            "\u{26a0} failed to apply AI proposal: {e}. Existing entry kept."
+                        );
+                    } else {
+                        let patched = doc_patch.to_string();
+                        chezmoi::write_routed(config.options.chezmoi, &config_path, &patched)
+                            .await?;
+                        println!(
+                            "Tuned {} ({} hook file(s) created).",
+                            plugin.display_name(),
+                            written_hooks.len()
+                        );
+                    }
+                }
+            }
+            crate::ai::ChatOutcome::Skipped => {
+                eprintln!("AI proposal skipped \u{2014} existing entry kept in config.toml.");
+            }
+            crate::ai::ChatOutcome::HandedOff => {
+                eprintln!(
+                    "Handed off to {} CLI. rvpm exits \u{2014} that session controls config.toml from here.",
+                    backend.label()
+                );
+            }
+        },
+        Err(e) => {
+            eprintln!("\u{26a0} AI tune failed: {e}. Existing entry kept unchanged.");
+        }
+    }
+
+    run_generate().await?;
+    Ok(())
+}
+
 /// 指定プラグインの任意のリスト型フィールド (on_cmd / on_ft / on_map / on_event / on_path / on_source 等) を設定する。
 /// 要素が1つの場合は文字列として、2つ以上の場合は配列として書き込む (TOML の string | string[] を活用)。
 fn set_plugin_list_field(
@@ -5779,6 +5978,54 @@ url = "a/b"
 url = "c/d"
 "#;
         assert!(replace_plugin_entry_with_ai_toml(&mut doc, "x/y", many, &[]).is_err());
+    }
+
+    // ─── extract_plugin_entry_toml (rvpm tune) ──────────────────────────
+
+    #[test]
+    fn extract_plugin_entry_toml_returns_full_block_with_header() {
+        let toml = r#"[options]
+ai = "claude"
+
+[[plugins]]
+url = "owner/first"
+on_cmd = ["First"]
+
+[[plugins]]
+url = "owner/target"
+on_cmd = ["Target"]
+on_ft = "rust"
+
+[[plugins]]
+url = "owner/last"
+"#;
+        let doc = toml.parse::<DocumentMut>().unwrap();
+        let entry = extract_plugin_entry_toml(&doc, "owner/target").unwrap();
+        // header が付く
+        assert!(entry.starts_with("[[plugins]]"));
+        // 中身を含む
+        assert!(entry.contains(r#"url = "owner/target""#));
+        assert!(entry.contains(r#"on_cmd = ["Target"]"#));
+        assert!(entry.contains(r#"on_ft = "rust""#));
+        // 他 entry は含まれない
+        assert!(!entry.contains("owner/first"));
+        assert!(!entry.contains("owner/last"));
+    }
+
+    #[test]
+    fn extract_plugin_entry_toml_returns_none_for_missing_url() {
+        let toml = r#"[[plugins]]
+url = "only/one"
+"#;
+        let doc = toml.parse::<DocumentMut>().unwrap();
+        assert!(extract_plugin_entry_toml(&doc, "missing/repo").is_none());
+    }
+
+    #[test]
+    fn extract_plugin_entry_toml_returns_none_when_plugins_missing() {
+        let toml = "[options]\nai = \"claude\"\n";
+        let doc = toml.parse::<DocumentMut>().unwrap();
+        assert!(extract_plugin_entry_toml(&doc, "any/url").is_none());
     }
 
     fn write_file(path: &Path, content: &str) {
