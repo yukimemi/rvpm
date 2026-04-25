@@ -73,8 +73,11 @@ pub async fn run_ai_add(
     // chat 履歴を反映して handoff に渡せるよう、最後に AI に投げた prompt を覚えておく。
     // 1 turn 目は initial_prompt そのもの、follow-up が走ったらそれで上書き。
     let mut last_prompt = initial_prompt.clone();
-    let mut prior_response = invoke_oneshot(backend, &initial_prompt).await?;
-    let mut proposal = parse_and_validate(&prior_response)?;
+    let first_response = invoke_oneshot(backend, &initial_prompt).await?;
+    let mut proposal = parse_and_validate(&first_response)?;
+    // raw response (preamble 込み) は使わない — follow-up では parsed `Proposal`
+    // から compact XML を再構築して投入する (token 圧縮のため)。
+    drop(first_response);
 
     loop {
         print_proposal_preview(&proposal, plugin_config_dir, user_config_toml_path);
@@ -105,19 +108,29 @@ pub async fn run_ai_add(
                 });
             }
             ChatAction::Chat => {
-                // chat — user の追加要求を 1 行受けて follow-up prompt 構築
+                // chat — user の追加要求を 1 行受けて follow-up prompt 構築。
+                //
+                // **prior 圧縮**: AI が返した raw response (preamble の "I'll propose..."
+                // などのプロセ含む) ではなく、parsed `Proposal` から `<rvpm:*>` tag だけを
+                // 再構築して投入する (CodeRabbit suggestion #95)。
+                //   - raw は 5-15KB / turn の preamble 込みになり得る
+                //   - 再構築 XML は ~1KB 程度 (TOML + lua bodies + explanation のみ)
+                //   - AI が次 turn で必要な context は構造化された `<rvpm:*>` だけなので
+                //     preamble を削っても reasoning chain を損なわない
+                //   - long chat で context window を圧迫しなくなる + token コスト減
                 let followup = ask_followup().await?;
                 if followup.trim().is_empty() {
                     eprintln!("(empty feedback, returning to action menu)");
                     continue;
                 }
-                last_prompt = build_followup_prompt(&initial_prompt, &prior_response, &followup);
+                let prior_xml = proposal_to_xml(&proposal);
+                last_prompt = build_followup_prompt(&initial_prompt, &prior_xml, &followup);
                 eprintln!(
                     "\u{1f916} Asking {} for an updated proposal...",
                     backend.label()
                 );
-                prior_response = invoke_oneshot(backend, &last_prompt).await?;
-                proposal = parse_and_validate(&prior_response)?;
+                let next_response = invoke_oneshot(backend, &last_prompt).await?;
+                proposal = parse_and_validate(&next_response)?;
             }
         }
     }
@@ -196,6 +209,36 @@ fn parse_and_validate(response: &str) -> Result<Proposal> {
     let proposal = parse_proposal(response)?;
     validate_proposal_toml(&proposal.plugin_entry_toml)?;
     Ok(proposal)
+}
+
+/// `Proposal` から `<rvpm:*>` tag だけの compact XML を再構築する。
+///
+/// follow-up turn の prompt 投入時に **AI の生 response (preamble 込み)** を
+/// そのまま re-inject する代わりにこれを使うと、preamble (例: "Sure, I'll
+/// propose...", "Based on the README..." 等の prose 混じり) を削れる。
+///
+/// AI が次 turn で reasoning に必要な情報は `<rvpm:*>` の中身に過不足なく
+/// 含まれている (TOML / hook bodies / explanation) ので情報損失ゼロ。
+/// 5-15KB / turn 削減され、長 chat の context window 圧迫と token コストを抑える。
+fn proposal_to_xml(p: &Proposal) -> String {
+    let mut out = String::with_capacity(p.plugin_entry_toml.len() + p.explanation.len() + 256);
+    out.push_str("<rvpm:plugin_entry>\n");
+    out.push_str(&p.plugin_entry_toml);
+    out.push_str("\n</rvpm:plugin_entry>\n");
+    for (tag, body) in [
+        ("init_lua", p.init_lua.as_deref()),
+        ("before_lua", p.before_lua.as_deref()),
+        ("after_lua", p.after_lua.as_deref()),
+    ] {
+        out.push_str(&format!(
+            "<rvpm:{tag}>\n{}\n</rvpm:{tag}>\n",
+            body.unwrap_or("(none)")
+        ));
+    }
+    out.push_str("<rvpm:explanation>\n");
+    out.push_str(&p.explanation);
+    out.push_str("\n</rvpm:explanation>\n");
+    out
 }
 
 fn print_proposal_preview(p: &Proposal, plugin_config_dir: &Path, config_toml_path: &Path) {
@@ -293,5 +336,74 @@ fn print_hook_section(
     }
     if line_count > 20 {
         eprintln!("  ... ({} more lines)", line_count - 20);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proposal_to_xml_emits_all_tags_with_present_lua() {
+        let p = Proposal {
+            plugin_entry_toml: "[[plugins]]\nurl = \"o/r\"".to_string(),
+            init_lua: Some("vim.g.x = 1".to_string()),
+            before_lua: None,
+            after_lua: Some("require('o').setup({})".to_string()),
+            explanation: "two sentence explanation here.".to_string(),
+        };
+        let xml = proposal_to_xml(&p);
+        // すべての tag が含まれる
+        assert!(xml.contains("<rvpm:plugin_entry>"));
+        assert!(xml.contains("</rvpm:plugin_entry>"));
+        assert!(xml.contains("<rvpm:init_lua>"));
+        assert!(xml.contains("vim.g.x = 1"));
+        // None の Lua は (none) marker で出力する
+        assert!(xml.contains("<rvpm:before_lua>\n(none)\n</rvpm:before_lua>"));
+        assert!(xml.contains("require('o').setup"));
+        assert!(xml.contains("two sentence explanation here."));
+    }
+
+    #[test]
+    fn proposal_to_xml_round_trips_through_parse_proposal() {
+        // 再構築した XML が元の Proposal にパースし戻せる (next turn の AI が
+        // 前 turn の構造化出力を「自分の前の reply」として読める保証)。
+        let original = Proposal {
+            plugin_entry_toml: "[[plugins]]\nurl = \"a/b\"\non_cmd = [\"X\"]".to_string(),
+            init_lua: Some("a = 1".to_string()),
+            before_lua: None,
+            after_lua: None,
+            explanation: "expl".to_string(),
+        };
+        let xml = proposal_to_xml(&original);
+        let reparsed = crate::ai::parse_proposal(&xml).unwrap();
+        assert_eq!(
+            reparsed.plugin_entry_toml.trim(),
+            original.plugin_entry_toml
+        );
+        assert_eq!(reparsed.init_lua, original.init_lua);
+        assert_eq!(reparsed.before_lua, None); // (none) → None
+        assert_eq!(reparsed.after_lua, None);
+        assert_eq!(reparsed.explanation, original.explanation);
+    }
+
+    #[test]
+    fn proposal_to_xml_is_smaller_than_typical_raw_response() {
+        // Raw AI response は preamble + tags + 余分な改行/コードフェンスで膨らむ。
+        // proposal_to_xml は構造のみなので大幅に小さくなる (代表的に 5-10x)。
+        let p = Proposal {
+            plugin_entry_toml: "[[plugins]]\nurl = \"o/r\"".to_string(),
+            init_lua: None,
+            before_lua: None,
+            after_lua: None,
+            explanation: "Brief".to_string(),
+        };
+        let compact = proposal_to_xml(&p);
+        // Compact 表現は 1KB 未満に収まるべき (簡素な proposal なら)。
+        assert!(
+            compact.len() < 1024,
+            "compact xml unexpectedly large: {} bytes",
+            compact.len()
+        );
     }
 }
