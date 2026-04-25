@@ -434,22 +434,38 @@ fn scan_vim_map(line: &str, user: &mut Vec<UserMap>, plug: &mut Vec<String>) {
     let bang = caps.name("bang").map_or("", |m| m.as_str());
     let rest = caps.name("rest").map_or("", |m| m.as_str());
     let modes = vim_map_modes(prefix, bang == "!");
-    if let Some(lhs) = parse_vim_map_lhs(rest) {
-        if is_plug_lhs(&lhs) {
-            plug.push(lhs);
-        } else {
-            user.push(UserMap { lhs, modes });
-        }
+    let Some((lhs, has_buffer)) = parse_vim_map_lhs(rest) else {
+        return;
+    };
+    // buffer-local 判定 (Vim): `<buffer>` flag 付きは plugin window 内の private
+    // バインディングなので、Lua 側 `has_buffer_option` と同じく入口候補から除外する
+    // (#92 review)。`<Plug>` も user-entry もどちらの sink でも skip。
+    if has_buffer {
+        return;
+    }
+    if is_plug_lhs(&lhs) {
+        plug.push(lhs);
+    } else {
+        user.push(UserMap { lhs, modes });
     }
 }
 
-fn parse_vim_map_lhs(rest: &str) -> Option<String> {
+/// `:map` 行の rest (mode prefix と bang を取り除いた残り) から lhs と
+/// `<buffer>` flag の有無を取り出す。`<silent>` / `<expr>` 等の他オプションは
+/// 透過 skip。`<buffer>` は呼び出し側で buffer-local 判定に使う。
+fn parse_vim_map_lhs(rest: &str) -> Option<(String, bool)> {
     let mut s = rest.trim_start();
+    let mut has_buffer = false;
     while let Some(after_lt) = s.strip_prefix('<') {
         let close = after_lt.find('>')?;
         let tag = &after_lt[..close];
-        match tag.to_ascii_lowercase().as_str() {
-            "silent" | "buffer" | "expr" | "nowait" | "unique" | "script" | "special" => {
+        let lower = tag.to_ascii_lowercase();
+        match lower.as_str() {
+            "buffer" => {
+                has_buffer = true;
+                s = after_lt[close + 1..].trim_start();
+            }
+            "silent" | "expr" | "nowait" | "unique" | "script" | "special" => {
                 s = after_lt[close + 1..].trim_start();
             }
             _ => break,
@@ -460,7 +476,7 @@ fn parse_vim_map_lhs(rest: &str) -> Option<String> {
     if lhs.is_empty() {
         None
     } else {
-        Some(lhs.to_string())
+        Some((lhs.to_string(), has_buffer))
     }
 }
 
@@ -729,8 +745,9 @@ vim.api.nvim_create_user_command("Real", function() end, {})
     }
 
     #[test]
-    fn scan_source_skips_silent_buffer_options() {
-        let src = "nnoremap <silent> <buffer> gc :echo 'x'<CR>";
+    fn scan_source_strips_silent_option_but_keeps_global_map() {
+        // `<silent>` 等は装飾なので透過 strip して lhs を取り出す。
+        let src = "nnoremap <silent> gc :echo 'x'<CR>";
         let maps = scan_source(src, Dialect::Vim).user_maps;
         assert_eq!(
             maps,
@@ -739,6 +756,26 @@ vim.api.nvim_create_user_command("Real", function() end, {})
                 modes: vec!["n".into()]
             }]
         );
+    }
+
+    #[test]
+    fn scan_source_skips_vim_buffer_local_user_map() {
+        // `<buffer>` 付きは buffer-local — plugin window 内の binding なので
+        // user-entry trigger 候補から除外する (#92 review)。Lua 側 `has_buffer_option`
+        // と統一。
+        let src = "nnoremap <silent> <buffer> gc :echo 'x'<CR>";
+        let result = scan_source(src, Dialect::Vim);
+        assert!(result.user_maps.is_empty());
+        assert!(result.plug_maps.is_empty());
+    }
+
+    #[test]
+    fn scan_source_skips_vim_buffer_local_plug_map() {
+        // 同じく `<Plug>` 系も `<buffer>` 付きなら plug_maps に入れない。
+        let src = "nnoremap <buffer> <Plug>(InternalOnly) :echo 'x'<CR>";
+        let result = scan_source(src, Dialect::Vim);
+        assert!(result.user_maps.is_empty());
+        assert!(result.plug_maps.is_empty());
     }
 
     #[test]

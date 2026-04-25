@@ -166,7 +166,8 @@ pub fn expand_pattern_list(
                         eprintln!(
                             "\u{26a0} {kind} regex {pat:?} matched nothing for {scope}; \
                              entry dropped from the generated loader. Write exact names or \
-                             check the plugin's plugin/ / lua/ directory for dynamic definitions."
+                             check the plugin's plugin/, ftplugin/, after/plugin/, lua/ \
+                             directories for dynamic definitions."
                         );
                     } else {
                         for m in matches {
