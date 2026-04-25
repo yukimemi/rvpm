@@ -170,6 +170,13 @@ fn sync_impl(url: &str, dst: &Path, rev: Option<&str>) -> Result<Option<GitChang
     } else {
         clone_impl(url, dst)?;
         if let Some(rev) = rev {
+            // 新規 clone は default branch しか fetch されてない (`gix::prepare_clone`
+            // の narrow refspec)。user が `rev = "v1"` 等の non-default branch を
+            // 指定したケースは、ここで全 branch refspec で再 fetch して
+            // `refs/remotes/origin/<rev>` を populate しないと checkout できない。
+            // `fetch_impl` 自体が冒頭で `ensure_all_branches_refspec` を呼ぶので、
+            // この経路で .git/config も同時に正しい状態になる。
+            fetch_impl(dst)?;
             gix_checkout(dst, rev)?;
         }
         let after = read_head(dst)?;
@@ -1301,6 +1308,27 @@ mod tests {
 
         fs::create_dir_all(&src).unwrap();
         git_cmd(&src).args(["init"]).output().await.unwrap();
+        // **最重要**: `git init` 直後の default branch を確定させる (CodeRabbit
+        // PR #99 review 指摘)。後で v1 を作って checkout するので、この段階で
+        // default を控えておかないと、setup 末尾で「現在の HEAD = v1」を
+        // default だと誤認識して checkout を skip し、clone 元 src の HEAD が
+        // v1 のまま残ってしまう。すると `gix::prepare_clone` が v1 を default
+        // として cloning し、`rev_parse_single("v1")` の direct path だけで
+        // 解決してしまうので、この test の本来の対象 (refs/remotes/origin/v1
+        // fallback path) が exercise されなくなる。
+        let init_head = git_cmd(&src)
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .output()
+            .await
+            .expect("symbolic-ref HEAD just after init");
+        let default_branch = String::from_utf8_lossy(&init_head.stdout)
+            .trim()
+            .to_string();
+        assert_ne!(
+            default_branch, "v1",
+            "test invariant: init default must not be v1"
+        );
+
         // master/main 上に commit
         fs::write(src.join("a.txt"), "main-1").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
@@ -1324,39 +1352,15 @@ mod tests {
             .unwrap();
         let v1_head = git_head(&src).await;
 
-        // src の default branch (main / master) に戻して、v1 が default に
-        // ならないようにしておく。`git symbolic-ref` で default を読み、それを
-        // checkout する。これで v1 を rev に指定してフェッチさせるテストが
-        // 「default branch を取りに行ったら偶然 v1 だった」では無いことを保証できる。
-        let symref = git_cmd(&src)
-            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+        // src を default branch に戻す。これで `gix::prepare_clone` 時の
+        // default ref は v1 ではなく default_branch になり、
+        // `gix_checkout(dst, "v1")` は `refs/remotes/origin/v1` の fallback path
+        // を経由して解決される (= この test の主旨)。
+        git_cmd(&src)
+            .args(["checkout", &default_branch])
             .output()
-            .await;
-        let default_branch = match symref {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .rsplit('/')
-                .next()
-                .unwrap_or("main")
-                .to_string(),
-            _ => {
-                // remotes/origin/HEAD が無い (= local-only repo) なら現在の HEAD ref を見る
-                let cur = git_cmd(&src)
-                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                    .output()
-                    .await;
-                match cur {
-                    Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-                    _ => "main".to_string(),
-                }
-            }
-        };
-        if default_branch != "v1" {
-            let _ = git_cmd(&src)
-                .args(["checkout", &default_branch])
-                .output()
-                .await;
-        }
+            .await
+            .expect("checkout init default before clone");
 
         let url = format!("file://{}", src.display());
         let repo = Repo::new(&url, &dst, Some("v1"));
