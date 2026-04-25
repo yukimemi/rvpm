@@ -103,11 +103,24 @@ fn wrap_if_powershell(path: PathBuf) -> ResolvedCli {
         .map(|e| e.eq_ignore_ascii_case("ps1"))
         .unwrap_or(false);
     if is_ps1 {
-        // Windows 標準の powershell.exe で `.ps1` を起動。-NoProfile で user の
-        // $PROFILE をスキップ (起動高速化 + side effect 排除)、-ExecutionPolicy Bypass
-        // で署名要求を無効化 (pnpm の wrapper は署名されない)。
+        // PowerShell 7 (`pwsh.exe`) を優先、無ければ Windows PowerShell 5.1
+        // (`powershell.exe`、Windows 標準同梱) に fallback。
+        //   - pnpm 利用層は modern toolchain に偏るので PS7 入りが大多数。
+        //   - pnpm の wrapper script は単純な PATH/exec 操作のみで、PS5.1 / 7
+        //     どちらでも同じ挙動 (silent fallback の behavioral risk が無い)。
+        //   - PS5.1 を primary にすると PS7 のみ user で odd ハマる可能性。
+        //
+        // `-NoProfile` で user の $PROFILE をスキップ (起動高速化 + side effect 排除)、
+        // `-ExecutionPolicy Bypass` で署名要求と zone-prompt の両方を無効化
+        // (Unrestricted は MOTW タグ付き script で interactive prompt を出すので、
+        // subprocess 起動時に hang する可能性がある)。
+        let ps_exe = if which::which("pwsh").is_ok() {
+            "pwsh.exe"
+        } else {
+            "powershell.exe"
+        };
         ResolvedCli {
-            program: PathBuf::from("powershell.exe"),
+            program: PathBuf::from(ps_exe),
             prefix_args: vec![
                 "-NoProfile".to_string(),
                 "-ExecutionPolicy".to_string(),
@@ -506,14 +519,21 @@ url = "c/d"
 
     #[test]
     fn wrap_if_powershell_wraps_ps1_path() {
-        // .ps1 ファイルは powershell.exe で起動するよう変換される。
+        // .ps1 ファイルは pwsh.exe (PS7 入りなら) または powershell.exe で起動。
+        // どちらが選ばれるかは test 実行環境に依存するので exact 比較しない。
         let p = std::path::PathBuf::from("C:/foo/gemini.ps1");
         let r = wrap_if_powershell(p);
-        assert_eq!(r.program, std::path::PathBuf::from("powershell.exe"));
+        let prog = r.program.to_string_lossy().to_ascii_lowercase();
+        assert!(
+            prog == "pwsh.exe" || prog == "powershell.exe",
+            "expected pwsh.exe or powershell.exe, got {prog}"
+        );
         assert!(r.prefix_args.iter().any(|a| a == "-File"));
         assert!(r.prefix_args.iter().any(|a| a.contains("gemini.ps1")));
-        // ExecutionPolicy Bypass で署名要求を無効化する
+        // ExecutionPolicy Bypass で署名要求 + zone prompt を無効化する
         assert!(r.prefix_args.iter().any(|a| a == "Bypass"));
+        // -NoProfile で user $PROFILE スキップ
+        assert!(r.prefix_args.iter().any(|a| a == "-NoProfile"));
     }
 
     #[test]
