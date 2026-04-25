@@ -138,14 +138,14 @@ pub enum AutoLazyPolicy {
 #[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone, Copy, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum AiBackend {
-    /// 静的 scan + auto_lazy フローを使う (default)。
+    /// Use the static scan + auto_lazy flow (default).
     #[default]
     Off,
-    /// `claude` CLI を subprocess 起動。
+    /// Spawn the `claude` CLI as a subprocess.
     Claude,
-    /// `gemini` CLI を subprocess 起動。
+    /// Spawn the `gemini` CLI as a subprocess.
     Gemini,
-    /// `codex` CLI を subprocess 起動。
+    /// Spawn the `codex` CLI as a subprocess.
     Codex,
 }
 
