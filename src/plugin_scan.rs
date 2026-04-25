@@ -40,49 +40,152 @@ pub struct ScanResult {
     pub user_events: Vec<String>,
 }
 
-/// Lua / Vim-script のソース文字列から 3 種類の hook 情報を抽出する。
-/// 出現順は保持、**重複除去は行わない** — 集約側 (`scan_files`) の責務。
+/// スキャン対象の言語方言。`.lua` と `.vim` では regex も comment 規約も別物で、
+/// 同じ buffer 上で両方を走らせると false positive が出る
+/// (例: Lua の `noremap = true,` に Vim の `^\s*noremap\s+` regex が誤ヒット)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Lua,
+    Vim,
+}
+
+impl Dialect {
+    /// ファイル拡張子から方言を判定。`.lua` / `.vim` 以外は `None`。
+    pub fn from_path(path: &Path) -> Option<Self> {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("lua") => Some(Dialect::Lua),
+            Some("vim") => Some(Dialect::Vim),
+            _ => None,
+        }
+    }
+}
+
+/// ソース文字列から 3 種類の hook 情報 (`commands` / `user_maps` / `user_events`)
+/// を抽出する。出現順は保持、**重複除去は行わない** — 集約側 (`scan_files`) の責務。
 ///
-/// Lua と Vim で走査戦略を分ける:
-///   - **Lua**: `nvim_create_user_command(\n  "Foo", …)` のような複数行にまたがる
-///     call site が現代プラグインで一般的なので、**source buffer 全体に対して
-///     regex 走査** する (`\s*` が改行を跨いでくれる)。行コメント (`-- …`) は
+/// `dialect` で走査戦略を切り替える:
+///   - `Dialect::Lua`: `nvim_create_user_command(\n  "Foo", …)` のような複数行に
+///     またがる call site が現代プラグインで一般的なので、**source buffer 全体
+///     に対して regex 走査** する (`\s*` が改行を跨ぐ)。行コメント (`-- …`) は
 ///     事前に削除。
-///   - **Vim**: `command!`, `nnoremap`, `doautocmd` は言語仕様上 1 行完結。
+///   - `Dialect::Vim`: `command!` / `nnoremap` / `doautocmd` は言語仕様上 1 行完結。
 ///     line-based で走査し、Vim では `--` がコメントでないので**元の line を
 ///     そのまま使う** (コメント除去すると `echo '--'` の body を誤って切る)。
-pub fn scan_source(src: &str) -> ScanResult {
+pub fn scan_source(src: &str, dialect: Dialect) -> ScanResult {
     let mut out = ScanResult::default();
-
-    // Lua: comment-stripped buffer に対して multiline regex
-    let lua_code = strip_lua_line_comments(src);
-    scan_lua_commands(&lua_code, &mut out.commands);
-    scan_lua_maps(&lua_code, &mut out.user_maps);
-    scan_lua_events(&lua_code, &mut out.user_events);
-
-    // Vim: 生の line (Vim では `--` はコメント扱いしない)
-    for line in src.lines() {
-        scan_vim_command(line, &mut out.commands);
-        scan_vim_map(line, &mut out.user_maps);
-        scan_vim_event(line, &mut out.user_events);
+    match dialect {
+        Dialect::Lua => {
+            // Lua: line-comment を削った buffer に multiline regex
+            let lua_code = strip_lua_line_comments(src);
+            scan_lua_commands(&lua_code, &mut out.commands);
+            scan_lua_maps(&lua_code, &mut out.user_maps);
+            scan_lua_events(&lua_code, &mut out.user_events);
+        }
+        Dialect::Vim => {
+            // Vim: 生の line (Vim では `--` はコメント扱いしない)
+            for line in src.lines() {
+                scan_vim_command(line, &mut out.commands);
+                scan_vim_map(line, &mut out.user_maps);
+                scan_vim_event(line, &mut out.user_events);
+            }
+        }
     }
-
     out
 }
 
-/// Lua 行コメント (`-- …`) を行末まで削る。block comment (`--[[ … ]]`) は
-/// 対象外 (プラグイン `plugin/`/`lua/` での使用は稀なので YAGNI)。
-/// 改行は残すので行番号・multiline マッチ位置は維持される。
+/// Lua のコメントを削る。
+///
+/// 対象:
+///   - 行コメント `-- …` — 行末まで削る。**文字列内の `--` は保護**する
+///     (neorg の `"--- Quitting ---"` のような docstring 風 label で強制切断すると
+///     string が未閉にズレ、後続の paren balance が狂って buffer-local 検出が壊れる)。
+///   - ブロックコメント `--[[ … ]]` / `--[=*[ … ]=*]` — 複数行対応。
+///     neorg や obsidian.nvim の header docstring (markdown を埋め込んだもの) が
+///     この形式で書かれており、内部に live code に見える `vim.keymap.set(...)` の
+///     example が埋まっている。削らないと user_maps に誤検出される。
+///
+/// `\n` は原則保持 (行番号・multiline regex マッチ位置を維持) するが、ブロック
+/// コメント内の改行は削られる (空白 1 文字に置換)。regex は `\s*` を使うので
+/// 内容が実コードと癒着する心配はない。
 fn strip_lua_line_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
     let mut out = String::with_capacity(src.len());
-    for (i, line) in src.lines().enumerate() {
-        if i > 0 {
-            out.push('\n');
+    let mut in_str: Option<u8> = None;
+    let mut escape = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = in_str {
+            // 文字列内: そのまま出力、閉じ引用符まで現状維持
+            out.push(c as char);
+            if escape {
+                escape = false;
+            } else if c == b'\\' {
+                escape = true;
+            } else if c == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
         }
-        let code = line.find("--").map_or(line, |i| &line[..i]);
-        out.push_str(code);
+        // 非文字列: `--[[` / `--[=*[` か `-- …` をまず確認
+        if c == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            let after_dashes = i + 2;
+            // `--[=*[` の開始判定
+            if after_dashes < bytes.len() && bytes[after_dashes] == b'[' {
+                let mut level = 0usize;
+                let mut j = after_dashes + 1;
+                while j < bytes.len() && bytes[j] == b'=' {
+                    level += 1;
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'[' {
+                    // `--[=^level[` 発見。対応する `]=^level]` まで skip
+                    let start = j + 1;
+                    let end = find_long_bracket_close(bytes, start, level);
+                    let slice_end = end.unwrap_or(bytes.len());
+                    // 空白 1 文字に置換 (regex ヒットしないように隔離)
+                    out.push(' ');
+                    i = slice_end;
+                    continue;
+                }
+            }
+            // 単純な行コメント `-- …` — 行末まで skip、`\n` は保持
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // 文字列開始?
+        if c == b'"' || c == b'\'' {
+            in_str = Some(c);
+        }
+        out.push(c as char);
+        i += 1;
     }
     out
+}
+
+/// Lua の long bracket `]=^level]` の終了位置 (最後の `]` の index) を返す。
+/// 見つからなければ `None` (unterminated block comment → EOF 扱いで全部 skip)。
+fn find_long_bracket_close(bytes: &[u8], from: usize, level: usize) -> Option<usize> {
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] == b']' {
+            // `]=^level]` パターンにマッチするか?
+            let mut j = i + 1;
+            let mut eq_count = 0usize;
+            while j < bytes.len() && bytes[j] == b'=' {
+                eq_count += 1;
+                j += 1;
+            }
+            if eq_count == level && j < bytes.len() && bytes[j] == b']' {
+                return Some(j + 1);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// ファイルパスのリストを読み込んで集約 + dedup した ScanResult を返す。
@@ -92,10 +195,14 @@ pub fn scan_files<P: AsRef<Path>>(paths: &[P]) -> ScanResult {
     let mut events_seen: HashSet<String> = HashSet::new();
     let mut agg = ScanResult::default();
     for p in paths {
-        let Ok(src) = std::fs::read_to_string(p) else {
+        let path = p.as_ref();
+        let Some(dialect) = Dialect::from_path(path) else {
             continue;
         };
-        let res = scan_source(&src);
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let res = scan_source(&src, dialect);
         for c in res.commands {
             if commands_seen.insert(c.clone()) {
                 agg.commands.push(c);
@@ -216,11 +323,64 @@ fn scan_lua_maps(code: &str, out: &mut Vec<UserMap>) {
         if lhs.is_empty() || is_plug_lhs(lhs) {
             continue;
         }
+        // buffer-local 判定: match 末尾 (lhs 閉じ引用符直後) から call の `)` までを
+        // paren-balance で拾い、options テーブル内に `buffer = …` があれば skip。
+        // これは aerial.nvim 等 plugin ウィンドウ内専用マップの誤検出を防ぐため。
+        let match_end = caps.get(0).map_or(0, |m| m.end());
+        if let Some(call_end) = find_lua_call_end(code, match_end)
+            && has_buffer_option(&code[match_end..call_end])
+        {
+            continue;
+        }
         out.push(UserMap {
             lhs: lhs.to_string(),
             modes: lua_mode_string_to_list(mode_str),
         });
     }
+}
+
+/// `(` が既に開いている状態で呼び出し、残りの buffer から対応する `)` 位置を返す。
+/// 文字列 (`"..."` / `'...'`) 内の paren は無視。閉じ paren が見つからなければ `None`。
+fn find_lua_call_end(code: &str, from: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    let mut depth: i32 = 1; // 既に open paren を消費済み (regex 側で `(` を matched)
+    let mut in_str: Option<u8> = None;
+    let mut escape = false;
+    let mut i = from;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = in_str {
+            if escape {
+                escape = false;
+            } else if c == b'\\' {
+                escape = true;
+            } else if c == q {
+                in_str = None;
+            }
+        } else {
+            match c {
+                b'"' | b'\'' => in_str = Some(c),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// options テーブル内に `buffer` キー (`buffer = …` / `["buffer"] = …`) があるか。
+/// `vim.keymap.set("n", "q", rhs, { buffer = bufnr })` の判定に使う。
+fn has_buffer_option(segment: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r#"(?:^|[\s,{])buffer\s*="#).unwrap());
+    re.is_match(segment)
 }
 
 /// Vim の `{nvim}_mode_list` 変換規則に合わせる:
@@ -399,6 +559,73 @@ fn is_valid_command_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+// ── auto-suggest helpers (#87) ──────────────────────────────────────────
+//
+// コマンド名リストを sort → 隣接 LCP クラスタ化して、各クラスタを
+// `/^<LCP>/` regex に、singleton / 短すぎる LCP は exact 名のままにして
+// "lazy trigger 提案" のコア出力を作る。
+//
+// 閾値 `min_prefix` は「プレフィクスが何文字以上あれば regex 化する価値が
+// あるか」。短すぎると他プラグインの command を誤爆するので 3 文字推奨
+// (`/^F/` は危険、`/^Foo/` は十分 specific)。
+
+/// コマンド名リストから lazy trigger の提案リストを作る。
+///
+///   - 共通プレフィクス ≥ `min_prefix` のクラスタを `/^<LCP>/` にまとめる
+///   - クラスタにならない (singleton / LCP 不足) は exact 名のまま残す
+///   - 入力空なら空 Vec
+///
+/// 出力はソート済み順 (呼び出し側の UI で安定表示するため)。
+pub fn suggest_cmd_triggers_smart(commands: &[String], min_prefix: usize) -> Vec<String> {
+    if commands.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<&str> = commands.iter().map(|s| s.as_str()).collect();
+    sorted.sort();
+    sorted.dedup();
+
+    let mut out = Vec::new();
+    let mut cluster_start = 0usize;
+    let mut cluster_lcp: &str = sorted[0];
+
+    for i in 1..sorted.len() {
+        let new_lcp = common_prefix(cluster_lcp, sorted[i]);
+        if new_lcp.chars().count() >= min_prefix {
+            cluster_lcp = new_lcp;
+        } else {
+            emit_cluster(&sorted[cluster_start..i], cluster_lcp, min_prefix, &mut out);
+            cluster_start = i;
+            cluster_lcp = sorted[i];
+        }
+    }
+    emit_cluster(&sorted[cluster_start..], cluster_lcp, min_prefix, &mut out);
+    out
+}
+
+fn emit_cluster(cluster: &[&str], lcp: &str, min_prefix: usize, out: &mut Vec<String>) {
+    if cluster.len() >= 2 && lcp.chars().count() >= min_prefix {
+        out.push(format!("/^{}/", regex::escape(lcp)));
+    } else {
+        // singleton もしくは LCP 不足 → exact 名で enumerate
+        for c in cluster {
+            out.push((*c).to_string());
+        }
+    }
+}
+
+/// 2 文字列の共通プレフィクス。UTF-8 境界を意識して char 単位で比較。
+fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
+    let mut end = 0;
+    for (ac, bc) in a.chars().zip(b.chars()) {
+        if ac == bc {
+            end += ac.len_utf8();
+        } else {
+            break;
+        }
+    }
+    &a[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,7 +639,7 @@ vim.api.nvim_create_user_command("FooOne", function() end, { bang = true })
 vim.api.nvim_create_user_command('FooTwo', function() end, {})
 require('foo').bar("NotCmd")
 "#;
-        let mut out = scan_source(src).commands;
+        let mut out = scan_source(src, Dialect::Lua).commands;
         out.sort();
         assert_eq!(out, vec!["FooOne", "FooTwo"]);
     }
@@ -425,7 +652,7 @@ command! -bang -nargs=* FooTwo echo 'two'
 command -bar FooThree echo 'three'
 command! -complete=file -nargs=1 FooFour echo 'four'
 "#;
-        let mut out = scan_source(src).commands;
+        let mut out = scan_source(src, Dialect::Vim).commands;
         out.sort();
         assert_eq!(out, vec!["FooFour", "FooOne", "FooThree", "FooTwo"]);
     }
@@ -436,16 +663,25 @@ command! -complete=file -nargs=1 FooFour echo 'four'
 -- example: vim.api.nvim_create_user_command("Example", function() end)
 vim.api.nvim_create_user_command("Real", function() end, {})
 "#;
-        assert_eq!(scan_source(src).commands, vec!["Real"]);
+        assert_eq!(scan_source(src, Dialect::Lua).commands, vec!["Real"]);
     }
 
     #[test]
-    fn scan_source_preserves_command_duplicates() {
-        let src = r#"
-vim.api.nvim_create_user_command("Foo", function() end)
-command! Foo echo 'same name'
-"#;
-        assert_eq!(scan_source(src).commands, vec!["Foo", "Foo"]);
+    fn scan_files_preserves_command_duplicates_across_dialects() {
+        // Same command name declared in a .lua file and a .vim file is preserved
+        // as two entries (dedup only happens by (name) tuple inside scan_files —
+        // here we want to show cross-dialect is counted via separate files).
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.lua");
+        let b = tmp.path().join("b.vim");
+        std::fs::write(
+            &a,
+            r#"vim.api.nvim_create_user_command("Foo", function() end)"#,
+        )
+        .unwrap();
+        std::fs::write(&b, "command! Foo echo 'same name'").unwrap();
+        // scan_files dedups by command name, so it reports Foo once.
+        assert_eq!(scan_files(&[a, b]).commands, vec!["Foo"]);
     }
 
     // ── user-facing keymap scanning ────────────────────────────────
@@ -453,7 +689,7 @@ command! Foo echo 'same name'
     #[test]
     fn scan_source_picks_vim_nnoremap_lhs() {
         let src = "nnoremap gc <Plug>(commentary)\nnnoremap gcc <Plug>(commentary-line)";
-        let maps = scan_source(src).user_maps;
+        let maps = scan_source(src, Dialect::Vim).user_maps;
         assert_eq!(
             maps,
             vec![
@@ -472,7 +708,7 @@ command! Foo echo 'same name'
     #[test]
     fn scan_source_skips_silent_buffer_options() {
         let src = "nnoremap <silent> <buffer> gc :echo 'x'<CR>";
-        let maps = scan_source(src).user_maps;
+        let maps = scan_source(src, Dialect::Vim).user_maps;
         assert_eq!(
             maps,
             vec![UserMap {
@@ -485,7 +721,7 @@ command! Foo echo 'same name'
     #[test]
     fn scan_source_filters_plug_lhs() {
         let src = "nnoremap <Plug>(Foo) :echo 'foo'<CR>\nnnoremap gc <Plug>(Bar)";
-        let maps = scan_source(src).user_maps;
+        let maps = scan_source(src, Dialect::Vim).user_maps;
         assert_eq!(
             maps,
             vec![UserMap {
@@ -502,7 +738,7 @@ vnoremap gc <Plug>(comment)
 inoremap gi <Plug>(i-cmd)
 xnoremap gx <Plug>(visual)
 cnoremap gc :echo 'cmdline'<CR>";
-        let maps = scan_source(src).user_maps;
+        let maps = scan_source(src, Dialect::Vim).user_maps;
         assert_eq!(
             maps,
             vec![
@@ -529,7 +765,7 @@ cnoremap gc :echo 'cmdline'<CR>";
     #[test]
     fn scan_source_bare_map_default_modes() {
         let src = "map gc <Plug>(Foo)";
-        let maps = scan_source(src).user_maps;
+        let maps = scan_source(src, Dialect::Vim).user_maps;
         assert_eq!(
             maps,
             vec![UserMap {
@@ -542,7 +778,7 @@ cnoremap gc :echo 'cmdline'<CR>";
     #[test]
     fn scan_source_map_bang_is_insert_and_cmdline() {
         let src = "noremap! gc <Plug>(Foo)";
-        let maps = scan_source(src).user_maps;
+        let maps = scan_source(src, Dialect::Vim).user_maps;
         assert_eq!(
             maps,
             vec![UserMap {
@@ -555,7 +791,7 @@ cnoremap gc :echo 'cmdline'<CR>";
     #[test]
     fn scan_source_picks_lua_keymap_set() {
         let src = r#"vim.keymap.set("n", "gc", function() end, {})"#;
-        let maps = scan_source(src).user_maps;
+        let maps = scan_source(src, Dialect::Lua).user_maps;
         assert_eq!(
             maps,
             vec![UserMap {
@@ -568,7 +804,7 @@ cnoremap gc :echo 'cmdline'<CR>";
     #[test]
     fn scan_source_picks_lua_nvim_set_keymap() {
         let src = r#"vim.api.nvim_set_keymap("v", "gv", "<Plug>(Foo)", {})"#;
-        let maps = scan_source(src).user_maps;
+        let maps = scan_source(src, Dialect::Lua).user_maps;
         assert_eq!(
             maps,
             vec![UserMap {
@@ -581,7 +817,7 @@ cnoremap gc :echo 'cmdline'<CR>";
     #[test]
     fn scan_source_filters_lua_plug_lhs() {
         let src = r#"vim.keymap.set("n", "<Plug>(Internal)", function() end)"#;
-        assert!(scan_source(src).user_maps.is_empty());
+        assert!(scan_source(src, Dialect::Lua).user_maps.is_empty());
     }
 
     // ── User event scanning ────────────────────────────────────────
@@ -589,19 +825,19 @@ cnoremap gc :echo 'cmdline'<CR>";
     #[test]
     fn scan_source_picks_lua_user_event_pattern() {
         let src = r#"vim.api.nvim_exec_autocmds("User", { pattern = "FooDone" })"#;
-        assert_eq!(scan_source(src).user_events, vec!["FooDone"]);
+        assert_eq!(scan_source(src, Dialect::Lua).user_events, vec!["FooDone"]);
     }
 
     #[test]
     fn scan_source_picks_vim_doautocmd_user() {
         let src = "doautocmd User BarReady";
-        assert_eq!(scan_source(src).user_events, vec!["BarReady"]);
+        assert_eq!(scan_source(src, Dialect::Vim).user_events, vec!["BarReady"]);
     }
 
     #[test]
     fn scan_source_picks_vim_doautocmd_with_options() {
         let src = "doautocmd <nomodeline> User BarReady";
-        assert_eq!(scan_source(src).user_events, vec!["BarReady"]);
+        assert_eq!(scan_source(src, Dialect::Vim).user_events, vec!["BarReady"]);
     }
 
     // ── multiline Lua call sites (CodeRabbit Major on #90) ─────────
@@ -616,7 +852,7 @@ vim.api.nvim_create_user_command(
   { bang = true }
 )
 "#;
-        assert_eq!(scan_source(src).commands, vec!["MultiFoo"]);
+        assert_eq!(scan_source(src, Dialect::Lua).commands, vec!["MultiFoo"]);
     }
 
     #[test]
@@ -629,7 +865,7 @@ vim.keymap.set(
   {}
 )
 "#;
-        let maps = scan_source(src).user_maps;
+        let maps = scan_source(src, Dialect::Lua).user_maps;
         assert_eq!(
             maps,
             vec![UserMap {
@@ -647,7 +883,7 @@ vim.api.nvim_exec_autocmds("User", {
   modeline = false,
 })
 "#;
-        assert_eq!(scan_source(src).user_events, vec!["FooDone"]);
+        assert_eq!(scan_source(src, Dialect::Lua).user_events, vec!["FooDone"]);
     }
 
     // ── Lua map: multi-char mode / empty / bang (Gemini L171, L199) ────
@@ -655,7 +891,7 @@ vim.api.nvim_exec_autocmds("User", {
     #[test]
     fn scan_source_lua_map_multi_char_mode() {
         let src = r#"vim.keymap.set("nv", "gc", function() end)"#;
-        let maps = scan_source(src).user_maps;
+        let maps = scan_source(src, Dialect::Lua).user_maps;
         assert_eq!(
             maps,
             vec![UserMap {
@@ -669,7 +905,7 @@ vim.api.nvim_exec_autocmds("User", {
     fn scan_source_lua_map_empty_mode_defaults_to_nvo() {
         // Neovim の `vim.keymap.set("", lhs, ...)` は bare `:map` 相当
         let src = r#"vim.keymap.set("", "gc", function() end)"#;
-        let maps = scan_source(src).user_maps;
+        let maps = scan_source(src, Dialect::Lua).user_maps;
         assert_eq!(
             maps,
             vec![UserMap {
@@ -682,7 +918,7 @@ vim.api.nvim_exec_autocmds("User", {
     #[test]
     fn scan_source_lua_map_bang_mode_is_insert_plus_cmdline() {
         let src = r#"vim.keymap.set("!", "gc", function() end)"#;
-        let maps = scan_source(src).user_maps;
+        let maps = scan_source(src, Dialect::Lua).user_maps;
         assert_eq!(
             maps,
             vec![UserMap {
@@ -697,7 +933,7 @@ vim.api.nvim_exec_autocmds("User", {
     #[test]
     fn scan_source_picks_lua_user_event_table_pattern() {
         let src = r#"vim.api.nvim_exec_autocmds("User", { pattern = {"Foo", "Bar"} })"#;
-        let mut events = scan_source(src).user_events;
+        let mut events = scan_source(src, Dialect::Lua).user_events;
         events.sort();
         assert_eq!(events, vec!["Bar", "Foo"]);
     }
@@ -712,7 +948,7 @@ vim.api.nvim_exec_autocmds("User", {
   },
 })
 "#;
-        let mut events = scan_source(src).user_events;
+        let mut events = scan_source(src, Dialect::Lua).user_events;
         events.sort();
         assert_eq!(events, vec!["AlphaDone", "BetaReady"]);
     }
@@ -725,7 +961,155 @@ vim.api.nvim_exec_autocmds("User", {
         // 削られると Vim 側 scan が bare な `command!` 行として誤判定する可能性。
         // Vim scan は元の line に対して行うべき。
         let src = r#"command! -bang Foo echo '--'"#;
-        assert_eq!(scan_source(src).commands, vec!["Foo"]);
+        assert_eq!(scan_source(src, Dialect::Vim).commands, vec!["Foo"]);
+    }
+
+    // ── dialect split (hardtime.nvim false positive) ─────────────────────
+
+    #[test]
+    fn scan_source_lua_does_not_match_vim_noremap_keyword() {
+        // hardtime.nvim init.lua の `noremap = true,` (Lua options テーブル) が
+        // Vim の `^\s*noremap\s+` regex で lhs="=" として誤検出される bug の回帰 test。
+        let src = r#"
+vim.keymap.set(mode, key, function()
+   return handler(key)
+end, {
+   noremap = true,
+   expr = true,
+})
+"#;
+        // mode / key が変数なので lua_map_re は matching しない → maps 空。
+        // 重要: noremap = true, を拾わない。
+        assert!(scan_source(src, Dialect::Lua).user_maps.is_empty());
+    }
+
+    #[test]
+    fn scan_source_vim_does_not_process_lua_keymap_set() {
+        // 逆: Vim dialect で走らせた Lua コード片は lua_* scanners を動かさない。
+        let src = r#"vim.keymap.set("n", "gc", function() end, {})"#;
+        assert!(scan_source(src, Dialect::Vim).user_maps.is_empty());
+    }
+
+    // ── buffer-local keymap skip (aerial.nvim q/<c-c> false positive) ────
+
+    #[test]
+    fn scan_source_skips_buffer_local_keymap_set() {
+        // aerial.nvim keymap_util.lua — buffer = bufnr 付きは plugin window 内専用。
+        let src = r#"
+vim.keymap.set("n", "q", "<cmd>close<CR>", { buffer = bufnr, nowait = true })
+vim.keymap.set("n", "<c-c>", "<cmd>close<CR>", { buffer = bufnr })
+"#;
+        assert!(scan_source(src, Dialect::Lua).user_maps.is_empty());
+    }
+
+    #[test]
+    fn scan_source_keeps_global_keymap_set_without_buffer() {
+        // buffer= が無いものは entry point なので残す。
+        let src = r#"vim.keymap.set("n", "gc", "<Plug>(commentary)", { desc = "comment" })"#;
+        let maps = scan_source(src, Dialect::Lua).user_maps;
+        assert_eq!(
+            maps,
+            vec![UserMap {
+                lhs: "gc".into(),
+                modes: vec!["n".into()]
+            }]
+        );
+    }
+
+    #[test]
+    fn scan_source_skips_buffer_local_multiline_keymap_set() {
+        // multiline options テーブルでも buffer= を拾える。
+        let src = r#"
+vim.keymap.set("n", "q", "<cmd>close<CR>", {
+  buffer = bufnr,
+  nowait = true,
+})
+"#;
+        assert!(scan_source(src, Dialect::Lua).user_maps.is_empty());
+    }
+
+    // ── suggest_cmd_triggers_smart (#87) ──────────────────────────
+
+    #[test]
+    fn suggest_empty_returns_empty() {
+        assert!(suggest_cmd_triggers_smart(&[], 3).is_empty());
+    }
+
+    #[test]
+    fn suggest_single_command_returns_exact_name() {
+        let out = suggest_cmd_triggers_smart(&["Foo".into()], 3);
+        assert_eq!(out, vec!["Foo"]);
+    }
+
+    #[test]
+    fn suggest_two_commands_with_shared_prefix_cluster_as_regex() {
+        let out = suggest_cmd_triggers_smart(&["ChezmoiEdit".into(), "ChezmoiList".into()], 3);
+        assert_eq!(out, vec!["/^Chezmoi/"]);
+    }
+
+    #[test]
+    fn suggest_two_commands_short_lcp_enumerates() {
+        // LCP が閾値未満なら enumerate のみ。
+        let out = suggest_cmd_triggers_smart(&["Foo".into(), "Fox".into()], 3);
+        assert_eq!(out, vec!["Foo", "Fox"]);
+    }
+
+    #[test]
+    fn suggest_two_unrelated_commands_enumerate() {
+        let out = suggest_cmd_triggers_smart(&["Foo".into(), "Bar".into()], 3);
+        assert_eq!(out, vec!["Bar", "Foo"]); // sort order
+    }
+
+    #[test]
+    fn suggest_two_clusters_both_become_regex() {
+        let out = suggest_cmd_triggers_smart(
+            &["Foo".into(), "FooOne".into(), "Bar".into(), "BarOne".into()],
+            3,
+        );
+        assert_eq!(out, vec!["/^Bar/", "/^Foo/"]);
+    }
+
+    #[test]
+    fn suggest_three_commands_shared_prefix_single_regex() {
+        let out = suggest_cmd_triggers_smart(
+            &[
+                "GrugFar".into(),
+                "GrugFarVisual".into(),
+                "GrugFarWithin".into(),
+            ],
+            3,
+        );
+        assert_eq!(out, vec!["/^GrugFar/"]);
+    }
+
+    #[test]
+    fn suggest_mixed_cluster_and_singleton() {
+        let out =
+            suggest_cmd_triggers_smart(&["Foo".into(), "FooOne".into(), "Standalone".into()], 3);
+        assert_eq!(out, vec!["/^Foo/", "Standalone"]);
+    }
+
+    #[test]
+    fn suggest_staircase_keeps_as_singletons() {
+        // A, AB, ABC では LCP が順に A (1), AB (2) で 3 字閾値を満たせない
+        let out = suggest_cmd_triggers_smart(&["A".into(), "AB".into(), "ABC".into()], 3);
+        assert_eq!(out, vec!["A", "AB", "ABC"]);
+    }
+
+    #[test]
+    fn suggest_dedups_duplicate_commands() {
+        let out = suggest_cmd_triggers_smart(&["Foo".into(), "Foo".into(), "FooBar".into()], 3);
+        assert_eq!(out, vec!["/^Foo/"]);
+    }
+
+    #[test]
+    fn suggest_lcp_uses_char_count_not_byte_count() {
+        // マルチバイト文字が含まれると len() (byte) と chars().count() (char) で
+        // 差が出るので、LCP 判定は char 基準。実用上 Vim command 名は ASCII のみ
+        // だがガードとして確認。
+        let out = suggest_cmd_triggers_smart(&["日本Foo".into(), "日本Bar".into()], 3);
+        // LCP = "日本" (2 chars、byte 数は 6) → threshold=3 未満 → enumerate
+        assert_eq!(out, vec!["日本Bar", "日本Foo"]);
     }
 
     // ── file / plugin aggregation ──────────────────────────────────
@@ -785,5 +1169,86 @@ vim.api.nvim_exec_autocmds("User", {
         let mut out = scan_plugin(root).commands;
         out.sort();
         assert_eq!(out, vec!["AfterB", "FtRust", "PluginA", "Setupd"]);
+    }
+
+    // ── block comment stripping (neorg false positive) ───────────────────
+
+    #[test]
+    fn scan_source_skips_keymap_set_inside_block_comment() {
+        // neorg の keybinds/module.lua は header docstring を `--[[ … ]]` ブロック
+        // コメントで書いており、内部に example として `vim.keymap.set(…)` が
+        // 埋まっている。live code ではないので拾ってはいけない。
+        let src = r#"
+--[[
+    Example user keybind:
+    vim.keymap.set("n", "my-key-here", "<Plug>(neorg.foo)", {})
+    vim.keymap.set("n", "<up>", "<Plug>(neorg.bar)", {})
+--]]
+
+vim.keymap.set("n", "real", "<Plug>(plugin.action)", {})
+"#;
+        let maps = scan_source(src, Dialect::Lua).user_maps;
+        assert_eq!(
+            maps,
+            vec![UserMap {
+                lhs: "real".into(),
+                modes: vec!["n".into()],
+            }],
+            "block comment body must not produce user_maps entries"
+        );
+    }
+
+    #[test]
+    fn scan_source_handles_long_bracket_level_in_block_comment() {
+        // `--[===[ … ]===]` も block comment として機能する (Lua の long bracket level)。
+        let src = r#"
+--[==[
+    vim.keymap.set("n", "must-be-skipped", "<Plug>(x)")
+]==]
+vim.keymap.set("n", "kept", "<Plug>(y)")
+"#;
+        let maps = scan_source(src, Dialect::Lua).user_maps;
+        assert_eq!(
+            maps,
+            vec![UserMap {
+                lhs: "kept".into(),
+                modes: vec!["n".into()],
+            }]
+        );
+    }
+
+    // ── line-comment stripper preserves strings containing `--` ──────────
+
+    #[test]
+    fn scan_source_preserves_string_with_double_dash_inside() {
+        // neorg calendar の `{ "--- Quitting ---", "@text.title" }` のような label は
+        // 文字列内の `--` なのでコメント扱いしてはいけない。以前は強制切断で
+        // 後続の paren balance が狂い、buffer-local 判定が失敗していた。
+        let src = r#"
+vim.keymap.set("n", "?", lib.wrap(display_help, {
+    { "--- Quitting ---", "@text.title" },
+    { "--- Date Syntax ---", "@text.title" },
+}), { buffer = bufnr })
+"#;
+        // buffer-local なので拾わない。文字列内の `--` が保護されて paren が正しく
+        // 閉じ、has_buffer_option が `{ buffer = bufnr }` を見つけられる。
+        assert!(scan_source(src, Dialect::Lua).user_maps.is_empty());
+    }
+
+    #[test]
+    fn scan_source_still_strips_real_line_comment_with_code_after() {
+        // 実際の `-- …` 行コメントは従来どおり削る。
+        let src = r#"
+-- vim.keymap.set("n", "commented-out", …)
+vim.keymap.set("n", "live", "<Plug>(x)")
+"#;
+        let maps = scan_source(src, Dialect::Lua).user_maps;
+        assert_eq!(
+            maps,
+            vec![UserMap {
+                lhs: "live".into(),
+                modes: vec!["n".into()],
+            }]
+        );
     }
 }

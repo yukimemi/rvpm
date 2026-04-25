@@ -47,11 +47,18 @@ Selecting the `[user config]` pseudo-plugin swaps the detail pane for a **requir
 
 ```sh
 # From crates.io
-cargo install rvpm
+cargo install rvpm --locked
 
 # Or from source (latest main)
-cargo install --git https://github.com/yukimemi/rvpm
+cargo install --git https://github.com/yukimemi/rvpm --locked
+
+# Or from a local clone (same as `cargo make install`)
+cargo install --path . --locked
 ```
+
+`--locked` pins the dependency versions recorded in `Cargo.lock`. Without it,
+`cargo install` re-resolves transitively and can pull mutually-incompatible
+`gix-*` / `winnow` versions that fail to compile.
 
 Pre-built binaries are also on the
 [Releases](https://github.com/yukimemi/rvpm/releases) page for Linux
@@ -152,6 +159,7 @@ for fully isolated test configs.
 | `auto_helptags` | `boolean` | `true` | `sync` / `generate` run `nvim --headless` once at the end to build helptags for every plugin's `doc/`. Skipped with a warning if `nvim` is missing |
 | `url_style` | `"short"` \| `"full"` | `"short"` | How `rvpm add` writes GitHub plugin URLs. Duplicate detection normalizes between styles |
 | `fetch_interval` | duration string (`"6h"`, `"30m"`, `"45s"`, `"1d"`, `"0"`) | `"6h"` | Per-plugin fetch cache window. `sync` skips `git fetch` for plugins pulled within the last *fetch_interval*. Accepted units: `s` / `m` / `h` / `d`. Set to `"0"` to disable caching (pre-v3.19 behavior). Override per-run with `rvpm sync --refresh` / `--no-refresh` |
+| `auto_lazy` | `"ask"` \| `"always"` \| `"never"` | `"ask"` | How `rvpm add` (and `rvpm browse → Enter`) handles the post-clone scan that looks for `nvim_create_user_command` / keymaps in the plugin's `plugin/` + `ftplugin/` + `after/plugin/` + `lua/` dirs. `"ask"` (default) prompts interactively on TTY and skips silently on non-TTY. `"always"` accepts the suggestion unconditionally. `"never"` skips the scan entirely. Per-call override via `--auto-lazy` / `--no-lazy` on `rvpm add`. Accepted suggestions cluster commands by 3-char LCP (3+ char shared prefix becomes `/^Prefix/` regex so future commands in that family auto-load) and enumerate keymaps (maps don't LCP well) |
 
 > **💡 Leave `config_root` / `cache_root` unset.** Defaults are already
 > `<appname>`-aware. Setting a literal path (e.g. `cache_root = "~/dotfiles/rvpm"`)
