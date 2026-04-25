@@ -45,9 +45,11 @@ impl Backend {
         }
     }
 
-    /// `cli_name()` が PATH 上に見つかるかを返す。
+    /// `cli_name()` が PATH 上に見つかるかを返す。Windows では `.ps1` 等の
+    /// non-default PATHEXT も探すので、pnpm 等が `.ps1` wrapper のみ install した
+    /// ケースでも検出できる。
     pub fn is_available(self) -> bool {
-        which::which(self.cli_name()).is_ok()
+        resolve_cli(self.cli_name()).is_some()
     }
 
     /// バックエンド共通のラベル。
@@ -56,6 +58,68 @@ impl Backend {
             Backend::Claude => "Claude",
             Backend::Gemini => "Gemini",
             Backend::Codex => "Codex",
+        }
+    }
+}
+
+/// 解決された CLI の起動情報。
+#[derive(Debug, Clone)]
+pub struct ResolvedCli {
+    /// `Command::new` に渡すプログラム (`.exe` 直、もしくは `powershell.exe`)。
+    pub program: PathBuf,
+    /// プログラムの最初に付ける引数 (PowerShell 経由時は `-File <path>` 等)。
+    pub prefix_args: Vec<String>,
+}
+
+/// `name` を PATH から解決する (Windows の `.ps1` 対応込み)。
+///
+/// 探索順:
+///   1. `which(name)` — Unix なら直接、Windows なら PATHEXT デフォルト (`.exe`/`.cmd`/`.bat` 等)。
+///      解決パスが `.ps1` だった場合は PowerShell 起動命令として包む。
+///   2. (Windows のみ) `which("name.ps1")` — pnpm 等が `.ps1` のみ install した
+///      ケースの fallback。PATHEXT に `.ps1` が無くても拾える。
+///
+/// `.ps1` を実行するには Windows の `CreateProcess` 単体では不可なので、
+/// `powershell.exe -NoProfile -ExecutionPolicy Bypass -File <full path>` で wrap する。
+pub fn resolve_cli(name: &str) -> Option<ResolvedCli> {
+    if let Ok(p) = which::which(name) {
+        return Some(wrap_if_powershell(p));
+    }
+    #[cfg(windows)]
+    {
+        for ext in ["ps1", "cmd", "bat", "exe"] {
+            if let Ok(p) = which::which(format!("{name}.{ext}")) {
+                return Some(wrap_if_powershell(p));
+            }
+        }
+    }
+    None
+}
+
+fn wrap_if_powershell(path: PathBuf) -> ResolvedCli {
+    let is_ps1 = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("ps1"))
+        .unwrap_or(false);
+    if is_ps1 {
+        // Windows 標準の powershell.exe で `.ps1` を起動。-NoProfile で user の
+        // $PROFILE をスキップ (起動高速化 + side effect 排除)、-ExecutionPolicy Bypass
+        // で署名要求を無効化 (pnpm の wrapper は署名されない)。
+        ResolvedCli {
+            program: PathBuf::from("powershell.exe"),
+            prefix_args: vec![
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                path.to_string_lossy().into_owned(),
+            ],
+        }
+    } else {
+        ResolvedCli {
+            program: path,
+            prefix_args: Vec::new(),
         }
     }
 }
@@ -97,13 +161,16 @@ pub async fn invoke_oneshot(backend: Backend, prompt_text: &str) -> Result<Strin
     use tokio::time::{Duration, timeout};
 
     ensure_cli_installed(backend)?;
+    let resolved = resolve_cli(backend.cli_name())
+        .ok_or_else(|| anyhow!("AI CLI `{}` is not on PATH", backend.cli_name()))?;
 
     // 各 CLI のフラグは「stdin から prompt を読み、結果を stdout に」のモードを選ぶ:
     //   - claude: `claude -p` で one-shot non-interactive、stdin で prompt
     //   - gemini: `gemini -p` 同様
     //   - codex:  `codex exec`  (or `codex -p`、ver 依存)
     // どれも stdin 受け付けるはず。安全側に prompt を stdin で渡す。
-    let mut cmd = Command::new(backend.cli_name());
+    let mut cmd = Command::new(&resolved.program);
+    cmd.args(&resolved.prefix_args);
     match backend {
         Backend::Claude | Backend::Gemini => {
             cmd.arg("-p").arg("-");
@@ -232,6 +299,8 @@ pub fn validate_proposal_toml(toml_src: &str) -> Result<()> {
 /// Tokio executor は塞がない。
 pub async fn run_handoff(backend: Backend, prompt_text: &str) -> Result<()> {
     ensure_cli_installed(backend)?;
+    let resolved = resolve_cli(backend.cli_name())
+        .ok_or_else(|| anyhow!("AI CLI `{}` is not on PATH", backend.cli_name()))?;
 
     // prompt をテンポラリファイルに保存
     let mut tmp_path = std::env::temp_dir();
@@ -252,14 +321,15 @@ pub async fn run_handoff(backend: Backend, prompt_text: &str) -> Result<()> {
     );
 
     // 子プロセスを spawn_blocking 内で起動 + wait (std::process は async に乗らないため)。
-    let cli_name = backend.cli_name().to_string();
+    let label = backend.cli_name().to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let status = std::process::Command::new(&cli_name)
+        let status = std::process::Command::new(&resolved.program)
+            .args(&resolved.prefix_args)
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .status()
-            .with_context(|| format!("failed to spawn AI CLI `{cli_name}`"))?;
+            .with_context(|| format!("failed to spawn AI CLI `{label}`"))?;
         let _ = status; // exit status は無視 (user 操作なのでエラーじゃない)
         Ok(())
     })
@@ -432,6 +502,36 @@ url = "c/d"
     fn validate_proposal_toml_rejects_no_plugins_array() {
         let toml_src = r#"name = "ignored""#;
         assert!(validate_proposal_toml(toml_src).is_err());
+    }
+
+    #[test]
+    fn wrap_if_powershell_wraps_ps1_path() {
+        // .ps1 ファイルは powershell.exe で起動するよう変換される。
+        let p = std::path::PathBuf::from("C:/foo/gemini.ps1");
+        let r = wrap_if_powershell(p);
+        assert_eq!(r.program, std::path::PathBuf::from("powershell.exe"));
+        assert!(r.prefix_args.iter().any(|a| a == "-File"));
+        assert!(r.prefix_args.iter().any(|a| a.contains("gemini.ps1")));
+        // ExecutionPolicy Bypass で署名要求を無効化する
+        assert!(r.prefix_args.iter().any(|a| a == "Bypass"));
+    }
+
+    #[test]
+    fn wrap_if_powershell_passes_exe_through() {
+        // .exe は直接起動 (prefix_args 空)。
+        let p = std::path::PathBuf::from("C:/foo/claude.exe");
+        let r = wrap_if_powershell(p.clone());
+        assert_eq!(r.program, p);
+        assert!(r.prefix_args.is_empty());
+    }
+
+    #[test]
+    fn wrap_if_powershell_passes_unix_path_through() {
+        // 拡張子無し (Unix の典型的な executable) も直接起動。
+        let p = std::path::PathBuf::from("/usr/local/bin/codex");
+        let r = wrap_if_powershell(p.clone());
+        assert_eq!(r.program, p);
+        assert!(r.prefix_args.is_empty());
     }
 
     #[tokio::test]
