@@ -196,6 +196,12 @@ pub async fn apply(wrote_to: &Path, target: &Path) {
 /// std::fs::write(&wp, content)?;
 /// chezmoi::apply(&wp, &target).await;
 /// ```
+///
+/// **エラー伝播ポリシー**: 戻り値の `Ok(())` は **bytes が disk に書き込まれた** こと
+/// を示すだけで、`chezmoi apply` の成功までは保証しない。`apply()` は失敗時に
+/// stderr へ warn を出すが Result としては Ok を返す (resilience 設計 — apply 1 件
+/// の失敗で rvpm 全体を止めない)。chezmoi 側の状態反映を厳密に確認したいユース
+/// ケース (test 等) では別途 `chezmoi status` 等を呼ぶ必要がある。
 pub async fn write_routed(
     enabled: bool,
     target: &Path,

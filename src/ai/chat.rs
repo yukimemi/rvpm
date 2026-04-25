@@ -196,18 +196,31 @@ fn print_proposal_preview(p: &Proposal, plugin_config_dir: &Path, config_toml_pa
         eprintln!("  {line}");
     }
 
-    print_hook_section(p.init_lua.as_deref(), plugin_config_dir, "init.lua", &rule);
+    // 各 hook の skip 対象を集めて、最後にサマリブロックを出す。
+    // 単発の "already exists" 行を見落として Apply されると AI 提案が無視されたまま
+    // になる UX 事故 (Gemini / CodeRabbit 共通指摘) を防ぐため、メニュー直前に
+    // 強調表示する。
+    let mut skipped: Vec<String> = Vec::new();
+    print_hook_section(
+        p.init_lua.as_deref(),
+        plugin_config_dir,
+        "init.lua",
+        &rule,
+        &mut skipped,
+    );
     print_hook_section(
         p.before_lua.as_deref(),
         plugin_config_dir,
         "before.lua",
         &rule,
+        &mut skipped,
     );
     print_hook_section(
         p.after_lua.as_deref(),
         plugin_config_dir,
         "after.lua",
         &rule,
+        &mut skipped,
     );
 
     eprintln!();
@@ -215,10 +228,31 @@ fn print_proposal_preview(p: &Proposal, plugin_config_dir: &Path, config_toml_pa
     for line in p.explanation.lines() {
         eprintln!("  {line}");
     }
+
+    if !skipped.is_empty() {
+        eprintln!();
+        eprintln!("{rule}");
+        eprintln!(
+            "\u{26a0}\u{fe0f}  HEADS UP — Apply will SKIP {} existing hook file(s):",
+            skipped.len()
+        );
+        for path in &skipped {
+            eprintln!("    [SKIPPED] {path}");
+        }
+        eprintln!("    Your existing edits are preserved. To apply the AI proposal,");
+        eprintln!("    delete the file first or merge manually.");
+        eprintln!("{rule}");
+    }
     eprintln!();
 }
 
-fn print_hook_section(body: Option<&str>, plugin_dir: &Path, name: &str, rule: &str) {
+fn print_hook_section(
+    body: Option<&str>,
+    plugin_dir: &Path,
+    name: &str,
+    rule: &str,
+    skipped: &mut Vec<String>,
+) {
     let Some(body) = body else { return };
     let path = plugin_dir.join(name);
     let exists = path.exists();
@@ -227,13 +261,14 @@ fn print_hook_section(body: Option<&str>, plugin_dir: &Path, name: &str, rule: &
     eprintln!();
     if exists {
         eprintln!(
-            "\u{1f4c4} {} already exists ({} line proposal will be skipped to preserve your edits):",
+            "\u{26a0}\u{fe0f}  [SKIPPED] {} already exists ({} line proposal preserved for reference):",
             path.display(),
             line_count,
         );
+        skipped.push(path.display().to_string());
     } else {
         eprintln!(
-            "\u{1f4c4} Will create {} ({} lines):",
+            "\u{1f195} Will create {} ({} lines):",
             path.display(),
             line_count
         );
