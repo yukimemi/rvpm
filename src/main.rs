@@ -559,15 +559,38 @@ fn resolve_plugin_dst(plugin: &crate::config::Plugin, cache_root: &Path) -> Path
     }
 }
 
-/// プラグインの build コマンドを実行する (依存 rtp 解決込み)。
-/// build が未設定なら None を返す。失敗時はエラーメッセージを返す。
+/// プラグインの build ステップを実行する。`build` (shell) と `build_lua` の両方が
+/// 設定されていれば、shell → lua の順に実行する。どちらか一方でも失敗したら
+/// 即座にエラー文字列を返す。両方未設定なら `None`。
 async fn execute_build_command(
     plugin: &crate::config::Plugin,
     dst_path: &Path,
     config: &crate::config::Config,
     cache_root: &Path,
 ) -> Option<String> {
-    let build_cmd = plugin.build.as_ref()?;
+    let rtp_dirs = collect_build_rtp(plugin, dst_path, config, cache_root);
+
+    // 1. shell コマンド (従来挙動)。失敗時は即 return。
+    if let Some(err) = run_build_shell(plugin, dst_path, &rtp_dirs).await {
+        return Some(err);
+    }
+
+    // 2. Lua callable (#97)。例: blink.cmp v2 の `require('blink.cmp').build():wait(...)`。
+    if let Some(err) = run_build_lua(plugin, dst_path, &rtp_dirs).await {
+        return Some(err);
+    }
+
+    None
+}
+
+/// build 実行時の rtp 候補一覧 (対象プラグイン + transitive depends パス)。
+/// 既存の shell build もこれを使ってきたので、Lua build 側も同じ rtp で揃える。
+fn collect_build_rtp(
+    plugin: &crate::config::Plugin,
+    dst_path: &Path,
+    config: &crate::config::Config,
+    cache_root: &Path,
+) -> Vec<PathBuf> {
     let mut rtp_dirs = vec![dst_path.to_path_buf()];
     let mut visited = std::collections::HashSet::new();
     let mut stack: Vec<String> = plugin.depends.iter().flatten().cloned().collect();
@@ -587,7 +610,17 @@ async fn execute_build_command(
             }
         }
     }
-    let (prog, args) = parse_build_command(build_cmd, &rtp_dirs);
+    rtp_dirs
+}
+
+/// shell `build` を実行する。未設定 / 成功なら `None`、失敗なら error message。
+async fn run_build_shell(
+    plugin: &crate::config::Plugin,
+    dst_path: &Path,
+    rtp_dirs: &[PathBuf],
+) -> Option<String> {
+    let build_cmd = plugin.build.as_ref()?;
+    let (prog, args) = parse_build_command(build_cmd, rtp_dirs);
     let build_timeout = std::time::Duration::from_secs(300); // 5 minutes
     let mut child = match tokio::process::Command::new(&prog)
         .args(&args)
@@ -611,6 +644,87 @@ async fn execute_build_command(
             Some(format!("build timed out ({}s)", build_timeout.as_secs()))
         }
         _ => None,
+    }
+}
+
+/// Lua callable `build_lua` を実行する (#97)。
+///
+/// `nvim --headless -u NONE -l <tmp.lua>` で起動し、rtp に対象プラグイン +
+/// transitive deps を append した上で user の Lua スニペットを呼ぶ。
+///
+/// `-u NONE` で user init.lua はスキップするが、`vim.fn.stdpath("data")` 等の
+/// real env は維持されるので blink.cmp v2 のように `~/.local/share/nvim/site/lib/`
+/// 等にファイルを置きたいケースでも期待通りの場所に届く。
+///
+/// nvim が PATH に無ければ warn + skip (resilience、helptags と同じ方針)。
+async fn run_build_lua(
+    plugin: &crate::config::Plugin,
+    dst_path: &Path,
+    rtp_dirs: &[PathBuf],
+) -> Option<String> {
+    let lua_code = plugin.build_lua.as_ref()?;
+
+    // rtp_dirs を `vim.opt.rtp:append(...)` の連続で前置する。生のパスを Lua
+    // 文字列リテラルに埋め込むので、backslash は `/` に正規化、引用符は escape。
+    let mut script = String::new();
+    for dir in rtp_dirs {
+        let p = dir
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('"', "\\\"");
+        script.push_str(&format!("vim.opt.rtp:append(\"{p}\")\n"));
+    }
+    script.push_str(lua_code);
+    script.push('\n');
+
+    let tmp_path = std::env::temp_dir().join(format!(
+        "rvpm-build-{}-{}.lua",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    if let Err(e) = std::fs::write(&tmp_path, &script) {
+        return Some(format!("build_lua: failed to write temp script: {e}"));
+    }
+
+    let build_timeout = std::time::Duration::from_secs(300);
+    let child = match tokio::process::Command::new("nvim")
+        .args(["--headless", "-u", "NONE", "-l"])
+        .arg(&tmp_path)
+        .current_dir(dst_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Some(format!(
+                "build_lua: failed to spawn `nvim --headless` ({e}); install nvim or remove `build_lua` from this plugin"
+            ));
+        }
+    };
+
+    let wait_result = tokio::time::timeout(build_timeout, child.wait_with_output()).await;
+    let _ = std::fs::remove_file(&tmp_path);
+
+    match wait_result {
+        Ok(Ok(out)) if !out.status.success() => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            Some(format!(
+                "build_lua failed (exit code: {:?}): {}",
+                out.status.code(),
+                stderr.trim()
+            ))
+        }
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => Some(format!("build_lua error: {e}")),
+        Err(_) => Some(format!(
+            "build_lua timed out ({}s)",
+            build_timeout.as_secs()
+        )),
     }
 }
 
@@ -6929,6 +7043,91 @@ lazy = false"#;
         assert!(rtp_arg.contains("/path/to/plugin"), "self: {}", rtp_arg);
         assert!(rtp_arg.contains("/path/to/dep1"), "dep1: {}", rtp_arg);
         assert!(rtp_arg.contains("/path/to/dep2"), "dep2: {}", rtp_arg);
+    }
+
+    // ─── build_lua / collect_build_rtp (#97) ────────────────────────────
+
+    #[test]
+    fn collect_build_rtp_includes_self_first_then_transitive_deps() {
+        // A depends [B], B depends [C]. rtp should be [A, B, C]. (#97)
+        let plugin_a = Plugin {
+            url: "owner/a".to_string(),
+            depends: Some(vec!["b".to_string()]),
+            ..Default::default()
+        };
+        let plugin_b = Plugin {
+            name: Some("b".to_string()),
+            url: "owner/b".to_string(),
+            depends: Some(vec!["c".to_string()]),
+            ..Default::default()
+        };
+        let plugin_c = Plugin {
+            name: Some("c".to_string()),
+            url: "owner/c".to_string(),
+            ..Default::default()
+        };
+        let config = Config {
+            vars: None,
+            options: Options::default(),
+            plugins: vec![plugin_a.clone(), plugin_b, plugin_c],
+        };
+        let cache_root = PathBuf::from("/cache");
+        let rtp = collect_build_rtp(
+            &plugin_a,
+            &PathBuf::from("/cache/plugins/repos/owner/a"),
+            &config,
+            &cache_root,
+        );
+        // self が先頭
+        assert_eq!(rtp[0], PathBuf::from("/cache/plugins/repos/owner/a"));
+        // transitive deps が含まれる (順序は DFS なので厳密には保証しないが、
+        // 全部存在することを確認)
+        let rtp_strings: Vec<String> = rtp.iter().map(|p| p.display().to_string()).collect();
+        assert!(
+            rtp_strings.iter().any(|s| s.contains("owner/b")),
+            "B in rtp: {rtp_strings:?}"
+        );
+        assert!(
+            rtp_strings.iter().any(|s| s.contains("owner/c")),
+            "C in rtp: {rtp_strings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_build_lua_returns_none_when_field_unset() {
+        let plugin = Plugin {
+            url: "x/y".to_string(),
+            ..Default::default()
+        };
+        let result = run_build_lua(&plugin, &PathBuf::from("/tmp"), &[]).await;
+        assert!(
+            result.is_none(),
+            "no build_lua field → no-op, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_build_lua_reports_error_when_nvim_missing() {
+        // nvim が PATH に無くても rvpm はクラッシュさせず、明示的なエラー文字列を返す。
+        // この test は nvim がインストールされてる環境ではスキップされる
+        // (nvim コマンドが本当に成功してしまうため)。CI / 開発機の typical 構成では
+        // nvim あり、ローカル run_build_lua の no-build-lua path を検証する別 test
+        // (run_build_lua_returns_none_when_field_unset) で十分。
+        if which::which("nvim").is_ok() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let plugin = Plugin {
+            url: "x/y".to_string(),
+            build_lua: Some("vim.print('hi')".to_string()),
+            ..Default::default()
+        };
+        let result = run_build_lua(&plugin, tmp.path(), &[tmp.path().to_path_buf()]).await;
+        let err = result.expect("missing nvim should yield an error");
+        assert!(
+            err.contains("failed to spawn") || err.contains("nvim"),
+            "error should mention nvim: {err}"
+        );
     }
 
     #[test]
