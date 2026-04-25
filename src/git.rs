@@ -427,10 +427,21 @@ fn clone_impl(url: &str, dst: &Path) -> Result<()> {
             anyhow::anyhow!("checkout failed: {}", e)
         })?;
 
+    // clone 直後に refspec を全 branch に正規化しておくと、user が `rev = "v1"`
+    // 等の非デフォルト branch を指定したケースで次回 fetch から拾える。
+    let _ = ensure_all_branches_refspec(dst);
+
     Ok(())
 }
 
 fn fetch_impl(dst: &Path) -> Result<()> {
+    // gix の prepare_clone は default で「default branch のみ」refspec を書く。
+    // user が `rev = "v1"` のように非デフォルト branch を指定したとき rev_parse_single
+    // が refs/remotes/origin/v1 を見つけられず "rev not found" になる。
+    // → fetch のたびに `.git/config` の refspec を全 branch に正規化して
+    //   次回以降 `git fetch` が全 branch を取れるようにする (idempotent)。
+    ensure_all_branches_refspec(dst)?;
+
     let repo = gix::open(dst)?;
     let remote = repo
         .find_default_remote(gix::remote::Direction::Fetch)
@@ -442,6 +453,71 @@ fn fetch_impl(dst: &Path) -> Result<()> {
         .with_shallow(gix::remote::fetch::Shallow::Deepen(1))
         .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)?;
 
+    Ok(())
+}
+
+/// `.git/config` の `[remote "origin"] fetch = ...` を全 branch refspec に正規化する。
+///
+/// gix の `prepare_clone` は default で `refs/heads/<default>:refs/remotes/origin/<default>`
+/// だけを書くが、これだと user が `rev = "v1"` (= origin の v1 branch) を指定したとき、
+/// fetch しても v1 が remote tracking ref として作られず checkout できない。
+///
+/// git CLI の標準動作 (`+refs/heads/*:refs/remotes/origin/*`) に揃えれば、以降の
+/// fetch_impl で全 branch が `refs/remotes/origin/<branch>` として取れる。
+///
+/// 既存 .git/config でも同じ問題があるので、fetch のたびにこの関数を呼ぶ
+/// (idempotent: 既に正しい設定なら no-op)。
+fn ensure_all_branches_refspec(dst: &Path) -> Result<()> {
+    let config_path = dst.join(".git").join("config");
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // .git/config が無いなら fetch 側でエラーになるので静観
+    };
+    let want = "+refs/heads/*:refs/remotes/origin/*";
+    if content.contains(want) {
+        return Ok(());
+    }
+    // `[remote "origin"]` セクション内の `fetch = ...` 行を全 branch refspec に置換。
+    // セクション境界は次の `[...]` 行か EOF。
+    let mut new_content = String::with_capacity(content.len() + 64);
+    let mut in_origin_section = false;
+    let mut replaced = false;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            // 新しいセクション開始
+            in_origin_section = trimmed.starts_with("[remote \"origin\"]")
+                || trimmed.starts_with("[remote 'origin']");
+        } else if in_origin_section
+            && let Some(idx) = trimmed.find("fetch")
+            && trimmed[idx..]
+                .trim_start_matches("fetch")
+                .trim_start()
+                .starts_with('=')
+        {
+            // `fetch = ...` 行を上書き
+            let leading_ws = &line[..line.len() - line.trim_start().len()];
+            new_content.push_str(leading_ws);
+            new_content.push_str("fetch = ");
+            new_content.push_str(want);
+            new_content.push('\n');
+            replaced = true;
+            continue;
+        }
+        new_content.push_str(line);
+        new_content.push('\n');
+    }
+    // [remote "origin"] セクションそのものが無い (or fetch 行が無い) ケースでは
+    // 末尾に追記する。普通の clone なら必ずあるはずだがガード。
+    if !replaced {
+        if !new_content.contains("[remote \"origin\"]") {
+            new_content.push_str("[remote \"origin\"]\n");
+        }
+        new_content.push_str("\tfetch = ");
+        new_content.push_str(want);
+        new_content.push('\n');
+    }
+    std::fs::write(&config_path, new_content)?;
     Ok(())
 }
 
@@ -1034,6 +1110,154 @@ mod tests {
         // Re-checkout of the same rev is a no-op (None GitChange).
         let change = repo.checkout_locally(&first).await.unwrap();
         assert!(change.is_none(), "re-checkout of same rev should be no-op");
+    }
+
+    #[test]
+    fn ensure_all_branches_refspec_replaces_narrow_default_refspec() {
+        // gix の prepare_clone は default で `.../<default>:.../<default>` の narrow
+        // な refspec を書く。これだと `rev = "v1"` 等の非デフォルト branch が
+        // fetch されない (issue: user 報告で rev 'v1' not found)。
+        // この helper で `+refs/heads/*:refs/remotes/origin/*` (= git CLI の default)
+        // に正規化される。
+        let tmp = tempdir().unwrap();
+        let dst = tmp.path();
+        fs::create_dir_all(dst.join(".git")).unwrap();
+        let initial = "[remote \"origin\"]\n\turl = https://github.com/foo/bar\n\tfetch = +refs/heads/main:refs/remotes/origin/main\n";
+        fs::write(dst.join(".git/config"), initial).unwrap();
+
+        ensure_all_branches_refspec(dst).unwrap();
+
+        let after = fs::read_to_string(dst.join(".git/config")).unwrap();
+        assert!(
+            after.contains("+refs/heads/*:refs/remotes/origin/*"),
+            "should rewrite to all-branch refspec: {after}"
+        );
+        assert!(
+            !after.contains("refs/remotes/origin/main"),
+            "narrow refspec should be replaced, not duplicated: {after}"
+        );
+    }
+
+    #[test]
+    fn ensure_all_branches_refspec_is_idempotent_when_already_correct() {
+        let tmp = tempdir().unwrap();
+        let dst = tmp.path();
+        fs::create_dir_all(dst.join(".git")).unwrap();
+        let already_correct =
+            "[remote \"origin\"]\n\turl = x\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n";
+        fs::write(dst.join(".git/config"), already_correct).unwrap();
+
+        ensure_all_branches_refspec(dst).unwrap();
+
+        let after = fs::read_to_string(dst.join(".git/config")).unwrap();
+        // 1 行だけ存在することを確認 (重複追記してない)
+        assert_eq!(
+            after.matches("fetch = ").count(),
+            1,
+            "refspec should not be duplicated: {after}"
+        );
+    }
+
+    #[test]
+    fn ensure_all_branches_refspec_only_touches_origin_section() {
+        // 他の remote セクションの fetch 行は触らない (rvpm は origin だけ管理)。
+        let tmp = tempdir().unwrap();
+        let dst = tmp.path();
+        fs::create_dir_all(dst.join(".git")).unwrap();
+        let mixed = "[remote \"upstream\"]\n\tfetch = +refs/heads/main:refs/remotes/upstream/main\n[remote \"origin\"]\n\tfetch = +refs/heads/main:refs/remotes/origin/main\n";
+        fs::write(dst.join(".git/config"), mixed).unwrap();
+
+        ensure_all_branches_refspec(dst).unwrap();
+
+        let after = fs::read_to_string(dst.join(".git/config")).unwrap();
+        assert!(
+            after.contains("upstream/main"),
+            "upstream section must be preserved: {after}"
+        );
+        assert!(
+            after.contains("+refs/heads/*:refs/remotes/origin/*"),
+            "origin should be normalized: {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_resolves_non_default_branch_via_full_refspec() {
+        // 非デフォルト branch 名 (e.g. `v1`) を rev に指定したとき、fetch が
+        // ちゃんと remote tracking ref を作って checkout が成功することを確認。
+        // user 報告: blink.cmp の `rev = "v1"` が "rev not found" になるバグの
+        // 回帰 test。
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        // master/main 上に commit
+        fs::write(src.join("a.txt"), "main-1").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "main"])
+            .output()
+            .await
+            .unwrap();
+        // v1 branch を作って別 commit
+        git_cmd(&src)
+            .args(["checkout", "-b", "v1"])
+            .output()
+            .await
+            .unwrap();
+        fs::write(src.join("a.txt"), "v1-1").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "v1"])
+            .output()
+            .await
+            .unwrap();
+        let v1_head = git_head(&src).await;
+
+        // src の default branch (main / master) に戻して、v1 が default に
+        // ならないようにしておく。`git symbolic-ref` で default を読み、それを
+        // checkout する。これで v1 を rev に指定してフェッチさせるテストが
+        // 「default branch を取りに行ったら偶然 v1 だった」では無いことを保証できる。
+        let symref = git_cmd(&src)
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .output()
+            .await;
+        let default_branch = match symref {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .rsplit('/')
+                .next()
+                .unwrap_or("main")
+                .to_string(),
+            _ => {
+                // remotes/origin/HEAD が無い (= local-only repo) なら現在の HEAD ref を見る
+                let cur = git_cmd(&src)
+                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                    .output()
+                    .await;
+                match cur {
+                    Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                    _ => "main".to_string(),
+                }
+            }
+        };
+        if default_branch != "v1" {
+            let _ = git_cmd(&src)
+                .args(["checkout", &default_branch])
+                .output()
+                .await;
+        }
+
+        let url = format!("file://{}", src.display());
+        let repo = Repo::new(&url, &dst, Some("v1"));
+        repo.sync()
+            .await
+            .expect("sync to v1 should succeed after refspec normalization");
+
+        // v1 の HEAD に揃っていること
+        let head = repo.head_commit().await.unwrap();
+        assert_eq!(head, v1_head, "checkout should land on v1 tip");
     }
 
     #[tokio::test]
