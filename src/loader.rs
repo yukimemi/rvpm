@@ -86,6 +86,41 @@ impl PluginScripts {
     }
 }
 
+/// 推移的 lazy depends を **topological 順** (deepest dep first) で `out` に push (#96)。
+///
+/// `node` の依存先を再帰的に DFS。post-order push なので「ある entry が depend する
+/// 先は配列の前方にある」 = 「`load_lazy` の呼び出し順がそのまま依存解決順」になる。
+///
+/// `on_path` は再帰中の plugin set。再訪したら循環なので break (transitive 解決を
+/// 入れると naive impl は無限ループしうる)。`visited` は完了済み set。同じ dep が
+/// 複数 plugin から共有されても 1 回だけ展開する。
+fn collect_transitive_lazy_deps(
+    node: &str,
+    direct_map: &std::collections::HashMap<String, Vec<String>>,
+    visited: &mut std::collections::HashSet<String>,
+    on_path: &mut std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    // visited チェックを on_path.insert より先にやる (Gemini #98 review)。
+    // 既に展開済の node を再訪したケースで、on_path への insert + remove の
+    // 無駄を省ける。意味的にも「完了済みなら即 return」が読みやすい。
+    if visited.contains(node) {
+        return;
+    }
+    if !on_path.insert(node.to_string()) {
+        // 循環: すでに再帰経路上にいる
+        return;
+    }
+    if let Some(direct) = direct_map.get(node) {
+        for d in direct {
+            collect_transitive_lazy_deps(d, direct_map, visited, on_path, out);
+        }
+    }
+    visited.insert(node.to_string());
+    on_path.remove(node);
+    out.push(node.to_string());
+}
+
 /// Lua のリスト literal に変換 (`{ "a", "b" }` 形式)
 fn lua_str_list(items: &[String]) -> String {
     if items.is_empty() {
@@ -430,10 +465,12 @@ pub fn generate_loader(
         .filter(|s| s.lazy)
         .map(|s| s.name.clone())
         .collect();
-    let lazy_deps_map: std::collections::HashMap<String, Vec<String>> = scripts
+    // 直接依存だけの map (DFS の入力)。各 lazy plugin が直接 depends する
+    // 「lazy plugin だけ」を収集する (eager dep は別経路で起動済みなので無視)。
+    let lazy_direct_deps: std::collections::HashMap<String, Vec<String>> = scripts
         .iter()
         .filter(|s| s.lazy)
-        .filter_map(|s| {
+        .map(|s| {
             let deps: Vec<String> = s
                 .depends
                 .iter()
@@ -441,10 +478,48 @@ pub fn generate_loader(
                 .filter(|d| lazy_names.contains(*d))
                 .cloned()
                 .collect();
-            if deps.is_empty() {
+            (s.name.clone(), deps)
+        })
+        .collect();
+
+    // 推移的 lazy depends を topological 順で展開 (#96)。
+    //
+    // 直接依存だけだと A→B→C のチェーンで C が漏れる: A の trigger 発火時に
+    // B は load されるが B が必要とする C が load されないため、B の plugin/
+    // で `require("C")` が失敗する (issue #96 で報告された blink.cmp / blink.lib
+    // 系の症状)。
+    //
+    // DFS post-order で deps を収集 → topological 順 (= 最深 dep が先頭)。
+    // emit 側はこの順で `load_lazy(...)` を吐けば、B が必要にする C が必ず B より
+    // 先に load される。`load_lazy` 自身が二重ロード guard を持つので同じ dep が
+    // 複数 plugin から共有されても安全。
+    //
+    // Cycle 検出: `on_path` set で再帰中の plugin を覚え、再訪したら break。
+    // 既存 test (test_circular_depends_does_not_infinite_loop, test_three_way_circular_depends)
+    // と同じ振る舞い。
+    let lazy_deps_map: std::collections::HashMap<String, Vec<String>> = lazy_names
+        .iter()
+        .filter_map(|name| {
+            let mut visited = std::collections::HashSet::new();
+            let mut on_path = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            // root 自身は出力しない (root は trigger 発火後に通常 path で load される)
+            if let Some(direct) = lazy_direct_deps.get(name) {
+                on_path.insert(name.clone());
+                for d in direct {
+                    collect_transitive_lazy_deps(
+                        d,
+                        &lazy_direct_deps,
+                        &mut visited,
+                        &mut on_path,
+                        &mut out,
+                    );
+                }
+            }
+            if out.is_empty() {
                 None
             } else {
-                Some((s.name.clone(), deps))
+                Some((name.clone(), out))
             }
         })
         .collect();
@@ -1489,6 +1564,136 @@ mod tests {
         assert!(lua.contains("nvim_create_user_command(\"FooA\""));
         assert!(lua.contains("nvim_create_user_command(\"FooB\""));
         assert!(lua.contains("nvim_create_user_command(\"FooC\""));
+    }
+
+    // ─── Transitive lazy depends (#96) ────────────────────────────────
+
+    #[test]
+    fn test_transitive_lazy_depends_loads_chain_in_topological_order() {
+        // A(lazy, on_event=BufReadPre, depends=[B]) → B(lazy, depends=[C]) → C(lazy)
+        // A の trigger 発火時に C が B より先に load されないと B の plugin/ で
+        // `require("c")` が失敗する (issue #96 の blink.lib / blink.cmp 系の症状)。
+        let mut a = PluginScripts::for_test("a", "/path/a");
+        a.lazy = true;
+        a.depends = Some(vec!["b".to_string()]);
+        a.on_event = Some(vec!["BufReadPre".to_string()]);
+
+        let mut b = PluginScripts::for_test("b", "/path/b");
+        b.lazy = true;
+        b.depends = Some(vec!["c".to_string()]);
+
+        let mut c = PluginScripts::for_test("c", "/path/c");
+        c.lazy = true;
+
+        let lua = gen_loader(Path::new("/merged"), &[a.clone(), b.clone(), c.clone()]);
+
+        // BufReadPre のトリガー実装内に load_lazy(C) と load_lazy(B) の両方が
+        // 含まれ、かつ C が先に呼ばれる順序になっていることを確認。
+        let trigger_block = extract_event_handler(&lua, "BufReadPre")
+            .expect("BufReadPre handler must exist for plugin a");
+        let pos_c = trigger_block.find("load_lazy(\"c\"");
+        let pos_b = trigger_block.find("load_lazy(\"b\"");
+        let pos_a = trigger_block.find("load_lazy(\"a\"");
+        assert!(
+            pos_c.is_some(),
+            "transitive dep C must appear in A's BufReadPre handler:\n{trigger_block}"
+        );
+        assert!(
+            pos_b.is_some(),
+            "direct dep B must appear in A's BufReadPre handler:\n{trigger_block}"
+        );
+        assert!(
+            pos_a.is_some(),
+            "root plugin A must appear in its own handler:\n{trigger_block}"
+        );
+        assert!(
+            pos_c < pos_b,
+            "C (B's dep) must load BEFORE B for require('c') to succeed: c@{pos_c:?} b@{pos_b:?}\n{trigger_block}"
+        );
+        assert!(
+            pos_b < pos_a,
+            "B (A's dep) must load BEFORE A: b@{pos_b:?} a@{pos_a:?}\n{trigger_block}"
+        );
+    }
+
+    #[test]
+    fn test_transitive_lazy_depends_skips_eager_plugins_in_chain() {
+        // A(lazy) depends=[B(eager)] depends=[C(lazy)]
+        // B は eager なので起動時点でロード済 → A の trigger では B も C も
+        // 改めて load_lazy する必要なし (eager は普通の rtp 経路で source 済)。
+        let mut a = PluginScripts::for_test("a", "/path/a");
+        a.lazy = true;
+        a.depends = Some(vec!["b".to_string()]);
+        a.on_event = Some(vec!["BufReadPre".to_string()]);
+
+        let mut b = PluginScripts::for_test("b", "/path/b");
+        b.lazy = false; // eager
+        b.depends = Some(vec!["c".to_string()]);
+        b.plugin_files = vec!["/path/b/plugin/b.lua".to_string()];
+
+        let mut c = PluginScripts::for_test("c", "/path/c");
+        c.lazy = true;
+
+        let lua = gen_loader(Path::new("/merged"), &[a, b, c]);
+        let trigger_block = extract_event_handler(&lua, "BufReadPre")
+            .expect("BufReadPre handler must exist for plugin a");
+        // B は eager なので handler 内で load_lazy(B) は emit されない。
+        assert!(
+            !trigger_block.contains("load_lazy(\"b\""),
+            "eager B must not appear in lazy A's handler:\n{trigger_block}"
+        );
+        // C は B 経由の indirect dep だが、B が eager なので C も eager 昇格済。
+        // よって C も handler に出ない。
+        assert!(
+            !trigger_block.contains("load_lazy(\"c\""),
+            "C reached only through eager B should not appear (eager-promoted):\n{trigger_block}"
+        );
+    }
+
+    #[test]
+    fn test_transitive_lazy_depends_handles_diamond_without_duplicate_load() {
+        // A(lazy) → [B, C] (both lazy), B → D, C → D — diamond
+        // D は B と C の両方から到達できるが、handler 内で 1 回だけ load_lazy する。
+        // (load_lazy 自身は二重ロード guard 持ちだが、emit 段階で 1 回にしておくと
+        // 出力 lua も短く読みやすい)
+        let mut a = PluginScripts::for_test("a", "/path/a");
+        a.lazy = true;
+        a.depends = Some(vec!["b".to_string(), "c".to_string()]);
+        a.on_event = Some(vec!["BufReadPre".to_string()]);
+
+        let mut b = PluginScripts::for_test("b", "/path/b");
+        b.lazy = true;
+        b.depends = Some(vec!["d".to_string()]);
+
+        let mut c = PluginScripts::for_test("c", "/path/c");
+        c.lazy = true;
+        c.depends = Some(vec!["d".to_string()]);
+
+        let mut d = PluginScripts::for_test("d", "/path/d");
+        d.lazy = true;
+
+        let lua = gen_loader(Path::new("/merged"), &[a, b, c, d]);
+        let handler =
+            extract_event_handler(&lua, "BufReadPre").expect("BufReadPre handler must exist");
+        let d_count = handler.matches("load_lazy(\"d\"").count();
+        assert_eq!(
+            d_count, 1,
+            "diamond shared dep D should appear exactly once in handler, got {d_count}:\n{handler}"
+        );
+    }
+
+    /// Helper: lua source 内で BufReadPre 等のイベントハンドラ block を抽出。
+    /// `nvim_create_autocmd({ "BufReadPre" }, ... callback = function(ev) ... end ...)`
+    /// の `callback = function(ev)` から対応する `end` までを返す。
+    fn extract_event_handler<'a>(lua: &'a str, event: &str) -> Option<&'a str> {
+        let needle = format!("\"{event}\"");
+        let event_pos = lua.find(&needle)?;
+        // この event を含む autocmd block の callback function 開始位置
+        let cb_pos = lua[event_pos..].find("callback = function(ev)")? + event_pos;
+        // function 開始から最初の `end })` (callback end + autocmd block close)
+        let end_marker = "end })";
+        let end_pos = lua[cb_pos..].find(end_marker)? + cb_pos + end_marker.len();
+        Some(&lua[cb_pos..end_pos])
     }
 
     #[test]
