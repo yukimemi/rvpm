@@ -165,17 +165,31 @@ async fn prompt_chat_action() -> Result<ChatAction> {
     })
 }
 
-/// follow-up テキスト入力も同様に worker thread で待つ。
+/// follow-up テキスト入力。`dialoguer::Input::interact_text` を使うと CJK や
+/// 絵文字 (Japanese / Chinese / 全角記号 等) の **display width** が code-point
+/// count と一致しないため、Backspace で内部 buffer は減ってもターミナル上に
+/// 残骸が残る (display は char width で消すべきだが dialoguer は code-point
+/// 単位)。
+///
+/// 解決: `stdin().read_line()` で **terminal の cooked mode に任せる**。OS の
+/// terminal driver は CJK Backspace の幅処理を正しくやるので問題が解消する。
+/// 副作用として ColorfulTheme の装飾 prompt は失うが、free-text 入力に theme は
+/// 不要 (Select の方は単キー入力なので dialoguer のままで OK)。
 async fn ask_followup() -> Result<String> {
-    use dialoguer::{Input, theme::ColorfulTheme};
-    tokio::task::spawn_blocking(|| {
-        Input::<String>::with_theme(&ColorfulTheme::default())
-            .with_prompt("Your feedback for the AI")
-            .interact_text()
+    use std::io::{self, BufRead, Write};
+    tokio::task::spawn_blocking(|| -> Result<String> {
+        // ColorfulTheme の `?` prompt prefix を可能な限り再現 (色は付けない)。
+        eprint!("? Your feedback for the AI: ");
+        io::stderr().flush().ok();
+        let mut buf = String::new();
+        io::stdin()
+            .lock()
+            .read_line(&mut buf)
+            .context("failed to read user input")?;
+        Ok(buf.trim_end_matches(['\r', '\n']).to_string())
     })
     .await
-    .context("failed to join blocking dialoguer task")?
-    .map_err(|e| anyhow::anyhow!("dialoguer input failed: {e}"))
+    .context("failed to join blocking input task")?
 }
 
 fn parse_and_validate(response: &str) -> Result<Proposal> {
