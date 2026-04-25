@@ -1096,16 +1096,21 @@ async fn run_sync(
                     // 200+ プラグイン構成では体感で遅い。`--rebuild` で従来挙動 (常に
                     // 全 build プラグインで実行) に戻せるので、`:TSUpdate` 等を強制
                     // 走らせたいときの逃げ道は確保。
-                    let should_build =
-                        plugin.build.is_some() && (force_rebuild || change.is_some());
+                    let has_any_build = plugin.build.is_some() || plugin.build_lua.is_some();
+                    let should_build = has_any_build && (force_rebuild || change.is_some());
                     let build_warn = if should_build {
+                        // status 表示は shell コマンドを優先 (具体的に何が走るか
+                        // user が分かるから)。shell が無く lua のみなら "(lua build)"
+                        // で済ます — Lua スニペット全文は冗長なので。
+                        let label = match plugin.build.as_deref() {
+                            Some(cmd) if plugin.build_lua.is_some() => format!("{cmd} + (lua)"),
+                            Some(cmd) => cmd.to_string(),
+                            None => "(lua build)".to_string(),
+                        };
                         let _ = tx
                             .send((
                                 plugin.url.clone(),
-                                PluginStatus::Syncing(format!(
-                                    "Building: {}",
-                                    plugin.build.as_deref().unwrap_or_default()
-                                )),
+                                PluginStatus::Syncing(format!("Building: {label}")),
                             ))
                             .await;
                         execute_build_command(&plugin, &dst_path, &config_for_build, &cache_root)
