@@ -167,7 +167,14 @@ pub fn ensure_cli_installed(backend: Backend) -> Result<()> {
 }
 
 /// CLI を一発呼び出しモードで起動して prompt を投げ、応答を文字列で返す。
-/// stdin で prompt を渡す (shell escape & 長文対策)。timeout 90 秒。
+/// stdin で prompt を渡す (shell escape & 長文対策)。
+///
+/// **timeout**: 5 分 (300 秒)。当初 90 秒だったが、chat 2 turn 目以降は
+/// `build_followup_prompt` で `initial + prior_response + feedback` を全部
+/// 再投入するので prompt が 50-100KB クラスに膨らみ、Gemini が 90 秒では
+/// 収まらないケース報告あり。300 秒なら現実的に余裕がある。
+/// `RVPM_AI_TIMEOUT_SECS` 環境変数で per-call 上書き可能 (ネットワーク遅延が
+/// 強い環境向け)。
 pub async fn invoke_oneshot(backend: Backend, prompt_text: &str) -> Result<String> {
     use tokio::io::AsyncWriteExt;
     use tokio::process::Command;
@@ -176,6 +183,13 @@ pub async fn invoke_oneshot(backend: Backend, prompt_text: &str) -> Result<Strin
     ensure_cli_installed(backend)?;
     let resolved = resolve_cli(backend.cli_name())
         .ok_or_else(|| anyhow!("AI CLI `{}` is not on PATH", backend.cli_name()))?;
+
+    // prompt サイズを表示 (timeout 原因の透明性 + sanity check)。
+    eprintln!(
+        "  (prompt size: {} bytes / {} lines)",
+        prompt_text.len(),
+        prompt_text.lines().count()
+    );
 
     // 各 CLI のフラグは「stdin から prompt を読み、結果を stdout に」のモードを選ぶ:
     //   - claude: `claude -p` で one-shot non-interactive、stdin で prompt
@@ -215,10 +229,21 @@ pub async fn invoke_oneshot(backend: Backend, prompt_text: &str) -> Result<Strin
         // explicit drop → close stdin → AI が EOF 受け取って応答開始
     }
 
-    // 最大 90 秒で打ち切り (network 遅延 + thinking time の余裕)。
-    let output = timeout(Duration::from_secs(90), child.wait_with_output())
+    // timeout は default 300 秒、`RVPM_AI_TIMEOUT_SECS` で上書き可能。
+    let timeout_secs = std::env::var("RVPM_AI_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300);
+    let output = timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
         .await
-        .map_err(|_| anyhow!("AI CLI `{}` timed out after 90s", backend.cli_name()))?
+        .map_err(|_| {
+            anyhow!(
+                "AI CLI `{}` timed out after {timeout_secs}s. \
+                 The chat follow-up prompt grows with conversation history; \
+                 set RVPM_AI_TIMEOUT_SECS=600 or longer if your network is slow.",
+                backend.cli_name()
+            )
+        })?
         .with_context(|| format!("AI CLI `{}` failed to produce output", backend.cli_name()))?;
 
     if !output.status.success() {
