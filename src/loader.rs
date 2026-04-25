@@ -101,12 +101,14 @@ fn collect_transitive_lazy_deps(
     on_path: &mut std::collections::HashSet<String>,
     out: &mut Vec<String>,
 ) {
-    if !on_path.insert(node.to_string()) {
-        // 循環: すでに再帰経路上にいる
+    // visited チェックを on_path.insert より先にやる (Gemini #98 review)。
+    // 既に展開済の node を再訪したケースで、on_path への insert + remove の
+    // 無駄を省ける。意味的にも「完了済みなら即 return」が読みやすい。
+    if visited.contains(node) {
         return;
     }
-    if visited.contains(node) {
-        on_path.remove(node);
+    if !on_path.insert(node.to_string()) {
+        // 循環: すでに再帰経路上にいる
         return;
     }
     if let Some(direct) = direct_map.get(node) {
