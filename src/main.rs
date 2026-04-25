@@ -653,6 +653,28 @@ async fn run_build_shell(
     }
 }
 
+/// `build_lua` に **lazy.nvim 流の `function() ... end` で囲まれた匿名関数式** が
+/// 渡された場合、その body だけを取り出して返す。
+///
+/// なぜ必要か: rvpm は `build_lua` の文字列を **statement context の Lua スニペット**
+/// として exec する (`-l <tmp.lua>`)。素の `function() ... end` は statement では
+/// 「function NAME() ... end」と解釈されるので名前必須 (E5112) になる。
+/// user は lazy.nvim の `build = function() require(...).build():wait(...) end` から
+/// 流用しがちなので、その形を検出して body へ unwrap する。
+///
+/// 検出は trim 後の文字列が `"function()"` (or `"function ()"`) で始まり、`"end"`
+/// で終わる場合のみ。strip_suffix は最後の 3 文字 "end" を比較するだけなので、
+/// 識別子末尾の "end" (例: `local end_var = 1`) を誤って切ることは無い (Rust の
+/// `strip_suffix` は exact suffix match)。
+fn unwrap_anonymous_lua_function(code: &str) -> Option<String> {
+    let trimmed = code.trim();
+    let after_func = trimmed
+        .strip_prefix("function()")
+        .or_else(|| trimmed.strip_prefix("function ()"))?;
+    let body = after_func.trim_end().strip_suffix("end")?;
+    Some(body.trim().to_string())
+}
+
 /// Lua callable `build_lua` を実行する (#97)。
 ///
 /// `nvim --headless -u NONE -l <tmp.lua>` で起動し、rtp に対象プラグイン +
@@ -668,7 +690,15 @@ async fn run_build_lua(
     dst_path: &Path,
     rtp_dirs: &[PathBuf],
 ) -> Option<String> {
-    let lua_code = plugin.build_lua.as_ref()?;
+    let raw_lua_code = plugin.build_lua.as_ref()?;
+
+    // user は lazy.nvim の `build = function() ... end` 流れで
+    // `build_lua = "function() ... end"` と書きがちだが、Lua の statement context
+    // で `function()` (匿名) は名前必須なので E5112 エラーになる。
+    // → `function() X end` の wrapping を検出したら body だけを残す。
+    let lua_code = unwrap_anonymous_lua_function(raw_lua_code)
+        .map(std::borrow::Cow::Owned)
+        .unwrap_or(std::borrow::Cow::Borrowed(raw_lua_code.as_str()));
 
     // rtp_dirs を `vim.opt.rtp:append(...)` の連続で前置する。生のパスを Lua
     // 文字列リテラルに埋め込むので、backslash は `/` に正規化、引用符は escape。
@@ -680,7 +710,7 @@ async fn run_build_lua(
             .replace('"', "\\\"");
         script.push_str(&format!("vim.opt.rtp:append(\"{p}\")\n"));
     }
-    script.push_str(lua_code);
+    script.push_str(&lua_code);
     script.push('\n');
 
     // tempfile crate に temp ファイル管理を委ねる (Gemini #99 指摘): manual な
@@ -7110,6 +7140,58 @@ lazy = false"#;
             rtp_strings.iter().any(|s| s.contains("owner/c")),
             "C in rtp: {rtp_strings:?}"
         );
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_strips_lazy_nvim_style_wrapper() {
+        // lazy.nvim style — user が `build = function() ... end` から copy
+        let r = unwrap_anonymous_lua_function(
+            "function() require('blink.cmp').build():wait(60000) end",
+        );
+        assert_eq!(
+            r.as_deref(),
+            Some("require('blink.cmp').build():wait(60000)"),
+            "function() body end → body extraction"
+        );
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_handles_space_after_function_keyword() {
+        let r = unwrap_anonymous_lua_function("function ()  vim.cmd('TSUpdate')  end");
+        assert_eq!(r.as_deref(), Some("vim.cmd('TSUpdate')"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_returns_none_for_plain_statement() {
+        // 既に statement なら触らない (None で「unwrap 不要」と通知)。
+        let r = unwrap_anonymous_lua_function("require('x').build():wait(60000)");
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_returns_none_for_named_function_decl() {
+        // `function name() ... end` は valid な statement (function 宣言) なので
+        // 触る理由が無い。
+        let r = unwrap_anonymous_lua_function("function build_step() require('x') end");
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_does_not_split_identifier_ending_in_end() {
+        // `local end_var = 1 end` のように identifier が "end" で終わるケースで
+        // strip_suffix が誤動作しないこと。strip_suffix は exact suffix match
+        // なので、"end_var" の "end" 部分は拾わない (前後の文字を見るので)。
+        let r = unwrap_anonymous_lua_function("function() local end_var = 1 end");
+        assert_eq!(r.as_deref(), Some("local end_var = 1"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_preserves_inner_function_blocks() {
+        // 入れ子の `function() ... end` は inner 側を保持する (strip_suffix は
+        // 最後の "end" だけ落とす)。
+        let r =
+            unwrap_anonymous_lua_function("function() local f = function() return 1 end; f() end");
+        assert_eq!(r.as_deref(), Some("local f = function() return 1 end; f()"));
     }
 
     #[tokio::test]
