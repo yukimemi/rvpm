@@ -82,6 +82,95 @@ pub fn build_initial_prompt(
     Ok(out)
 }
 
+/// AI tune (`rvpm tune`) 用の最初の turn の prompt を組み立てる。
+///
+/// `build_initial_prompt` との違い:
+///   - **既存の `[[plugins]]` entry を入力に含める** — AI に「これを改善して」と
+///     渡す。`current_entry_toml` には config.toml から抜き出した当該プラグインの
+///     entry をそのまま入れる。
+///   - **タスクの主旨が改善** — 新規追加ではなく、既に動いている設定の tune-up。
+///     AI には `on_*` の追加 / 削除、不要 field の trim、より良い trigger の提案、
+///     before/after.lua の見直しを依頼する。
+///
+/// 出力フォーマット (XML tag) は `build_initial_prompt` と完全共通。chat loop /
+/// proposal parse / Apply 周りのコードを使い回せる。
+pub fn build_tune_prompt(
+    plugin_url: &str,
+    plugin_root: &Path,
+    current_entry_toml: &str,
+    user_config_toml: &str,
+    user_plugins_tree: &str,
+    ai_language: &str,
+) -> Result<String> {
+    let plugin_readme = read_plugin_readme(plugin_root);
+    let plugin_doc = read_plugin_doc(plugin_root);
+
+    let mut out = String::new();
+    out.push_str(SCHEMA);
+    out.push_str("\n\n---\n\n");
+
+    if !ai_language.eq_ignore_ascii_case("en") {
+        out.push_str(&format!(
+            "## Language\n\n\
+             Respond in **{ai_language}** for natural-language portions: the \
+             `<rvpm:explanation>` body and any chat replies after this turn. \
+             Keep XML tag names, TOML, and Lua code in their original form (no translation).\n\n",
+        ));
+    }
+
+    out.push_str("---\n\n");
+    out.push_str("# Plugin to tune\n\n");
+    out.push_str(&format!("URL: `{plugin_url}`\n\n"));
+    out.push_str(
+        "This plugin is **already configured** in the user's `config.toml`. \
+         Your job is to **improve** the existing setup — add missing lazy triggers, \
+         drop redundant fields, suggest better `on_*` patterns, refine \
+         `init.lua` / `before.lua` / `after.lua` if helpful, etc. Feel free to \
+         overwrite any field of the existing entry; the user will push back via \
+         chat if a particular field should be left alone.\n\n",
+    );
+
+    out.push_str("## Current `[[plugins]]` entry\n\n");
+    out.push_str("```toml\n");
+    out.push_str(current_entry_toml.trim_end());
+    out.push_str("\n```\n\n");
+
+    if let Some(readme) = plugin_readme {
+        out.push_str("## README\n\n");
+        out.push_str(&trim_to_cap(&readme, 30_000));
+        out.push_str("\n\n");
+    }
+    if let Some(doc) = plugin_doc {
+        out.push_str("## Vim help (doc/)\n\n");
+        out.push_str(&trim_to_cap(&doc, 15_000));
+        out.push_str("\n\n");
+    }
+
+    out.push_str("---\n\n");
+    out.push_str("# User context\n\n");
+    out.push_str("## Current config.toml\n\n");
+    out.push_str("```toml\n");
+    out.push_str(&trim_to_cap(user_config_toml, 30_000));
+    out.push_str("\n```\n\n");
+
+    out.push_str("## Existing plugins/ directory tree\n\n");
+    out.push_str("```\n");
+    out.push_str(user_plugins_tree.trim_end());
+    out.push_str("\n```\n\n");
+
+    out.push_str("---\n\n");
+    out.push_str(
+        "Now propose an **improved** `[[plugins]]` block for the plugin above, \
+         plus any hook files. The TOML you emit will fully replace the existing \
+         entry — keep `name` / `url` consistent with the current entry but feel \
+         free to revise everything else. Output exactly the XML tag structure \
+         shown earlier — no markdown code fences around the tags, no preamble \
+         text outside the tags.\n",
+    );
+
+    Ok(out)
+}
+
 /// 後続 turn (user follow-up) 用の prompt を組み立てる。
 /// 直前の AI 応答 + user の追加要求を渡し、提案を更新させる。
 pub fn build_followup_prompt(
@@ -242,6 +331,54 @@ mod tests {
         std::fs::write(plugin_root.join("README.md"), "x").unwrap();
 
         let prompt = build_initial_prompt("owner/repo", &plugin_root, "", "(empty)", "ja").unwrap();
+        assert!(prompt.contains("Respond in **ja**"));
+    }
+
+    #[test]
+    fn build_tune_prompt_includes_current_entry_and_tune_framing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_root = tmp.path().join("plugin");
+        std::fs::create_dir_all(&plugin_root).unwrap();
+        std::fs::write(plugin_root.join("README.md"), "# tune-me\n\nUse :Bar.").unwrap();
+
+        let current_entry =
+            "[[plugins]]\nname = \"tune-me\"\nurl = \"owner/tune-me\"\non_cmd = [\"Bar\"]\n";
+        let prompt = build_tune_prompt(
+            "owner/tune-me",
+            &plugin_root,
+            current_entry,
+            "[[plugins]]\nurl = \"owner/tune-me\"\n",
+            "(empty)",
+            "en",
+        )
+        .unwrap();
+
+        assert!(prompt.contains("Plugin to tune"));
+        assert!(prompt.contains("already configured"));
+        assert!(prompt.contains("Current `[[plugins]]` entry"));
+        assert!(prompt.contains("on_cmd = [\"Bar\"]"));
+        assert!(prompt.contains("Use :Bar"));
+        assert!(prompt.contains("rvpm — TOML schema brief"));
+        // Tune モードでも "improved" を強調
+        assert!(prompt.contains("improved"));
+    }
+
+    #[test]
+    fn build_tune_prompt_inserts_language_hint_when_non_english() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_root = tmp.path().join("plugin");
+        std::fs::create_dir_all(&plugin_root).unwrap();
+        std::fs::write(plugin_root.join("README.md"), "x").unwrap();
+
+        let prompt = build_tune_prompt(
+            "owner/repo",
+            &plugin_root,
+            "[[plugins]]\nurl = \"owner/repo\"\n",
+            "",
+            "(empty)",
+            "ja",
+        )
+        .unwrap();
         assert!(prompt.contains("Respond in **ja**"));
     }
 

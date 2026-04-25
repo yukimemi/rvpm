@@ -179,6 +179,34 @@ enum Commands {
         no_ai: bool,
     },
 
+    /// Tune an existing plugin's config with the AI backend
+    ///
+    /// Like `add --ai`, but for plugins **already configured** in
+    /// `config.toml`. Picks one entry (by `[query]` fuzzy match or
+    /// interactive select), feeds the current `[[plugins]]` block plus
+    /// the cloned plugin's README/doc to the AI CLI, and lets the AI
+    /// propose an improved entry + per-plugin hook files.
+    ///
+    /// DESTRUCTIVE BY DEFAULT. The AI proposal fully replaces the
+    /// selected `[[plugins]]` entry — fields the AI omits are dropped
+    /// (e.g. an old `on_cmd` is removed if the AI thinks it's no longer
+    /// needed). Use the Chat action to tell the AI to keep a particular
+    /// field. Existing per-plugin hook files are never overwritten —
+    /// they're shown as `[SKIPPED]` in the preview.
+    Tune {
+        /// Fuzzy match plugin url (omit to pick interactively)
+        query: Option<String>,
+
+        /// AI backend for this `tune`. Overrides `options.ai` for this call.
+        #[arg(long, value_enum, conflicts_with = "no_ai")]
+        ai: Option<crate::config::AiBackend>,
+
+        /// Force-disable AI for this call. `tune` is AI-only, so this
+        /// effectively errors out — provided for symmetry with `add`.
+        #[arg(long)]
+        no_ai: bool,
+    },
+
     /// Edit per-plugin or global hook files in $EDITOR
     ///
     /// Without flags, prompts which plugin and file to edit.
@@ -440,6 +468,17 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Commands::Tune { query, ai, no_ai } => {
+            // `--no-ai` は config の `ai` を打ち消して Off に固定。`--ai <backend>` は
+            // 明示指定。両方無指定 (None) なら config 値を使う。
+            // tune は AI 専用なので Off に解決した場合は run_tune 内で error する。
+            let ai_override = if no_ai {
+                Some(crate::config::AiBackend::Off)
+            } else {
+                ai
+            };
+            run_tune(query, ai_override).await?;
+        }
         Commands::Edit {
             query,
             init,
@@ -556,6 +595,64 @@ fn resolve_plugin_dst(plugin: &crate::config::Plugin, cache_root: &Path) -> Path
         expand_tilde(d)
     } else {
         resolve_repos_dir(cache_root).join(plugin.canonical_path())
+    }
+}
+
+/// `query` で url を fuzzy / 部分一致で 1 件選ぶ、または非対話なら FuzzySelect TUI を出す。
+///
+/// 戻り値:
+///   - `Ok(Some(url))` — 選択成功
+///   - `Ok(None)`     — interactive 選択で user が ESC キャンセルした
+///   - `Err(_)`       — `query` 指定時に該当 plugin が無かった (Plugin not found)
+///
+/// `run_remove` / `run_set` / `run_tune` に同じ if/else ブロックが散らばっていたのを
+/// 共通化したもの (Gemini PR #100 review 指摘)。caller 側でキャンセル時の戻り値が
+/// 違うので (`Ok(())` / `Ok(false)` / etc) `Option` で受けて呼び元が分岐する。
+fn select_plugin_url(
+    plugins: &[crate::config::Plugin],
+    query: Option<&str>,
+    prompt: &str,
+) -> Result<Option<String>> {
+    if let Some(q) = query {
+        // 曖昧 partial match を防ぐ (CodeRabbit PR #100 指摘):
+        // 複数の plugin を含む query を黙って先頭採用すると、`rvpm tune cmp`
+        // で `cmp-buffer` / `cmp-cmdline` ... のうちどれが書き換えられるか
+        // 予測不能になり、mutating コマンドで重大事故が起きる。
+        //
+        // 解決順序:
+        //   1. 完全一致 (`p.url == q`) があれば即採用 (1 個だけ通過)。
+        //   2. 部分一致が 1 件 → 採用。0 件 → "Plugin not found"。
+        //   3. 部分一致が複数 → match 一覧を見せて refine を促す error。
+        if let Some(p) = plugins.iter().find(|p| p.url == q) {
+            return Ok(Some(p.url.clone()));
+        }
+        let partial: Vec<&str> = plugins
+            .iter()
+            .filter(|p| p.url.contains(q))
+            .map(|p| p.url.as_str())
+            .collect();
+        match partial.len() {
+            0 => Err(anyhow::anyhow!("Plugin not found")),
+            1 => Ok(Some(partial[0].to_string())),
+            _ => {
+                let listing = partial
+                    .iter()
+                    .map(|u| format!("  - {u}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Err(anyhow::anyhow!(
+                    "Query '{q}' matches multiple plugins; refine your query or omit it to pick interactively:\n{listing}"
+                ))
+            }
+        }
+    } else {
+        let urls: Vec<String> = plugins.iter().map(|p| p.url.clone()).collect();
+        let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt(prompt)
+            .default(0)
+            .items(&urls)
+            .interact_opt()?;
+        Ok(selection.map(|idx| urls[idx].clone()))
     }
 }
 
@@ -2463,8 +2560,24 @@ fn decide_add_lazy_apply(
     }
 }
 
+/// `replace_plugin_entry_with_ai_toml` の挙動切替。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeMode {
+    /// **Merge** (additive). 既存 entry に AI 提案 key を上書き / 追加するが、
+    /// 提案に無い既存 key は保持。`rvpm add --ai` 用 — stub entry には CLI flag で
+    /// 入れた値しか無いので merge も replace も結果は同じだが、
+    /// 安全側に倒している。
+    Merge,
+    /// **Replace** (destructive). AI 提案に無い既存 key も `preserved_keys` で
+    /// 明示保護されていない限り削除。`rvpm tune` 用 — user は「AI に全部書き直して」
+    /// と頼んでいるので、AI が omit した stale field (`on_cmd`, `rev` 等) も
+    /// 落とすのが期待値 (CodeRabbit PR #100 指摘)。`url` は `preserved_keys` 扱いで
+    /// 常に `stored_url` に強制リセット。
+    Replace,
+}
+
 /// AI mode 用 (#93): AI が返した `[[plugins]]` ブロック (1 entry のみ) を、既存
-/// stub entry に **in-place マージ** する。
+/// entry に書き込む。`mode` で merge / destructive replace を切り替える。
 ///
 /// 設計ポイント:
 ///   - **stub entry の文書中の位置 / 装飾 (改行・空白) を保つ** — `remove + insert`
@@ -2473,11 +2586,15 @@ fn decide_add_lazy_apply(
 ///   - **user の明示 CLI flag を尊重** — `preserved_keys` に挙げたキーは AI 提案で
 ///     上書きしない (`rvpm add owner/repo --rev v1.0 --ai claude` で `--rev` を残す)。
 ///     `url` は `stored_url` に強制リセット (canonical 化)。
+///   - **`Replace` mode** では更に、`preserved_keys` にも proposal にも無い既存 key を
+///     明示削除する。これが無いと `tune` で AI が "この field はもう不要だから消して"
+///     と返したつもりが反映されない (CodeRabbit PR #100 指摘)。
 fn replace_plugin_entry_with_ai_toml(
     doc: &mut DocumentMut,
     stored_url: &str,
     proposal_toml: &str,
     preserved_keys: &[&str],
+    mode: MergeMode,
 ) -> anyhow::Result<()> {
     use anyhow::{Context, anyhow};
 
@@ -2511,6 +2628,25 @@ fn replace_plugin_entry_with_ai_toml(
             continue;
         }
         let existing = plugins.get_mut(i).unwrap();
+
+        // Replace mode: AI 提案にも preserved_keys にも無い既存 key を消す。
+        // url は preserved 扱いで常に保持される (下で強制リセットされるが、ここでは消さない)。
+        if mode == MergeMode::Replace {
+            let proposal_keys: std::collections::HashSet<&str> =
+                new_entry.iter().map(|(k, _)| k).collect();
+            let to_remove: Vec<String> = existing
+                .iter()
+                .map(|(k, _)| k.to_string())
+                .filter(|k| {
+                    k != "url"
+                        && !preserved_keys.contains(&k.as_str())
+                        && !proposal_keys.contains(k.as_str())
+                })
+                .collect();
+            for k in to_remove {
+                existing.remove(&k);
+            }
+        }
 
         // AI 提案の各キーを既存 entry に書き込む。
         // ただし `preserved_keys` (user が CLI flag で明示したもの) は skip。
@@ -2775,13 +2911,7 @@ async fn run_add(
                 // AI 設定が `Off` 以外なら静的 scan を skip して AI 経路 (#93)。
                 // それ以外は従来の auto-lazy scan + prompt (#87) に流す。
                 let effective_ai = ai_override.unwrap_or(config_data.options.ai);
-                if !matches!(effective_ai, crate::config::AiBackend::Off) {
-                    let backend = match effective_ai {
-                        crate::config::AiBackend::Claude => crate::ai::Backend::Claude,
-                        crate::config::AiBackend::Gemini => crate::ai::Backend::Gemini,
-                        crate::config::AiBackend::Codex => crate::ai::Backend::Codex,
-                        crate::config::AiBackend::Off => unreachable!(),
-                    };
+                if let Ok(backend) = crate::ai::Backend::try_from(effective_ai) {
                     let cfg_root = resolve_config_root(config_data.options.config_root.as_deref());
                     let plugin_cfg_dir = resolve_plugin_config_dir(&cfg_root, &plugin);
                     match crate::ai::run_ai_add(
@@ -2807,6 +2937,7 @@ async fn run_add(
                                         &stored_url,
                                         &prop.plugin_entry_toml,
                                         &preserved_keys,
+                                        MergeMode::Merge,
                                     ) {
                                         eprintln!(
                                             "\u{26a0} failed to apply AI proposal: {e}. Stub entry remains."
@@ -3164,24 +3295,10 @@ async fn run_set(
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
 
-    let selected_repo_url = if let Some(q) = query.as_ref() {
-        config
-            .plugins
-            .iter()
-            .find(|p| &p.url == q || p.url.contains(q))
-            .map(|p| p.url.clone())
-            .context("Plugin not found")?
-    } else {
-        let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
-        let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
-            .with_prompt("Select plugin to set")
-            .default(0)
-            .items(&urls)
-            .interact_opt()?;
-        match selection {
-            Some(index) => urls[index].clone(),
-            None => return Ok(false),
-        }
+    let Some(selected_repo_url) =
+        select_plugin_url(&config.plugins, query.as_deref(), "Select plugin to set")?
+    else {
+        return Ok(false);
     };
 
     println!("\n>> Setting options for: {}", selected_repo_url);
@@ -3546,24 +3663,10 @@ async fn run_remove(query: Option<String>) -> Result<()> {
     let toml_content = std::fs::read_to_string(&config_path)?;
     let config = parse_config(&toml_content)?;
 
-    let selected_url = if let Some(q) = query.as_ref() {
-        config
-            .plugins
-            .iter()
-            .find(|p| p.url == *q || p.url.contains(q.as_str()))
-            .map(|p| p.url.clone())
-            .context("Plugin not found")?
-    } else {
-        let urls: Vec<String> = config.plugins.iter().map(|p| p.url.clone()).collect();
-        let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
-            .with_prompt("Select plugin to remove")
-            .default(0)
-            .items(&urls)
-            .interact_opt()?;
-        match selection {
-            Some(idx) => urls[idx].clone(),
-            None => return Ok(()),
-        }
+    let Some(selected_url) =
+        select_plugin_url(&config.plugins, query.as_deref(), "Select plugin to remove")?
+    else {
+        return Ok(());
     };
 
     let confirm = dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
@@ -3596,6 +3699,149 @@ async fn run_remove(query: Option<String>) -> Result<()> {
     }
 
     println!("Regenerating loader.lua...");
+    run_generate().await?;
+    Ok(())
+}
+
+/// 既存 config.toml の DocumentMut から、指定 url の `[[plugins]]` entry を
+/// **TOML テキストとして** 抜き出す (AI tune の prompt に貼るため)。
+///
+/// 単純に `existing.to_string()` だと `[[plugins]]` ヘッダが付かないので、
+/// `[[plugins]]\n` を頭に明示的に貼って、その後に table の各 key/value を
+/// 通常レンダリングで連結する。toml_edit が table 内の元 formatting (空白 /
+/// 改行 / コメント) をできる限り保つので、user が手で書いた config の見た目を
+/// AI に正しく見せられる。
+fn extract_plugin_entry_toml(doc: &DocumentMut, url: &str) -> Option<String> {
+    let plugins = doc.get("plugins").and_then(|p| p.as_array_of_tables())?;
+    let entry = plugins
+        .iter()
+        .find(|t| t.get("url").and_then(|v| v.as_str()) == Some(url))?;
+    // `[[plugins]]` header を含めて build。
+    let mut out = String::from("[[plugins]]\n");
+    out.push_str(&entry.to_string());
+    Some(out)
+}
+
+async fn run_tune(
+    query: Option<String>,
+    ai_override: Option<crate::config::AiBackend>,
+) -> Result<()> {
+    let config_path = rvpm_config_path();
+    ensure_config_exists(&config_path)?;
+    let toml_content = std::fs::read_to_string(&config_path)?;
+    let config = parse_config(&toml_content)?;
+
+    if config.plugins.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No plugins in config.toml. Use `rvpm add <repo>` first."
+        ));
+    }
+
+    // AI backend を解決。`--no-ai` (Off) や config が Off なら error
+    // (tune は AI 専用 — non-AI 経路を提供する意味がない、`set` で代替できる)。
+    let effective_ai = ai_override.unwrap_or(config.options.ai);
+    let backend = crate::ai::Backend::try_from(effective_ai).map_err(|_| {
+        anyhow::anyhow!(
+            "rvpm tune requires an AI backend. Set `options.ai` in config.toml \
+             or pass `--ai <claude|gemini|codex>`."
+        )
+    })?;
+
+    let Some(selected_url) =
+        select_plugin_url(&config.plugins, query.as_deref(), "Select plugin to tune")?
+    else {
+        return Ok(());
+    };
+
+    let plugin = config
+        .plugins
+        .iter()
+        .find(|p| p.url == selected_url)
+        .cloned()
+        .context("plugin disappeared after selection")?;
+
+    let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
+    let dst_path = resolve_plugin_dst(&plugin, &cache_root);
+    if !dst_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Plugin directory does not exist: {}. Run `rvpm sync` first so the AI can read the README/doc.",
+            dst_path.display()
+        ));
+    }
+
+    // 現在の `[[plugins]]` entry を TOML テキストとして抜き出す。
+    let doc = toml_content.parse::<DocumentMut>()?;
+    let current_entry_toml = extract_plugin_entry_toml(&doc, &selected_url).ok_or_else(|| {
+        anyhow::anyhow!("could not extract current entry for `{selected_url}` from config.toml")
+    })?;
+
+    let config_root = resolve_config_root(config.options.config_root.as_deref());
+    let plugin_cfg_dir = resolve_plugin_config_dir(&config_root, &plugin);
+
+    println!(
+        "\u{1f527} Tuning {} with {} ...",
+        plugin.display_name(),
+        backend.label()
+    );
+
+    match crate::ai::run_ai_tune(
+        backend,
+        &selected_url,
+        &dst_path,
+        &plugin_cfg_dir,
+        &config_root,
+        &config_path,
+        &current_entry_toml,
+        &config.options.ai_language,
+        config.options.chezmoi,
+    )
+    .await
+    {
+        Ok(outcome) => match outcome.outcome {
+            crate::ai::ChatOutcome::Applied { written_hooks } => {
+                if let Some(prop) = outcome.proposal {
+                    let latest = std::fs::read_to_string(&config_path)?;
+                    let mut doc_patch = latest.parse::<DocumentMut>()?;
+                    // Option A: AI 提案で **全 field 上書き** (`preserved_keys` は空)。
+                    // user は Chat ループ中に "X は触らないで" と言えば AI 側で field を保持する。
+                    // `Replace` mode で AI が omit した stale field (e.g. 古い `on_cmd`) を消す。
+                    if let Err(e) = replace_plugin_entry_with_ai_toml(
+                        &mut doc_patch,
+                        &selected_url,
+                        &prop.plugin_entry_toml,
+                        &[],
+                        MergeMode::Replace,
+                    ) {
+                        eprintln!(
+                            "\u{26a0} failed to apply AI proposal: {e}. Existing entry kept."
+                        );
+                    } else {
+                        let patched = doc_patch.to_string();
+                        chezmoi::write_routed(config.options.chezmoi, &config_path, &patched)
+                            .await?;
+                        println!(
+                            "Tuned {} ({} hook file(s) created).",
+                            plugin.display_name(),
+                            written_hooks.len()
+                        );
+                    }
+                }
+            }
+            crate::ai::ChatOutcome::Skipped => {
+                eprintln!("AI proposal skipped \u{2014} existing entry kept in config.toml.");
+            }
+            crate::ai::ChatOutcome::HandedOff => {
+                eprintln!(
+                    "Handed off to {} CLI. rvpm exits \u{2014} that session controls config.toml from here.",
+                    backend.label()
+                );
+            }
+        },
+        Err(e) => {
+            eprintln!("\u{26a0} AI tune failed: {e}. Existing entry kept unchanged.");
+        }
+    }
+
     run_generate().await?;
     Ok(())
 }
@@ -5694,7 +5940,8 @@ url = "third/plugin"
 url = "second/stub"
 on_event = ["BufReadPre"]
 "#;
-        replace_plugin_entry_with_ai_toml(&mut doc, "second/stub", proposal, &[]).unwrap();
+        replace_plugin_entry_with_ai_toml(&mut doc, "second/stub", proposal, &[], MergeMode::Merge)
+            .unwrap();
         let out = doc.to_string();
         // first/plugin → second/stub → third/plugin の順序が維持される
         let first_pos = out.find("first/plugin").unwrap();
@@ -5723,7 +5970,14 @@ on_map = ["<leader>x"]
 "#;
         // user が --rev と --on-cmd を明示したシナリオ
         let preserved = ["url", "rev", "on_cmd"];
-        replace_plugin_entry_with_ai_toml(&mut doc, "owner/repo", proposal, &preserved).unwrap();
+        replace_plugin_entry_with_ai_toml(
+            &mut doc,
+            "owner/repo",
+            proposal,
+            &preserved,
+            MergeMode::Merge,
+        )
+        .unwrap();
         let out = doc.to_string();
         // user の rev / on_cmd が残る
         assert!(
@@ -5754,7 +6008,8 @@ url = "owner/repo"
 url = "different/url"
 on_cmd = ["AICmd"]
 "#;
-        replace_plugin_entry_with_ai_toml(&mut doc, "owner/repo", proposal, &[]).unwrap();
+        replace_plugin_entry_with_ai_toml(&mut doc, "owner/repo", proposal, &[], MergeMode::Merge)
+            .unwrap();
         let out = doc.to_string();
         // url は stored_url を維持 (AI が url を勘違いしても保護)
         assert!(out.contains(r#"url = "owner/repo""#));
@@ -5770,7 +6025,10 @@ url = "x/y"
         let mut doc = initial.parse::<DocumentMut>().unwrap();
 
         let zero = r#"name = "no plugins""#;
-        assert!(replace_plugin_entry_with_ai_toml(&mut doc, "x/y", zero, &[]).is_err());
+        assert!(
+            replace_plugin_entry_with_ai_toml(&mut doc, "x/y", zero, &[], MergeMode::Merge)
+                .is_err()
+        );
 
         let many = r#"[[plugins]]
 url = "a/b"
@@ -5778,7 +6036,233 @@ url = "a/b"
 [[plugins]]
 url = "c/d"
 "#;
-        assert!(replace_plugin_entry_with_ai_toml(&mut doc, "x/y", many, &[]).is_err());
+        assert!(
+            replace_plugin_entry_with_ai_toml(&mut doc, "x/y", many, &[], MergeMode::Merge)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn replace_plugin_entry_with_ai_toml_replace_mode_drops_stale_keys() {
+        // CodeRabbit PR #100 指摘: tune で AI が omit した既存 field が
+        // (`on_cmd`, `rev` 等) 残ってしまう問題の回帰 test。
+        let initial = r#"[[plugins]]
+url = "owner/tuneme"
+on_cmd = ["StaleCmd"]
+rev = "abc123"
+on_ft = "rust"
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        // AI 提案は on_cmd のみ — rev / on_ft は意図的に omit して "削除して" の意図。
+        let proposal = r#"[[plugins]]
+url = "owner/tuneme"
+on_cmd = ["NewCmd"]
+"#;
+        replace_plugin_entry_with_ai_toml(
+            &mut doc,
+            "owner/tuneme",
+            proposal,
+            &[],
+            MergeMode::Replace,
+        )
+        .unwrap();
+        let out = doc.to_string();
+        assert!(out.contains(r#"on_cmd = ["NewCmd"]"#));
+        // 提案に含まれない既存 field は削除される
+        assert!(
+            !out.contains(r#"rev = "abc123""#),
+            "Replace mode must drop stale rev:\n{out}"
+        );
+        assert!(
+            !out.contains(r#"on_ft = "rust""#),
+            "Replace mode must drop stale on_ft:\n{out}"
+        );
+        // url は強制保持
+        assert!(out.contains(r#"url = "owner/tuneme""#));
+    }
+
+    #[test]
+    fn replace_plugin_entry_with_ai_toml_replace_mode_keeps_preserved_keys() {
+        // Replace mode でも `preserved_keys` に挙げた field は残す
+        // (将来 `tune --keep rev` のような flag を足したときの保証)。
+        let initial = r#"[[plugins]]
+url = "owner/repo"
+rev = "stable"
+on_cmd = ["KeepMe"]
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let proposal = r#"[[plugins]]
+url = "owner/repo"
+on_event = ["BufRead"]
+"#;
+        replace_plugin_entry_with_ai_toml(
+            &mut doc,
+            "owner/repo",
+            proposal,
+            &["rev"],
+            MergeMode::Replace,
+        )
+        .unwrap();
+        let out = doc.to_string();
+        // preserved な rev は残る
+        assert!(out.contains(r#"rev = "stable""#));
+        // preserved でない on_cmd は AI 提案に無いので消える
+        assert!(!out.contains("KeepMe"));
+        // AI 提案の on_event は新規追加
+        assert!(out.contains(r#"on_event = ["BufRead"]"#));
+    }
+
+    // ─── extract_plugin_entry_toml (rvpm tune) ──────────────────────────
+
+    #[test]
+    fn extract_plugin_entry_toml_returns_full_block_with_header() {
+        let toml = r#"[options]
+ai = "claude"
+
+[[plugins]]
+url = "owner/first"
+on_cmd = ["First"]
+
+[[plugins]]
+url = "owner/target"
+on_cmd = ["Target"]
+on_ft = "rust"
+
+[[plugins]]
+url = "owner/last"
+"#;
+        let doc = toml.parse::<DocumentMut>().unwrap();
+        let entry = extract_plugin_entry_toml(&doc, "owner/target").unwrap();
+        // header が付く
+        assert!(entry.starts_with("[[plugins]]"));
+        // 中身を含む
+        assert!(entry.contains(r#"url = "owner/target""#));
+        assert!(entry.contains(r#"on_cmd = ["Target"]"#));
+        assert!(entry.contains(r#"on_ft = "rust""#));
+        // 他 entry は含まれない
+        assert!(!entry.contains("owner/first"));
+        assert!(!entry.contains("owner/last"));
+    }
+
+    #[test]
+    fn extract_plugin_entry_toml_returns_none_for_missing_url() {
+        let toml = r#"[[plugins]]
+url = "only/one"
+"#;
+        let doc = toml.parse::<DocumentMut>().unwrap();
+        assert!(extract_plugin_entry_toml(&doc, "missing/repo").is_none());
+    }
+
+    #[test]
+    fn extract_plugin_entry_toml_returns_none_when_plugins_missing() {
+        let toml = "[options]\nai = \"claude\"\n";
+        let doc = toml.parse::<DocumentMut>().unwrap();
+        assert!(extract_plugin_entry_toml(&doc, "any/url").is_none());
+    }
+
+    // ─── select_plugin_url (rvpm tune / set / remove 共通) ───────────────
+
+    #[test]
+    fn select_plugin_url_query_exact_match_returns_url() {
+        use crate::config::Plugin;
+        let plugins = vec![
+            Plugin {
+                url: "owner/first".to_string(),
+                ..Default::default()
+            },
+            Plugin {
+                url: "owner/second".to_string(),
+                ..Default::default()
+            },
+        ];
+        let got = select_plugin_url(&plugins, Some("owner/second"), "select").unwrap();
+        assert_eq!(got, Some("owner/second".to_string()));
+    }
+
+    #[test]
+    fn select_plugin_url_query_substring_match_returns_first_match() {
+        use crate::config::Plugin;
+        let plugins = vec![
+            Plugin {
+                url: "alpha/foo".to_string(),
+                ..Default::default()
+            },
+            Plugin {
+                url: "beta/bar".to_string(),
+                ..Default::default()
+            },
+        ];
+        let got = select_plugin_url(&plugins, Some("beta"), "select").unwrap();
+        assert_eq!(got, Some("beta/bar".to_string()));
+    }
+
+    #[test]
+    fn select_plugin_url_query_no_match_errors() {
+        use crate::config::Plugin;
+        let plugins = vec![Plugin {
+            url: "owner/repo".to_string(),
+            ..Default::default()
+        }];
+        let err = select_plugin_url(&plugins, Some("nonexistent"), "select").unwrap_err();
+        assert!(err.to_string().contains("Plugin not found"));
+    }
+
+    #[test]
+    fn select_plugin_url_exact_match_wins_over_partial() {
+        // user typed `cmp` and a plugin called exactly `cmp` exists alongside
+        // longer `cmp-buffer` etc → exact match takes precedence (no ambiguity).
+        use crate::config::Plugin;
+        let plugins = vec![
+            Plugin {
+                url: "hrsh7th/cmp-buffer".to_string(),
+                ..Default::default()
+            },
+            Plugin {
+                url: "cmp".to_string(),
+                ..Default::default()
+            },
+            Plugin {
+                url: "hrsh7th/cmp-cmdline".to_string(),
+                ..Default::default()
+            },
+        ];
+        let got = select_plugin_url(&plugins, Some("cmp"), "select").unwrap();
+        assert_eq!(got, Some("cmp".to_string()));
+    }
+
+    #[test]
+    fn select_plugin_url_ambiguous_partial_errors_with_listing() {
+        // CodeRabbit PR #100 指摘: 複数の partial match を黙って先頭採用すると
+        // mutating コマンドが意図しない plugin を変更してしまう。複数 match は
+        // error にし、候補一覧を見せる。
+        use crate::config::Plugin;
+        let plugins = vec![
+            Plugin {
+                url: "hrsh7th/cmp-buffer".to_string(),
+                ..Default::default()
+            },
+            Plugin {
+                url: "hrsh7th/cmp-cmdline".to_string(),
+                ..Default::default()
+            },
+            Plugin {
+                url: "hrsh7th/cmp-path".to_string(),
+                ..Default::default()
+            },
+            Plugin {
+                url: "folke/snacks.nvim".to_string(),
+                ..Default::default()
+            },
+        ];
+        let err = select_plugin_url(&plugins, Some("cmp"), "select").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("matches multiple"));
+        // 全候補が表示される
+        assert!(msg.contains("hrsh7th/cmp-buffer"));
+        assert!(msg.contains("hrsh7th/cmp-cmdline"));
+        assert!(msg.contains("hrsh7th/cmp-path"));
+        // match しないものは含まれない
+        assert!(!msg.contains("snacks"));
     }
 
     fn write_file(path: &Path, content: &str) {
