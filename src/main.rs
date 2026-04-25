@@ -187,10 +187,12 @@ enum Commands {
     /// the cloned plugin's README/doc to the AI CLI, and lets the AI
     /// propose an improved entry + per-plugin hook files.
     ///
-    /// The AI proposal can overwrite any field of the existing entry
-    /// (use the `Chat` action to tell the AI to leave a particular
-    /// field alone). Existing per-plugin hook files are never
-    /// overwritten — they're shown as `[SKIPPED]` in the preview.
+    /// DESTRUCTIVE BY DEFAULT. The AI proposal fully replaces the
+    /// selected `[[plugins]]` entry — fields the AI omits are dropped
+    /// (e.g. an old `on_cmd` is removed if the AI thinks it's no longer
+    /// needed). Use the Chat action to tell the AI to keep a particular
+    /// field. Existing per-plugin hook files are never overwritten —
+    /// they're shown as `[SKIPPED]` in the preview.
     Tune {
         /// Fuzzy match plugin url (omit to pick interactively)
         query: Option<String>,

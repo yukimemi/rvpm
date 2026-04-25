@@ -369,11 +369,17 @@ rvpm tune folke/snacks.nvim --ai gemini
 
 The AI sees your **current `[[plugins]]` block** plus the cloned plugin's
 README/doc and proposes an improved entry — adjusted lazy triggers,
-trimmed redundant fields, refined hook files, etc. The proposal is free
-to overwrite any field of the existing entry; if you want a particular
-field left alone, tell the AI in **Chat** ("don't change `rev`"). The
-chat / apply / hand-off / skip actions are identical to `add --ai`, and
-existing per-plugin hook files are still never overwritten.
+trimmed redundant fields, refined hook files, etc.
+
+**`tune` is destructive by default.** The AI proposal **fully replaces**
+the selected `[[plugins]]` entry: any field the AI omits is dropped. So
+if your existing entry has `on_cmd = ["Foo"]` and the AI proposes a
+config without `on_cmd`, the field is removed (the AI is signalling that
+trigger is no longer needed). If you want a particular field left alone,
+tell the AI in **Chat** ("don't change `rev`") — the AI will keep it in
+the next proposal. The chat / apply / hand-off / skip actions are
+identical to `add --ai`, and existing per-plugin hook files are still
+never overwritten.
 
 `tune` is AI-only — `--no-ai` errors out. Use `rvpm set` for
 non-AI tweaks.
