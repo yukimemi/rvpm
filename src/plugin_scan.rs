@@ -4,21 +4,26 @@
 //   - `commands`     : `nvim_create_user_command("Foo", ...)` / `command! Foo`
 //   - `user_maps`    : `nnoremap gc ...` / `vim.keymap.set("n", "gc", ...)` 等、
 //                       **`<Plug>(...)` LHS は除外**した「user が直接押すキー」
+//   - `plug_maps`    : `<Plug>(Foo)` 形式 LHS のみ。プラグインが exposing する
+//                       `<Plug>` バインディング一覧。
 //   - `user_events`  : プラグインが `nvim_exec_autocmds("User", {pattern = "X"})`
 //                       / `doautocmd User X` で fire する User event 名
 //
 // 用途:
 //   - `on_cmd` の `/regex/` 展開 (#86, shipped) — `commands` を消費
-//   - `on_map` の `/regex/` 展開 (#88) — `user_maps` を消費
+//   - `on_map` の `/regex/` 展開 (#88) — `plug_maps` を消費
+//   - `on_event` の `/User .../` 展開 (#88) — `user_events` を消費
 //   - `rvpm add` 自動 lazy 提案 (#87 UI) — `commands` + `user_maps` を消費
 //
 // 制約:
 //   - 動的定義 (computed name, setup() 内定義で setup 未呼出) は拾えない。
 //     これらは user が exact 名を手書きする想定。
-//   - `<Plug>(...)` LHS は **user-facing でない** ので user_maps から弾く。
+//   - `<Plug>(...)` LHS は user-entry ではないので user_maps から弾き、専用
+//     フィールド `plug_maps` に集める。
 //   - On-event suggestion は deadlock 的制約があり、プラグインが **発火する側** の
-//     User event を自身の lazy trigger にはできない。user_events の収集は #88 の
-//     regex 展開で user が他プラグインの event を trigger に書く際の参照用。
+//     User event を自身の lazy trigger にはできない (起動した瞬間まだ event は
+//     fire されていない)。user_events は **他プラグインの** trigger として user が
+//     `on_event = ["/User Foo.*/"]` と書くときの展開ソースとして使う。
 
 use regex::Regex;
 use std::collections::HashSet;
@@ -36,7 +41,12 @@ pub struct UserMap {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanResult {
     pub commands: Vec<String>,
+    /// `<Plug>(...)` を **除いた** user-facing キーマップ。`#[87]` の auto-suggest
+    /// (rvpm add) 用。
     pub user_maps: Vec<UserMap>,
+    /// `<Plug>(...)` LHS のリスト。プラグインが exposing する `<Plug>` バインディング
+    /// だけを集める。`#[88]` の `on_map = ["/^<Plug>(Foo/"]` 正規表現展開用。
+    pub plug_maps: Vec<String>,
     pub user_events: Vec<String>,
 }
 
@@ -78,14 +88,14 @@ pub fn scan_source(src: &str, dialect: Dialect) -> ScanResult {
             // Lua: line-comment を削った buffer に multiline regex
             let lua_code = strip_lua_line_comments(src);
             scan_lua_commands(&lua_code, &mut out.commands);
-            scan_lua_maps(&lua_code, &mut out.user_maps);
+            scan_lua_maps(&lua_code, &mut out.user_maps, &mut out.plug_maps);
             scan_lua_events(&lua_code, &mut out.user_events);
         }
         Dialect::Vim => {
             // Vim: 生の line (Vim では `--` はコメント扱いしない)
             for line in src.lines() {
                 scan_vim_command(line, &mut out.commands);
-                scan_vim_map(line, &mut out.user_maps);
+                scan_vim_map(line, &mut out.user_maps, &mut out.plug_maps);
                 scan_vim_event(line, &mut out.user_events);
             }
         }
@@ -192,6 +202,7 @@ fn find_long_bracket_close(bytes: &[u8], from: usize, level: usize) -> Option<us
 pub fn scan_files<P: AsRef<Path>>(paths: &[P]) -> ScanResult {
     let mut commands_seen: HashSet<String> = HashSet::new();
     let mut maps_seen: HashSet<(String, Vec<String>)> = HashSet::new();
+    let mut plug_maps_seen: HashSet<String> = HashSet::new();
     let mut events_seen: HashSet<String> = HashSet::new();
     let mut agg = ScanResult::default();
     for p in paths {
@@ -212,6 +223,11 @@ pub fn scan_files<P: AsRef<Path>>(paths: &[P]) -> ScanResult {
             let key = (m.lhs.clone(), m.modes.clone());
             if maps_seen.insert(key) {
                 agg.user_maps.push(m);
+            }
+        }
+        for p in res.plug_maps {
+            if plug_maps_seen.insert(p.clone()) {
+                agg.plug_maps.push(p);
             }
         }
         for e in res.user_events {
@@ -316,26 +332,31 @@ fn lua_map_re() -> &'static Regex {
     })
 }
 
-fn scan_lua_maps(code: &str, out: &mut Vec<UserMap>) {
+fn scan_lua_maps(code: &str, user: &mut Vec<UserMap>, plug: &mut Vec<String>) {
     for caps in lua_map_re().captures_iter(code) {
         let mode_str = caps.name("mode").map_or("", |m| m.as_str());
         let lhs = caps.name("lhs").map_or("", |m| m.as_str());
-        if lhs.is_empty() || is_plug_lhs(lhs) {
+        if lhs.is_empty() {
             continue;
         }
         // buffer-local 判定: match 末尾 (lhs 閉じ引用符直後) から call の `)` までを
         // paren-balance で拾い、options テーブル内に `buffer = …` があれば skip。
-        // これは aerial.nvim 等 plugin ウィンドウ内専用マップの誤検出を防ぐため。
+        // aerial.nvim 等 plugin ウィンドウ内専用マップ (user-entry でも `<Plug>`-internal
+        // でもない) の誤検出を防ぐため、両 sink で同じ filter を適用する。
         let match_end = caps.get(0).map_or(0, |m| m.end());
         if let Some(call_end) = find_lua_call_end(code, match_end)
             && has_buffer_option(&code[match_end..call_end])
         {
             continue;
         }
-        out.push(UserMap {
-            lhs: lhs.to_string(),
-            modes: lua_mode_string_to_list(mode_str),
-        });
+        if is_plug_lhs(lhs) {
+            plug.push(lhs.to_string());
+        } else {
+            user.push(UserMap {
+                lhs: lhs.to_string(),
+                modes: lua_mode_string_to_list(mode_str),
+            });
+        }
     }
 }
 
@@ -405,7 +426,7 @@ fn vim_map_re() -> &'static Regex {
     })
 }
 
-fn scan_vim_map(line: &str, out: &mut Vec<UserMap>) {
+fn scan_vim_map(line: &str, user: &mut Vec<UserMap>, plug: &mut Vec<String>) {
     let Some(caps) = vim_map_re().captures(line) else {
         return;
     };
@@ -413,20 +434,38 @@ fn scan_vim_map(line: &str, out: &mut Vec<UserMap>) {
     let bang = caps.name("bang").map_or("", |m| m.as_str());
     let rest = caps.name("rest").map_or("", |m| m.as_str());
     let modes = vim_map_modes(prefix, bang == "!");
-    if let Some(lhs) = parse_vim_map_lhs(rest)
-        && !is_plug_lhs(&lhs)
-    {
-        out.push(UserMap { lhs, modes });
+    let Some((lhs, has_buffer)) = parse_vim_map_lhs(rest) else {
+        return;
+    };
+    // buffer-local 判定 (Vim): `<buffer>` flag 付きは plugin window 内の private
+    // バインディングなので、Lua 側 `has_buffer_option` と同じく入口候補から除外する
+    // (#92 review)。`<Plug>` も user-entry もどちらの sink でも skip。
+    if has_buffer {
+        return;
+    }
+    if is_plug_lhs(&lhs) {
+        plug.push(lhs);
+    } else {
+        user.push(UserMap { lhs, modes });
     }
 }
 
-fn parse_vim_map_lhs(rest: &str) -> Option<String> {
+/// `:map` 行の rest (mode prefix と bang を取り除いた残り) から lhs と
+/// `<buffer>` flag の有無を取り出す。`<silent>` / `<expr>` 等の他オプションは
+/// 透過 skip。`<buffer>` は呼び出し側で buffer-local 判定に使う。
+fn parse_vim_map_lhs(rest: &str) -> Option<(String, bool)> {
     let mut s = rest.trim_start();
+    let mut has_buffer = false;
     while let Some(after_lt) = s.strip_prefix('<') {
         let close = after_lt.find('>')?;
         let tag = &after_lt[..close];
-        match tag.to_ascii_lowercase().as_str() {
-            "silent" | "buffer" | "expr" | "nowait" | "unique" | "script" | "special" => {
+        let lower = tag.to_ascii_lowercase();
+        match lower.as_str() {
+            "buffer" => {
+                has_buffer = true;
+                s = after_lt[close + 1..].trim_start();
+            }
+            "silent" | "expr" | "nowait" | "unique" | "script" | "special" => {
                 s = after_lt[close + 1..].trim_start();
             }
             _ => break,
@@ -437,7 +476,7 @@ fn parse_vim_map_lhs(rest: &str) -> Option<String> {
     if lhs.is_empty() {
         None
     } else {
-        Some(lhs.to_string())
+        Some((lhs.to_string(), has_buffer))
     }
 }
 
@@ -706,8 +745,9 @@ vim.api.nvim_create_user_command("Real", function() end, {})
     }
 
     #[test]
-    fn scan_source_skips_silent_buffer_options() {
-        let src = "nnoremap <silent> <buffer> gc :echo 'x'<CR>";
+    fn scan_source_strips_silent_option_but_keeps_global_map() {
+        // `<silent>` 等は装飾なので透過 strip して lhs を取り出す。
+        let src = "nnoremap <silent> gc :echo 'x'<CR>";
         let maps = scan_source(src, Dialect::Vim).user_maps;
         assert_eq!(
             maps,
@@ -719,16 +759,39 @@ vim.api.nvim_create_user_command("Real", function() end, {})
     }
 
     #[test]
-    fn scan_source_filters_plug_lhs() {
+    fn scan_source_skips_vim_buffer_local_user_map() {
+        // `<buffer>` 付きは buffer-local — plugin window 内の binding なので
+        // user-entry trigger 候補から除外する (#92 review)。Lua 側 `has_buffer_option`
+        // と統一。
+        let src = "nnoremap <silent> <buffer> gc :echo 'x'<CR>";
+        let result = scan_source(src, Dialect::Vim);
+        assert!(result.user_maps.is_empty());
+        assert!(result.plug_maps.is_empty());
+    }
+
+    #[test]
+    fn scan_source_skips_vim_buffer_local_plug_map() {
+        // 同じく `<Plug>` 系も `<buffer>` 付きなら plug_maps に入れない。
+        let src = "nnoremap <buffer> <Plug>(InternalOnly) :echo 'x'<CR>";
+        let result = scan_source(src, Dialect::Vim);
+        assert!(result.user_maps.is_empty());
+        assert!(result.plug_maps.is_empty());
+    }
+
+    #[test]
+    fn scan_source_separates_plug_lhs_from_user_maps() {
+        // `<Plug>(...)` LHS は user_maps から除外され、plug_maps へ。
+        // user-typed LHS (`gc`) は user_maps に残る。
         let src = "nnoremap <Plug>(Foo) :echo 'foo'<CR>\nnnoremap gc <Plug>(Bar)";
-        let maps = scan_source(src, Dialect::Vim).user_maps;
+        let result = scan_source(src, Dialect::Vim);
         assert_eq!(
-            maps,
+            result.user_maps,
             vec![UserMap {
                 lhs: "gc".into(),
                 modes: vec!["n".into()]
             }]
         );
+        assert_eq!(result.plug_maps, vec!["<Plug>(Foo)"]);
     }
 
     #[test]
@@ -1026,6 +1089,62 @@ vim.keymap.set("n", "q", "<cmd>close<CR>", {
 })
 "#;
         assert!(scan_source(src, Dialect::Lua).user_maps.is_empty());
+    }
+
+    // ── plug_maps scanning (#88) ─────────────────────────────────────────
+
+    #[test]
+    fn scan_source_collects_vim_plug_maps() {
+        let src = "\
+nnoremap <Plug>(Foo)  :echo 'foo'<CR>
+xnoremap <Plug>(BarVisual) :echo 'visual'<CR>
+nmap <Plug>(NotNoRemap) <Plug>(Foo)
+inoremap gi <Plug>(NotEntry)";
+        let result = scan_source(src, Dialect::Vim);
+        // <Plug>(...) LHS のみ plug_maps に集まる。`gi` は user-entry なので user_maps へ。
+        assert_eq!(
+            result.plug_maps,
+            vec!["<Plug>(Foo)", "<Plug>(BarVisual)", "<Plug>(NotNoRemap)"]
+        );
+        assert_eq!(
+            result.user_maps,
+            vec![UserMap {
+                lhs: "gi".into(),
+                modes: vec!["i".into()]
+            }]
+        );
+    }
+
+    #[test]
+    fn scan_source_collects_lua_plug_maps() {
+        let src = r#"
+vim.keymap.set("n", "<Plug>(LuaFoo)", function() end, {})
+vim.api.nvim_set_keymap("v", "<Plug>(LuaBarVisual)", ":echo 'v'<CR>", {})
+vim.keymap.set("n", "<leader>g", "<Plug>(NotEntry)", {})
+"#;
+        let result = scan_source(src, Dialect::Lua);
+        assert_eq!(
+            result.plug_maps,
+            vec!["<Plug>(LuaFoo)", "<Plug>(LuaBarVisual)"]
+        );
+        assert_eq!(
+            result.user_maps,
+            vec![UserMap {
+                lhs: "<leader>g".into(),
+                modes: vec!["n".into()]
+            }]
+        );
+    }
+
+    #[test]
+    fn scan_source_skips_buffer_local_plug_map() {
+        // buffer-local な `<Plug>` は plugin window 内専用なので拾わない。
+        // (本来 `<Plug>` は global RTP で公開する慣習だが念のため filter)
+        let src = r#"
+vim.keymap.set("n", "<Plug>(InternalOnly)", function() end, { buffer = bufnr })
+"#;
+        let result = scan_source(src, Dialect::Lua);
+        assert!(result.plug_maps.is_empty());
     }
 
     // ── suggest_cmd_triggers_smart (#87) ──────────────────────────

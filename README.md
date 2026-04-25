@@ -255,12 +255,12 @@ same plugin they are OR-ed: **any one** firing loads the plugin.
 
 | Key | Type | Accepts | Description |
 |---|---|---|---|
-| `on_cmd` | `string \| string[]` | `"Foo"`, `["Foo", "Bar"]`, or `"/^Foo/"` (regex) | Load when the user runs `:Foo`. Supports bang, range, count, completion. `/regex/` entries are expanded at `rvpm generate` time against commands rvpm statically scans from the plugin's `plugin/`, `ftplugin/`, and `after/plugin/` files — runtime cost matches exact-name listing, `:Prefix<Tab>` completion stays intact |
+| `on_cmd` | `string \| string[]` | `"Foo"`, `["Foo", "Bar"]`, or `"/^Foo/"` (regex) | Load when the user runs `:Foo`. Supports bang, range, count, completion. `/regex/` entries are expanded at `rvpm generate` time against commands rvpm statically scans from the plugin's `plugin/`, `ftplugin/`, `after/plugin/`, and `lua/` files — runtime cost matches exact-name listing, `:Prefix<Tab>` completion stays intact |
 | `on_ft` | `string \| string[]` | `"rust"` or `["rust", "toml"]` | Load on `FileType`, then re-trigger so `ftplugin/` fires |
-| `on_event` | `string \| string[]` | `"BufReadPre"` or `["BufReadPre", "User LazyDone"]` | Load on Neovim event. `"User Xxx"` shorthand creates a User autocmd with `pattern = "Xxx"` |
+| `on_event` | `string \| string[]` | `"BufReadPre"`, `["BufReadPre", "User LazyDone"]`, or `"/^User Foo/"` (regex) | Load on Neovim event. `"User Xxx"` shorthand creates a User autocmd with `pattern = "Xxx"`. `/regex/` entries match against `"User <name>"` synthesized strings using the plugin's statically-fired User events (`nvim_exec_autocmds("User", { pattern = ... })` literals). Standard events (`BufRead` etc) are pass-through only |
 | `on_path` | `string \| string[]` | `"*.rs"` or `["*.rs", "Cargo.toml"]` | Load on `BufRead` / `BufNewFile` matching the glob pattern |
 | `on_source` | `string \| string[]` | `"snacks.nvim"` or `["snacks.nvim", "nui.nvim"]` | Load when the named plugin fires its `rvpm_loaded_<name>` User autocmd |
-| `on_map` | `string \| MapSpec \| array` | see below | Load on keypress. Simple `"<leader>f"` or table form |
+| `on_map` | `string \| MapSpec \| array` | see below | Load on keypress. Simple `"<leader>f"` or table form. `lhs` may be a `/regex/` that expands against the plugin's `<Plug>(...)` mappings — the original `mode` / `desc` are inherited by every expanded entry |
 
 **`on_map` formats:**
 
@@ -276,6 +276,9 @@ on_map = [
   "<leader>f",
   { lhs = "<leader>v", mode = ["n", "x"] },
   { lhs = "<leader>g", mode = "n", desc = "Grep files" },
+  # Regex form — expands against the plugin's <Plug>(...) mappings.
+  # Mode/desc are inherited by every expanded entry.
+  { lhs = "/^<Plug>\\(Chezmoi/", mode = ["n"] },
 ]
 ```
 
