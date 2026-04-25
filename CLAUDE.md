@@ -122,6 +122,12 @@ url  = "nvim-telescope/telescope.nvim"
 depends = ["snacks.nvim"]
 # rev: ブランチ / タグ / コミットハッシュ
 # rev = "v0.1.0"
+# build: shell コマンド (sync / update 完了後に実行、5 分 timeout)
+# build = "cargo build --release"
+# build_lua: nvim --headless -u NONE -l で実行する Lua スニペット (#97)
+# rtp に self + transitive depends を append、stdpath() は real env なので
+# blink.cmp 等の native lib install もちゃんと user の data dir に入る
+# build_lua = "require('blink.cmp').build():wait(60000)"
 
 # 遅延読み込みトリガー (いずれか 1 つでも書けば lazy は自動で true に推論される)
 on_cmd    = ["Telescope", "/^Chezmoi/"]      # exact 名 or /regex/ (rvpm generate で展開)

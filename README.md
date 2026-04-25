@@ -244,7 +244,8 @@ what you're doing.
 | `rev` | `string` | HEAD | Branch, tag, or commit hash to check out after clone/pull |
 | `depends` | `string[]` | none | Plugins that must be loaded before this one. Accepts `display_name` (e.g. `"snacks.nvim"`) or `url` (e.g. `"folke/snacks.nvim"`). Eager → lazy dep auto-promotes the dep to eager (with a warning); lazy → lazy dep loads dep first inside the trigger callback |
 | `cond` | `string` | none | Lua expression. When set, the plugin's loader code is wrapped in `if <cond> then ... end` |
-| `build` | `string` | none | Shell command to run after clone (not yet implemented) |
+| `build` | `string` | none | Shell command to run after clone / update. Vim-style `:Cmd` is invoked via `nvim --headless` with the plugin and its transitive depends on `runtimepath`. 5-minute timeout. Failures are reported in the sync summary but don't stop other plugins (resilience) |
+| `build_lua` | `string` | none | Lua snippet to run after clone / update, **after** the shell `build` if both are set. Invoked via `nvim --headless -u NONE -l <tmp.lua>` with the plugin and its transitive depends appended to `runtimepath`. `vim.fn.stdpath("data")` etc. resolve to the user's real data dir (no `--clean`), so plugins like `blink.cmp` that install native libs into `{stdpath('data')}/site/lib/` work as expected. Both `build_lua = "require('blink.cmp').build():wait(60000)"` (statement form) and `build_lua = "function() require('blink.cmp').build():wait(60000) end"` (lazy.nvim function form, auto-unwrapped) are accepted |
 | `dev` | `bool` | `false` | When `true`, `sync` and `update` skip this plugin entirely (no clone/fetch/reset). Use for local development |
 
 </details>

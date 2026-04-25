@@ -559,15 +559,44 @@ fn resolve_plugin_dst(plugin: &crate::config::Plugin, cache_root: &Path) -> Path
     }
 }
 
-/// プラグインの build コマンドを実行する (依存 rtp 解決込み)。
-/// build が未設定なら None を返す。失敗時はエラーメッセージを返す。
+/// プラグインの build ステップを実行する。`build` (shell) と `build_lua` の両方が
+/// 設定されていれば、shell → lua の順に実行する。どちらか一方でも失敗したら
+/// 即座にエラー文字列を返す。両方未設定なら `None`。
 async fn execute_build_command(
     plugin: &crate::config::Plugin,
     dst_path: &Path,
     config: &crate::config::Config,
     cache_root: &Path,
 ) -> Option<String> {
-    let build_cmd = plugin.build.as_ref()?;
+    // 早期 return: build step が一つも無ければ rtp 計算自体スキップ (Gemini #99
+    // 指摘の short-circuit。大きな depends グラフでの無駄走査を避ける)。
+    if plugin.build.is_none() && plugin.build_lua.is_none() {
+        return None;
+    }
+
+    let rtp_dirs = collect_build_rtp(plugin, dst_path, config, cache_root);
+
+    // 1. shell コマンド (従来挙動)。失敗時は即 return。
+    if let Some(err) = run_build_shell(plugin, dst_path, &rtp_dirs).await {
+        return Some(err);
+    }
+
+    // 2. Lua callable (#97)。例: blink.cmp v2 の `require('blink.cmp').build():wait(...)`。
+    if let Some(err) = run_build_lua(plugin, dst_path, &rtp_dirs).await {
+        return Some(err);
+    }
+
+    None
+}
+
+/// build 実行時の rtp 候補一覧 (対象プラグイン + transitive depends パス)。
+/// 既存の shell build もこれを使ってきたので、Lua build 側も同じ rtp で揃える。
+fn collect_build_rtp(
+    plugin: &crate::config::Plugin,
+    dst_path: &Path,
+    config: &crate::config::Config,
+    cache_root: &Path,
+) -> Vec<PathBuf> {
     let mut rtp_dirs = vec![dst_path.to_path_buf()];
     let mut visited = std::collections::HashSet::new();
     let mut stack: Vec<String> = plugin.depends.iter().flatten().cloned().collect();
@@ -587,7 +616,17 @@ async fn execute_build_command(
             }
         }
     }
-    let (prog, args) = parse_build_command(build_cmd, &rtp_dirs);
+    rtp_dirs
+}
+
+/// shell `build` を実行する。未設定 / 成功なら `None`、失敗なら error message。
+async fn run_build_shell(
+    plugin: &crate::config::Plugin,
+    dst_path: &Path,
+    rtp_dirs: &[PathBuf],
+) -> Option<String> {
+    let build_cmd = plugin.build.as_ref()?;
+    let (prog, args) = parse_build_command(build_cmd, rtp_dirs);
     let build_timeout = std::time::Duration::from_secs(300); // 5 minutes
     let mut child = match tokio::process::Command::new(&prog)
         .args(&args)
@@ -611,6 +650,138 @@ async fn execute_build_command(
             Some(format!("build timed out ({}s)", build_timeout.as_secs()))
         }
         _ => None,
+    }
+}
+
+/// `build_lua` に **lazy.nvim 流の `function() ... end` で囲まれた匿名関数式** が
+/// 渡された場合、その body だけを取り出して返す。
+///
+/// なぜ必要か: rvpm は `build_lua` の文字列を **statement context の Lua スニペット**
+/// として exec する (`-l <tmp.lua>`)。素の `function() ... end` は statement では
+/// 「function NAME() ... end」と解釈されるので名前必須 (E5112) になる。
+/// user は lazy.nvim の `build = function() require(...).build():wait(...) end` から
+/// 流用しがちなので、その形を検出して body へ unwrap する。
+///
+/// **対応する記述**:
+/// - 1 行 / 複数行どちらも (regex `(?s)` で `.` が改行マッチ)
+/// - `function()` 直後・`end` 直前の任意の空白/改行
+/// - `end` の後ろの trailing line コメント (`-- ...`) と空白
+/// - 入れ子の `function() ... end` は body 内に **そのまま保持** (lazy quantifier
+///   `.*?` + 末尾 anchor `$` で「最後の一番外の `end`」を拾うため)
+///
+/// **マッチしない**:
+/// - `function name() ... end` (named function 宣言は valid statement なので unwrap 不要)
+/// - 末尾に statement や `;` が続くケース (lazy.nvim 流ではない)
+fn unwrap_anonymous_lua_function(code: &str) -> Option<String> {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // (?s): . が \n にマッチする dot-all モード。
+        // (.*?): lazy match で末尾 anchor `$` と組み合わせて「最後の `end`」を拾う。
+        // 末尾の trailing line コメント (`-- ...`) は optional。
+        Regex::new(r"(?s)^\s*function\s*\(\s*\)\s*(.*?)\s*end\s*(?:--[^\n\r]*)?\s*$").unwrap()
+    });
+    re.captures(code)
+        .map(|c| c.get(1).map_or("", |m| m.as_str()).trim().to_string())
+}
+
+/// Lua callable `build_lua` を実行する (#97)。
+///
+/// `nvim --headless -u NONE -l <tmp.lua>` で起動し、rtp に対象プラグイン +
+/// transitive deps を append した上で user の Lua スニペットを呼ぶ。
+///
+/// `-u NONE` で user init.lua はスキップするが、`vim.fn.stdpath("data")` 等の
+/// real env は維持されるので blink.cmp v2 のように `~/.local/share/nvim/site/lib/`
+/// 等にファイルを置きたいケースでも期待通りの場所に届く。
+///
+/// nvim が PATH に無ければ warn + skip (resilience、helptags と同じ方針)。
+async fn run_build_lua(
+    plugin: &crate::config::Plugin,
+    dst_path: &Path,
+    rtp_dirs: &[PathBuf],
+) -> Option<String> {
+    let raw_lua_code = plugin.build_lua.as_ref()?;
+
+    // user は lazy.nvim の `build = function() ... end` 流れで
+    // `build_lua = "function() ... end"` と書きがちだが、Lua の statement context
+    // で `function()` (匿名) は名前必須なので E5112 エラーになる。
+    // → `function() X end` の wrapping を検出したら body だけを残す。
+    let lua_code = unwrap_anonymous_lua_function(raw_lua_code)
+        .map(std::borrow::Cow::Owned)
+        .unwrap_or(std::borrow::Cow::Borrowed(raw_lua_code.as_str()));
+
+    // rtp_dirs を `vim.opt.rtp:append(...)` の連続で前置する。生のパスを Lua
+    // 文字列リテラルに埋め込むので、backslash は `/` に正規化、引用符は escape。
+    let mut script = String::new();
+    for dir in rtp_dirs {
+        let p = dir
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('"', "\\\"");
+        script.push_str(&format!("vim.opt.rtp:append(\"{p}\")\n"));
+    }
+    script.push_str(&lua_code);
+    script.push('\n');
+
+    // tempfile crate に temp ファイル管理を委ねる (Gemini #99 指摘): manual な
+    // SystemTime + process::id 組立ては、process が中断された場合にゴミが残る。
+    // `NamedTempFile` は drop で自動削除 + プラットフォームに合った安全な命名を行う。
+    let tmp_file = match tempfile::Builder::new()
+        .prefix("rvpm-build-")
+        .suffix(".lua")
+        .tempfile()
+    {
+        Ok(f) => f,
+        Err(e) => return Some(format!("build_lua: failed to create temp script: {e}")),
+    };
+    let tmp_path = tmp_file.path().to_path_buf();
+    // async 経路なので blocking な std::fs::write は tokio::fs::write に置換
+    // (Gemini #99 review): executor を塞いで他プラグインの並列 build を妨げないように。
+    if let Err(e) = tokio::fs::write(&tmp_path, &script).await {
+        return Some(format!("build_lua: failed to write temp script: {e}"));
+    }
+
+    let build_timeout = std::time::Duration::from_secs(300);
+    let child = match tokio::process::Command::new("nvim")
+        .args(["--headless", "-u", "NONE", "-l"])
+        .arg(&tmp_path)
+        .current_dir(dst_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // tokio Command の default は `kill_on_drop = false` なので、timeout 時に
+        // future が drop されても child の nvim は走り続けてしまう (Gemini High
+        // 指摘の resource leak)。`true` で drop = kill 連動させる。
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Some(format!(
+                "build_lua: failed to spawn `nvim --headless` ({e}); install nvim or remove `build_lua` from this plugin"
+            ));
+        }
+    };
+
+    let wait_result = tokio::time::timeout(build_timeout, child.wait_with_output()).await;
+    // tmp_file は scope を抜ける時 drop で自動削除されるので明示削除は不要。
+    drop(tmp_file);
+
+    match wait_result {
+        Ok(Ok(out)) if !out.status.success() => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            Some(format!(
+                "build_lua failed (exit code: {:?}): {}",
+                out.status.code(),
+                stderr.trim()
+            ))
+        }
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => Some(format!("build_lua error: {e}")),
+        Err(_) => Some(format!(
+            "build_lua timed out ({}s)",
+            build_timeout.as_secs()
+        )),
     }
 }
 
@@ -968,16 +1139,21 @@ async fn run_sync(
                     // 200+ プラグイン構成では体感で遅い。`--rebuild` で従来挙動 (常に
                     // 全 build プラグインで実行) に戻せるので、`:TSUpdate` 等を強制
                     // 走らせたいときの逃げ道は確保。
-                    let should_build =
-                        plugin.build.is_some() && (force_rebuild || change.is_some());
+                    let has_any_build = plugin.build.is_some() || plugin.build_lua.is_some();
+                    let should_build = has_any_build && (force_rebuild || change.is_some());
                     let build_warn = if should_build {
+                        // status 表示は shell コマンドを優先 (具体的に何が走るか
+                        // user が分かるから)。shell が無く lua のみなら "(lua build)"
+                        // で済ます — Lua スニペット全文は冗長なので。
+                        let label = match plugin.build.as_deref() {
+                            Some(cmd) if plugin.build_lua.is_some() => format!("{cmd} + (lua)"),
+                            Some(cmd) => cmd.to_string(),
+                            None => "(lua build)".to_string(),
+                        };
                         let _ = tx
                             .send((
                                 plugin.url.clone(),
-                                PluginStatus::Syncing(format!(
-                                    "Building: {}",
-                                    plugin.build.as_deref().unwrap_or_default()
-                                )),
+                                PluginStatus::Syncing(format!("Building: {label}")),
                             ))
                             .await;
                         execute_build_command(&plugin, &dst_path, &config_for_build, &cache_root)
@@ -6929,6 +7105,194 @@ lazy = false"#;
         assert!(rtp_arg.contains("/path/to/plugin"), "self: {}", rtp_arg);
         assert!(rtp_arg.contains("/path/to/dep1"), "dep1: {}", rtp_arg);
         assert!(rtp_arg.contains("/path/to/dep2"), "dep2: {}", rtp_arg);
+    }
+
+    // ─── build_lua / collect_build_rtp (#97) ────────────────────────────
+
+    #[test]
+    fn collect_build_rtp_includes_self_first_then_transitive_deps() {
+        // A depends [B], B depends [C]. rtp should be [A, B, C]. (#97)
+        let plugin_a = Plugin {
+            url: "owner/a".to_string(),
+            depends: Some(vec!["b".to_string()]),
+            ..Default::default()
+        };
+        let plugin_b = Plugin {
+            name: Some("b".to_string()),
+            url: "owner/b".to_string(),
+            depends: Some(vec!["c".to_string()]),
+            ..Default::default()
+        };
+        let plugin_c = Plugin {
+            name: Some("c".to_string()),
+            url: "owner/c".to_string(),
+            ..Default::default()
+        };
+        let config = Config {
+            vars: None,
+            options: Options::default(),
+            plugins: vec![plugin_a.clone(), plugin_b, plugin_c],
+        };
+        let cache_root = PathBuf::from("/cache");
+        let rtp = collect_build_rtp(
+            &plugin_a,
+            &PathBuf::from("/cache/plugins/repos/owner/a"),
+            &config,
+            &cache_root,
+        );
+        // self が先頭
+        assert_eq!(rtp[0], PathBuf::from("/cache/plugins/repos/owner/a"));
+        // transitive deps が含まれる (順序は DFS なので厳密には保証しないが、
+        // 全部存在することを確認)
+        let rtp_strings: Vec<String> = rtp.iter().map(|p| p.display().to_string()).collect();
+        assert!(
+            rtp_strings.iter().any(|s| s.contains("owner/b")),
+            "B in rtp: {rtp_strings:?}"
+        );
+        assert!(
+            rtp_strings.iter().any(|s| s.contains("owner/c")),
+            "C in rtp: {rtp_strings:?}"
+        );
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_strips_lazy_nvim_style_wrapper() {
+        // lazy.nvim style — user が `build = function() ... end` から copy
+        let r = unwrap_anonymous_lua_function(
+            "function() require('blink.cmp').build():wait(60000) end",
+        );
+        assert_eq!(
+            r.as_deref(),
+            Some("require('blink.cmp').build():wait(60000)"),
+            "function() body end → body extraction"
+        );
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_handles_space_after_function_keyword() {
+        let r = unwrap_anonymous_lua_function("function ()  vim.cmd('TSUpdate')  end");
+        assert_eq!(r.as_deref(), Some("vim.cmd('TSUpdate')"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_returns_none_for_plain_statement() {
+        // 既に statement なら触らない (None で「unwrap 不要」と通知)。
+        let r = unwrap_anonymous_lua_function("require('x').build():wait(60000)");
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_returns_none_for_named_function_decl() {
+        // `function name() ... end` は valid な statement (function 宣言) なので
+        // 触る理由が無い。
+        let r = unwrap_anonymous_lua_function("function build_step() require('x') end");
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_does_not_split_identifier_ending_in_end() {
+        // `local end_var = 1 end` のように identifier が "end" で終わるケースで
+        // strip_suffix が誤動作しないこと。strip_suffix は exact suffix match
+        // なので、"end_var" の "end" 部分は拾わない (前後の文字を見るので)。
+        let r = unwrap_anonymous_lua_function("function() local end_var = 1 end");
+        assert_eq!(r.as_deref(), Some("local end_var = 1"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_preserves_inner_function_blocks() {
+        // 入れ子の `function() ... end` は inner 側を保持する (lazy `.*?` + 末尾
+        // anchor で「最後の一番外の end」だけを落とす)。
+        let r =
+            unwrap_anonymous_lua_function("function() local f = function() return 1 end; f() end");
+        assert_eq!(r.as_deref(), Some("local f = function() return 1 end; f()"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_handles_multiline_body() {
+        // 改行を含む typical な複数行 build_lua。
+        let code = "function()\n  local cmp = require('blink.cmp')\n  cmp.build():wait(60000)\n  vim.print('done')\nend";
+        let r = unwrap_anonymous_lua_function(code);
+        let body = r.expect("multiline function() should unwrap");
+        assert!(body.contains("local cmp = require('blink.cmp')"));
+        assert!(body.contains("cmp.build():wait(60000)"));
+        assert!(body.contains("vim.print('done')"));
+        assert!(!body.contains("function()"));
+        // 末尾に余分な end が残ってないこと
+        assert!(!body.ends_with("end"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_handles_complex_multiline_with_nested_function() {
+        // 複雑な複数行: ローカル関数定義入り。inner の function() ... end は保持。
+        let code = "function()\n  local helper = function(x)\n    return x * 2\n  end\n  print(helper(21))\nend";
+        let r = unwrap_anonymous_lua_function(code);
+        let body = r.expect("complex multiline should unwrap outer only");
+        assert!(body.contains("local helper = function(x)"));
+        assert!(body.contains("return x * 2"));
+        assert!(body.contains("print(helper(21))"));
+        // inner の helper 定義 end が残ってる
+        assert!(
+            body.matches("end").count() >= 1,
+            "inner helper end should remain, body: {body}"
+        );
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_tolerates_trailing_line_comment() {
+        // `end` の後に行コメントが付くケース (regex で末尾 `(?:--[^\n]*)?` 許容)。
+        let r = unwrap_anonymous_lua_function("function() vim.print('hi') end -- post-build hook");
+        assert_eq!(r.as_deref(), Some("vim.print('hi')"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_tolerates_whitespace_inside_parens() {
+        // `function ( )` のような余分な空白も許容。
+        let r = unwrap_anonymous_lua_function("function(  )  print('x')  end");
+        assert_eq!(r.as_deref(), Some("print('x')"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_returns_none_when_function_takes_args() {
+        // `function(a, b)` のように引数があるものは触らない (匿名 zero-arity 専用)。
+        let r = unwrap_anonymous_lua_function("function(a, b) return a + b end");
+        assert!(r.is_none(), "function with args should not be unwrapped");
+    }
+
+    #[tokio::test]
+    async fn run_build_lua_returns_none_when_field_unset() {
+        let plugin = Plugin {
+            url: "x/y".to_string(),
+            ..Default::default()
+        };
+        let result = run_build_lua(&plugin, &PathBuf::from("/tmp"), &[]).await;
+        assert!(
+            result.is_none(),
+            "no build_lua field → no-op, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_build_lua_reports_error_when_nvim_missing() {
+        // nvim が PATH に無くても rvpm はクラッシュさせず、明示的なエラー文字列を返す。
+        // この test は nvim がインストールされてる環境ではスキップされる
+        // (nvim コマンドが本当に成功してしまうため)。CI / 開発機の typical 構成では
+        // nvim あり、ローカル run_build_lua の no-build-lua path を検証する別 test
+        // (run_build_lua_returns_none_when_field_unset) で十分。
+        if which::which("nvim").is_ok() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let plugin = Plugin {
+            url: "x/y".to_string(),
+            build_lua: Some("vim.print('hi')".to_string()),
+            ..Default::default()
+        };
+        let result = run_build_lua(&plugin, tmp.path(), &[tmp.path().to_path_buf()]).await;
+        let err = result.expect("missing nvim should yield an error");
+        assert!(
+            err.contains("failed to spawn") || err.contains("nvim"),
+            "error should mention nvim: {err}"
+        );
     }
 
     #[test]

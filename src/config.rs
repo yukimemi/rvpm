@@ -256,6 +256,18 @@ pub struct Plugin {
     pub on_source: Option<Vec<String>>,
     pub depends: Option<Vec<String>>,
     pub build: Option<String>,
+    /// Lua callable build step (#97). 例: blink.cmp v2 の native fuzzy 用
+    /// `require('blink.cmp').build():wait(60000)`。
+    ///
+    /// `build` (shell コマンド) と併用可能 — 両方セットされていれば shell を
+    /// 先に走らせてから Lua を実行する。
+    ///
+    /// 実行は `nvim --headless -u NONE -l <tmp.lua>` で行い、rtp に **対象
+    /// プラグイン + transitive depends** を append してから user の Lua を呼ぶ。
+    /// `-u NONE` で user init.lua を読まないが、`stdpath("data")` 等の real env
+    /// は維持されるので `~/.local/share/nvim/site/lib/...` 等への install も
+    /// 期待どおりの場所に届く。
+    pub build_lua: Option<String>,
     pub rev: Option<String>,
     pub cond: Option<String>,
     /// dev = true のプラグインは sync/update をスキップする。
