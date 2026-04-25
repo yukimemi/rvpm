@@ -522,20 +522,47 @@ fn ensure_all_branches_refspec(dst: &Path) -> Result<()> {
 }
 
 /// gix で特定の rev に checkout。branch の場合は branch を維持。
+///
+/// rev 解決順 (git CLI の `git checkout <rev>` と挙動を揃える):
+///   1. `rev_parse_single(rev)` — 直接 ref / tag / SHA を試す
+///   2. (1) が失敗で rev が non-default branch のとき: `refs/remotes/origin/<rev>` を
+///      明示的に試して、ローカル branch を作る (git CLI の auto-track 相当)
+///
+/// 旧実装は (1) のみだったので `rev = "v1"` 等の非デフォルト branch は、`.git/config`
+/// が全 branch refspec を持ち remote tracking ref も存在していても "rev not found"
+/// になっていた (#user 報告)。
 fn gix_checkout(dst: &Path, rev: &str) -> Result<()> {
     let repo = gix::open(dst)?;
-    let target = repo
-        .rev_parse_single(rev)
-        .map_err(|_| anyhow::anyhow!("rev '{}' not found", rev))?;
-    let commit_id = target.detach();
 
-    // rev が local branch を指す場合は symbolic HEAD を設定
+    // (1) 直接解決
+    let direct = repo.rev_parse_single(rev);
+    let (commit_id, source) = match direct {
+        Ok(id) => (id.detach(), DirectOrRemote::Direct),
+        Err(_) => {
+            // (2) refs/remotes/origin/<rev> を試す (= remote tracking branch)
+            let remote_ref = format!("refs/remotes/origin/{rev}");
+            let remote_id = repo
+                .find_reference(&remote_ref)
+                .ok()
+                .and_then(|mut r| r.peel_to_id().ok())
+                .ok_or_else(|| anyhow::anyhow!("rev '{}' not found", rev))?;
+            (remote_id.detach(), DirectOrRemote::FromRemote)
+        }
+    };
+
+    // rev が local branch (refs/heads/<rev>) を指す or 上記 (2) で remote から
+    // 拾ったケースのどちらでも、symbolic HEAD で local branch を立てる。
+    // (2) のとき local branch がまだ無ければ作る (= git CLI の `checkout <branch>`
+    // で自動 tracking branch を作るのと同じ振る舞い)。
     let branch_ref = format!("refs/heads/{}", rev);
-    if repo.find_reference(&branch_ref).is_ok() {
-        // HEAD を symbolic ref にする (直接ファイル書き込み)
+    let local_branch_exists = repo.find_reference(&branch_ref).is_ok();
+    let should_set_branch = local_branch_exists
+        || matches!(source, DirectOrRemote::FromRemote)
+        || matches!(source, DirectOrRemote::Direct) && repo.find_reference(&branch_ref).is_ok();
+
+    if should_set_branch {
         let head_path = repo.git_dir().join("HEAD");
         std::fs::write(&head_path, format!("ref: {}\n", branch_ref))?;
-        // branch ref を更新
         repo.reference(
             branch_ref.as_str(),
             commit_id,
@@ -554,6 +581,15 @@ fn gix_checkout(dst: &Path, rev: &str) -> Result<()> {
 
     gix_checkout_head(&repo)?;
     Ok(())
+}
+
+/// `gix_checkout` の rev 解決経路 (debug / test 用)。
+#[derive(Debug, Clone, Copy)]
+enum DirectOrRemote {
+    /// `rev_parse_single` で直接解決できた (local branch / tag / SHA)。
+    Direct,
+    /// `refs/remotes/origin/<rev>` から拾った (= remote tracking branch fallback)。
+    FromRemote,
 }
 
 /// fetch 後に working tree を remote の最新に更新 (git reset --hard 相当)。
