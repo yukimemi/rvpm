@@ -2240,6 +2240,20 @@ async fn run_list(no_tui: bool) -> Result<bool> {
                         reload!();
                     }
                 }
+                crossterm::event::KeyCode::Char('t') => {
+                    if let Some(url) = tui_state.selected_url() {
+                        if url.is_empty() {
+                            // sentinel 行は per-plugin tune の対象外
+                            continue;
+                        }
+                        leave_tui(&mut terminal)?;
+                        // ai_override=None で options.ai に従う。Off なら run_tune が
+                        // 案内 error を出して return するので TUI 側で握りつぶす必要なし。
+                        let _ = run_tune(Some(url), None).await;
+                        wait_for_keypress("\nPress any key to return to list...")?;
+                        reload!();
+                    }
+                }
                 crossterm::event::KeyCode::Char('S') => {
                     leave_tui(&mut terminal)?;
                     let _ = run_sync(false, false, false, None, false, false).await;

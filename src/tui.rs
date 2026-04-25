@@ -878,6 +878,8 @@ impl TuiState {
                 Span::styled(":edit ", Style::default().fg(Color::DarkGray)),
                 Span::styled("s", Style::default().fg(Color::Cyan)),
                 Span::styled(":set ", Style::default().fg(Color::DarkGray)),
+                Span::styled("t", Style::default().fg(Color::Cyan)),
+                Span::styled(":tune ", Style::default().fg(Color::DarkGray)),
                 Span::styled("S", Style::default().fg(Color::Cyan)),
                 Span::styled(":sync ", Style::default().fg(Color::DarkGray)),
                 Span::styled("u/U", Style::default().fg(Color::Cyan)),
@@ -948,6 +950,13 @@ impl TuiState {
                 Line::from(vec![
                     Span::styled("  s           ", Style::default().fg(Color::Cyan)),
                     Span::styled("Set plugin options", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  t           ", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        "Tune (AI refine selected)",
+                        Style::default().fg(Color::White),
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled("  S           ", Style::default().fg(Color::Cyan)),
