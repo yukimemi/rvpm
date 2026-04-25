@@ -736,7 +736,9 @@ async fn run_build_lua(
         Err(e) => return Some(format!("build_lua: failed to create temp script: {e}")),
     };
     let tmp_path = tmp_file.path().to_path_buf();
-    if let Err(e) = std::fs::write(&tmp_path, &script) {
+    // async 経路なので blocking な std::fs::write は tokio::fs::write に置換
+    // (Gemini #99 review): executor を塞いで他プラグインの並列 build を妨げないように。
+    if let Err(e) = tokio::fs::write(&tmp_path, &script).await {
         return Some(format!("build_lua: failed to write temp script: {e}"));
     }
 
