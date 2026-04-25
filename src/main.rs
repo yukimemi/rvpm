@@ -2287,17 +2287,24 @@ fn decide_add_lazy_apply(
     }
 }
 
-/// AI mode 用 (#93): AI が返した `[[plugins]]` ブロック (1 entry のみ) で、
-/// stub `[[plugins]]` 行 (url のみ書き込み済み) を全置換する。
-/// `url` は `stored_url` に強制リセット (AI が url_style を勘違いしても拾える)。
+/// AI mode 用 (#93): AI が返した `[[plugins]]` ブロック (1 entry のみ) を、既存
+/// stub entry に **in-place マージ** する。
+///
+/// 設計ポイント:
+///   - **stub entry の文書中の位置 / 装飾 (改行・空白) を保つ** — `remove + insert`
+///     方式は toml_edit が新 entry を `[vars]` の直後など想定外の位置にレンダリング
+///     してしまう (user 報告: 既存 [[plugins]] の末尾ではなく `[vars]` 直後に配置される)。
+///   - **user の明示 CLI flag を尊重** — `preserved_keys` に挙げたキーは AI 提案で
+///     上書きしない (`rvpm add owner/repo --rev v1.0 --ai claude` で `--rev` を残す)。
+///     `url` は `stored_url` に強制リセット (canonical 化)。
 fn replace_plugin_entry_with_ai_toml(
     doc: &mut DocumentMut,
     stored_url: &str,
     proposal_toml: &str,
+    preserved_keys: &[&str],
 ) -> anyhow::Result<()> {
     use anyhow::{Context, anyhow};
 
-    // 提案 TOML を仮 doc としてパースして `[[plugins]]` 配列を取り出す。
     let proposal_doc: DocumentMut = proposal_toml
         .parse::<DocumentMut>()
         .context("AI proposal TOML failed to parse")?;
@@ -2311,11 +2318,9 @@ fn replace_plugin_entry_with_ai_toml(
             proposal_plugins.len()
         ));
     }
-    let mut new_entry = proposal_plugins.get(0).unwrap().clone();
-    // url は config 側の `stored_url` に揃える (AI が full/short を取り違える保険)
-    new_entry["url"] = value(stored_url);
+    let new_entry = proposal_plugins.get(0).unwrap();
 
-    // 既存 doc の plugins 配列から url 一致を探して in-place 差し替え。
+    // 既存 doc の plugins 配列から url 一致を探して in-place マージ。
     let plugins = doc
         .get_mut("plugins")
         .and_then(|p| p.as_array_of_tables_mut())
@@ -2326,12 +2331,25 @@ fn replace_plugin_entry_with_ai_toml(
             .and_then(|t| t.get("url"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if existing_url == stored_url {
-            // toml_edit には Vec.replace 相当が無いので remove + insert で置換。
-            plugins.remove(i);
-            plugins.insert(i, new_entry);
-            return Ok(());
+        if existing_url != stored_url {
+            continue;
         }
+        let existing = plugins.get_mut(i).unwrap();
+
+        // AI 提案の各キーを既存 entry に書き込む。
+        // ただし `preserved_keys` (user が CLI flag で明示したもの) は skip。
+        // url は最後に強制セット。
+        for (key, value_item) in new_entry.iter() {
+            if key == "url" {
+                continue;
+            }
+            if preserved_keys.contains(&key) {
+                continue;
+            }
+            existing[key] = value_item.clone();
+        }
+        existing["url"] = value(stored_url);
+        return Ok(());
     }
     Err(anyhow!(
         "could not find stub [[plugins]] entry with url=`{stored_url}` in config.toml"
@@ -2452,6 +2470,35 @@ async fn run_add(
     }
     // 書き込み URL は options.url_style に従って整形 (GitHub 以外はそのまま)。
     let stored_url = format_plugin_url(&repo, url_style);
+
+    // user が明示的に CLI flag で指定したキー一覧 — AI mode 適用時はこれを尊重して
+    // 上書きしない (#95 review CodeRabbit Major)。`url` は常に保護 (canonical 化される)。
+    let preserved_keys: Vec<&'static str> = {
+        let mut k = vec!["url"];
+        if name.is_some() {
+            k.push("name");
+        }
+        if lazy.is_some() {
+            k.push("lazy");
+        }
+        if rev.is_some() {
+            k.push("rev");
+        }
+        if on_cmd.is_some() {
+            k.push("on_cmd");
+        }
+        if on_ft.is_some() {
+            k.push("on_ft");
+        }
+        if on_map.is_some() {
+            k.push("on_map");
+        }
+        if on_event.is_some() {
+            k.push("on_event");
+        }
+        k
+    };
+
     let mut new_plugin = table();
     new_plugin["url"] = value(&stored_url);
     if let Some(n) = name {
@@ -2562,10 +2609,12 @@ async fn run_add(
                         crate::config::AiBackend::Off => unreachable!(),
                     };
                     let cfg_root = resolve_config_root(config_data.options.config_root.as_deref());
+                    let plugin_cfg_dir = resolve_plugin_config_dir(&cfg_root, &plugin);
                     match crate::ai::run_ai_add(
                         backend,
                         &stored_url,
                         &dst_path,
+                        &plugin_cfg_dir,
                         &cfg_root,
                         &config_path,
                         &config_data.options.ai_language,
@@ -2582,6 +2631,7 @@ async fn run_add(
                                         &mut doc_patch,
                                         &stored_url,
                                         &prop.plugin_entry_toml,
+                                        &preserved_keys,
                                     ) {
                                         eprintln!(
                                             "\u{26a0} failed to apply AI proposal: {e}. Stub entry remains."
@@ -5447,6 +5497,118 @@ url = "owner/repo"
         patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
         let out = doc.to_string();
         assert!(out.contains("ScannedFoo"));
+    }
+
+    // ─── replace_plugin_entry_with_ai_toml (#95) ─────────────────────────
+
+    #[test]
+    fn replace_plugin_entry_with_ai_toml_preserves_position_among_other_entries() {
+        // [vars] や既存 [[plugins]] の中に stub が並んでいるとき、in-place マージが
+        // entry の位置を維持することを確認 (user 報告: AI 提案が `[vars]` 直後に
+        // 飛んで配置される現象の回帰 test)。
+        let initial = r#"[vars]
+nvim_rc = "~/.config/nvim/rc"
+
+[[plugins]]
+url = "first/plugin"
+on_cmd = ["First"]
+
+[[plugins]]
+url = "second/stub"
+
+[[plugins]]
+url = "third/plugin"
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let proposal = r#"[[plugins]]
+url = "second/stub"
+on_event = ["BufReadPre"]
+"#;
+        replace_plugin_entry_with_ai_toml(&mut doc, "second/stub", proposal, &[]).unwrap();
+        let out = doc.to_string();
+        // first/plugin → second/stub → third/plugin の順序が維持される
+        let first_pos = out.find("first/plugin").unwrap();
+        let second_pos = out.find("second/stub").unwrap();
+        let third_pos = out.find("third/plugin").unwrap();
+        assert!(first_pos < second_pos);
+        assert!(second_pos < third_pos);
+        assert!(out.contains(r#"on_event = ["BufReadPre"]"#));
+    }
+
+    #[test]
+    fn replace_plugin_entry_with_ai_toml_preserves_user_specified_keys() {
+        // user の `--rev` / `--on-cmd` が既に stub に書かれている場合、AI 提案で
+        // 上書きしないことを確認 (CodeRabbit Major #95)。
+        let initial = r#"[[plugins]]
+url = "owner/repo"
+rev = "stable"
+on_cmd = ["ManualCmd"]
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let proposal = r#"[[plugins]]
+url = "owner/repo"
+rev = "main"
+on_cmd = ["AICmd"]
+on_map = ["<leader>x"]
+"#;
+        // user が --rev と --on-cmd を明示したシナリオ
+        let preserved = ["url", "rev", "on_cmd"];
+        replace_plugin_entry_with_ai_toml(&mut doc, "owner/repo", proposal, &preserved).unwrap();
+        let out = doc.to_string();
+        // user の rev / on_cmd が残る
+        assert!(
+            out.contains(r#"rev = "stable""#),
+            "user --rev must be preserved:\n{out}"
+        );
+        assert!(
+            out.contains(r#"on_cmd = ["ManualCmd"]"#),
+            "user --on-cmd must be preserved:\n{out}"
+        );
+        // AI が新規に追加した on_map は反映される
+        assert!(
+            out.contains("on_map"),
+            "AI-only field must be added:\n{out}"
+        );
+        // url は stored_url で正規化される
+        assert!(out.contains(r#"url = "owner/repo""#));
+    }
+
+    #[test]
+    fn replace_plugin_entry_with_ai_toml_writes_ai_keys_when_no_preservation() {
+        // preserved_keys が空 (user が CLI flag を出してない) なら AI 提案が全反映。
+        let initial = r#"[[plugins]]
+url = "owner/repo"
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let proposal = r#"[[plugins]]
+url = "different/url"
+on_cmd = ["AICmd"]
+"#;
+        replace_plugin_entry_with_ai_toml(&mut doc, "owner/repo", proposal, &[]).unwrap();
+        let out = doc.to_string();
+        // url は stored_url を維持 (AI が url を勘違いしても保護)
+        assert!(out.contains(r#"url = "owner/repo""#));
+        assert!(!out.contains("different/url"));
+        assert!(out.contains(r#"on_cmd = ["AICmd"]"#));
+    }
+
+    #[test]
+    fn replace_plugin_entry_with_ai_toml_rejects_proposal_with_zero_or_many_entries() {
+        let initial = r#"[[plugins]]
+url = "x/y"
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+
+        let zero = r#"name = "no plugins""#;
+        assert!(replace_plugin_entry_with_ai_toml(&mut doc, "x/y", zero, &[]).is_err());
+
+        let many = r#"[[plugins]]
+url = "a/b"
+
+[[plugins]]
+url = "c/d"
+"#;
+        assert!(replace_plugin_entry_with_ai_toml(&mut doc, "x/y", many, &[]).is_err());
     }
 
     fn write_file(path: &Path, content: &str) {

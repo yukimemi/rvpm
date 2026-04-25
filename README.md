@@ -325,11 +325,20 @@ hook files are never overwritten.
 "actually, I want this eager"); rvpm rebuilds the prompt with your message
 and the previous proposal, fetches an updated proposal, and re-prompts.
 
-**Hand off** spawns the chosen CLI in interactive mode with the same prompt
-preloaded. **rvpm exits at this point** — your subsequent conversation is
-between you and the CLI, and the CLI's own file-editing tools (Edit / Write
-in claude-code, etc.) are responsible for any further changes to
-`config.toml` or hook files. rvpm does not re-import the result.
+**Hand off** saves the latest prompt (initial + any chat refinements you
+made) to a temp file, announces the path, and spawns the chosen CLI in
+interactive mode with stdio inherited from your terminal. **rvpm hands
+control over to the CLI** — load the saved prompt with the CLI's own
+file-reading mechanism (e.g. `cat <path>` in claude-code, or copy-paste).
+Your subsequent conversation is between you and the CLI, and its own
+file-editing tools (Edit / Write in claude-code, etc.) are responsible
+for any further changes to `config.toml` or hook files. rvpm does not
+re-import the result.
+
+> **Why a saved file instead of stdin pipe?** Tools like `claude-code`
+> exit immediately when stdin closes, so a piped prompt can't keep the
+> session interactive. The temp-file approach gives you the full prompt
+> *and* an interactive session.
 
 **Skip** discards the proposal but leaves the stub `[[plugins]]` entry that
 was written before the AI was invoked, so you can edit it manually.

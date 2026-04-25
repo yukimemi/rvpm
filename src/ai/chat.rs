@@ -8,7 +8,6 @@ use crate::ai::{
     validate_proposal_toml, write_hook_files,
 };
 use anyhow::{Context, Result};
-use dialoguer::{Input, Select, theme::ColorfulTheme};
 use std::path::{Path, PathBuf};
 
 /// chat loop の終了アクション。
@@ -41,6 +40,7 @@ pub async fn run_ai_add(
     backend: Backend,
     plugin_url: &str,
     plugin_root: &Path,
+    plugin_config_dir: &Path,
     config_root: &Path,
     user_config_toml_path: &Path,
     ai_language: &str,
@@ -65,16 +65,18 @@ pub async fn run_ai_add(
         plugin_url
     );
 
-    // 最初の turn
+    // chat 履歴を反映して handoff に渡せるよう、最後に AI に投げた prompt を覚えておく。
+    // 1 turn 目は initial_prompt そのもの、follow-up が走ったらそれで上書き。
+    let mut last_prompt = initial_prompt.clone();
     let mut prior_response = invoke_oneshot(backend, &initial_prompt).await?;
     let mut proposal = parse_and_validate(&prior_response)?;
 
     loop {
         print_proposal_preview(&proposal);
 
-        let action = match prompt_chat_action()? {
+        match prompt_chat_action().await? {
             ChatAction::Apply => {
-                let written = write_hook_files(config_root, plugin_url, &proposal)?;
+                let written = write_hook_files(plugin_config_dir, &proposal)?;
                 return Ok(AiAddOutcome {
                     outcome: ChatOutcome::Applied {
                         written_hooks: written,
@@ -89,32 +91,29 @@ pub async fn run_ai_add(
                 });
             }
             ChatAction::HandOff => {
-                run_handoff(backend, &initial_prompt)?;
+                // refine 済み文脈を維持: 最後に投げた prompt をそのまま handoff に渡す。
+                run_handoff(backend, &last_prompt).await?;
                 return Ok(AiAddOutcome {
                     outcome: ChatOutcome::HandedOff,
                     proposal: None,
                 });
             }
-            ChatAction::Chat => ChatAction::Chat,
-        };
-
-        // chat — user の追加要求を 1 行受けて follow-up prompt 構築
-        let _ = action;
-        let followup: String = Input::with_theme(&ColorfulTheme::default())
-            .with_prompt("Your feedback for the AI")
-            .interact_text()?;
-        if followup.trim().is_empty() {
-            eprintln!("(empty feedback, returning to action menu)");
-            continue;
+            ChatAction::Chat => {
+                // chat — user の追加要求を 1 行受けて follow-up prompt 構築
+                let followup = ask_followup().await?;
+                if followup.trim().is_empty() {
+                    eprintln!("(empty feedback, returning to action menu)");
+                    continue;
+                }
+                last_prompt = build_followup_prompt(&initial_prompt, &prior_response, &followup);
+                eprintln!(
+                    "\u{1f916} Asking {} for an updated proposal...",
+                    backend.label()
+                );
+                prior_response = invoke_oneshot(backend, &last_prompt).await?;
+                proposal = parse_and_validate(&prior_response)?;
+            }
         }
-
-        let next_prompt = build_followup_prompt(&initial_prompt, &prior_response, &followup);
-        eprintln!(
-            "\u{1f916} Asking {} for an updated proposal...",
-            backend.label()
-        );
-        prior_response = invoke_oneshot(backend, &next_prompt).await?;
-        proposal = parse_and_validate(&prior_response)?;
     }
 }
 
@@ -133,24 +132,44 @@ enum ChatAction {
     Skip,
 }
 
-fn prompt_chat_action() -> Result<ChatAction> {
-    let choices = [
-        "Apply (write to config.toml + create hook files)",
-        "Chat (refine with feedback)",
-        "Hand off to native CLI (rvpm exits, AI continues directly)",
-        "Skip (discard proposal, no changes)",
-    ];
-    let sel = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("How should we proceed?")
-        .items(choices.as_slice())
-        .default(0)
-        .interact()?;
-    Ok(match sel {
+/// dialoguer は同期 API なので `spawn_blocking` で worker thread に逃がす。
+/// async fn 内で `.interact()` を直呼びすると Tokio executor を塞ぐ。
+async fn prompt_chat_action() -> Result<ChatAction> {
+    use dialoguer::{Select, theme::ColorfulTheme};
+    let result = tokio::task::spawn_blocking(|| {
+        let choices = [
+            "Apply (write to config.toml + create hook files)",
+            "Chat (refine with feedback)",
+            "Hand off to native CLI (rvpm exits, AI continues directly)",
+            "Skip (discard proposal, no changes)",
+        ];
+        Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("How should we proceed?")
+            .items(choices.as_slice())
+            .default(0)
+            .interact()
+    })
+    .await
+    .context("failed to join blocking dialoguer task")??;
+    Ok(match result {
         0 => ChatAction::Apply,
         1 => ChatAction::Chat,
         2 => ChatAction::HandOff,
         _ => ChatAction::Skip,
     })
+}
+
+/// follow-up テキスト入力も同様に worker thread で待つ。
+async fn ask_followup() -> Result<String> {
+    use dialoguer::{Input, theme::ColorfulTheme};
+    tokio::task::spawn_blocking(|| {
+        Input::<String>::with_theme(&ColorfulTheme::default())
+            .with_prompt("Your feedback for the AI")
+            .interact_text()
+    })
+    .await
+    .context("failed to join blocking dialoguer task")?
+    .map_err(|e| anyhow::anyhow!("dialoguer input failed: {e}"))
 }
 
 fn parse_and_validate(response: &str) -> Result<Proposal> {

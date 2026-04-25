@@ -11,10 +11,12 @@
 //   - **Mode A (内蔵 chat loop)** がメイン路: rvpm が会話履歴を保持し毎ターン
 //     `claude -p "..."` を一発投げ直す。長期会話は token 食うが TOML 抽出が
 //     確実 + 3 ツール挙動統一。
-//   - **Mode B (handoff)** は user に CLI を直接渡す逃げ道: 初期 prompt を
-//     最初の turn として用意して `claude` (interactive) を spawn → rvpm 退出。
-//     CLI ツール側のファイル編集機能で config.toml / hook 直接書かせる。
-//     **rvpm 側は結果を re-import しない** (README に明記)。
+//   - **Mode B (handoff)** は user に CLI を直接渡す逃げ道: prompt をテンポラリ
+//     ファイルに保存してパスを announce、`claude` (interactive) を inherit-stdio
+//     で spawn する。**stdin 事前注入はしない** (claude-code は EOF で即 exit する
+//     ため interactive にならない)。user が CLI 内で prompt ファイルを読めば
+//     refine 済み文脈が手に入る。CLI ツール側のファイル編集機能で config.toml /
+//     hook 直接書かせる。**rvpm 側は結果を re-import しない** (README に明記)。
 
 use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
@@ -112,7 +114,10 @@ pub async fn invoke_oneshot(backend: Backend, prompt_text: &str) -> Result<Strin
     }
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        // tokio Command の `kill_on_drop` は default false。timeout で future が
+        // drop されたとき子プロセスを残さないように true にする (CodeRabbit Critical)。
+        .kill_on_drop(true);
 
     let mut child = cmd.spawn().with_context(|| {
         format!(
@@ -169,12 +174,16 @@ pub fn parse_proposal(response: &str) -> Result<Proposal> {
 
 /// `<rvpm:NAME>...</rvpm:NAME>` の中身を返す (前後 whitespace つき)。
 /// 見つからなければ `None`。
+///
+/// AI の preamble に `<rvpm:plugin_entry>` という単語が混じる false positive を避けるため、
+/// **最後の occurrence** を起点に matching する: 構造化出力は応答末尾に来るのが
+/// 通常だし、preamble の言及で偶発的に block を切り出す事故が起きにくい。
 fn extract_tag(text: &str, name: &str) -> Option<String> {
     let open = format!("<rvpm:{name}>");
     let close = format!("</rvpm:{name}>");
-    let start = text.find(&open)? + open.len();
-    let end = text[start..].find(&close)? + start;
-    Some(text[start..end].to_string())
+    let start_off = text.rfind(&open)? + open.len();
+    let close_off = text[start_off..].find(&close)? + start_off;
+    Some(text[start_off..close_off].to_string())
 }
 
 /// Lua 系 tag の中身を `Option<String>` で返す。`(none)` (大文字小文字無視) は `None`。
@@ -209,47 +218,65 @@ pub fn validate_proposal_toml(toml_src: &str) -> Result<()> {
     Ok(())
 }
 
-/// Mode B のハンドオフ: 初期 prompt を **最初の user turn として渡しつつ** CLI を
-/// interactive 起動する。rvpm はそのまま親プロセスを引き継ぐ (exec 相当)。
-/// 戻り値の Result は spawn 失敗のみで、CLI 終了は user 任せ。
+/// Mode B のハンドオフ: prompt をテンポラリファイルに書き出し、CLI を
+/// **interactive モードで** 起動する (stdin / stdout / stderr とも親 TTY を継承)。
+/// rvpm は CLI 終了まで `wait` するだけで、それ以降の状態は CLI 側に委譲する。
 ///
-/// **重要**: ここから先は rvpm は介入しない。CLI ツール側のファイル編集機能で
-/// `config.toml` や hook を user が直接書かせる前提 (README に明記)。
-pub fn run_handoff(backend: Backend, prompt_text: &str) -> Result<()> {
-    use std::io::Write;
-
+/// **prompt の事前注入は意図的に行わない**: stdin pipe + drop すると claude-code
+/// などは EOF を受けて即座に exit するため、interactive にならない (Gemini High)。
+/// 代わりに prompt をテンポラリ MD ファイルに保存してパスを announce する。
+/// user は CLI 内で `/file <path>` (claude-code) や `cat <path>` を使って
+/// 読み込めばよい。
+///
+/// CLI 終了まで blocking wait するが、`spawn_blocking` で別 thread に逃がして
+/// Tokio executor は塞がない。
+pub async fn run_handoff(backend: Backend, prompt_text: &str) -> Result<()> {
     ensure_cli_installed(backend)?;
 
-    // どの CLI も interactive モードでは prompt を引数 / stdin から取れる。
-    // 安全側に「対話起動 + stdin で prompt 流し込み」を選ぶ。CLI が EOF を
-    // 受け取った後も interactive 継続するか否かは ツール依存。実用上は
-    // user がそこから対話可能なので問題ない (handoff した瞬間 rvpm は退場)。
-    let mut child = std::process::Command::new(backend.cli_name())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("failed to spawn AI CLI `{}`", backend.cli_name()))?;
+    // prompt をテンポラリファイルに保存
+    let mut tmp_path = std::env::temp_dir();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    tmp_path.push(format!("rvpm-ai-prompt-{stamp}.md"));
+    std::fs::write(&tmp_path, prompt_text)
+        .with_context(|| format!("failed to write prompt to {}", tmp_path.display()))?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(prompt_text.as_bytes());
-        let _ = stdin.write_all(b"\n");
-    }
+    eprintln!();
+    eprintln!(
+        "\u{1f4dd} Prompt saved to: {}\n\
+         Starting `{}` interactively. Paste the prompt or load it via your CLI's file-reading mechanism.\n",
+        tmp_path.display(),
+        backend.cli_name()
+    );
 
-    // user が CLI を終了するまで待つ。
-    let _ = child.wait();
+    // 子プロセスを spawn_blocking 内で起動 + wait (std::process は async に乗らないため)。
+    let cli_name = backend.cli_name().to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let status = std::process::Command::new(&cli_name)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .with_context(|| format!("failed to spawn AI CLI `{cli_name}`"))?;
+        let _ = status; // exit status は無視 (user 操作なのでエラーじゃない)
+        Ok(())
+    })
+    .await
+    .context("failed to join blocking handoff task")??;
+
     Ok(())
 }
 
-/// AI mode で生成された hook 内容を user の config_root 配下に書き込む。
-/// `<host>/<owner>/<repo>/{init,before,after}.lua` の規約に従う。
-pub fn write_hook_files(
-    config_root: &Path,
-    plugin_url: &str,
-    proposal: &Proposal,
-) -> Result<Vec<PathBuf>> {
-    let plugin_dir = compute_plugin_config_dir(config_root, plugin_url)?;
-    std::fs::create_dir_all(&plugin_dir).with_context(|| {
+/// AI mode で生成された hook 内容を、呼び出し側で resolve 済みの per-plugin
+/// config dir (`<config_root>/plugins/<host>/<owner>/<repo>/`) に書き込む。
+///
+/// path 解決は呼び出し側 (`run_add`) が `resolve_plugin_config_dir` 経由で行う。
+/// ここでホスト名や url 形式を再パースしないことで、GitLab / 他 host や
+/// `Plugin::canonical_path` の形式変更にも自動追従する。
+pub fn write_hook_files(plugin_dir: &Path, proposal: &Proposal) -> Result<Vec<PathBuf>> {
+    std::fs::create_dir_all(plugin_dir).with_context(|| {
         format!(
             "failed to create plugin config dir {}",
             plugin_dir.display()
@@ -277,33 +304,6 @@ pub fn write_hook_files(
         written.push(path);
     }
     Ok(written)
-}
-
-/// `<host>/<owner>/<repo>/` 形式に展開。GitHub URL のみ対応。
-fn compute_plugin_config_dir(config_root: &Path, plugin_url: &str) -> Result<PathBuf> {
-    let trimmed = plugin_url
-        .trim()
-        .trim_end_matches('/')
-        .trim_end_matches(".git")
-        .trim_end_matches('/');
-    let owner_repo = if let Some(stripped) = trimmed.strip_prefix("https://github.com/") {
-        stripped.to_string()
-    } else if let Some(stripped) = trimmed.strip_prefix("git@github.com:") {
-        stripped.to_string()
-    } else if trimmed.contains('/') && !trimmed.contains("://") {
-        trimmed.to_string()
-    } else {
-        return Err(anyhow!(
-            "cannot derive owner/repo from plugin URL `{plugin_url}`"
-        ));
-    };
-    let parts: Vec<&str> = owner_repo.split('/').collect();
-    if parts.len() != 2 {
-        return Err(anyhow!(
-            "plugin URL `{plugin_url}` does not match owner/repo"
-        ));
-    }
-    Ok(config_root.join("github.com").join(parts[0]).join(parts[1]))
 }
 
 #[cfg(test)]
@@ -347,6 +347,27 @@ README shows :Foo as the entry command.
     fn parse_proposal_missing_plugin_entry_errors() {
         let response = "<rvpm:explanation>nothing else</rvpm:explanation>";
         assert!(parse_proposal(response).is_err());
+    }
+
+    #[test]
+    fn parse_proposal_ignores_tag_name_in_preamble() {
+        // AI が "I will use the <rvpm:plugin_entry> tag below..." のように preamble で
+        // tag 名を言及するケース。最後の occurrence を起点にすれば誤切り出しを回避できる。
+        let response = r#"
+I will populate the <rvpm:plugin_entry> tag below with the proposal.
+
+<rvpm:plugin_entry>
+[[plugins]]
+url = "real/entry"
+</rvpm:plugin_entry>
+<rvpm:init_lua>(none)</rvpm:init_lua>
+<rvpm:before_lua>(none)</rvpm:before_lua>
+<rvpm:after_lua>(none)</rvpm:after_lua>
+<rvpm:explanation>ok</rvpm:explanation>
+"#;
+        let p = parse_proposal(response).unwrap();
+        assert!(p.plugin_entry_toml.contains("real/entry"));
+        assert!(!p.plugin_entry_toml.contains("populate"));
     }
 
     #[test]
@@ -404,23 +425,29 @@ url = "c/d"
     }
 
     #[test]
-    fn compute_plugin_config_dir_handles_short_form() {
-        let root = std::path::Path::new("/cfg");
-        let p = compute_plugin_config_dir(root, "owner/repo").unwrap();
-        assert_eq!(
-            p,
-            std::path::Path::new("/cfg/github.com/owner/repo").to_path_buf()
-        );
-    }
-
-    #[test]
-    fn compute_plugin_config_dir_handles_https_form() {
-        let root = std::path::Path::new("/cfg");
-        let p = compute_plugin_config_dir(root, "https://github.com/owner/repo.git").unwrap();
-        assert_eq!(
-            p,
-            std::path::Path::new("/cfg/github.com/owner/repo").to_path_buf()
-        );
+    fn write_hook_files_writes_only_present_lua_blocks() {
+        // 呼び出し側 (`run_add`) が plugin_dir を resolve 済みで渡す前提を確認。
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp
+            .path()
+            .join("plugins")
+            .join("github.com")
+            .join("o")
+            .join("r");
+        let p = Proposal {
+            plugin_entry_toml: r#"[[plugins]]
+url = "o/r""#
+                .to_string(),
+            init_lua: Some("vim.g.x = 1".to_string()),
+            before_lua: None,
+            after_lua: Some("require('o').setup({})".to_string()),
+            explanation: "test".to_string(),
+        };
+        let written = write_hook_files(&plugin_dir, &p).unwrap();
+        assert_eq!(written.len(), 2);
+        assert!(plugin_dir.join("init.lua").exists());
+        assert!(!plugin_dir.join("before.lua").exists());
+        assert!(plugin_dir.join("after.lua").exists());
     }
 
     #[test]
