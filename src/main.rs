@@ -612,12 +612,37 @@ fn select_plugin_url(
     prompt: &str,
 ) -> Result<Option<String>> {
     if let Some(q) = query {
-        let url = plugins
+        // 曖昧 partial match を防ぐ (CodeRabbit PR #100 指摘):
+        // 複数の plugin を含む query を黙って先頭採用すると、`rvpm tune cmp`
+        // で `cmp-buffer` / `cmp-cmdline` ... のうちどれが書き換えられるか
+        // 予測不能になり、mutating コマンドで重大事故が起きる。
+        //
+        // 解決順序:
+        //   1. 完全一致 (`p.url == q`) があれば即採用 (1 個だけ通過)。
+        //   2. 部分一致が 1 件 → 採用。0 件 → "Plugin not found"。
+        //   3. 部分一致が複数 → match 一覧を見せて refine を促す error。
+        if let Some(p) = plugins.iter().find(|p| p.url == q) {
+            return Ok(Some(p.url.clone()));
+        }
+        let partial: Vec<&str> = plugins
             .iter()
-            .find(|p| p.url == q || p.url.contains(q))
-            .map(|p| p.url.clone())
-            .context("Plugin not found")?;
-        Ok(Some(url))
+            .filter(|p| p.url.contains(q))
+            .map(|p| p.url.as_str())
+            .collect();
+        match partial.len() {
+            0 => Err(anyhow::anyhow!("Plugin not found")),
+            1 => Ok(Some(partial[0].to_string())),
+            _ => {
+                let listing = partial
+                    .iter()
+                    .map(|u| format!("  - {u}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Err(anyhow::anyhow!(
+                    "Query '{q}' matches multiple plugins; refine your query or omit it to pick interactively:\n{listing}"
+                ))
+            }
+        }
     } else {
         let urls: Vec<String> = plugins.iter().map(|p| p.url.clone()).collect();
         let selection = FuzzySelect::with_theme(&dialoguer::theme::ColorfulTheme::default())
@@ -2533,8 +2558,24 @@ fn decide_add_lazy_apply(
     }
 }
 
+/// `replace_plugin_entry_with_ai_toml` の挙動切替。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeMode {
+    /// **Merge** (additive). 既存 entry に AI 提案 key を上書き / 追加するが、
+    /// 提案に無い既存 key は保持。`rvpm add --ai` 用 — stub entry には CLI flag で
+    /// 入れた値しか無いので merge も replace も結果は同じだが、
+    /// 安全側に倒している。
+    Merge,
+    /// **Replace** (destructive). AI 提案に無い既存 key も `preserved_keys` で
+    /// 明示保護されていない限り削除。`rvpm tune` 用 — user は「AI に全部書き直して」
+    /// と頼んでいるので、AI が omit した stale field (`on_cmd`, `rev` 等) も
+    /// 落とすのが期待値 (CodeRabbit PR #100 指摘)。`url` は `preserved_keys` 扱いで
+    /// 常に `stored_url` に強制リセット。
+    Replace,
+}
+
 /// AI mode 用 (#93): AI が返した `[[plugins]]` ブロック (1 entry のみ) を、既存
-/// stub entry に **in-place マージ** する。
+/// entry に書き込む。`mode` で merge / destructive replace を切り替える。
 ///
 /// 設計ポイント:
 ///   - **stub entry の文書中の位置 / 装飾 (改行・空白) を保つ** — `remove + insert`
@@ -2543,11 +2584,15 @@ fn decide_add_lazy_apply(
 ///   - **user の明示 CLI flag を尊重** — `preserved_keys` に挙げたキーは AI 提案で
 ///     上書きしない (`rvpm add owner/repo --rev v1.0 --ai claude` で `--rev` を残す)。
 ///     `url` は `stored_url` に強制リセット (canonical 化)。
+///   - **`Replace` mode** では更に、`preserved_keys` にも proposal にも無い既存 key を
+///     明示削除する。これが無いと `tune` で AI が "この field はもう不要だから消して"
+///     と返したつもりが反映されない (CodeRabbit PR #100 指摘)。
 fn replace_plugin_entry_with_ai_toml(
     doc: &mut DocumentMut,
     stored_url: &str,
     proposal_toml: &str,
     preserved_keys: &[&str],
+    mode: MergeMode,
 ) -> anyhow::Result<()> {
     use anyhow::{Context, anyhow};
 
@@ -2581,6 +2626,25 @@ fn replace_plugin_entry_with_ai_toml(
             continue;
         }
         let existing = plugins.get_mut(i).unwrap();
+
+        // Replace mode: AI 提案にも preserved_keys にも無い既存 key を消す。
+        // url は preserved 扱いで常に保持される (下で強制リセットされるが、ここでは消さない)。
+        if mode == MergeMode::Replace {
+            let proposal_keys: std::collections::HashSet<&str> =
+                new_entry.iter().map(|(k, _)| k).collect();
+            let to_remove: Vec<String> = existing
+                .iter()
+                .map(|(k, _)| k.to_string())
+                .filter(|k| {
+                    k != "url"
+                        && !preserved_keys.contains(&k.as_str())
+                        && !proposal_keys.contains(k.as_str())
+                })
+                .collect();
+            for k in to_remove {
+                existing.remove(&k);
+            }
+        }
 
         // AI 提案の各キーを既存 entry に書き込む。
         // ただし `preserved_keys` (user が CLI flag で明示したもの) は skip。
@@ -2871,6 +2935,7 @@ async fn run_add(
                                         &stored_url,
                                         &prop.plugin_entry_toml,
                                         &preserved_keys,
+                                        MergeMode::Merge,
                                     ) {
                                         eprintln!(
                                             "\u{26a0} failed to apply AI proposal: {e}. Stub entry remains."
@@ -3737,11 +3802,13 @@ async fn run_tune(
                     let mut doc_patch = latest.parse::<DocumentMut>()?;
                     // Option A: AI 提案で **全 field 上書き** (`preserved_keys` は空)。
                     // user は Chat ループ中に "X は触らないで" と言えば AI 側で field を保持する。
+                    // `Replace` mode で AI が omit した stale field (e.g. 古い `on_cmd`) を消す。
                     if let Err(e) = replace_plugin_entry_with_ai_toml(
                         &mut doc_patch,
                         &selected_url,
                         &prop.plugin_entry_toml,
                         &[],
+                        MergeMode::Replace,
                     ) {
                         eprintln!(
                             "\u{26a0} failed to apply AI proposal: {e}. Existing entry kept."
@@ -5871,7 +5938,8 @@ url = "third/plugin"
 url = "second/stub"
 on_event = ["BufReadPre"]
 "#;
-        replace_plugin_entry_with_ai_toml(&mut doc, "second/stub", proposal, &[]).unwrap();
+        replace_plugin_entry_with_ai_toml(&mut doc, "second/stub", proposal, &[], MergeMode::Merge)
+            .unwrap();
         let out = doc.to_string();
         // first/plugin → second/stub → third/plugin の順序が維持される
         let first_pos = out.find("first/plugin").unwrap();
@@ -5900,7 +5968,14 @@ on_map = ["<leader>x"]
 "#;
         // user が --rev と --on-cmd を明示したシナリオ
         let preserved = ["url", "rev", "on_cmd"];
-        replace_plugin_entry_with_ai_toml(&mut doc, "owner/repo", proposal, &preserved).unwrap();
+        replace_plugin_entry_with_ai_toml(
+            &mut doc,
+            "owner/repo",
+            proposal,
+            &preserved,
+            MergeMode::Merge,
+        )
+        .unwrap();
         let out = doc.to_string();
         // user の rev / on_cmd が残る
         assert!(
@@ -5931,7 +6006,8 @@ url = "owner/repo"
 url = "different/url"
 on_cmd = ["AICmd"]
 "#;
-        replace_plugin_entry_with_ai_toml(&mut doc, "owner/repo", proposal, &[]).unwrap();
+        replace_plugin_entry_with_ai_toml(&mut doc, "owner/repo", proposal, &[], MergeMode::Merge)
+            .unwrap();
         let out = doc.to_string();
         // url は stored_url を維持 (AI が url を勘違いしても保護)
         assert!(out.contains(r#"url = "owner/repo""#));
@@ -5947,7 +6023,10 @@ url = "x/y"
         let mut doc = initial.parse::<DocumentMut>().unwrap();
 
         let zero = r#"name = "no plugins""#;
-        assert!(replace_plugin_entry_with_ai_toml(&mut doc, "x/y", zero, &[]).is_err());
+        assert!(
+            replace_plugin_entry_with_ai_toml(&mut doc, "x/y", zero, &[], MergeMode::Merge)
+                .is_err()
+        );
 
         let many = r#"[[plugins]]
 url = "a/b"
@@ -5955,7 +6034,80 @@ url = "a/b"
 [[plugins]]
 url = "c/d"
 "#;
-        assert!(replace_plugin_entry_with_ai_toml(&mut doc, "x/y", many, &[]).is_err());
+        assert!(
+            replace_plugin_entry_with_ai_toml(&mut doc, "x/y", many, &[], MergeMode::Merge)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn replace_plugin_entry_with_ai_toml_replace_mode_drops_stale_keys() {
+        // CodeRabbit PR #100 指摘: tune で AI が omit した既存 field が
+        // (`on_cmd`, `rev` 等) 残ってしまう問題の回帰 test。
+        let initial = r#"[[plugins]]
+url = "owner/tuneme"
+on_cmd = ["StaleCmd"]
+rev = "abc123"
+on_ft = "rust"
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        // AI 提案は on_cmd のみ — rev / on_ft は意図的に omit して "削除して" の意図。
+        let proposal = r#"[[plugins]]
+url = "owner/tuneme"
+on_cmd = ["NewCmd"]
+"#;
+        replace_plugin_entry_with_ai_toml(
+            &mut doc,
+            "owner/tuneme",
+            proposal,
+            &[],
+            MergeMode::Replace,
+        )
+        .unwrap();
+        let out = doc.to_string();
+        assert!(out.contains(r#"on_cmd = ["NewCmd"]"#));
+        // 提案に含まれない既存 field は削除される
+        assert!(
+            !out.contains(r#"rev = "abc123""#),
+            "Replace mode must drop stale rev:\n{out}"
+        );
+        assert!(
+            !out.contains(r#"on_ft = "rust""#),
+            "Replace mode must drop stale on_ft:\n{out}"
+        );
+        // url は強制保持
+        assert!(out.contains(r#"url = "owner/tuneme""#));
+    }
+
+    #[test]
+    fn replace_plugin_entry_with_ai_toml_replace_mode_keeps_preserved_keys() {
+        // Replace mode でも `preserved_keys` に挙げた field は残す
+        // (将来 `tune --keep rev` のような flag を足したときの保証)。
+        let initial = r#"[[plugins]]
+url = "owner/repo"
+rev = "stable"
+on_cmd = ["KeepMe"]
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let proposal = r#"[[plugins]]
+url = "owner/repo"
+on_event = ["BufRead"]
+"#;
+        replace_plugin_entry_with_ai_toml(
+            &mut doc,
+            "owner/repo",
+            proposal,
+            &["rev"],
+            MergeMode::Replace,
+        )
+        .unwrap();
+        let out = doc.to_string();
+        // preserved な rev は残る
+        assert!(out.contains(r#"rev = "stable""#));
+        // preserved でない on_cmd は AI 提案に無いので消える
+        assert!(!out.contains("KeepMe"));
+        // AI 提案の on_event は新規追加
+        assert!(out.contains(r#"on_event = ["BufRead"]"#));
     }
 
     // ─── extract_plugin_entry_toml (rvpm tune) ──────────────────────────
@@ -6051,6 +6203,64 @@ url = "only/one"
         }];
         let err = select_plugin_url(&plugins, Some("nonexistent"), "select").unwrap_err();
         assert!(err.to_string().contains("Plugin not found"));
+    }
+
+    #[test]
+    fn select_plugin_url_exact_match_wins_over_partial() {
+        // user typed `cmp` and a plugin called exactly `cmp` exists alongside
+        // longer `cmp-buffer` etc → exact match takes precedence (no ambiguity).
+        use crate::config::Plugin;
+        let plugins = vec![
+            Plugin {
+                url: "hrsh7th/cmp-buffer".to_string(),
+                ..Default::default()
+            },
+            Plugin {
+                url: "cmp".to_string(),
+                ..Default::default()
+            },
+            Plugin {
+                url: "hrsh7th/cmp-cmdline".to_string(),
+                ..Default::default()
+            },
+        ];
+        let got = select_plugin_url(&plugins, Some("cmp"), "select").unwrap();
+        assert_eq!(got, Some("cmp".to_string()));
+    }
+
+    #[test]
+    fn select_plugin_url_ambiguous_partial_errors_with_listing() {
+        // CodeRabbit PR #100 指摘: 複数の partial match を黙って先頭採用すると
+        // mutating コマンドが意図しない plugin を変更してしまう。複数 match は
+        // error にし、候補一覧を見せる。
+        use crate::config::Plugin;
+        let plugins = vec![
+            Plugin {
+                url: "hrsh7th/cmp-buffer".to_string(),
+                ..Default::default()
+            },
+            Plugin {
+                url: "hrsh7th/cmp-cmdline".to_string(),
+                ..Default::default()
+            },
+            Plugin {
+                url: "hrsh7th/cmp-path".to_string(),
+                ..Default::default()
+            },
+            Plugin {
+                url: "folke/snacks.nvim".to_string(),
+                ..Default::default()
+            },
+        ];
+        let err = select_plugin_url(&plugins, Some("cmp"), "select").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("matches multiple"));
+        // 全候補が表示される
+        assert!(msg.contains("hrsh7th/cmp-buffer"));
+        assert!(msg.contains("hrsh7th/cmp-cmdline"));
+        assert!(msg.contains("hrsh7th/cmp-path"));
+        // match しないものは含まれない
+        assert!(!msg.contains("snacks"));
     }
 
     fn write_file(path: &Path, content: &str) {
