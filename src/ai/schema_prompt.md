@@ -33,9 +33,18 @@ cond = "vim.fn.has('win32') == 1"   # optional Lua expression; load only when tr
 
 ## Hook file conventions
 
-- `init.lua` — runs **before** RTP append. Use for `vim.g.<plugin>_setting = ...` global config.
-- `before.lua` — runs **after** RTP append, before `plugin/*` source. Use for `require('foo').setup(...)`.
-- `after.lua` — runs **after** `plugin/*` source. Use for keymaps and post-setup tweaks.
+The three hook files differ along **two axes**: *when in the boot sequence they run*, and *whether they run for lazy plugins at Neovim startup or at trigger time*.
+
+- `init.lua` — runs at **Neovim startup**, **before RTP append**, for **every** plugin including lazy ones. This is the only hook that fires at startup for a lazy plugin (the other two wait until the trigger fires). **Rare.** Use it only when:
+  - You want some side effect to happen at Neovim startup even though the plugin itself is lazy (e.g. register a `VimEnter` autocmd, or set a flag another startup-time plugin reads), OR
+  - Something must run before any plugin code is on `runtimepath` (very rare).
+  - **Most plugins don't need init.lua.** If you'd just be setting `vim.g.<plugin>_xxx` for the plugin's own use, that belongs in `before.lua`, not here.
+- `before.lua` — runs at **plugin load time** (immediately for eager, at trigger time for lazy), **after** RTP append, **before** the plugin's `plugin/*` is sourced. **This is the standard place for pre-source config:** `vim.g.<plugin>_xxx = ...` style options that the plugin's `plugin/*` reads when it sources, or any other pre-load tweak the README documents.
+- `after.lua` — runs at **plugin load time**, **after** the plugin's `plugin/*` is sourced. **This is the default place for `require('foo').setup({...})`** and keymaps. Modern Lua plugins almost always document their setup as "call `require('foo').setup({...})`" with no ordering constraint — that means after.lua.
+
+**Default rule for `setup({...})`: put it in `after.lua`.** Move it to `before.lua` only when the README has an explicit "this must run before the plugin's `plugin/*`" / "call this before the plugin is sourced" instruction. rvpm's `after.lua` is the equivalent of lazy.nvim's `config = function() ... end` and packer's `config = ...`.
+
+**Default rule for `vim.g.<plugin>_xxx = ...`: put it in `before.lua`.** Only move it to `init.lua` if you specifically need that variable set at Neovim startup time (rare — most `vim.g` plugin options only need to be set before the plugin's `plugin/*` sources, which is exactly what before.lua provides).
 
 If the plugin needs no special hook, output `(none)` for that section. Don't invent hooks "just in case."
 
