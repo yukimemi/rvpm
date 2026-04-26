@@ -631,10 +631,23 @@ fn print_proposal_preview(
 }
 
 /// `[[plugins]]` entry 用の preview ブロック。fresh / merged の両方があれば並べて出す。
+///
+/// 各 variant ([EXISTING] / [FRESH] / [MERGED]) を色分け + 短い区切り線つきで
+/// 表示する。`console::style` が NO_COLOR / 非 TTY を尊重するので、redirect 時や
+/// CI 環境では自動的にプレーン表示にフォールバックする。
 fn print_section_block(name: &str, section: &ProposalSection, existing: Option<&str>, rule: &str) {
+    use console::style;
+
     eprintln!("{rule}");
+
+    // 短い区切り線 (各 variant ブロックの本文上に挟む) — section header の `{rule}`
+    // とは別の幅 / 文字を使うことで「セクション境界 vs variant 境界」を区別する。
+    let sub_rule = "\u{2504}".repeat(40);
+
     if let Some(body) = existing {
-        eprintln!("  [EXISTING {name}]");
+        // EXISTING — yellow + bold (「現状」を warm 系に)
+        eprintln!("  {}", style(format!("[EXISTING {name}]")).yellow().bold());
+        eprintln!("  {sub_rule}");
         for line in body.lines().take(20) {
             eprintln!("    {line}");
         }
@@ -643,8 +656,10 @@ fn print_section_block(name: &str, section: &ProposalSection, existing: Option<&
         }
         eprintln!();
     }
+    // FRESH — cyan + bold (「ゼロから書き直し」を cool 系に)
     if let Some(body) = section.fresh.as_deref() {
-        eprintln!("  [FRESH {name}]");
+        eprintln!("  {}", style(format!("[FRESH {name}]")).cyan().bold());
+        eprintln!("  {sub_rule}");
         for line in body.lines().take(40) {
             eprintln!("    {line}");
         }
@@ -652,11 +667,17 @@ fn print_section_block(name: &str, section: &ProposalSection, existing: Option<&
             eprintln!("    ... ({} more lines)", body.lines().count() - 40);
         }
     } else {
-        eprintln!("  [FRESH {name}] (none)");
+        eprintln!(
+            "  {} {}",
+            style(format!("[FRESH {name}]")).cyan().bold(),
+            style("(none)").dim()
+        );
     }
+    // MERGED — magenta + bold (「ハイブリッド」をはっきり別の色に)
     if let Some(body) = section.merged.as_deref() {
         eprintln!();
-        eprintln!("  [MERGED {name}]");
+        eprintln!("  {}", style(format!("[MERGED {name}]")).magenta().bold());
+        eprintln!("  {sub_rule}");
         for line in body.lines().take(40) {
             eprintln!("    {line}");
         }
