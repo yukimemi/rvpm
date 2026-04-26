@@ -2891,6 +2891,18 @@ async fn run_add(
     let lockfile_path = resolve_lockfile_path(&config_root_for_lock);
     let mut lockfile = crate::lockfile::LockFile::load(&lockfile_path);
     let mut lockfile_dirty = false;
+
+    // **fetch_state も load しておく**: clone 完了後に `last_fetched` を upsert
+    // するため。これをやらないと、`rvpm add` 直後に `rvpm sync` を回したとき、
+    // `fetch_state.find(name) → None` で should_fetch が "fetch する" を返し、
+    // 直前 clone した repo に対して即 fetch を発射する。Docker overlay /
+    // WSL2 のような race の起きやすい FS で gix の "Failed to update
+    // references to their new position to match their remote locations"
+    // を踏みやすい (user 報告)。run_sync が done している upsert と等価な
+    // 後始末を run_add も負担すべき。
+    let fetch_state_path = resolve_fetch_state_path(&cache_root);
+    let mut fetch_state = crate::fetch_state::FetchState::load(&fetch_state_path);
+    let mut fetch_state_dirty = false;
     if let Some(mut plugin) = config_data
         .plugins
         .iter()
@@ -2926,6 +2938,13 @@ async fn run_add(
                     });
                     lockfile_dirty = true;
                 }
+
+                // fetch_state はこのブロックの末尾で upsert する (CodeRabbit PR
+                // #107 指摘)。AI / auto-lazy の patch path が config.toml の
+                // `name` を変更する可能性があるため、`plugin` のスナップショット
+                // ではなく **AI 適用後の最終 name** で記録する必要がある。
+                // 実際の upsert は Ok-arm の最後で `read_persisted_plugin_name`
+                // を使って行う。
 
                 // run_add 直後に merge する必要は無い: 末尾で `run_generate()` を呼び、
                 // そこで merged/ を rm -rf して全 eager+merge を再構築するため。
@@ -3057,6 +3076,30 @@ async fn run_add(
                         );
                     }
                 }
+
+                // fetch_state 記録 (deferred): clone / pull が成功したので
+                // 「今 fetch した」とマーク。これで直後の `rvpm sync` が
+                // fetch_interval fast-path を通って同じ repo に再 fetch を
+                // かけずに済み、Docker overlay / WSL2 で gix が踏みやすい
+                // post-fetch ref-update race を避けられる (user 報告)。
+                //
+                //   - `if !plugin.dev` ガード: lockfile + run_sync と挙動を統一
+                //     (Gemini PR #107 指摘)。dev plugin は fetch_state 管理対象外。
+                //   - **AI / auto-lazy patch 後の `name`** を読みに行く: 上の
+                //     branch で config.toml の `name` フィールドが書き換わって
+                //     いる可能性があるため、`plugin.display_name()` のスナップ
+                //     ショットではなく `read_persisted_plugin_name` で再取得
+                //     (CodeRabbit PR #107 指摘)。
+                if !plugin.dev {
+                    let final_name =
+                        read_persisted_plugin_name(&config_path, &stored_url, &plugin.url);
+                    fetch_state.upsert(crate::fetch_state::FetchEntry {
+                        name: final_name,
+                        url: plugin.url.clone(),
+                        last_fetched: crate::fetch_state::now_rfc3339(),
+                    });
+                    fetch_state_dirty = true;
+                }
             }
         }
     }
@@ -3075,6 +3118,17 @@ async fn run_add(
         } else {
             chezmoi::apply(&wp, &lockfile_path).await;
         }
+    }
+
+    // fetch_state.json は cache_root 配下の local-only データなので chezmoi
+    // 経路は通さない (run_sync の終端と同じ扱い)。failure は warn のみ —
+    // resilience: 本処理は終わってるので fetch_state save 失敗で全体を倒さない。
+    if fetch_state_dirty && let Err(e) = fetch_state.save(&fetch_state_path) {
+        eprintln!(
+            "\u{26a0} failed to save {}: {} (fetch_state not updated)",
+            fetch_state_path.display(),
+            e
+        );
     }
 
     run_generate().await?;
@@ -3775,6 +3829,37 @@ fn extract_plugin_entry_toml(doc: &DocumentMut, url: &str) -> Option<String> {
     let mut out = String::from("[[plugins]]\n");
     out.push_str(&entry.to_string());
     Some(out)
+}
+
+/// 現在 disk 上の `config.toml` から `stored_url` 一致の entry を引いて、
+/// `name` フィールド があればそれを、なければ URL 由来のデフォルト名を返す。
+///
+/// 用途: `run_add` の末尾で `fetch_state` に名前を記録するとき、AI / auto-lazy
+/// branch が config.toml の `name` を後から書き換えている可能性があるため、
+/// 初回 `parse_config` のスナップショット (`plugin.display_name()`) ではなく
+/// **最新 disk 状態** から名前を引く必要がある。失敗時は URL 由来 fallback
+/// (`Plugin::default_name` と同じロジック) で resilience を保つ。
+fn read_persisted_plugin_name(config_path: &Path, stored_url: &str, fallback_url: &str) -> String {
+    // `Plugin::default_name` (src/config.rs) と同じ規則で URL から repo 名を切り出す。
+    let derive_default = || {
+        let url = fallback_url.trim_end_matches(".git");
+        let normalized = url.replace(':', "/");
+        normalized.rsplit('/').next().unwrap_or(url).to_string()
+    };
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|s| s.parse::<DocumentMut>().ok())
+        .and_then(|doc| {
+            let plugins = doc.get("plugins")?.as_array_of_tables()?;
+            let entry = plugins
+                .iter()
+                .find(|t| t.get("url").and_then(|v| v.as_str()) == Some(stored_url))?;
+            entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(derive_default)
 }
 
 async fn run_tune(
