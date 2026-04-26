@@ -2,10 +2,12 @@
 //
 // Mode B (handoff) は `mod.rs` の `run_handoff` に分離。
 
-use crate::ai::prompt::{build_followup_prompt, build_initial_prompt, collect_plugins_tree};
+use crate::ai::prompt::{
+    ExistingHooks, build_followup_prompt, build_initial_prompt, collect_plugins_tree,
+};
 use crate::ai::{
-    Backend, Proposal, ensure_cli_installed, invoke_oneshot, parse_proposal, run_handoff,
-    validate_proposal_toml, write_hook_files,
+    Backend, HookChoice, HookWriteDecisions, Proposal, ProposalSection, ensure_cli_installed,
+    invoke_oneshot, parse_proposal, run_handoff, validate_proposal_toml, write_hook_files,
 };
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -31,10 +33,11 @@ pub enum ChatOutcome {
 ///   - `ai_language`: explanation/chat の言語 (`"en"` / `"ja"` 等)
 ///
 /// 戻り値:
-///   - `Ok(ChatOutcome::Applied { plugin_entry_toml, written_hooks })` —
+///   - `Ok(AiAddOutcome { outcome: Applied, plugin_entry_toml: Some(_), .. })` —
 ///     呼び出し側 (`run_add`) が `plugin_entry_toml` を `config.toml` に append。
-///   - `Ok(ChatOutcome::Skipped)` — user 取り消し。
-///   - `Ok(ChatOutcome::HandedOff)` — Mode B エスケープ済み。
+///     `None` が返ったら user が "Keep existing entry" を選んだ意味で、config は触らない。
+///   - `Ok(_, Skipped)` — user 取り消し。
+///   - `Ok(_, HandedOff)` — Mode B エスケープ済み。
 ///   - `Err(_)` — CLI 不在 / network / parse 不能 等。
 // 引数数が clippy too_many_arguments の閾値超だが、各 path / flag は
 // caller (`run_add`) 文脈で意味が明確 (struct でまとめると逆に指示性が下がる)
@@ -54,12 +57,14 @@ pub async fn run_ai_add(
 
     let (user_config_toml, user_plugins_tree) =
         collect_user_context(user_config_toml_path, config_root)?;
+    let existing_hooks = read_existing_hooks(plugin_config_dir);
 
     let initial_prompt = build_initial_prompt(
         plugin_url,
         plugin_root,
         &user_config_toml,
         &user_plugins_tree,
+        &existing_hooks,
         ai_language,
     )?;
 
@@ -74,6 +79,8 @@ pub async fn run_ai_add(
         initial_prompt,
         plugin_config_dir,
         user_config_toml_path,
+        existing_hooks,
+        /* tune_mode */ false,
         chezmoi_enabled,
     )
     .await
@@ -101,6 +108,7 @@ pub async fn run_ai_tune(
 
     let (user_config_toml, user_plugins_tree) =
         collect_user_context(user_config_toml_path, config_root)?;
+    let existing_hooks = read_existing_hooks(plugin_config_dir);
 
     let initial_prompt = crate::ai::prompt::build_tune_prompt(
         plugin_url,
@@ -108,6 +116,7 @@ pub async fn run_ai_tune(
         current_entry_toml,
         &user_config_toml,
         &user_plugins_tree,
+        &existing_hooks,
         ai_language,
     )?;
 
@@ -122,6 +131,8 @@ pub async fn run_ai_tune(
         initial_prompt,
         plugin_config_dir,
         user_config_toml_path,
+        existing_hooks,
+        /* tune_mode */ true,
         chezmoi_enabled,
     )
     .await
@@ -145,15 +156,33 @@ fn collect_user_context(
     Ok((toml, tree))
 }
 
+/// per-plugin config dir から既存 hook ファイル本文を読む。読めなければ `None`
+/// (= AI に既存ファイルを見せない、merged variant も要求しない)。
+fn read_existing_hooks(plugin_dir: &Path) -> ExistingHooks {
+    let read_one = |name: &str| -> Option<String> {
+        let path = plugin_dir.join(name);
+        std::fs::read_to_string(&path).ok()
+    };
+    ExistingHooks {
+        init_lua: read_one("init.lua"),
+        before_lua: read_one("before.lua"),
+        after_lua: read_one("after.lua"),
+    }
+}
+
 /// AI との対話ループ本体。`run_ai_add` / `run_ai_tune` の共通中核。
 ///
 /// `initial_prompt` を最初に投げ、Apply / Chat / HandOff / Skip の選択を loop し、
-/// Apply で `Proposal` を返す。
+/// Apply で per-section の user 選択を確定 → hook ファイル書き込み + config 用
+/// `plugin_entry_toml` を `AiAddOutcome` に詰めて返す。
+#[allow(clippy::too_many_arguments)]
 async fn run_chat_loop(
     backend: Backend,
     initial_prompt: String,
     plugin_config_dir: &Path,
     user_config_toml_path: &Path,
+    existing_hooks: ExistingHooks,
+    tune_mode: bool,
     chezmoi_enabled: bool,
 ) -> Result<AiAddOutcome> {
     // chat 履歴を反映して handoff に渡せるよう、最後に AI に投げた prompt を覚えておく。
@@ -166,23 +195,30 @@ async fn run_chat_loop(
     drop(first_response);
 
     loop {
-        print_proposal_preview(&proposal, plugin_config_dir, user_config_toml_path);
+        print_proposal_preview(
+            &proposal,
+            plugin_config_dir,
+            user_config_toml_path,
+            &existing_hooks,
+        );
 
         match prompt_chat_action().await? {
             ChatAction::Apply => {
+                let (decisions, plugin_entry_toml) =
+                    resolve_user_decisions(&proposal, &existing_hooks, tune_mode).await?;
                 let written =
-                    write_hook_files(plugin_config_dir, &proposal, chezmoi_enabled).await?;
+                    write_hook_files(plugin_config_dir, &decisions, chezmoi_enabled).await?;
                 return Ok(AiAddOutcome {
                     outcome: ChatOutcome::Applied {
                         written_hooks: written,
                     },
-                    proposal: Some(proposal),
+                    plugin_entry_toml,
                 });
             }
             ChatAction::Skip => {
                 return Ok(AiAddOutcome {
                     outcome: ChatOutcome::Skipped,
-                    proposal: None,
+                    plugin_entry_toml: None,
                 });
             }
             ChatAction::HandOff => {
@@ -190,7 +226,7 @@ async fn run_chat_loop(
                 run_handoff(backend, &last_prompt).await?;
                 return Ok(AiAddOutcome {
                     outcome: ChatOutcome::HandedOff,
-                    proposal: None,
+                    plugin_entry_toml: None,
                 });
             }
             ChatAction::Chat => {
@@ -222,11 +258,12 @@ async fn run_chat_loop(
     }
 }
 
-/// `run_ai_add` の戻り値。Applied 時は `proposal` から `plugin_entry_toml` を取り出して
-/// config.toml に書き込むのが呼び出し側 (`run_add`) の責務。
+/// `run_ai_add` / `run_ai_tune` の戻り値。Applied 時は `plugin_entry_toml` に user が
+/// 選んだ TOML 本文 (fresh / merged / `None` = keep existing) が入る。
 pub struct AiAddOutcome {
     pub outcome: ChatOutcome,
-    pub proposal: Option<Proposal>,
+    /// user が選んだ `[[plugins]]` 本文 (Apply 時のみ Some)。`None` は「keep existing」。
+    pub plugin_entry_toml: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -243,7 +280,7 @@ async fn prompt_chat_action() -> Result<ChatAction> {
     use dialoguer::{Select, theme::ColorfulTheme};
     let result = tokio::task::spawn_blocking(|| {
         let choices = [
-            "Apply (write to config.toml + create hook files)",
+            "Apply (pick fresh / merged / keep per-file, then write)",
             "Chat (refine with feedback)",
             "Hand off to native CLI (rvpm exits, AI continues directly)",
             "Skip (discard proposal, no changes)",
@@ -293,7 +330,32 @@ async fn ask_followup() -> Result<String> {
 
 fn parse_and_validate(response: &str) -> Result<Proposal> {
     let proposal = parse_proposal(response)?;
-    validate_proposal_toml(&proposal.plugin_entry_toml)?;
+    // 少なくとも fresh または merged のどちらかが TOML として valid であれば OK。
+    // 両方とも無いケースは `parse_proposal` が既に弾く。
+    let fresh_ok = proposal
+        .plugin_entry
+        .fresh
+        .as_deref()
+        .map(validate_proposal_toml)
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+    let merged_ok = proposal
+        .plugin_entry
+        .merged
+        .as_deref()
+        .map(validate_proposal_toml)
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+    if !fresh_ok && !merged_ok {
+        // どちらも valid でなければ、より informative な error を再度実行して返す。
+        if let Some(s) = proposal.plugin_entry.fresh.as_deref() {
+            return Err(validate_proposal_toml(s).unwrap_err());
+        }
+        if let Some(s) = proposal.plugin_entry.merged.as_deref() {
+            return Err(validate_proposal_toml(s).unwrap_err());
+        }
+        return Err(anyhow::anyhow!("AI proposal had no valid plugin entry"));
+    }
     Ok(proposal)
 }
 
@@ -307,63 +369,234 @@ fn parse_and_validate(response: &str) -> Result<Proposal> {
 /// 含まれている (TOML / hook bodies / explanation) ので情報損失ゼロ。
 /// 5-15KB / turn 削減され、長 chat の context window 圧迫と token コストを抑える。
 fn proposal_to_xml(p: &Proposal) -> String {
-    let mut out = String::with_capacity(p.plugin_entry_toml.len() + p.explanation.len() + 256);
-    out.push_str("<rvpm:plugin_entry>\n");
-    out.push_str(&p.plugin_entry_toml);
-    out.push_str("\n</rvpm:plugin_entry>\n");
-    for (tag, body) in [
-        ("init_lua", p.init_lua.as_deref()),
-        ("before_lua", p.before_lua.as_deref()),
-        ("after_lua", p.after_lua.as_deref()),
-    ] {
-        out.push_str(&format!(
-            "<rvpm:{tag}>\n{}\n</rvpm:{tag}>\n",
-            body.unwrap_or("(none)")
-        ));
-    }
+    let mut out = String::new();
+    push_section_xml(&mut out, "plugin_entry", &p.plugin_entry);
+    push_section_xml(&mut out, "init_lua", &p.init_lua);
+    push_section_xml(&mut out, "before_lua", &p.before_lua);
+    push_section_xml(&mut out, "after_lua", &p.after_lua);
     out.push_str("<rvpm:explanation>\n");
     out.push_str(&p.explanation);
     out.push_str("\n</rvpm:explanation>\n");
     out
 }
 
-fn print_proposal_preview(p: &Proposal, plugin_config_dir: &Path, config_toml_path: &Path) {
+fn push_section_xml(out: &mut String, name: &str, section: &ProposalSection) {
+    // fresh は常に emit (中身が無ければ "(none)") — schema は `<rvpm:NAME>` を
+    // 必須側で扱っているので、AI に "前 turn の構造" を再提示するときも欠落させない。
+    out.push_str(&format!(
+        "<rvpm:{name}>\n{}\n</rvpm:{name}>\n",
+        section.fresh.as_deref().unwrap_or("(none)")
+    ));
+    // merged は section.merged が Some のときのみ emit。None で書き出すと AI が
+    // "次 turn でも _merged を返さなくていい" と誤解するリスクを避けるため、
+    // 「merged なし」を明示するときは tag そのものを省略する。
+    if let Some(body) = section.merged.as_deref() {
+        out.push_str(&format!(
+            "<rvpm:{name}_merged>\n{body}\n</rvpm:{name}_merged>\n"
+        ));
+    }
+}
+
+/// 1 セクションが提示できる選択肢を集計し、user に per-file dialog を出して決定を返す。
+///
+/// 戻り値:
+///   - `HookWriteDecisions`: 3 hook ファイル分の決定 (Keep / Write)
+///   - `Option<String>`: `[[plugins]]` 本文 (None = "keep existing")
+async fn resolve_user_decisions(
+    proposal: &Proposal,
+    existing_hooks: &ExistingHooks,
+    tune_mode: bool,
+) -> Result<(HookWriteDecisions, Option<String>)> {
+    // [[plugins]] entry の選択
+    // - tune_mode (既存 entry あり) → fresh / merged / keep の三択
+    // - add mode (まだ stub のみ) → fresh しか無い → 自動採用 (ask しない)
+    let plugin_entry_toml = pick_plugin_entry_decision(&proposal.plugin_entry, tune_mode).await?;
+
+    // 3 hook ファイルそれぞれの選択
+    let init_lua = pick_hook_decision(
+        "init.lua",
+        &proposal.init_lua,
+        existing_hooks.init_lua.as_deref(),
+    )
+    .await?;
+    let before_lua = pick_hook_decision(
+        "before.lua",
+        &proposal.before_lua,
+        existing_hooks.before_lua.as_deref(),
+    )
+    .await?;
+    let after_lua = pick_hook_decision(
+        "after.lua",
+        &proposal.after_lua,
+        existing_hooks.after_lua.as_deref(),
+    )
+    .await?;
+
+    Ok((
+        HookWriteDecisions {
+            init_lua,
+            before_lua,
+            after_lua,
+        },
+        plugin_entry_toml,
+    ))
+}
+
+/// `[[plugins]]` entry の per-section 選択。
+async fn pick_plugin_entry_decision(
+    section: &ProposalSection,
+    tune_mode: bool,
+) -> Result<Option<String>> {
+    // add mode: fresh しか提示されない → 自動採用 (skip にしたければ Skip メニューを使う)。
+    if !tune_mode {
+        return Ok(section.fresh.clone());
+    }
+
+    // tune mode: 既存 entry がある前提。fresh / merged / keep を提示。
+    let mut choices: Vec<(String, EntryChoiceKind)> = Vec::new();
+    if section.fresh.is_some() {
+        choices.push((
+            "Use FRESH (clean redesign — overwrite existing entry)".to_string(),
+            EntryChoiceKind::Fresh,
+        ));
+    }
+    if section.merged.is_some() {
+        choices.push((
+            "Use MERGED (preserves your fields, adjusts triggers etc.)".to_string(),
+            EntryChoiceKind::Merged,
+        ));
+    }
+    choices.push((
+        "Keep existing entry (no change)".to_string(),
+        EntryChoiceKind::Keep,
+    ));
+
+    if choices.len() == 1 {
+        // Keep だけが選択肢 (AI が両方 (none) で返した) → 自動的に keep。
+        return Ok(None);
+    }
+
+    let labels: Vec<String> = choices.iter().map(|(l, _)| l.clone()).collect();
+    let pick = pick_index("[[plugins]] entry — choose:", labels).await?;
+    Ok(match choices[pick].1 {
+        EntryChoiceKind::Fresh => section.fresh.clone(),
+        EntryChoiceKind::Merged => section.merged.clone(),
+        EntryChoiceKind::Keep => None,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum EntryChoiceKind {
+    Fresh,
+    Merged,
+    Keep,
+}
+
+/// 1 hook ファイルの per-section 選択。
+async fn pick_hook_decision(
+    name: &str,
+    section: &ProposalSection,
+    existing: Option<&str>,
+) -> Result<HookChoice> {
+    // 何も提示されない (AI が両方 (none) で返した) なら何もしない。
+    if section.is_empty() {
+        return Ok(HookChoice::Keep);
+    }
+
+    let mut choices: Vec<(String, HookChoiceKind)> = Vec::new();
+    if section.fresh.is_some() {
+        let label = if existing.is_some() {
+            format!("Use FRESH proposal (overwrite existing {name})")
+        } else {
+            format!("Use FRESH proposal (create {name})")
+        };
+        choices.push((label, HookChoiceKind::Fresh));
+    }
+    if section.merged.is_some() {
+        choices.push((
+            "Use MERGED proposal (preserves your edits, adds AI suggestions)".to_string(),
+            HookChoiceKind::Merged,
+        ));
+    }
+    let keep_label = if existing.is_some() {
+        format!("Keep existing {name} (no change)")
+    } else {
+        format!("Skip — don't create {name}")
+    };
+    choices.push((keep_label, HookChoiceKind::Keep));
+
+    let labels: Vec<String> = choices.iter().map(|(l, _)| l.clone()).collect();
+    let pick = pick_index(&format!("{name} — choose:"), labels).await?;
+    Ok(match choices[pick].1 {
+        HookChoiceKind::Fresh => HookChoice::Write(section.fresh.clone().unwrap()),
+        HookChoiceKind::Merged => HookChoice::Write(section.merged.clone().unwrap()),
+        HookChoiceKind::Keep => HookChoice::Keep,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum HookChoiceKind {
+    Fresh,
+    Merged,
+    Keep,
+}
+
+/// dialoguer の `Select` で 1 choice を選ばせる薄ラッパ。同期 API なので
+/// `spawn_blocking` で thread に逃がす。
+async fn pick_index(prompt: &str, labels: Vec<String>) -> Result<usize> {
+    use dialoguer::{Select, theme::ColorfulTheme};
+    let prompt_owned = prompt.to_string();
+    tokio::task::spawn_blocking(move || -> Result<usize> {
+        Select::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt_owned)
+            .items(&labels)
+            .default(0)
+            .interact()
+            .context("failed to read user choice")
+    })
+    .await
+    .context("failed to join blocking dialoguer task")?
+}
+
+fn print_proposal_preview(
+    p: &Proposal,
+    plugin_config_dir: &Path,
+    config_toml_path: &Path,
+    existing: &ExistingHooks,
+) {
     let rule = "\u{2500}".repeat(60);
     eprintln!();
     eprintln!(
-        "\u{1f4dd} [[plugins]] entry to merge into {}:",
+        "\u{1f4dd} [[plugins]] entry to write into {}:",
         config_toml_path.display()
     );
-    eprintln!("{rule}");
-    for line in p.plugin_entry_toml.lines() {
-        eprintln!("  {line}");
-    }
+    print_section_block(
+        "plugin_entry",
+        &p.plugin_entry,
+        /* existing */ None,
+        &rule,
+    );
 
-    // 各 hook の skip 対象を集めて、最後にサマリブロックを出す。
-    // 単発の "already exists" 行を見落として Apply されると AI 提案が無視されたまま
-    // になる UX 事故 (Gemini / CodeRabbit 共通指摘) を防ぐため、メニュー直前に
-    // 強調表示する。
-    let mut skipped: Vec<String> = Vec::new();
-    print_hook_section(
-        p.init_lua.as_deref(),
-        plugin_config_dir,
+    print_hook_section_block(
         "init.lua",
-        &rule,
-        &mut skipped,
-    );
-    print_hook_section(
-        p.before_lua.as_deref(),
+        &p.init_lua,
         plugin_config_dir,
+        existing.init_lua.as_deref(),
+        &rule,
+    );
+    print_hook_section_block(
         "before.lua",
-        &rule,
-        &mut skipped,
-    );
-    print_hook_section(
-        p.after_lua.as_deref(),
+        &p.before_lua,
         plugin_config_dir,
-        "after.lua",
+        existing.before_lua.as_deref(),
         &rule,
-        &mut skipped,
+    );
+    print_hook_section_block(
+        "after.lua",
+        &p.after_lua,
+        plugin_config_dir,
+        existing.after_lua.as_deref(),
+        &rule,
     );
 
     eprintln!();
@@ -371,58 +604,63 @@ fn print_proposal_preview(p: &Proposal, plugin_config_dir: &Path, config_toml_pa
     for line in p.explanation.lines() {
         eprintln!("  {line}");
     }
-
-    if !skipped.is_empty() {
-        eprintln!();
-        eprintln!("{rule}");
-        eprintln!(
-            "\u{26a0}\u{fe0f}  HEADS UP — Apply will SKIP {} existing hook file(s):",
-            skipped.len()
-        );
-        for path in &skipped {
-            eprintln!("    [SKIPPED] {path}");
-        }
-        eprintln!("    Your existing edits are preserved. To apply the AI proposal,");
-        eprintln!("    delete the file first or merge manually.");
-        eprintln!("{rule}");
-    }
     eprintln!();
 }
 
-fn print_hook_section(
-    body: Option<&str>,
-    plugin_dir: &Path,
-    name: &str,
-    rule: &str,
-    skipped: &mut Vec<String>,
-) {
-    let Some(body) = body else { return };
-    let path = plugin_dir.join(name);
-    let exists = path.exists();
-    let line_count = body.lines().count();
-
-    eprintln!();
-    if exists {
-        eprintln!(
-            "\u{26a0}\u{fe0f}  [SKIPPED] {} already exists ({} line proposal preserved for reference):",
-            path.display(),
-            line_count,
-        );
-        skipped.push(path.display().to_string());
-    } else {
-        eprintln!(
-            "\u{1f195} Will create {} ({} lines):",
-            path.display(),
-            line_count
-        );
-    }
+/// `[[plugins]]` entry 用の preview ブロック。fresh / merged の両方があれば並べて出す。
+fn print_section_block(name: &str, section: &ProposalSection, existing: Option<&str>, rule: &str) {
     eprintln!("{rule}");
-    for line in body.lines().take(20) {
-        eprintln!("  {line}");
+    if let Some(body) = existing {
+        eprintln!("  [EXISTING {name}]");
+        for line in body.lines().take(20) {
+            eprintln!("    {line}");
+        }
+        if body.lines().count() > 20 {
+            eprintln!("    ... ({} more lines)", body.lines().count() - 20);
+        }
+        eprintln!();
     }
-    if line_count > 20 {
-        eprintln!("  ... ({} more lines)", line_count - 20);
+    if let Some(body) = section.fresh.as_deref() {
+        eprintln!("  [FRESH {name}]");
+        for line in body.lines().take(40) {
+            eprintln!("    {line}");
+        }
+        if body.lines().count() > 40 {
+            eprintln!("    ... ({} more lines)", body.lines().count() - 40);
+        }
+    } else {
+        eprintln!("  [FRESH {name}] (none)");
     }
+    if let Some(body) = section.merged.as_deref() {
+        eprintln!();
+        eprintln!("  [MERGED {name}]");
+        for line in body.lines().take(40) {
+            eprintln!("    {line}");
+        }
+        if body.lines().count() > 40 {
+            eprintln!("    ... ({} more lines)", body.lines().count() - 40);
+        }
+    }
+}
+
+/// hook ファイル用の preview ブロック。
+fn print_hook_section_block(
+    name: &str,
+    section: &ProposalSection,
+    plugin_dir: &Path,
+    existing: Option<&str>,
+    rule: &str,
+) {
+    if section.is_empty() && existing.is_none() {
+        return;
+    }
+    eprintln!();
+    eprintln!(
+        "\u{1f4c4} {} (target: {}):",
+        name,
+        plugin_dir.join(name).display()
+    );
+    print_section_block(name, section, existing, rule);
 }
 
 #[cfg(test)]
@@ -432,14 +670,23 @@ mod tests {
     #[test]
     fn proposal_to_xml_emits_all_tags_with_present_lua() {
         let p = Proposal {
-            plugin_entry_toml: "[[plugins]]\nurl = \"o/r\"".to_string(),
-            init_lua: Some("vim.g.x = 1".to_string()),
-            before_lua: None,
-            after_lua: Some("require('o').setup({})".to_string()),
+            plugin_entry: ProposalSection {
+                fresh: Some("[[plugins]]\nurl = \"o/r\"".to_string()),
+                merged: None,
+            },
+            init_lua: ProposalSection {
+                fresh: Some("vim.g.x = 1".to_string()),
+                merged: None,
+            },
+            before_lua: ProposalSection::default(),
+            after_lua: ProposalSection {
+                fresh: Some("require('o').setup({})".to_string()),
+                merged: None,
+            },
             explanation: "two sentence explanation here.".to_string(),
         };
         let xml = proposal_to_xml(&p);
-        // すべての tag が含まれる
+        // すべての fresh tag が含まれる
         assert!(xml.contains("<rvpm:plugin_entry>"));
         assert!(xml.contains("</rvpm:plugin_entry>"));
         assert!(xml.contains("<rvpm:init_lua>"));
@@ -448,6 +695,36 @@ mod tests {
         assert!(xml.contains("<rvpm:before_lua>\n(none)\n</rvpm:before_lua>"));
         assert!(xml.contains("require('o').setup"));
         assert!(xml.contains("two sentence explanation here."));
+        // merged が無いセクションは _merged tag を emit しない
+        assert!(!xml.contains("<rvpm:before_lua_merged>"));
+        assert!(!xml.contains("<rvpm:after_lua_merged>"));
+    }
+
+    #[test]
+    fn proposal_to_xml_emits_merged_tag_when_present() {
+        let p = Proposal {
+            plugin_entry: ProposalSection {
+                fresh: Some("[[plugins]]\nurl = \"o/r\"".to_string()),
+                merged: Some(
+                    r#"[[plugins]]
+url = "o/r"
+on_cmd = ["Foo"]"#
+                        .to_string(),
+                ),
+            },
+            init_lua: ProposalSection::default(),
+            before_lua: ProposalSection::default(),
+            after_lua: ProposalSection {
+                fresh: Some("FRESH".to_string()),
+                merged: Some("MERGED".to_string()),
+            },
+            explanation: "expl".to_string(),
+        };
+        let xml = proposal_to_xml(&p);
+        assert!(xml.contains("<rvpm:plugin_entry_merged>"));
+        assert!(xml.contains("on_cmd = [\"Foo\"]"));
+        assert!(xml.contains("<rvpm:after_lua_merged>"));
+        assert!(xml.contains("MERGED"));
     }
 
     #[test]
@@ -455,21 +732,26 @@ mod tests {
         // 再構築した XML が元の Proposal にパースし戻せる (next turn の AI が
         // 前 turn の構造化出力を「自分の前の reply」として読める保証)。
         let original = Proposal {
-            plugin_entry_toml: "[[plugins]]\nurl = \"a/b\"\non_cmd = [\"X\"]".to_string(),
-            init_lua: Some("a = 1".to_string()),
-            before_lua: None,
-            after_lua: None,
+            plugin_entry: ProposalSection {
+                fresh: Some("[[plugins]]\nurl = \"a/b\"\non_cmd = [\"X\"]".to_string()),
+                merged: Some("[[plugins]]\nurl = \"a/b\"\non_cmd = [\"X\", \"Y\"]".to_string()),
+            },
+            init_lua: ProposalSection {
+                fresh: Some("a = 1".to_string()),
+                merged: None,
+            },
+            before_lua: ProposalSection::default(),
+            after_lua: ProposalSection::default(),
             explanation: "expl".to_string(),
         };
         let xml = proposal_to_xml(&original);
         let reparsed = crate::ai::parse_proposal(&xml).unwrap();
-        assert_eq!(
-            reparsed.plugin_entry_toml.trim(),
-            original.plugin_entry_toml
-        );
-        assert_eq!(reparsed.init_lua, original.init_lua);
-        assert_eq!(reparsed.before_lua, None); // (none) → None
-        assert_eq!(reparsed.after_lua, None);
+        assert_eq!(reparsed.plugin_entry.fresh, original.plugin_entry.fresh);
+        assert_eq!(reparsed.plugin_entry.merged, original.plugin_entry.merged);
+        assert_eq!(reparsed.init_lua.fresh, original.init_lua.fresh);
+        assert_eq!(reparsed.init_lua.merged, None);
+        assert!(reparsed.before_lua.fresh.is_none());
+        assert!(reparsed.after_lua.fresh.is_none());
         assert_eq!(reparsed.explanation, original.explanation);
     }
 
@@ -478,10 +760,13 @@ mod tests {
         // Raw AI response は preamble + tags + 余分な改行/コードフェンスで膨らむ。
         // proposal_to_xml は構造のみなので大幅に小さくなる (代表的に 5-10x)。
         let p = Proposal {
-            plugin_entry_toml: "[[plugins]]\nurl = \"o/r\"".to_string(),
-            init_lua: None,
-            before_lua: None,
-            after_lua: None,
+            plugin_entry: ProposalSection {
+                fresh: Some("[[plugins]]\nurl = \"o/r\"".to_string()),
+                merged: None,
+            },
+            init_lua: ProposalSection::default(),
+            before_lua: ProposalSection::default(),
+            after_lua: ProposalSection::default(),
             explanation: "Brief".to_string(),
         };
         let compact = proposal_to_xml(&p);
@@ -491,5 +776,26 @@ mod tests {
             "compact xml unexpectedly large: {} bytes",
             compact.len()
         );
+    }
+
+    #[test]
+    fn read_existing_hooks_returns_none_for_missing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("p");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let hooks = read_existing_hooks(&plugin_dir);
+        assert!(hooks.is_empty());
+    }
+
+    #[test]
+    fn read_existing_hooks_returns_some_when_files_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("p");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("after.lua"), "USER CONTENT\n").unwrap();
+        let hooks = read_existing_hooks(&plugin_dir);
+        assert!(hooks.init_lua.is_none());
+        assert!(hooks.before_lua.is_none());
+        assert_eq!(hooks.after_lua.as_deref(), Some("USER CONTENT\n"));
     }
 }

@@ -14,6 +14,45 @@ use std::path::Path;
 /// rvpm の TOML schema brief (生成時に compile-time に取り込む)。
 const SCHEMA: &str = include_str!("schema_prompt.md");
 
+/// User の既存 hook 本文 (chat loop が事前に disk から読み出して渡す)。
+/// 値が `Some(_)` のセクションだけ AI に「merged variant も返して」と依頼する。
+#[derive(Debug, Clone, Default)]
+pub struct ExistingHooks {
+    pub init_lua: Option<String>,
+    pub before_lua: Option<String>,
+    pub after_lua: Option<String>,
+}
+
+impl ExistingHooks {
+    pub fn is_empty(&self) -> bool {
+        self.init_lua.is_none() && self.before_lua.is_none() && self.after_lua.is_none()
+    }
+}
+
+/// 既存 hook 本文を prompt に書き出すヘルパー。`is_empty` のときは何もしない。
+fn write_existing_hooks(out: &mut String, hooks: &ExistingHooks) {
+    if hooks.is_empty() {
+        return;
+    }
+    out.push_str("## Existing hook files (user has these on disk)\n\n");
+    out.push_str(
+        "For each section with an existing body below, you MUST also emit a `_merged` tag \
+         (`<rvpm:after_lua_merged>` etc.) that preserves the user's intent. See the \
+         \"Merged variants\" section above for rules.\n\n",
+    );
+    for (name, body) in [
+        ("init.lua", hooks.init_lua.as_deref()),
+        ("before.lua", hooks.before_lua.as_deref()),
+        ("after.lua", hooks.after_lua.as_deref()),
+    ] {
+        let Some(body) = body else { continue };
+        out.push_str(&format!("### Existing `{name}`\n\n"));
+        out.push_str("```lua\n");
+        out.push_str(&trim_to_cap(body, 10_000));
+        out.push_str("\n```\n\n");
+    }
+}
+
 /// AI add の最初の turn で投げる prompt を組み立てる。
 ///
 /// 構成 (ブロック順):
@@ -27,6 +66,7 @@ pub fn build_initial_prompt(
     plugin_root: &Path,
     user_config_toml: &str,
     user_plugins_tree: &str,
+    existing_hooks: &ExistingHooks,
     ai_language: &str,
 ) -> Result<String> {
     let plugin_readme = read_plugin_readme(plugin_root);
@@ -72,6 +112,8 @@ pub fn build_initial_prompt(
     out.push_str(user_plugins_tree.trim_end());
     out.push_str("\n```\n\n");
 
+    write_existing_hooks(&mut out, existing_hooks);
+
     out.push_str("---\n\n");
     out.push_str(
         "Now propose the optimal `[[plugins]]` block for the plugin above, plus any \
@@ -100,6 +142,7 @@ pub fn build_tune_prompt(
     current_entry_toml: &str,
     user_config_toml: &str,
     user_plugins_tree: &str,
+    existing_hooks: &ExistingHooks,
     ai_language: &str,
 ) -> Result<String> {
     let plugin_readme = read_plugin_readme(plugin_root);
@@ -125,9 +168,12 @@ pub fn build_tune_prompt(
         "This plugin is **already configured** in the user's `config.toml`. \
          Your job is to **improve** the existing setup — add missing lazy triggers, \
          drop redundant fields, suggest better `on_*` patterns, refine \
-         `init.lua` / `before.lua` / `after.lua` if helpful, etc. Feel free to \
-         overwrite any field of the existing entry; the user will push back via \
-         chat if a particular field should be left alone.\n\n",
+         `init.lua` / `before.lua` / `after.lua` if helpful, etc.\n\n\
+         Because the user has an existing entry, you MUST emit BOTH \
+         `<rvpm:plugin_entry>` (clean redesign) and `<rvpm:plugin_entry_merged>` \
+         (conservative merge that preserves the user's intent). The user will \
+         pick one. Same applies for any hook files where existing content is \
+         shown below.\n\n",
     );
 
     out.push_str("## Current `[[plugins]]` entry\n\n");
@@ -158,12 +204,15 @@ pub fn build_tune_prompt(
     out.push_str(user_plugins_tree.trim_end());
     out.push_str("\n```\n\n");
 
+    write_existing_hooks(&mut out, existing_hooks);
+
     out.push_str("---\n\n");
     out.push_str(
         "Now propose an **improved** `[[plugins]]` block for the plugin above, \
-         plus any hook files. The TOML you emit will fully replace the existing \
-         entry — keep `name` / `url` consistent with the current entry but feel \
-         free to revise everything else. Output exactly the XML tag structure \
+         plus any hook files. Emit BOTH `<rvpm:plugin_entry>` (clean redesign) \
+         and `<rvpm:plugin_entry_merged>` (conservative merge of the existing \
+         entry). For hook files where existing content was shown above, also \
+         emit the `_merged` variant. Output exactly the XML tag structure \
          shown earlier — no markdown code fences around the tags, no preamble \
          text outside the tags.\n",
     );
@@ -311,6 +360,7 @@ mod tests {
             &plugin_root,
             "[[plugins]]\nurl = \"existing/dep\"\n",
             "github.com/existing/dep/\n",
+            &ExistingHooks::default(),
             "en",
         )
         .unwrap();
@@ -321,6 +371,8 @@ mod tests {
         assert!(prompt.contains("existing/dep"));
         // 英語デフォルトでは Language ヒントは挿入しない
         assert!(!prompt.contains("Respond in"));
+        // 既存 hook なしの場合 "Existing hook files" セクションは出さない
+        assert!(!prompt.contains("Existing hook files"));
     }
 
     #[test]
@@ -330,8 +382,40 @@ mod tests {
         std::fs::create_dir_all(&plugin_root).unwrap();
         std::fs::write(plugin_root.join("README.md"), "x").unwrap();
 
-        let prompt = build_initial_prompt("owner/repo", &plugin_root, "", "(empty)", "ja").unwrap();
+        let prompt = build_initial_prompt(
+            "owner/repo",
+            &plugin_root,
+            "",
+            "(empty)",
+            &ExistingHooks::default(),
+            "ja",
+        )
+        .unwrap();
         assert!(prompt.contains("Respond in **ja**"));
+    }
+
+    #[test]
+    fn build_initial_prompt_injects_existing_hook_bodies() {
+        // `add` でも user が手書きで先に hook を置いていれば AI に見せて merged variant を頼む
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_root = tmp.path().join("plugin");
+        std::fs::create_dir_all(&plugin_root).unwrap();
+        std::fs::write(plugin_root.join("README.md"), "x").unwrap();
+
+        let existing = ExistingHooks {
+            after_lua: Some("vim.keymap.set('n', '<leader>x', ':Foo<CR>')".to_string()),
+            ..Default::default()
+        };
+        let prompt =
+            build_initial_prompt("owner/repo", &plugin_root, "", "(empty)", &existing, "en")
+                .unwrap();
+        assert!(prompt.contains("Existing hook files"));
+        assert!(prompt.contains("Existing `after.lua`"));
+        assert!(prompt.contains("vim.keymap.set"));
+        assert!(prompt.contains("`_merged` tag"));
+        // before/init は無いので section も出さない
+        assert!(!prompt.contains("Existing `init.lua`"));
+        assert!(!prompt.contains("Existing `before.lua`"));
     }
 
     #[test]
@@ -349,6 +433,7 @@ mod tests {
             current_entry,
             "[[plugins]]\nurl = \"owner/tune-me\"\n",
             "(empty)",
+            &ExistingHooks::default(),
             "en",
         )
         .unwrap();
@@ -359,8 +444,8 @@ mod tests {
         assert!(prompt.contains("on_cmd = [\"Bar\"]"));
         assert!(prompt.contains("Use :Bar"));
         assert!(prompt.contains("rvpm — TOML schema brief"));
-        // Tune モードでも "improved" を強調
-        assert!(prompt.contains("improved"));
+        // Tune モードは plugin_entry_merged を要求
+        assert!(prompt.contains("plugin_entry_merged"));
     }
 
     #[test]
@@ -376,10 +461,41 @@ mod tests {
             "[[plugins]]\nurl = \"owner/repo\"\n",
             "",
             "(empty)",
+            &ExistingHooks::default(),
             "ja",
         )
         .unwrap();
         assert!(prompt.contains("Respond in **ja**"));
+    }
+
+    #[test]
+    fn build_tune_prompt_includes_existing_hooks_when_provided() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_root = tmp.path().join("plugin");
+        std::fs::create_dir_all(&plugin_root).unwrap();
+        std::fs::write(plugin_root.join("README.md"), "x").unwrap();
+
+        let existing = ExistingHooks {
+            before_lua: Some("vim.g.foo_pre = 'user'".to_string()),
+            after_lua: Some("require('foo').setup({ user = true })".to_string()),
+            ..Default::default()
+        };
+        let prompt = build_tune_prompt(
+            "owner/foo",
+            &plugin_root,
+            "[[plugins]]\nurl = \"owner/foo\"\n",
+            "",
+            "(empty)",
+            &existing,
+            "en",
+        )
+        .unwrap();
+        assert!(prompt.contains("Existing hook files"));
+        assert!(prompt.contains("Existing `before.lua`"));
+        assert!(prompt.contains("vim.g.foo_pre"));
+        assert!(prompt.contains("Existing `after.lua`"));
+        assert!(prompt.contains("user = true"));
+        assert!(!prompt.contains("Existing `init.lua`"));
     }
 
     #[test]

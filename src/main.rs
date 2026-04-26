@@ -2946,14 +2946,15 @@ async fn run_add(
                     {
                         Ok(outcome) => match outcome.outcome {
                             crate::ai::ChatOutcome::Applied { written_hooks } => {
-                                if let Some(prop) = outcome.proposal {
-                                    // AI 提案の `[[plugins]]` body で既存 stub entry を置換。
+                                // user が `[[plugins]]` セクションで "Keep existing" を選んだら
+                                // `plugin_entry_toml` は None — stub entry をそのまま残す。
+                                if let Some(entry_toml) = outcome.plugin_entry_toml {
                                     let latest = std::fs::read_to_string(&config_path)?;
                                     let mut doc_patch = latest.parse::<DocumentMut>()?;
                                     if let Err(e) = replace_plugin_entry_with_ai_toml(
                                         &mut doc_patch,
                                         &stored_url,
-                                        &prop.plugin_entry_toml,
+                                        &entry_toml,
                                         &preserved_keys,
                                         MergeMode::Merge,
                                     ) {
@@ -2974,6 +2975,12 @@ async fn run_add(
                                             written_hooks.len()
                                         );
                                     }
+                                } else {
+                                    println!(
+                                        "Kept existing entry for {} ({} hook file(s) created).",
+                                        plugin.display_name(),
+                                        written_hooks.len()
+                                    );
                                 }
                             }
                             crate::ai::ChatOutcome::Skipped => {
@@ -3817,16 +3824,17 @@ async fn run_tune(
     {
         Ok(outcome) => match outcome.outcome {
             crate::ai::ChatOutcome::Applied { written_hooks } => {
-                if let Some(prop) = outcome.proposal {
+                // user が `[[plugins]]` セクションで "Keep existing entry" を選んだら
+                // `plugin_entry_toml` は None — config.toml は触らず、hook ファイル更新のみ。
+                if let Some(entry_toml) = outcome.plugin_entry_toml {
                     let latest = std::fs::read_to_string(&config_path)?;
                     let mut doc_patch = latest.parse::<DocumentMut>()?;
-                    // Option A: AI 提案で **全 field 上書き** (`preserved_keys` は空)。
-                    // user は Chat ループ中に "X は触らないで" と言えば AI 側で field を保持する。
+                    // user は preview で fresh / merged を per-section に選択済み。
                     // `Replace` mode で AI が omit した stale field (e.g. 古い `on_cmd`) を消す。
                     if let Err(e) = replace_plugin_entry_with_ai_toml(
                         &mut doc_patch,
                         &selected_url,
-                        &prop.plugin_entry_toml,
+                        &entry_toml,
                         &[],
                         MergeMode::Replace,
                     ) {
@@ -3838,11 +3846,17 @@ async fn run_tune(
                         chezmoi::write_routed(config.options.chezmoi, &config_path, &patched)
                             .await?;
                         println!(
-                            "Tuned {} ({} hook file(s) created).",
+                            "Tuned {} ({} hook file(s) created/overwritten).",
                             plugin.display_name(),
                             written_hooks.len()
                         );
                     }
+                } else {
+                    println!(
+                        "Kept existing entry for {} ({} hook file(s) created/overwritten).",
+                        plugin.display_name(),
+                        written_hooks.len()
+                    );
                 }
             }
             crate::ai::ChatOutcome::Skipped => {
