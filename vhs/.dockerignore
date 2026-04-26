@@ -1,0 +1,5 @@
+# vhs build context only needs the Dockerfile itself — the *.tape files
+# are bind-mounted at run time, not baked into the image, and the *.gif
+# outputs would just bloat the build context.
+*
+!Dockerfile
