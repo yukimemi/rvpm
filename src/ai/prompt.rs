@@ -14,6 +14,47 @@ use std::path::Path;
 /// rvpm の TOML schema brief (生成時に compile-time に取り込む)。
 const SCHEMA: &str = include_str!("schema_prompt.md");
 
+/// `RVPM_AI_NO_MERGED=1` で立つ実験フラグ。`_merged` variant 要求を prompt から
+/// 一切落として「fresh のみの旧挙動」相当の prompt を生成する。
+///
+/// 動機: Gemini CLI v0.39 の `_recoverFromLoop` で abort される事例 (user 報告)。
+/// 仮説は「fresh + merged の両出力指示が "似たトークン連続" として Gemini の
+/// loop guard に誤検知されている」。これを切り分けるためのデバッグ knob。
+///
+/// 影響範囲:
+///   - SCHEMA の `### Merged variants` 節を strip
+///   - "Existing hook files" 節を出さない (= AI に既存 hook 本文を見せない)
+///   - tune mode の "MUST emit BOTH plugin_entry / plugin_entry_merged" 指示を
+///     "improve the existing entry" の控えめ表現に差し替える
+///
+/// preview / Apply は chat.rs 側で既存 hook / 既存 entry を保持しているので
+/// UX には影響しない (AI が `_merged` を返してこなくても fresh / keep の選択
+/// 肢は残る)。
+fn no_merged_flag() -> bool {
+    std::env::var("RVPM_AI_NO_MERGED")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
+/// `no_merged` 時に SCHEMA から "### Merged variants" 節を取り除く。
+/// 開始マーカ `### Merged variants` から次の `## Constraints` 直前までを切り出す。
+fn schema_for_prompt(no_merged: bool) -> std::borrow::Cow<'static, str> {
+    if !no_merged {
+        return std::borrow::Cow::Borrowed(SCHEMA);
+    }
+    let start_marker = "### Merged variants";
+    let end_marker = "## Constraints";
+    if let (Some(start), Some(end)) = (SCHEMA.find(start_marker), SCHEMA.find(end_marker))
+        && start < end
+    {
+        let mut out = String::with_capacity(SCHEMA.len());
+        out.push_str(&SCHEMA[..start]);
+        out.push_str(&SCHEMA[end..]);
+        return std::borrow::Cow::Owned(out);
+    }
+    std::borrow::Cow::Borrowed(SCHEMA)
+}
+
 /// User の既存 hook 本文 (chat loop が事前に disk から読み出して渡す)。
 /// 値が `Some(_)` のセクションだけ AI に「merged variant も返して」と依頼する。
 #[derive(Debug, Clone, Default)]
@@ -96,9 +137,10 @@ pub fn build_initial_prompt(
 ) -> Result<String> {
     let plugin_readme = read_plugin_readme(plugin_root);
     let plugin_doc = read_plugin_doc(plugin_root);
+    let no_merged = no_merged_flag();
 
     let mut out = String::new();
-    out.push_str(SCHEMA);
+    out.push_str(&schema_for_prompt(no_merged));
     out.push_str("\n\n---\n\n");
 
     // 言語ヒント — schema 構造は英語固定だが explanation は user 言語
@@ -138,7 +180,9 @@ pub fn build_initial_prompt(
     out.push_str(user_plugins_tree.trim_end());
     out.push_str("\n```\n\n");
 
-    write_existing_hooks(&mut out, existing_hooks);
+    if !no_merged {
+        write_existing_hooks(&mut out, existing_hooks);
+    }
 
     out.push_str("---\n\n");
     out.push_str(
@@ -176,9 +220,10 @@ pub fn build_tune_prompt(
 ) -> Result<String> {
     let plugin_readme = read_plugin_readme(plugin_root);
     let plugin_doc = read_plugin_doc(plugin_root);
+    let no_merged = no_merged_flag();
 
     let mut out = String::new();
-    out.push_str(SCHEMA);
+    out.push_str(&schema_for_prompt(no_merged));
     out.push_str("\n\n---\n\n");
 
     if !ai_language.eq_ignore_ascii_case("en") {
@@ -193,17 +238,26 @@ pub fn build_tune_prompt(
     out.push_str("---\n\n");
     out.push_str("# Plugin to tune\n\n");
     out.push_str(&format!("URL: `{plugin_url}`\n\n"));
-    out.push_str(
-        "This plugin is **already configured** in the user's `config.toml`. \
-         Your job is to **improve** the existing setup — add missing lazy triggers, \
-         drop redundant fields, suggest better `on_*` patterns, refine \
-         `init.lua` / `before.lua` / `after.lua` if helpful, etc.\n\n\
-         Because the user has an existing entry, you MUST emit BOTH \
-         `<rvpm:plugin_entry>` (clean redesign) and `<rvpm:plugin_entry_merged>` \
-         (conservative merge that preserves the user's intent). The user will \
-         pick one. Same applies for any hook files where existing content is \
-         shown below.\n\n",
-    );
+    if no_merged {
+        out.push_str(
+            "This plugin is **already configured** in the user's `config.toml`. \
+             Your job is to **improve** the existing setup — add missing lazy \
+             triggers, drop redundant fields, suggest better `on_*` patterns, \
+             refine `init.lua` / `before.lua` / `after.lua` if helpful, etc.\n\n",
+        );
+    } else {
+        out.push_str(
+            "This plugin is **already configured** in the user's `config.toml`. \
+             Your job is to **improve** the existing setup — add missing lazy triggers, \
+             drop redundant fields, suggest better `on_*` patterns, refine \
+             `init.lua` / `before.lua` / `after.lua` if helpful, etc.\n\n\
+             Because the user has an existing entry, you MUST emit BOTH \
+             `<rvpm:plugin_entry>` (clean redesign) and `<rvpm:plugin_entry_merged>` \
+             (conservative merge that preserves the user's intent). The user will \
+             pick one. Same applies for any hook files where existing content is \
+             shown below.\n\n",
+        );
+    }
 
     out.push_str("## Current `[[plugins]]` entry\n\n");
     out.push_str("```toml\n");
@@ -234,18 +288,29 @@ pub fn build_tune_prompt(
     out.push_str(user_plugins_tree.trim_end());
     out.push_str("\n```\n\n");
 
-    write_existing_hooks(&mut out, existing_hooks);
+    if !no_merged {
+        write_existing_hooks(&mut out, existing_hooks);
+    }
 
     out.push_str("---\n\n");
-    out.push_str(
-        "Now propose an **improved** `[[plugins]]` block for the plugin above, \
-         plus any hook files. Emit BOTH `<rvpm:plugin_entry>` (clean redesign) \
-         and `<rvpm:plugin_entry_merged>` (conservative merge of the existing \
-         entry). For hook files where existing content was shown above, also \
-         emit the `_merged` variant. Output exactly the XML tag structure \
-         shown earlier — no markdown code fences around the tags, no preamble \
-         text outside the tags.\n",
-    );
+    if no_merged {
+        out.push_str(
+            "Now propose an **improved** `[[plugins]]` block for the plugin above, \
+             plus any hook files. Output exactly the XML tag structure shown \
+             earlier — no markdown code fences around the tags, no preamble \
+             text outside the tags.\n",
+        );
+    } else {
+        out.push_str(
+            "Now propose an **improved** `[[plugins]]` block for the plugin above, \
+             plus any hook files. Emit BOTH `<rvpm:plugin_entry>` (clean redesign) \
+             and `<rvpm:plugin_entry_merged>` (conservative merge of the existing \
+             entry). For hook files where existing content was shown above, also \
+             emit the `_merged` variant. Output exactly the XML tag structure \
+             shown earlier — no markdown code fences around the tags, no preamble \
+             text outside the tags.\n",
+        );
+    }
 
     Ok(out)
 }
@@ -548,6 +613,23 @@ mod tests {
         assert!(prompt.contains("Existing `after.lua`"));
         assert!(prompt.contains("user = true"));
         assert!(!prompt.contains("Existing `init.lua`"));
+    }
+
+    #[test]
+    fn schema_for_prompt_strips_merged_section_when_flag_set() {
+        // strip 後は "Merged variants" 節が消え、"## Constraints" 以降は残る
+        let stripped = schema_for_prompt(true);
+        assert!(!stripped.contains("### Merged variants"));
+        assert!(stripped.contains("## Constraints"));
+        // 元の SCHEMA の冒頭は残る
+        assert!(stripped.contains("rvpm — TOML schema brief"));
+    }
+
+    #[test]
+    fn schema_for_prompt_keeps_merged_section_by_default() {
+        let full = schema_for_prompt(false);
+        assert!(full.contains("### Merged variants"));
+        assert!(full.contains("## Constraints"));
     }
 
     #[test]

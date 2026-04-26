@@ -70,6 +70,10 @@ pub async fn run_ai_add(
         ai_language,
     )?;
 
+    if let Some(out) = maybe_dump_and_skip(&initial_prompt)? {
+        return Ok(out);
+    }
+
     eprintln!(
         "\u{1f916} Asking {} about {} (this may take a moment)...",
         backend.label(),
@@ -124,6 +128,10 @@ pub async fn run_ai_tune(
         ai_language,
     )?;
 
+    if let Some(out) = maybe_dump_and_skip(&initial_prompt)? {
+        return Ok(out);
+    }
+
     eprintln!(
         "\u{1f916} Asking {} to tune {} (this may take a moment)...",
         backend.label(),
@@ -158,6 +166,39 @@ fn collect_user_context(
         .with_context(|| format!("failed to read {}", user_config_toml_path.display()))?;
     let tree = collect_plugins_tree(config_root);
     Ok((toml, tree))
+}
+
+/// `RVPM_AI_DUMP_PROMPT=<path>` が設定されていれば、組み立て済み prompt を
+/// そのパスに書き出して **AI 呼び出しを skip** する (Skipped で早期 return)。
+///
+/// 動機: Gemini CLI v0.39 の `_recoverFromLoop` で abort されるなど、prompt の
+/// 中身を見ながら手動で iterate したい場面がある。env var だけで挙動を切り替え
+/// られる軽量デバッグ knob — CLI flag は増やさない。
+///
+/// 書き出し先パスが空文字や書き込み失敗時は err を返さず stderr に warn を
+/// 流すだけにして、user の他の作業 (sync/generate のあとに run_add 完了) を
+/// 妨げないようにしてもよかったが、明示的に dump を要求した user がエラーを
+/// 見過ごすほうが事故るので `?` で propagate する。
+fn maybe_dump_and_skip(prompt_text: &str) -> Result<Option<AiAddOutcome>> {
+    let Ok(dump_path) = std::env::var("RVPM_AI_DUMP_PROMPT") else {
+        return Ok(None);
+    };
+    if dump_path.trim().is_empty() {
+        return Ok(None);
+    }
+    std::fs::write(&dump_path, prompt_text)
+        .with_context(|| format!("failed to write prompt dump to {dump_path}"))?;
+    eprintln!(
+        "\u{1f4dd} Prompt dumped to {} ({} bytes / {} lines). Skipping AI call \
+         (RVPM_AI_DUMP_PROMPT was set).",
+        dump_path,
+        prompt_text.len(),
+        prompt_text.lines().count()
+    );
+    Ok(Some(AiAddOutcome {
+        outcome: ChatOutcome::Skipped,
+        plugin_entry_toml: None,
+    }))
 }
 
 /// per-plugin config dir から既存 hook ファイル本文を読む。読めなければ `None`
