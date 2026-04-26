@@ -184,15 +184,16 @@ enum Commands {
     /// Like `add --ai`, but for plugins **already configured** in
     /// `config.toml`. Picks one entry (by `[query]` fuzzy match or
     /// interactive select), feeds the current `[[plugins]]` block plus
-    /// the cloned plugin's README/doc to the AI CLI, and lets the AI
-    /// propose an improved entry + per-plugin hook files.
+    /// the cloned plugin's README/doc and any existing per-plugin hook
+    /// files to the AI CLI, and asks for two parallel proposals per
+    /// section: a fresh redesign and a merged variant that preserves
+    /// your edits.
     ///
-    /// DESTRUCTIVE BY DEFAULT. The AI proposal fully replaces the
-    /// selected `[[plugins]]` entry — fields the AI omits are dropped
-    /// (e.g. an old `on_cmd` is removed if the AI thinks it's no longer
-    /// needed). Use the Chat action to tell the AI to keep a particular
-    /// field. Existing per-plugin hook files are never overwritten —
-    /// they're shown as `[SKIPPED]` in the preview.
+    /// At Apply time you pick per-section: `Use FRESH` (overwrite),
+    /// `Use MERGED` (overwrite, keep your edits), or `Keep existing`
+    /// (no change). Same choice applies to the `[[plugins]]` entry
+    /// itself. Use the Chat action to tell the AI to keep a particular
+    /// field, or just pick `Keep existing` for that section.
     Tune {
         /// Fuzzy match plugin url (omit to pick interactively)
         query: Option<String>,
@@ -2946,14 +2947,15 @@ async fn run_add(
                     {
                         Ok(outcome) => match outcome.outcome {
                             crate::ai::ChatOutcome::Applied { written_hooks } => {
-                                if let Some(prop) = outcome.proposal {
-                                    // AI 提案の `[[plugins]]` body で既存 stub entry を置換。
+                                // user が `[[plugins]]` セクションで "Keep existing" を選んだら
+                                // `plugin_entry_toml` は None — stub entry をそのまま残す。
+                                if let Some(entry_toml) = outcome.plugin_entry_toml {
                                     let latest = std::fs::read_to_string(&config_path)?;
                                     let mut doc_patch = latest.parse::<DocumentMut>()?;
                                     if let Err(e) = replace_plugin_entry_with_ai_toml(
                                         &mut doc_patch,
                                         &stored_url,
-                                        &prop.plugin_entry_toml,
+                                        &entry_toml,
                                         &preserved_keys,
                                         MergeMode::Merge,
                                     ) {
@@ -2969,11 +2971,17 @@ async fn run_add(
                                         )
                                         .await?;
                                         println!(
-                                            "Applied AI-proposed config for {} ({} hook file(s) created).",
+                                            "Applied AI-proposed config for {} ({} hook file(s) created/overwritten).",
                                             plugin.display_name(),
                                             written_hooks.len()
                                         );
                                     }
+                                } else {
+                                    println!(
+                                        "Kept existing entry for {} ({} hook file(s) created/overwritten).",
+                                        plugin.display_name(),
+                                        written_hooks.len()
+                                    );
                                 }
                             }
                             crate::ai::ChatOutcome::Skipped => {
@@ -2991,7 +2999,15 @@ async fn run_add(
                         },
                         Err(e) => {
                             eprintln!(
-                                "\u{26a0} AI add failed: {e}. Stub entry kept; rerun with `--no-ai` for static-scan mode."
+                                "\u{26a0} AI add failed: {e:#}. Stub entry kept; rerun with `--no-ai` for static-scan mode."
+                            );
+                            eprintln!(
+                                "\n  Debug knobs (env vars):\n\
+                                 \x20 RVPM_AI_DUMP_PROMPT=/tmp/p.md   write the prompt to a file and skip the AI call\n\
+                                 \x20 RVPM_AI_NO_MERGED=1             drop the `_merged` variant requirement (helps if\n\
+                                 \x20                                 the backend's loop-detection trips on near-duplicate\n\
+                                 \x20                                 fresh+merged output, e.g. gemini's _recoverFromLoop)\n\
+                                 \x20 RVPM_AI_TIMEOUT_SECS=600        raise the per-call timeout (default 300)"
                             );
                         }
                     }
@@ -3817,16 +3833,17 @@ async fn run_tune(
     {
         Ok(outcome) => match outcome.outcome {
             crate::ai::ChatOutcome::Applied { written_hooks } => {
-                if let Some(prop) = outcome.proposal {
+                // user が `[[plugins]]` セクションで "Keep existing entry" を選んだら
+                // `plugin_entry_toml` は None — config.toml は触らず、hook ファイル更新のみ。
+                if let Some(entry_toml) = outcome.plugin_entry_toml {
                     let latest = std::fs::read_to_string(&config_path)?;
                     let mut doc_patch = latest.parse::<DocumentMut>()?;
-                    // Option A: AI 提案で **全 field 上書き** (`preserved_keys` は空)。
-                    // user は Chat ループ中に "X は触らないで" と言えば AI 側で field を保持する。
+                    // user は preview で fresh / merged を per-section に選択済み。
                     // `Replace` mode で AI が omit した stale field (e.g. 古い `on_cmd`) を消す。
                     if let Err(e) = replace_plugin_entry_with_ai_toml(
                         &mut doc_patch,
                         &selected_url,
-                        &prop.plugin_entry_toml,
+                        &entry_toml,
                         &[],
                         MergeMode::Replace,
                     ) {
@@ -3838,11 +3855,17 @@ async fn run_tune(
                         chezmoi::write_routed(config.options.chezmoi, &config_path, &patched)
                             .await?;
                         println!(
-                            "Tuned {} ({} hook file(s) created).",
+                            "Tuned {} ({} hook file(s) created/overwritten).",
                             plugin.display_name(),
                             written_hooks.len()
                         );
                     }
+                } else {
+                    println!(
+                        "Kept existing entry for {} ({} hook file(s) created/overwritten).",
+                        plugin.display_name(),
+                        written_hooks.len()
+                    );
                 }
             }
             crate::ai::ChatOutcome::Skipped => {
@@ -3856,7 +3879,16 @@ async fn run_tune(
             }
         },
         Err(e) => {
-            eprintln!("\u{26a0} AI tune failed: {e}. Existing entry kept unchanged.");
+            eprintln!("\u{26a0} AI tune failed: {e:#}. Existing entry kept unchanged.");
+            eprintln!(
+                "\n  Debug knobs (env vars):\n\
+                 \x20 RVPM_AI_DUMP_PROMPT=/tmp/p.md   write the prompt to a file and skip the AI call\n\
+                 \x20 RVPM_AI_NO_MERGED=1             drop the `_merged` variant requirement (force off)\n\
+                 \x20 RVPM_AI_FORCE_MERGED=1          force `_merged` on for Gemini (auto-disabled\n\
+                 \x20                                 by default because gemini-cli v0.39's loop guard\n\
+                 \x20                                 aborts on near-duplicate fresh+merged output)\n\
+                 \x20 RVPM_AI_TIMEOUT_SECS=600        raise the per-call timeout (default 300)"
+            );
         }
     }
 

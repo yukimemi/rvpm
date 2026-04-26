@@ -84,6 +84,25 @@ url = "..."
 </rvpm:explanation>
 ```
 
+### Merged variants (REQUIRED when existing content is provided)
+
+When the "User context" section below contains an **existing `[[plugins]]` entry** or **existing hook file body**, you MUST emit an additional `_merged` tag for **each** section that has existing content. The user will be shown both versions side-by-side and pick one.
+
+- `<rvpm:plugin_entry>` — your **clean redesign**, treating the entry as if you were configuring this plugin from scratch (you may drop or rename fields you think are wrong).
+- `<rvpm:plugin_entry_merged>` — your **conservative merge**: preserve the user's intent (custom names, `rev` pins, custom triggers they've added, ordering) and only adjust where you're confident the change is an improvement.
+- `<rvpm:after_lua>` / `<rvpm:after_lua_merged>` — same split for `after.lua`. Fresh = ignore existing body. Merged = preserve user-added keymaps / custom blocks, integrate your additions.
+- Same convention for `<rvpm:init_lua_merged>` and `<rvpm:before_lua_merged>`.
+
+Rules for the merged variant:
+
+1. **Don't drop user-added content silently.** Keymaps, autocmds, custom helper functions, comments — preserve them unless they're clearly broken.
+2. **Don't duplicate.** If you'd add the same line that's already there, just keep it once.
+3. **Order matters for Lua hooks.** `vim.g.<plugin>_xxx = ...` must run before `require('plugin').setup({})` — keep the user's ordering or fix it if broken.
+4. **For `[[plugins]]` entry merged**: keep `name`, `url`, `rev`, `dev`, `dst`, `cond`, `build`, `build_lua`, `depends` intact unless you have a strong reason to change them. `on_*` triggers are where you'd typically refine.
+5. **If there's nothing meaningful to merge** (existing is empty or unrelated), output `(none)` in the `_merged` tag and keep the fresh variant alone.
+
+When **no existing content is provided** for a section, omit the `_merged` tag entirely (or output `(none)` — both are accepted).
+
 ## Constraints
 
 - Match the user's `url_style` (`short` = `owner/repo`, `full` = `https://github.com/owner/repo`) — see User context.
