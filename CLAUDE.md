@@ -451,6 +451,15 @@ merge 戦略がファイル単位 hard link に切り替わって以降、Window
 **廃止コマンド:**
 - `status` → `list --no-tui` に統合 (plain text 出力で機能同等)
 
+### CLI フラグ / サブコマンド追加時のチェックリスト
+
+サブコマンドフラグ (`--prune` / `--ai` / `--no-tui` 等) を **追加・改名・削除** したり、**新規サブコマンド** を増やしたりした場合、[rvpm.nvim](https://github.com/yukimemi/rvpm.nvim) の `lua/rvpm/command.lua` も同期更新すること。具体的には:
+
+- 新規サブコマンド: `SUBCOMMANDS` 配列に追加。TUI に流すなら `TUI` テーブル、plugin 名引数を取るなら `PLUGIN_ARG_SUBS` テーブルにも登録。フラグを持つなら `FLAGS` テーブルにエントリ追加。`lua/rvpm/init.lua` の便利 Lua API も検討。
+- 既存サブコマンドへのフラグ追加/改名/削除: 該当する `FLAGS[<sub>]` エントリを更新。
+
+rvpm.nvim 側は `:Rvpm <sub> --<Tab>` の補完候補のために rvpm core のフラグ一覧を **ハードコードでミラー** している (動的な `--help` parse は Neovim 起動時のコスト観点から採用していない)。同期し忘れると Neovim 上で「実在するフラグが補完候補に出ない」or「廃止済みフラグが候補に残る」という silent な drift が発生する。CLI 関連 PR の self-review checklist に含めること。
+
 ### ディレクトリレイアウト (デフォルト)
 
 | パス | 用途 |
