@@ -1,6 +1,10 @@
 # rvpm demo — README GIF
-# Usage: (cd vhs && vhs demo.tape)   # output lands next to this tape
-# Note: On Windows, run from WSL (vhs hangs on Set Theme in native Windows).
+# Usage:
+#   Native (Linux/macOS):  cd vhs && vhs demo.tape
+#   Docker (recommended on Windows — native vhs hangs on Set Theme):
+#     cd vhs && docker build -t rvpm-vhs . && \
+#       docker run --rm -v "$PWD:/vhs" -e ANTHROPIC_API_KEY rvpm-vhs demo.tape
+#     (or just `bash regen.sh` from this directory once the image is built).
 # Note: FontFamily must be installed in the system. Adjust if tofu appears.
 # Note: The tape runs in an isolated NVIM_APPNAME/RVPM_APPNAME sandbox
 #       (`rvpm-demo`) and only ever touches paths under that appname. It
@@ -8,7 +12,12 @@
 #
 # Flow (single gif covering both list and browse TUIs):
 #   1. init --write
-#   2. rvpm add folke/snacks.nvim                  (CLI add)
+#   2. rvpm add dstein64/vim-startuptime --ai gemini   (AI-assisted add)
+#      - gemini CLI must be on PATH and authenticated for this to work
+#      - vim-startuptime is intentionally tiny (single :StartupTime
+#        command, no Lua setup) so the AI proposal preview fits in
+#        the GIF window without truncation
+#      - the tape presses Enter to Apply the AI proposal as-is
 #   3. silently seed extra plugins for a lively sync UI later
 #   4. rvpm list                                   (list TUI tour)
 #      - j/k navigation, / search
@@ -37,9 +46,12 @@ Hide
 Type "export NVIM_APPNAME=rvpm-demo RVPM_APPNAME=rvpm-demo"
 Enter
 Sleep 200ms
-Type "rm -rf ~/.config/rvpm/rvpm-demo ~/.cache/rvpm/rvpm-demo ~/.config/rvpm-demo 2>/dev/null; clear"
+Type "rm -rf ~/.config/rvpm/rvpm-demo ~/.cache/rvpm/rvpm-demo ~/.config/rvpm-demo 2>/dev/null"
 Enter
 Sleep 500ms
+Type "clear"
+Enter
+Sleep 200ms
 Show
 
 # ── 1. init ──
@@ -49,15 +61,44 @@ Sleep 500ms
 Enter
 Sleep 2500ms
 
-# ── 2. CLI add ──
-Type "rvpm add folke/snacks.nvim"
+# ── 2. AI-assisted CLI add ──
+# `rvpm add ... --ai gemini` runs the chat loop: AI proposal preview →
+# "How should we proceed?" Select menu (default = Apply) → for each hook
+# file the AI proposes, a per-file dialog (default = Use FRESH).
+Type "rvpm add dstein64/vim-startuptime --ai gemini"
 Sleep 500ms
 Enter
-Sleep 2500ms
+# Show the "🤖 Asking Gemini..." status line briefly so viewers know
+# what's happening, then Hide while the actual API round-trip runs —
+# vhs keeps elapsing real time but the GIF skips those frames, so we
+# don't bake the AI wait into the output. Show resumes recording when
+# the preview is expected on screen.
+Sleep 1500ms
+Hide
+Sleep 38500ms
+Show
+# Preview is on screen; let it linger briefly before pressing Enter.
+Sleep 2s
+# Accept "Apply" on the action menu (it is the default).
+Enter
+Sleep 3s
+# Per-file hook dialogs fire only for hooks the AI actually proposed.
+# Default option for each is "Use FRESH proposal (create <name>)" so a
+# single Enter accepts. Send three Enters with small sleeps so any
+# combination (init / before / after) is dismissed sequentially. Extra
+# Enters when no dialog is shown are harmless — they just become
+# trailing blank lines in the shell prompt that follows.
+# Enter
+# Sleep 800ms
+# Enter
+# Sleep 800ms
+# Enter
+# Sleep 2500ms
 
 # ── 3. silent seed: append raw entries so `list` has rows and the later
-#    `S` sync fires actual clones. Plus, `browse`'s `✓` marker works
-#    because snacks.nvim is already in config. ──
+#    `S` sync fires actual clones. The seeded plugins are mainstream
+#    neovim-plugin-topic entries so browse's `✓` marker lights up for
+#    them when we visit the browse TUI in step 5. ──
 Hide
 Type `printf '\n[[plugins]]\nurl = "%s"\n' nvim-lua/plenary.nvim stevearc/oil.nvim MunifTanjim/nui.nvim lewis6991/gitsigns.nvim >> ~/.config/rvpm/$RVPM_APPNAME/config.toml`
 Enter
@@ -87,12 +128,14 @@ Sleep 400ms
 Type "j"
 Sleep 400ms
 Type "k"
+Sleep 400ms
+Type "G"
 Sleep 600ms
 
-# search
+# search — find the plugin we just AI-added
 Type "/"
 Sleep 400ms
-Type "snacks"
+Type "startup"
 Sleep 1200ms
 Enter
 Sleep 800ms
@@ -136,6 +179,8 @@ Tab
 Sleep 400ms
 
 # Add highlighted plugin from browse TUI
+Enter
+Sleep 5s
 Enter
 Sleep 5s
 # "Press any key to return to browse..."

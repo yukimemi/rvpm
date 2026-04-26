@@ -46,3 +46,46 @@ hook_content = set "#!/bin/sh\n# Installed by: cargo make hook-install\ncargo ma
 writefile ${hook_file} ${hook_content}
 echo "Installed pre-push hook -> ${hook_file}"
 '''
+
+# ─── vhs / demo GIF regeneration ───────────────────────────────────────
+# Native vhs on Windows hangs on `Set Theme`, so we ship a Docker image
+# (vhs + rvpm + claude/gemini/codex CLIs) and drive it from cargo-make.
+#
+# Windows prerequisites: Docker Engine inside WSL2 (Docker Desktop is not
+# required); these tasks shell out via `wsl -- docker ...`. To forward the
+# AI API key from PowerShell into WSL, add this to your $PROFILE once:
+#   $env:WSLENV += ":GEMINI_API_KEY/u:ANTHROPIC_API_KEY/u:OPENAI_API_KEY/u"
+# Linux / macOS: a real `docker` on PATH is enough.
+
+[tasks.vhs-build]
+description = "Build the rvpm-vhs Docker image (~5 min first time, cached after)"
+cwd = "vhs"
+
+[tasks.vhs-build.windows]
+command = "wsl"
+args = ["--", "docker", "build", "-t", "rvpm-vhs", "."]
+
+[tasks.vhs-build.linux]
+command = "docker"
+args = ["build", "-t", "rvpm-vhs", "."]
+
+[tasks.vhs-build.mac]
+command = "docker"
+args = ["build", "-t", "rvpm-vhs", "."]
+
+[tasks.vhs-regen]
+description = "Regenerate vhs/demo.gif (or another tape via `cargo make vhs-regen <tape>`)"
+dependencies = ["vhs-build"]
+cwd = "vhs"
+
+[tasks.vhs-regen.windows]
+command = "wsl"
+args = ["--", "bash", "regen.sh", "${@}"]
+
+[tasks.vhs-regen.linux]
+command = "bash"
+args = ["regen.sh", "${@}"]
+
+[tasks.vhs-regen.mac]
+command = "bash"
+args = ["regen.sh", "${@}"]
