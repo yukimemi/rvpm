@@ -14,32 +14,10 @@ use std::path::Path;
 /// rvpm の TOML schema brief (生成時に compile-time に取り込む)。
 const SCHEMA: &str = include_str!("schema_prompt.md");
 
-/// `RVPM_AI_NO_MERGED=1` で立つ実験フラグ。`_merged` variant 要求を prompt から
-/// 一切落として「fresh のみの旧挙動」相当の prompt を生成する。
-///
-/// 動機: Gemini CLI v0.39 の `_recoverFromLoop` で abort される事例 (user 報告)。
-/// 仮説は「fresh + merged の両出力指示が "似たトークン連続" として Gemini の
-/// loop guard に誤検知されている」。これを切り分けるためのデバッグ knob。
-///
-/// 影響範囲:
-///   - SCHEMA の `### Merged variants` 節を strip
-///   - "Existing hook files" 節を出さない (= AI に既存 hook 本文を見せない)
-///   - tune mode の "MUST emit BOTH plugin_entry / plugin_entry_merged" 指示を
-///     "improve the existing entry" の控えめ表現に差し替える
-///
-/// preview / Apply は chat.rs 側で既存 hook / 既存 entry を保持しているので
-/// UX には影響しない (AI が `_merged` を返してこなくても fresh / keep の選択
-/// 肢は残る)。
-fn no_merged_flag() -> bool {
-    std::env::var("RVPM_AI_NO_MERGED")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
-}
-
-/// `no_merged` 時に SCHEMA から "### Merged variants" 節を取り除く。
+/// `merged_supported = false` 時に SCHEMA から "### Merged variants" 節を取り除く。
 /// 開始マーカ `### Merged variants` から次の `## Constraints` 直前までを切り出す。
-fn schema_for_prompt(no_merged: bool) -> std::borrow::Cow<'static, str> {
-    if !no_merged {
+fn schema_for_prompt(merged_supported: bool) -> std::borrow::Cow<'static, str> {
+    if merged_supported {
         return std::borrow::Cow::Borrowed(SCHEMA);
     }
     let start_marker = "### Merged variants";
@@ -133,14 +111,15 @@ pub fn build_initial_prompt(
     user_config_toml: &str,
     user_plugins_tree: &str,
     existing_hooks: &ExistingHooks,
+    merged_supported: bool,
     ai_language: &str,
 ) -> Result<String> {
     let plugin_readme = read_plugin_readme(plugin_root);
     let plugin_doc = read_plugin_doc(plugin_root);
-    let no_merged = no_merged_flag();
+    let no_merged = !merged_supported;
 
     let mut out = String::new();
-    out.push_str(&schema_for_prompt(no_merged));
+    out.push_str(&schema_for_prompt(merged_supported));
     out.push_str("\n\n---\n\n");
 
     // 言語ヒント — schema 構造は英語固定だが explanation は user 言語
@@ -216,14 +195,15 @@ pub fn build_tune_prompt(
     user_config_toml: &str,
     user_plugins_tree: &str,
     existing_hooks: &ExistingHooks,
+    merged_supported: bool,
     ai_language: &str,
 ) -> Result<String> {
     let plugin_readme = read_plugin_readme(plugin_root);
     let plugin_doc = read_plugin_doc(plugin_root);
-    let no_merged = no_merged_flag();
+    let no_merged = !merged_supported;
 
     let mut out = String::new();
-    out.push_str(&schema_for_prompt(no_merged));
+    out.push_str(&schema_for_prompt(merged_supported));
     out.push_str("\n\n---\n\n");
 
     if !ai_language.eq_ignore_ascii_case("en") {
@@ -458,6 +438,7 @@ mod tests {
             "[[plugins]]\nurl = \"existing/dep\"\n",
             "github.com/existing/dep/\n",
             &ExistingHooks::default(),
+            true, // merged_supported
             "en",
         )
         .unwrap();
@@ -491,6 +472,7 @@ mod tests {
             "",
             "(empty)",
             &ExistingHooks::default(),
+            true, // merged_supported
             "ja",
         )
         .unwrap();
@@ -517,6 +499,7 @@ mod tests {
             "",
             "(empty)",
             &existing,
+            true, // merged_supported
             "en",
         )
         .unwrap();
@@ -547,6 +530,7 @@ mod tests {
             "[[plugins]]\nurl = \"owner/tune-me\"\n",
             "(empty)",
             &ExistingHooks::default(),
+            true, // merged_supported
             "en",
         )
         .unwrap();
@@ -577,6 +561,7 @@ mod tests {
             "",
             "(empty)",
             &ExistingHooks::default(),
+            true, // merged_supported
             "ja",
         )
         .unwrap();
@@ -604,6 +589,7 @@ mod tests {
             "",
             "(empty)",
             &existing,
+            true, // merged_supported
             "en",
         )
         .unwrap();
@@ -616,9 +602,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_for_prompt_strips_merged_section_when_flag_set() {
-        // strip 後は "Merged variants" 節が消え、"## Constraints" 以降は残る
-        let stripped = schema_for_prompt(true);
+    fn schema_for_prompt_strips_merged_section_when_unsupported() {
+        // merged_supported=false で "Merged variants" 節が消え、"## Constraints" 以降は残る
+        let stripped = schema_for_prompt(false);
         assert!(!stripped.contains("### Merged variants"));
         assert!(stripped.contains("## Constraints"));
         // 元の SCHEMA の冒頭は残る
@@ -626,8 +612,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_for_prompt_keeps_merged_section_by_default() {
-        let full = schema_for_prompt(false);
+    fn schema_for_prompt_keeps_merged_section_when_supported() {
+        let full = schema_for_prompt(true);
         assert!(full.contains("### Merged variants"));
         assert!(full.contains("## Constraints"));
     }

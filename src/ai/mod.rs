@@ -383,6 +383,38 @@ pub fn validate_proposal_toml(toml_src: &str) -> Result<()> {
     Ok(())
 }
 
+/// この backend で `_merged` variant 出力をデフォルトで有効にしてよいか。
+///
+/// 既知の問題:
+///   - **Gemini CLI v0.39 の `_recoverFromLoop`**: fresh + merged の near-duplicate
+///     XML を連続で吐くと loop guard に検知されて abort される (user 報告)。
+///     仮説検証済み: `RVPM_AI_NO_MERGED=1` で同 prompt を投げると通る。
+///
+/// 解決方針: Gemini はデフォルトで `_merged` を **自動 OFF**。Claude / Codex は
+/// 従来通り fresh + merged の 2 案を出す。
+///
+/// override:
+///   - `RVPM_AI_FORCE_MERGED=1` — backend に関わらず強制 ON (Gemini ユーザーが
+///     新しいバージョンの CLI で試したい場合等の escape hatch)
+///   - `RVPM_AI_NO_MERGED=1` — backend に関わらず強制 OFF (デバッグ用)
+pub fn should_emit_merged(backend: Backend) -> bool {
+    let env_flag = |name: &str| {
+        std::env::var(name)
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    };
+    if env_flag("RVPM_AI_FORCE_MERGED") {
+        return true;
+    }
+    if env_flag("RVPM_AI_NO_MERGED") {
+        return false;
+    }
+    match backend {
+        Backend::Gemini => false,
+        Backend::Claude | Backend::Codex => true,
+    }
+}
+
 /// CLI 起動時に最初の user message をどう注入するかの戦略。各 backend の
 /// interactive 起動時の引数仕様に合わせて切り替える。
 #[derive(Debug, Clone, Copy)]
@@ -612,6 +644,23 @@ mod tests {
         assert_eq!(Backend::try_from(Cfg::Gemini), Ok(Backend::Gemini));
         assert_eq!(Backend::try_from(Cfg::Codex), Ok(Backend::Codex));
         assert_eq!(Backend::try_from(Cfg::Off), Err(()));
+    }
+
+    #[test]
+    fn should_emit_merged_default_per_backend() {
+        // env mutation はテスト並列実行で副作用が出るので、env を触らない判定だけ
+        // 確認する。デフォルトは backend dispatch:
+        //   - Gemini → false (gemini-cli の _recoverFromLoop 回避)
+        //   - Claude / Codex → true
+        // env override 系 (RVPM_AI_FORCE_MERGED / RVPM_AI_NO_MERGED) は手元で
+        // env 設定して確認する運用 (ここでは弾性が低い test なので skip)。
+        unsafe {
+            std::env::remove_var("RVPM_AI_FORCE_MERGED");
+            std::env::remove_var("RVPM_AI_NO_MERGED");
+        }
+        assert!(should_emit_merged(Backend::Claude));
+        assert!(should_emit_merged(Backend::Codex));
+        assert!(!should_emit_merged(Backend::Gemini));
     }
 
     #[test]

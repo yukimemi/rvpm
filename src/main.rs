@@ -3883,9 +3883,10 @@ async fn run_tune(
             eprintln!(
                 "\n  Debug knobs (env vars):\n\
                  \x20 RVPM_AI_DUMP_PROMPT=/tmp/p.md   write the prompt to a file and skip the AI call\n\
-                 \x20 RVPM_AI_NO_MERGED=1             drop the `_merged` variant requirement (helps if\n\
-                 \x20                                 the backend's loop-detection trips on near-duplicate\n\
-                 \x20                                 fresh+merged output, e.g. gemini's _recoverFromLoop)\n\
+                 \x20 RVPM_AI_NO_MERGED=1             drop the `_merged` variant requirement (force off)\n\
+                 \x20 RVPM_AI_FORCE_MERGED=1          force `_merged` on for Gemini (auto-disabled\n\
+                 \x20                                 by default because gemini-cli v0.39's loop guard\n\
+                 \x20                                 aborts on near-duplicate fresh+merged output)\n\
                  \x20 RVPM_AI_TIMEOUT_SECS=600        raise the per-call timeout (default 300)"
             );
         }

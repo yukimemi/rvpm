@@ -7,7 +7,8 @@ use crate::ai::prompt::{
 };
 use crate::ai::{
     Backend, HookChoice, HookWriteDecisions, Proposal, ProposalSection, ensure_cli_installed,
-    invoke_oneshot, parse_proposal, run_handoff, validate_proposal_toml, write_hook_files,
+    invoke_oneshot, parse_proposal, run_handoff, should_emit_merged, validate_proposal_toml,
+    write_hook_files,
 };
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -59,6 +60,8 @@ pub async fn run_ai_add(
         collect_user_context(user_config_toml_path, config_root)?;
     let existing_hooks = read_existing_hooks(plugin_config_dir);
 
+    let merged_supported = should_emit_merged(backend);
+    announce_merged_decision(backend, merged_supported);
     let initial_prompt = build_initial_prompt(
         plugin_url,
         plugin_root,
@@ -67,6 +70,7 @@ pub async fn run_ai_add(
         &user_config_toml,
         &user_plugins_tree,
         &existing_hooks,
+        merged_supported,
         ai_language,
     )?;
 
@@ -116,6 +120,8 @@ pub async fn run_ai_tune(
         collect_user_context(user_config_toml_path, config_root)?;
     let existing_hooks = read_existing_hooks(plugin_config_dir);
 
+    let merged_supported = should_emit_merged(backend);
+    announce_merged_decision(backend, merged_supported);
     let initial_prompt = crate::ai::prompt::build_tune_prompt(
         plugin_url,
         plugin_root,
@@ -125,6 +131,7 @@ pub async fn run_ai_tune(
         &user_config_toml,
         &user_plugins_tree,
         &existing_hooks,
+        merged_supported,
         ai_language,
     )?;
 
@@ -166,6 +173,31 @@ fn collect_user_context(
         .with_context(|| format!("failed to read {}", user_config_toml_path.display()))?;
     let tree = collect_plugins_tree(config_root);
     Ok((toml, tree))
+}
+
+/// `should_emit_merged` の決定を user に伝える。Gemini で auto-OFF された場合だけ
+/// stderr にヒントを出す (claude/codex は ON が期待挙動なので無音)。
+fn announce_merged_decision(backend: Backend, merged_supported: bool) {
+    if merged_supported {
+        return;
+    }
+    if std::env::var("RVPM_AI_NO_MERGED")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+    {
+        // user 自身が明示 off にしてるので余計なヒントを出さない
+        return;
+    }
+    if matches!(backend, Backend::Gemini) {
+        eprintln!(
+            "\u{2139}\u{fe0f}  Disabled `_merged` variants for Gemini (gemini-cli's \
+             loop detector aborts on near-duplicate fresh+merged XML output)."
+        );
+        eprintln!(
+            "   Set RVPM_AI_FORCE_MERGED=1 to override and try the full 2-variant \
+             prompt anyway."
+        );
+    }
 }
 
 /// `RVPM_AI_DUMP_PROMPT=<path>` が設定されていれば、組み立て済み prompt を
