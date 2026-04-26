@@ -192,8 +192,14 @@ enum Commands {
     /// At Apply time you pick per-section: `Use FRESH` (overwrite),
     /// `Use MERGED` (overwrite, keep your edits), or `Keep existing`
     /// (no change). Same choice applies to the `[[plugins]]` entry
-    /// itself. Use the Chat action to tell the AI to keep a particular
-    /// field, or just pick `Keep existing` for that section.
+    /// itself.
+    ///
+    /// Note: selecting `FRESH` or `MERGED` still overwrites that section.
+    /// For the `[[plugins]]` entry, fields the chosen proposal omits are
+    /// removed (destructive replace); only `Keep existing` leaves the
+    /// current entry untouched. Use the Chat action to tell the AI to
+    /// keep a particular field, or just pick `Keep existing` for that
+    /// section.
     Tune {
         /// Fuzzy match plugin url (omit to pick interactively)
         query: Option<String>,
@@ -2977,10 +2983,15 @@ async fn run_add(
                                         );
                                     }
                                 } else {
-                                    println!(
-                                        "Kept existing entry for {} ({} hook file(s) created/overwritten).",
-                                        plugin.display_name(),
-                                        written_hooks.len()
+                                    // `add --ai` には "keep existing" の概念が無い (stub
+                                    // entry しか存在しない) ので、ここに来るのは chat /
+                                    // apply の regression を示す。silent に stub を残すと
+                                    // 「green path に化けたバグ」になるので明示 fail する
+                                    // (CodeRabbit PR #104 post-merge レビュー指摘)。
+                                    anyhow::bail!(
+                                        "AI add returned no [[plugins]] proposal for {}; \
+                                         refusing to keep the stub entry from `rvpm add --ai`",
+                                        plugin.display_name()
                                     );
                                 }
                             }

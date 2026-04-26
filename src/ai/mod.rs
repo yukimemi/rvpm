@@ -398,15 +398,25 @@ pub fn validate_proposal_toml(toml_src: &str) -> Result<()> {
 ///     新しいバージョンの CLI で試したい場合等の escape hatch)
 ///   - `RVPM_AI_NO_MERGED=1` — backend に関わらず強制 OFF (デバッグ用)
 pub fn should_emit_merged(backend: Backend) -> bool {
-    let env_flag = |name: &str| {
-        std::env::var(name)
+    should_emit_merged_with(backend, |k| std::env::var(k).ok())
+}
+
+/// `should_emit_merged` の testable な実体。env 読み込みを closure に注入する。
+///
+/// なぜ injection: Rust 2024 では `std::env::set_var` / `remove_var` が `unsafe`
+/// 扱いになり、cargo test の並列実行下で他テストが env を変更すると非決定的
+/// になる。closure を取れば process-global env を触らずに backend dispatch /
+/// override 優先順位の単体テストが書ける (CodeRabbit PR #104 post-merge 指摘)。
+pub fn should_emit_merged_with(backend: Backend, get_env: impl Fn(&str) -> Option<String>) -> bool {
+    let flag = |name: &str| {
+        get_env(name)
             .map(|v| !v.is_empty() && v != "0")
             .unwrap_or(false)
     };
-    if env_flag("RVPM_AI_FORCE_MERGED") {
+    if flag("RVPM_AI_FORCE_MERGED") {
         return true;
     }
-    if env_flag("RVPM_AI_NO_MERGED") {
+    if flag("RVPM_AI_NO_MERGED") {
         return false;
     }
     match backend {
@@ -652,19 +662,72 @@ mod tests {
 
     #[test]
     fn should_emit_merged_default_per_backend() {
-        // env mutation はテスト並列実行で副作用が出るので、env を触らない判定だけ
-        // 確認する。デフォルトは backend dispatch:
-        //   - Gemini → false (gemini-cli の _recoverFromLoop 回避)
-        //   - Claude / Codex → true
-        // env override 系 (RVPM_AI_FORCE_MERGED / RVPM_AI_NO_MERGED) は手元で
-        // env 設定して確認する運用 (ここでは弾性が低い test なので skip)。
-        unsafe {
-            std::env::remove_var("RVPM_AI_FORCE_MERGED");
-            std::env::remove_var("RVPM_AI_NO_MERGED");
-        }
-        assert!(should_emit_merged(Backend::Claude));
-        assert!(should_emit_merged(Backend::Codex));
-        assert!(!should_emit_merged(Backend::Gemini));
+        // closure injection で process-global env を触らずに判定。
+        // 並列実行下でも他テストの env 変更に影響されない (CodeRabbit 指摘対応)。
+        let no_env = |_: &str| None;
+        assert!(should_emit_merged_with(Backend::Claude, no_env));
+        assert!(should_emit_merged_with(Backend::Codex, no_env));
+        assert!(!should_emit_merged_with(Backend::Gemini, no_env));
+    }
+
+    #[test]
+    fn should_emit_merged_force_overrides_backend_default() {
+        // RVPM_AI_FORCE_MERGED=1 は backend に関わらず ON
+        let force_on = |k: &str| {
+            if k == "RVPM_AI_FORCE_MERGED" {
+                Some("1".to_string())
+            } else {
+                None
+            }
+        };
+        assert!(should_emit_merged_with(Backend::Gemini, force_on));
+        assert!(should_emit_merged_with(Backend::Claude, force_on));
+    }
+
+    #[test]
+    fn should_emit_merged_no_merged_overrides_backend_default() {
+        // RVPM_AI_NO_MERGED=1 は backend に関わらず OFF
+        let no_merged = |k: &str| {
+            if k == "RVPM_AI_NO_MERGED" {
+                Some("1".to_string())
+            } else {
+                None
+            }
+        };
+        assert!(!should_emit_merged_with(Backend::Claude, no_merged));
+        assert!(!should_emit_merged_with(Backend::Codex, no_merged));
+        assert!(!should_emit_merged_with(Backend::Gemini, no_merged));
+    }
+
+    #[test]
+    fn should_emit_merged_force_wins_over_no_merged() {
+        // 両方立ってたら FORCE が勝つ (escape hatch を尊重)
+        let both = |k: &str| match k {
+            "RVPM_AI_FORCE_MERGED" | "RVPM_AI_NO_MERGED" => Some("1".to_string()),
+            _ => None,
+        };
+        assert!(should_emit_merged_with(Backend::Gemini, both));
+    }
+
+    #[test]
+    fn should_emit_merged_treats_zero_and_empty_as_unset() {
+        // "0" と "" は flag 立ってない扱い (rvpm 一般の環境変数規約)
+        let zero = |k: &str| {
+            if k == "RVPM_AI_NO_MERGED" {
+                Some("0".to_string())
+            } else {
+                None
+            }
+        };
+        assert!(should_emit_merged_with(Backend::Claude, zero));
+        let empty = |k: &str| {
+            if k == "RVPM_AI_NO_MERGED" {
+                Some(String::new())
+            } else {
+                None
+            }
+        };
+        assert!(should_emit_merged_with(Backend::Claude, empty));
     }
 
     #[test]
