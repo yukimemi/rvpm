@@ -2999,7 +2999,7 @@ async fn run_add(
                         },
                         Err(e) => {
                             eprintln!(
-                                "\u{26a0} AI add failed: {e}. Stub entry kept; rerun with `--no-ai` for static-scan mode."
+                                "\u{26a0} AI add failed: {e:#}. Stub entry kept; rerun with `--no-ai` for static-scan mode."
                             );
                             eprintln!(
                                 "\n  Debug knobs (env vars):\n\
@@ -3879,7 +3879,7 @@ async fn run_tune(
             }
         },
         Err(e) => {
-            eprintln!("\u{26a0} AI tune failed: {e}. Existing entry kept unchanged.");
+            eprintln!("\u{26a0} AI tune failed: {e:#}. Existing entry kept unchanged.");
             eprintln!(
                 "\n  Debug knobs (env vars):\n\
                  \x20 RVPM_AI_DUMP_PROMPT=/tmp/p.md   write the prompt to a file and skip the AI call\n\

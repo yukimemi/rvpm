@@ -475,20 +475,24 @@ pub async fn run_handoff(backend: Backend, prompt_text: &str) -> Result<()> {
         .with_context(|| format!("failed to write prompt to {}", tmp_path.display()))?;
 
     let path_str = tmp_path.to_string_lossy().into_owned();
-    // **Passive な指示にする** — 旧 wording は "apply parts ... refine ... revise" と
-    // 動詞先行で書いていたため、claude code 等が「読み終えたらすぐ適用していい」と
-    // 解釈して handoff 直後に勝手に config.toml / hook を書き換える事故が起きた
-    // (user 報告)。ここでは「まず読むだけ」「内容を 1-2 行で要約」「次の指示を
-    // 待て」の 3 点を明示し、最初の turn でファイル編集ツールを呼ばないように釘を刺す。
+    // **Passive な指示** + **Windows-safe な単一行プレーンテキスト**:
+    //
+    //   1. Passive 化: 旧 wording は "apply parts ... refine ... revise" と動詞
+    //      先行だったため、claude code 等が handoff 直後に勝手に config.toml /
+    //      hook を書き換える事故が起きた (user 報告)。「読むだけ」「次の指示を
+    //      待て」「Edit/Write は明示要求まで使うな」の 3 点で釘を刺す。
+    //
+    //   2. CreateProcess-safe: first_message は CLI argument として渡される
+    //      (`claude "<msg>"` / `gemini -i "<msg>"` / `codex "<msg>"`) ので、改行や
+    //      `**bold**` 装飾、バッククオート入りカッコなどを含めると Windows の
+    //      pwsh wrapper (`pwsh -File gemini.ps1 -i <msg>`) で spawn 失敗するケース
+    //      を観測 (user 報告 — gemini 限定で `failed to spawn`)。**単一行の
+    //      プレーンテキスト** に保ち、特殊文字は最小限にする。
     let first_message = format!(
-        "Read the file at `{path_str}` for our shared context — it contains \
-         rvpm's full context plus the latest proposal as XML tags \
-         (`<rvpm:plugin_entry>`, `<rvpm:after_lua>`, etc.).\n\n\
-         **Important: do NOT apply, edit, or write any files yet.** \
-         After reading, briefly acknowledge what you found (1-2 sentences \
-         summarizing the proposal) and then **wait for my next instruction**. \
-         I will tell you which parts to apply, what to refine, or how to \
-         revise. Don't run any Edit / Write tools until I explicitly ask."
+        "Read the file at {path_str} for our shared context. \
+         Summarize what it contains in 1-2 sentences. \
+         Do NOT apply, edit, or write any files yet. \
+         Wait for my next instruction before running Edit or Write tools."
     );
 
     eprintln!();
