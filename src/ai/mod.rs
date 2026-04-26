@@ -443,11 +443,20 @@ pub async fn run_handoff(backend: Backend, prompt_text: &str) -> Result<()> {
         .with_context(|| format!("failed to write prompt to {}", tmp_path.display()))?;
 
     let path_str = tmp_path.to_string_lossy().into_owned();
+    // **Passive な指示にする** — 旧 wording は "apply parts ... refine ... revise" と
+    // 動詞先行で書いていたため、claude code 等が「読み終えたらすぐ適用していい」と
+    // 解釈して handoff 直後に勝手に config.toml / hook を書き換える事故が起きた
+    // (user 報告)。ここでは「まず読むだけ」「内容を 1-2 行で要約」「次の指示を
+    // 待て」の 3 点を明示し、最初の turn でファイル編集ツールを呼ばないように釘を刺す。
     let first_message = format!(
-        "Read the file at `{path_str}` — it contains rvpm's full context plus \
-         the latest proposal as XML tags (`<rvpm:plugin_entry>`, `<rvpm:after_lua>`, etc.). \
-         Continue our conversation from there: apply parts of the proposal, \
-         refine specific sections, or revise it as I direct."
+        "Read the file at `{path_str}` for our shared context — it contains \
+         rvpm's full context plus the latest proposal as XML tags \
+         (`<rvpm:plugin_entry>`, `<rvpm:after_lua>`, etc.).\n\n\
+         **Important: do NOT apply, edit, or write any files yet.** \
+         After reading, briefly acknowledge what you found (1-2 sentences \
+         summarizing the proposal) and then **wait for my next instruction**. \
+         I will tell you which parts to apply, what to refine, or how to \
+         revise. Don't run any Edit / Write tools until I explicitly ask."
     );
 
     eprintln!();

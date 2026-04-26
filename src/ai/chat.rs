@@ -246,10 +246,16 @@ async fn run_chat_loop(
                      ---\n\n\
                      # rvpm's latest proposal (already shown to the user)\n\n\
                      The user just picked **Hand off** in rvpm after seeing the \
-                     proposal below. **Continue from here** — apply parts of \
-                     this proposal, refine specific sections, or revise it as \
-                     the user directs. Use the absolute paths from the \
-                     \"On-disk paths\" section above when you write files.\n\n\
+                     proposal below.\n\n\
+                     **Do NOT apply this proposal automatically.** The user \
+                     handed off precisely so they can discuss it with you \
+                     before anything is written. They may want to apply only \
+                     specific parts, ask for refinements, or revise the \
+                     proposal entirely. Wait for the user's explicit \
+                     instruction before running any Edit / Write tools or \
+                     touching `config.toml` / hook files.\n\n\
+                     When the user does ask you to apply something, use the \
+                     absolute paths from the \"On-disk paths\" section above.\n\n\
                      {proposal_xml}\n"
                 );
                 run_handoff(backend, &handoff_prompt).await?;
