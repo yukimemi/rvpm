@@ -60,32 +60,20 @@ echo "Installed pre-push hook -> ${hook_file}"
 [tasks.vhs-build]
 description = "Build the rvpm-vhs Docker image (~5 min first time, cached after)"
 cwd = "vhs"
+command = "docker"
+args = ["build", "-t", "rvpm-vhs", "."]
 
 [tasks.vhs-build.windows]
 command = "wsl"
 args = ["--", "docker", "build", "-t", "rvpm-vhs", "."]
 
-[tasks.vhs-build.linux]
-command = "docker"
-args = ["build", "-t", "rvpm-vhs", "."]
-
-[tasks.vhs-build.mac]
-command = "docker"
-args = ["build", "-t", "rvpm-vhs", "."]
-
 [tasks.vhs-regen]
 description = "Regenerate vhs/demo.gif (or another tape via `cargo make vhs-regen <tape>`)"
 dependencies = ["vhs-build"]
 cwd = "vhs"
+command = "bash"
+args = ["regen.sh", "${@}"]
 
 [tasks.vhs-regen.windows]
 command = "wsl"
 args = ["--", "bash", "regen.sh", "${@}"]
-
-[tasks.vhs-regen.linux]
-command = "bash"
-args = ["regen.sh", "${@}"]
-
-[tasks.vhs-regen.mac]
-command = "bash"
-args = ["regen.sh", "${@}"]

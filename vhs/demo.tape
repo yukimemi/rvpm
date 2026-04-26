@@ -82,18 +82,11 @@ Sleep 2s
 # Accept "Apply" on the action menu (it is the default).
 Enter
 Sleep 3s
-# Per-file hook dialogs fire only for hooks the AI actually proposed.
-# Default option for each is "Use FRESH proposal (create <name>)" so a
-# single Enter accepts. Send three Enters with small sleeps so any
-# combination (init / before / after) is dismissed sequentially. Extra
-# Enters when no dialog is shown are harmless — they just become
-# trailing blank lines in the shell prompt that follows.
-# Enter
-# Sleep 800ms
-# Enter
-# Sleep 800ms
-# Enter
-# Sleep 2500ms
+# Note: vim-startuptime needs no Lua hooks, so the AI proposes
+# `(none)` for init/before/after.lua and the per-file dialogs never
+# fire. If this tape is repointed at a plugin that does need hooks,
+# add an `Enter` + `Sleep 800ms` here for each hook the AI proposes
+# so the default "Use FRESH" gets accepted.
 
 # ── 3. silent seed: append raw entries so `list` has rows and the later
 #    `S` sync fires actual clones. The seeded plugins are mainstream
