@@ -2891,6 +2891,18 @@ async fn run_add(
     let lockfile_path = resolve_lockfile_path(&config_root_for_lock);
     let mut lockfile = crate::lockfile::LockFile::load(&lockfile_path);
     let mut lockfile_dirty = false;
+
+    // **fetch_state も load しておく**: clone 完了後に `last_fetched` を upsert
+    // するため。これをやらないと、`rvpm add` 直後に `rvpm sync` を回したとき、
+    // `fetch_state.find(name) → None` で should_fetch が "fetch する" を返し、
+    // 直前 clone した repo に対して即 fetch を発射する。Docker overlay /
+    // WSL2 のような race の起きやすい FS で gix の "Failed to update
+    // references to their new position to match their remote locations"
+    // を踏みやすい (user 報告)。run_sync が done している upsert と等価な
+    // 後始末を run_add も負担すべき。
+    let fetch_state_path = resolve_fetch_state_path(&cache_root);
+    let mut fetch_state = crate::fetch_state::FetchState::load(&fetch_state_path);
+    let mut fetch_state_dirty = false;
     if let Some(mut plugin) = config_data
         .plugins
         .iter()
@@ -2926,6 +2938,17 @@ async fn run_add(
                     });
                     lockfile_dirty = true;
                 }
+
+                // fetch_state 記録: clone もしくは pull が走ったので「今 fetch
+                // した」とマークする。これで直後の `rvpm sync` が fetch_interval
+                // 内 fast-path を通って同じ repo に再 fetch をかけずに済む
+                // (race による gix ref-update 失敗の回避)。
+                fetch_state.upsert(crate::fetch_state::FetchEntry {
+                    name: plugin.display_name(),
+                    url: plugin.url.clone(),
+                    last_fetched: crate::fetch_state::now_rfc3339(),
+                });
+                fetch_state_dirty = true;
 
                 // run_add 直後に merge する必要は無い: 末尾で `run_generate()` を呼び、
                 // そこで merged/ を rm -rf して全 eager+merge を再構築するため。
@@ -3075,6 +3098,17 @@ async fn run_add(
         } else {
             chezmoi::apply(&wp, &lockfile_path).await;
         }
+    }
+
+    // fetch_state.json は cache_root 配下の local-only データなので chezmoi
+    // 経路は通さない (run_sync の終端と同じ扱い)。failure は warn のみ —
+    // resilience: 本処理は終わってるので fetch_state save 失敗で全体を倒さない。
+    if fetch_state_dirty && let Err(e) = fetch_state.save(&fetch_state_path) {
+        eprintln!(
+            "\u{26a0} failed to save {}: {} (fetch_state not updated)",
+            fetch_state_path.display(),
+            e
+        );
     }
 
     run_generate().await?;
