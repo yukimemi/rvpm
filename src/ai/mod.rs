@@ -387,22 +387,26 @@ pub fn validate_proposal_toml(toml_src: &str) -> Result<()> {
 /// interactive 起動時の引数仕様に合わせて切り替える。
 #[derive(Debug, Clone, Copy)]
 enum FirstMessageStrategy {
-    /// `claude "<msg>"` — positional arg で interactive を継続したまま最初の
-    /// user message を送る (claude code v2 documented behavior)。
+    /// `<cli> "<msg>"` — positional arg で interactive を継続したまま最初の
+    /// user message を送る。claude / codex 両方この方式。
     Positional,
     /// `gemini -i "<msg>"` — `--prompt-interactive` 相当の short flag。
     /// `-p` (non-interactive) と区別して対話継続する。
     InteractiveFlag,
-    /// Auto-send が安全に出来ない backend (codex 等)。argless で interactive 起動 +
-    /// stderr に「コピペしてください」案内を出すフォールバック。
+    /// Auto-send が安全に出来ない backend 用フォールバック。argless で
+    /// interactive 起動 + stderr に「コピペしてください」案内を出す。現状
+    /// 未使用だが将来 backend を増やした際の保険として残す。
+    #[allow(dead_code)]
     Manual,
 }
 
 fn first_message_strategy(backend: Backend) -> FirstMessageStrategy {
     match backend {
-        Backend::Claude => FirstMessageStrategy::Positional,
+        // claude: `claude "<msg>"`
+        // codex:  `codex  "<msg>"` (claude と同様 positional 仕様)
+        Backend::Claude | Backend::Codex => FirstMessageStrategy::Positional,
+        // gemini: `gemini -i "<msg>"` (`-p` だと one-shot non-interactive)
         Backend::Gemini => FirstMessageStrategy::InteractiveFlag,
-        Backend::Codex => FirstMessageStrategy::Manual,
     }
 }
 
