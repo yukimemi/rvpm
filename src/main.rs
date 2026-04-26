@@ -2988,10 +2988,20 @@ async fn run_add(
                                     // apply の regression を示す。silent に stub を残すと
                                     // 「green path に化けたバグ」になるので明示 fail する
                                     // (CodeRabbit PR #104 post-merge レビュー指摘)。
+                                    //
+                                    // **state note (Gemini PR #105 指摘)**: stub entry は
+                                    // run_add の冒頭で既に config.toml に書き込まれている。
+                                    // ここでの bail はそれを rollback しないので、stub は
+                                    // disk に残ったまま。message でその事実 + リカバリ手段を
+                                    // 明示し、「refusing to keep」みたいな誤読しやすい表現は
+                                    // 避ける。
                                     anyhow::bail!(
-                                        "AI add returned no [[plugins]] proposal for {}; \
-                                         refusing to keep the stub entry from `rvpm add --ai`",
-                                        plugin.display_name()
+                                        "AI add returned no [[plugins]] proposal for {0}. \
+                                         The stub entry written to {1} is left as-is — \
+                                         remove it manually with `rvpm remove {0}` or rerun \
+                                         `rvpm add` with `--no-ai` for the static-scan path.",
+                                        plugin.display_name(),
+                                        config_path.display()
                                     );
                                 }
                             }
