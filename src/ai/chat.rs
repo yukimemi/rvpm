@@ -62,6 +62,8 @@ pub async fn run_ai_add(
     let initial_prompt = build_initial_prompt(
         plugin_url,
         plugin_root,
+        user_config_toml_path,
+        plugin_config_dir,
         &user_config_toml,
         &user_plugins_tree,
         &existing_hooks,
@@ -113,6 +115,8 @@ pub async fn run_ai_tune(
     let initial_prompt = crate::ai::prompt::build_tune_prompt(
         plugin_url,
         plugin_root,
+        user_config_toml_path,
+        plugin_config_dir,
         current_entry_toml,
         &user_config_toml,
         &user_plugins_tree,

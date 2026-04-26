@@ -29,6 +29,28 @@ impl ExistingHooks {
     }
 }
 
+/// disk 上の絶対パス (config.toml と per-plugin hook ディレクトリ) を prompt に
+/// 書き出す。これがあると hand-off モードで AI CLI に作業させたとき、CLI 側の
+/// Edit / Write tool が即座にこのパスへ書ける (paths が無いと AI が CWD を探し
+/// 始めて誤動作する — user 報告)。Mode A (rvpm 側で適用) では rvpm 自身が
+/// path を解決して書き込むので不要だが、両モードで同じ prompt を使う方が
+/// シンプル + AI の explanation が path を参照できると user にも親切。
+fn write_on_disk_paths(out: &mut String, config_toml_path: &Path, plugin_config_dir: &Path) {
+    out.push_str("## On-disk paths (for hand-off mode)\n\n");
+    out.push_str(
+        "When you write files yourself (e.g. via Edit / Write in claude-code), \
+         use these absolute paths exactly:\n\n",
+    );
+    out.push_str(&format!(
+        "- `config.toml`: `{}`\n",
+        config_toml_path.display()
+    ));
+    out.push_str(&format!(
+        "- per-plugin hook directory: `{}` (write `init.lua` / `before.lua` / `after.lua` here)\n\n",
+        plugin_config_dir.display()
+    ));
+}
+
 /// 既存 hook 本文を prompt に書き出すヘルパー。`is_empty` のときは何もしない。
 fn write_existing_hooks(out: &mut String, hooks: &ExistingHooks) {
     if hooks.is_empty() {
@@ -61,9 +83,12 @@ fn write_existing_hooks(out: &mut String, hooks: &ExistingHooks) {
 ///   3. 対象プラグイン情報 (URL / README / doc/)
 ///   4. user の現状 config (config.toml 全文 + plugins/ ツリー一覧)
 ///   5. 最終インストラクション
+#[allow(clippy::too_many_arguments)]
 pub fn build_initial_prompt(
     plugin_url: &str,
     plugin_root: &Path,
+    config_toml_path: &Path,
+    plugin_config_dir: &Path,
     user_config_toml: &str,
     user_plugins_tree: &str,
     existing_hooks: &ExistingHooks,
@@ -102,6 +127,7 @@ pub fn build_initial_prompt(
 
     out.push_str("---\n\n");
     out.push_str("# User context\n\n");
+    write_on_disk_paths(&mut out, config_toml_path, plugin_config_dir);
     out.push_str("## Current config.toml\n\n");
     out.push_str("```toml\n");
     out.push_str(&trim_to_cap(user_config_toml, 30_000));
@@ -136,9 +162,12 @@ pub fn build_initial_prompt(
 ///
 /// 出力フォーマット (XML tag) は `build_initial_prompt` と完全共通。chat loop /
 /// proposal parse / Apply 周りのコードを使い回せる。
+#[allow(clippy::too_many_arguments)]
 pub fn build_tune_prompt(
     plugin_url: &str,
     plugin_root: &Path,
+    config_toml_path: &Path,
+    plugin_config_dir: &Path,
     current_entry_toml: &str,
     user_config_toml: &str,
     user_plugins_tree: &str,
@@ -194,6 +223,7 @@ pub fn build_tune_prompt(
 
     out.push_str("---\n\n");
     out.push_str("# User context\n\n");
+    write_on_disk_paths(&mut out, config_toml_path, plugin_config_dir);
     out.push_str("## Current config.toml\n\n");
     out.push_str("```toml\n");
     out.push_str(&trim_to_cap(user_config_toml, 30_000));
@@ -358,6 +388,8 @@ mod tests {
         let prompt = build_initial_prompt(
             "owner/repo",
             &plugin_root,
+            std::path::Path::new("/home/u/.config/rvpm/config.toml"),
+            std::path::Path::new("/home/u/.config/rvpm/nvim/plugins/github.com/owner/repo"),
             "[[plugins]]\nurl = \"existing/dep\"\n",
             "github.com/existing/dep/\n",
             &ExistingHooks::default(),
@@ -373,6 +405,10 @@ mod tests {
         assert!(!prompt.contains("Respond in"));
         // 既存 hook なしの場合 "Existing hook files" セクションは出さない
         assert!(!prompt.contains("Existing hook files"));
+        // disk paths are surfaced for hand-off mode
+        assert!(prompt.contains("On-disk paths"));
+        assert!(prompt.contains("/home/u/.config/rvpm/config.toml"));
+        assert!(prompt.contains("github.com/owner/repo"));
     }
 
     #[test]
@@ -385,6 +421,8 @@ mod tests {
         let prompt = build_initial_prompt(
             "owner/repo",
             &plugin_root,
+            std::path::Path::new("/cfg/config.toml"),
+            std::path::Path::new("/cfg/plugins/x/y/z"),
             "",
             "(empty)",
             &ExistingHooks::default(),
@@ -406,9 +444,17 @@ mod tests {
             after_lua: Some("vim.keymap.set('n', '<leader>x', ':Foo<CR>')".to_string()),
             ..Default::default()
         };
-        let prompt =
-            build_initial_prompt("owner/repo", &plugin_root, "", "(empty)", &existing, "en")
-                .unwrap();
+        let prompt = build_initial_prompt(
+            "owner/repo",
+            &plugin_root,
+            std::path::Path::new("/cfg/config.toml"),
+            std::path::Path::new("/cfg/plugins/x/y/z"),
+            "",
+            "(empty)",
+            &existing,
+            "en",
+        )
+        .unwrap();
         assert!(prompt.contains("Existing hook files"));
         assert!(prompt.contains("Existing `after.lua`"));
         assert!(prompt.contains("vim.keymap.set"));
@@ -430,6 +476,8 @@ mod tests {
         let prompt = build_tune_prompt(
             "owner/tune-me",
             &plugin_root,
+            std::path::Path::new("/cfg/config.toml"),
+            std::path::Path::new("/cfg/plugins/x/y/z"),
             current_entry,
             "[[plugins]]\nurl = \"owner/tune-me\"\n",
             "(empty)",
@@ -458,6 +506,8 @@ mod tests {
         let prompt = build_tune_prompt(
             "owner/repo",
             &plugin_root,
+            std::path::Path::new("/cfg/config.toml"),
+            std::path::Path::new("/cfg/plugins/x/y/z"),
             "[[plugins]]\nurl = \"owner/repo\"\n",
             "",
             "(empty)",
@@ -483,6 +533,8 @@ mod tests {
         let prompt = build_tune_prompt(
             "owner/foo",
             &plugin_root,
+            std::path::Path::new("/cfg/config.toml"),
+            std::path::Path::new("/cfg/plugins/x/y/z"),
             "[[plugins]]\nurl = \"owner/foo\"\n",
             "",
             "(empty)",
