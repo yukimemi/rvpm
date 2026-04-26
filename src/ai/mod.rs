@@ -383,6 +383,29 @@ pub fn validate_proposal_toml(toml_src: &str) -> Result<()> {
     Ok(())
 }
 
+/// CLI 起動時に最初の user message をどう注入するかの戦略。各 backend の
+/// interactive 起動時の引数仕様に合わせて切り替える。
+#[derive(Debug, Clone, Copy)]
+enum FirstMessageStrategy {
+    /// `claude "<msg>"` — positional arg で interactive を継続したまま最初の
+    /// user message を送る (claude code v2 documented behavior)。
+    Positional,
+    /// `gemini -i "<msg>"` — `--prompt-interactive` 相当の short flag。
+    /// `-p` (non-interactive) と区別して対話継続する。
+    InteractiveFlag,
+    /// Auto-send が安全に出来ない backend (codex 等)。argless で interactive 起動 +
+    /// stderr に「コピペしてください」案内を出すフォールバック。
+    Manual,
+}
+
+fn first_message_strategy(backend: Backend) -> FirstMessageStrategy {
+    match backend {
+        Backend::Claude => FirstMessageStrategy::Positional,
+        Backend::Gemini => FirstMessageStrategy::InteractiveFlag,
+        Backend::Codex => FirstMessageStrategy::Manual,
+    }
+}
+
 /// Mode B のハンドオフ: prompt をテンポラリファイルに書き出し、CLI を
 /// **interactive モードで** 起動する (stdin / stdout / stderr とも親 TTY を継承)。
 /// rvpm は CLI 終了まで `wait` するだけで、それ以降の状態は CLI 側に委譲する。
@@ -391,14 +414,10 @@ pub fn validate_proposal_toml(toml_src: &str) -> Result<()> {
 /// などは EOF を受けて即座に exit するため、interactive にならない。
 /// 代わりに prompt をテンポラリ MD ファイルに保存してパスを announce する。
 ///
-/// **CLI 別の "first message" 戦略**:
-///   - `claude` は `claude "<msg>"` の positional arg で interactive を継続しつつ
-///     最初の user message を投げられるので、起動時に「この file を読んで」と
-///     伝えて対話開始できる (user 報告対応 — 引き継ぎ先 CLI が temp file を
-///     読まないまま全く別のことを始める事故を防ぐ)。
-///   - `gemini` (v0.39 等) は positional arg だと `-p` モード相当 (= one-shot
-///     non-interactive) に切り替わって即終了するリスクがある。`codex` も同様に
-///     挙動が version で不安定。これらは argless で interactive 起動 + コピペ案内に留める。
+/// **CLI 別の "first message" 戦略**: `first_message_strategy` を参照。
+///   - claude: positional arg
+///   - gemini: `-i <msg>` flag
+///   - codex: コピペ案内のみ (interactive-first-message の安定 flag が無いため)
 ///
 /// CLI 終了まで blocking wait するが、`spawn_blocking` で別 thread に逃がして
 /// Tokio executor は塞がない。
@@ -434,14 +453,8 @@ pub async fn run_handoff(backend: Backend, prompt_text: &str) -> Result<()> {
     );
     eprintln!();
 
-    let send_first_message = matches!(backend, Backend::Claude);
-    if send_first_message {
-        eprintln!(
-            "Starting `{}` interactively. The first message asking it to read \
-             the file above will be sent automatically.\n",
-            backend.cli_name()
-        );
-    } else {
+    let strategy = first_message_strategy(backend);
+    if matches!(strategy, FirstMessageStrategy::Manual) {
         eprintln!(
             "Starting `{}` interactively. Once the prompt opens, paste this as \
              your first message:\n",
@@ -449,6 +462,12 @@ pub async fn run_handoff(backend: Backend, prompt_text: &str) -> Result<()> {
         );
         eprintln!("  {}", style(&first_message).bold());
         eprintln!();
+    } else {
+        eprintln!(
+            "Starting `{}` interactively. The first message asking it to read \
+             the file above will be sent automatically.\n",
+            backend.cli_name()
+        );
     }
 
     // 子プロセスを spawn_blocking 内で起動 + wait (std::process は async に乗らないため)。
@@ -458,9 +477,18 @@ pub async fn run_handoff(backend: Backend, prompt_text: &str) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut cmd = std::process::Command::new(&program);
         cmd.args(&prefix_args);
-        if send_first_message {
-            // claude "<msg>" — 最初の user message として送りつつ interactive を継続
-            cmd.arg(&first_message);
+        match strategy {
+            FirstMessageStrategy::Positional => {
+                // claude "<msg>"
+                cmd.arg(&first_message);
+            }
+            FirstMessageStrategy::InteractiveFlag => {
+                // gemini -i "<msg>"
+                cmd.arg("-i").arg(&first_message);
+            }
+            FirstMessageStrategy::Manual => {
+                // no extra args — user pastes the message after the prompt opens
+            }
         }
         let status = cmd
             .stdin(std::process::Stdio::inherit())
