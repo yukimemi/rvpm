@@ -520,14 +520,14 @@ fn drop_duplicate_merged(section: &mut ProposalSection) {
 /// 2 つの文字列を line 単位で trim + 空行 drop して比較。AI が空行や
 /// インデントだけ違う実質同一テキストを返す ことがあるため、厳密一致より
 /// やや甘めに「本質的同じ」を判定する。
+///
+/// `Iterator::eq` で直接比較するので `Vec<String>` の中間 alloc は不要 —
+/// AI 提案 1 件ごとに 4 セクション分この関数が呼ばれるので地味に効く
+/// (Gemini PR #106 指摘)。
 fn essentially_same(a: &str, b: &str) -> bool {
-    let normalize = |s: &str| -> Vec<String> {
-        s.lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect()
-    };
-    normalize(a) == normalize(b)
+    let iter_a = a.lines().map(|l| l.trim()).filter(|l| !l.is_empty());
+    let iter_b = b.lines().map(|l| l.trim()).filter(|l| !l.is_empty());
+    iter_a.eq(iter_b)
 }
 
 /// `Proposal` から `<rvpm:*>` tag だけの compact XML を再構築する。
