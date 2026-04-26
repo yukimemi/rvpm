@@ -60,8 +60,14 @@ pub async fn run_ai_add(
         collect_user_context(user_config_toml_path, config_root)?;
     let existing_hooks = read_existing_hooks(plugin_config_dir);
 
-    let merged_supported = should_emit_merged(backend);
-    announce_merged_decision(backend, merged_supported);
+    // **add mode で既存 hook が一個も無ければ `_merged` 要求は無意味** —
+    // user 報告: AI に merged を求めると fresh と同じ内容を merged にも詰めて
+    // 返してきて、preview で [FRESH] と [MERGED] が重複表示される事故が起きる。
+    // backend / env で merged が ON でも、merge 対象が物理的に無い add 新規では
+    // 強制 OFF にする。tune は current entry が常にあるので別扱い。
+    let has_existing_to_merge_against = !existing_hooks.is_empty();
+    let merged_supported = should_emit_merged(backend) && has_existing_to_merge_against;
+    announce_merged_decision(backend, merged_supported, has_existing_to_merge_against);
     let initial_prompt = build_initial_prompt(
         plugin_url,
         plugin_root,
@@ -120,8 +126,11 @@ pub async fn run_ai_tune(
         collect_user_context(user_config_toml_path, config_root)?;
     let existing_hooks = read_existing_hooks(plugin_config_dir);
 
+    // tune mode: current_entry_toml が常に存在する → has_existing = true 固定。
+    // existing hook の有無は per-section の AI 提案に影響するが、announce 用の
+    // 「merge 対象があるか」は `[[plugins]]` entry の存在で代表させる。
     let merged_supported = should_emit_merged(backend);
-    announce_merged_decision(backend, merged_supported);
+    announce_merged_decision(backend, merged_supported, /* has_existing */ true);
     let initial_prompt = crate::ai::prompt::build_tune_prompt(
         plugin_url,
         plugin_root,
@@ -175,17 +184,27 @@ fn collect_user_context(
     Ok((toml, tree))
 }
 
-/// `should_emit_merged` の決定を user に伝える。Gemini で auto-OFF された場合だけ
-/// stderr にヒントを出す (claude/codex は ON が期待挙動なので無音)。
-fn announce_merged_decision(backend: Backend, merged_supported: bool) {
+/// `should_emit_merged` の決定を user に伝える。Gemini で **backend default**
+/// による auto-OFF が発火したときだけ stderr にヒントを出す。
+///
+/// 黙る条件:
+///   - merged_supported が true (=何も伝えることがない)
+///   - has_existing が false (= 物理的に merge 対象が無いので merged の話自体が
+///     moot。add 新規で false 強制になるケース)
+///   - user が override env を **定義** している (RVPM_AI_NO_MERGED /
+///     RVPM_AI_FORCE_MERGED の値が `=0` でも `=1` でも、定義されてる時点で
+///     「auto-off に気付いていて意識的に流している」合図とみなす)
+fn announce_merged_decision(backend: Backend, merged_supported: bool, has_existing: bool) {
     if merged_supported {
         return;
     }
-    if std::env::var("RVPM_AI_NO_MERGED")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
+    if !has_existing {
+        // merge 対象が無いので merged の話そのものが意味なし。warning も意味なし。
+        return;
+    }
+    if std::env::var_os("RVPM_AI_NO_MERGED").is_some()
+        || std::env::var_os("RVPM_AI_FORCE_MERGED").is_some()
     {
-        // user 自身が明示 off にしてるので余計なヒントを出さない
         return;
     }
     if matches!(backend, Backend::Gemini) {
@@ -473,7 +492,42 @@ fn parse_and_validate(response: &str) -> Result<Proposal> {
     if !merged_ok {
         proposal.plugin_entry.merged = None;
     }
+
+    // **dedupe: fresh と merged が実質同じなら merged を落とす** — user 報告:
+    // add 新規で AI が prompt の指示を超えて _merged にも fresh と同じ内容を
+    // 詰めて返すケースがあり、preview に [FRESH] / [MERGED] の重複行が並んで
+    // dialog でも「Use FRESH / Use MERGED」と等価な選択肢が二択になる事故。
+    // prompt-level fix (no merge target → merged_supported=false) と多重防御。
+    drop_duplicate_merged(&mut proposal.plugin_entry);
+    drop_duplicate_merged(&mut proposal.init_lua);
+    drop_duplicate_merged(&mut proposal.before_lua);
+    drop_duplicate_merged(&mut proposal.after_lua);
+
     Ok(proposal)
+}
+
+/// section.fresh と section.merged が **本質的に同じ内容** (line ごとの trim +
+/// 空行除去で比較) なら、merged を `None` に落とす。
+fn drop_duplicate_merged(section: &mut ProposalSection) {
+    let (Some(fresh), Some(merged)) = (section.fresh.as_deref(), section.merged.as_deref()) else {
+        return;
+    };
+    if essentially_same(fresh, merged) {
+        section.merged = None;
+    }
+}
+
+/// 2 つの文字列を line 単位で trim + 空行 drop して比較。AI が空行や
+/// インデントだけ違う実質同一テキストを返す ことがあるため、厳密一致より
+/// やや甘めに「本質的同じ」を判定する。
+///
+/// `Iterator::eq` で直接比較するので `Vec<String>` の中間 alloc は不要 —
+/// AI 提案 1 件ごとに 4 セクション分この関数が呼ばれるので地味に効く
+/// (Gemini PR #106 指摘)。
+fn essentially_same(a: &str, b: &str) -> bool {
+    let iter_a = a.lines().map(|l| l.trim()).filter(|l| !l.is_empty());
+    let iter_b = b.lines().map(|l| l.trim()).filter(|l| !l.is_empty());
+    iter_a.eq(iter_b)
 }
 
 /// `Proposal` から `<rvpm:*>` tag だけの compact XML を再構築する。
@@ -995,5 +1049,82 @@ also not toml
 <rvpm:explanation>both broken</rvpm:explanation>
 "#;
         assert!(parse_and_validate(response).is_err());
+    }
+
+    #[test]
+    fn parse_and_validate_drops_merged_when_identical_to_fresh() {
+        // user 報告: AI が prompt の指示を超えて _merged にも fresh と同じ内容を
+        // 詰めて返してくるケース。preview で [FRESH] / [MERGED] の重複行が並んで
+        // dialog でも等価な選択肢が二択になる UX 事故を防ぐ output-level dedupe。
+        let response = r#"
+<rvpm:plugin_entry>
+[[plugins]]
+url = "owner/repo"
+on_cmd = ["Foo"]
+</rvpm:plugin_entry>
+<rvpm:plugin_entry_merged>
+[[plugins]]
+url = "owner/repo"
+on_cmd = ["Foo"]
+</rvpm:plugin_entry_merged>
+<rvpm:after_lua>
+require('foo').setup({})
+</rvpm:after_lua>
+<rvpm:after_lua_merged>
+require('foo').setup({})
+</rvpm:after_lua_merged>
+<rvpm:explanation>identical fresh+merged</rvpm:explanation>
+"#;
+        let p = parse_and_validate(response).unwrap();
+        assert!(p.plugin_entry.fresh.is_some());
+        assert!(
+            p.plugin_entry.merged.is_none(),
+            "duplicate plugin_entry_merged should be dropped"
+        );
+        assert!(p.after_lua.fresh.is_some());
+        assert!(
+            p.after_lua.merged.is_none(),
+            "duplicate after_lua_merged should be dropped"
+        );
+    }
+
+    #[test]
+    fn parse_and_validate_keeps_merged_when_meaningfully_different() {
+        // 内容が違えば dedupe で落とさない (本来の merged 提示は保持)。
+        let response = r#"
+<rvpm:plugin_entry>
+[[plugins]]
+url = "owner/repo"
+on_cmd = ["Foo"]
+</rvpm:plugin_entry>
+<rvpm:plugin_entry_merged>
+[[plugins]]
+url = "owner/repo"
+on_cmd = ["Foo", "Bar"]
+rev = "v1.0"
+</rvpm:plugin_entry_merged>
+<rvpm:explanation>genuinely different</rvpm:explanation>
+"#;
+        let p = parse_and_validate(response).unwrap();
+        assert!(p.plugin_entry.fresh.is_some());
+        assert!(p.plugin_entry.merged.is_some());
+    }
+
+    #[test]
+    fn essentially_same_ignores_whitespace_only_differences() {
+        // インデント / 空行だけの違いは「同じ」扱い
+        assert!(essentially_same(
+            "  vim.g.x = 1\n  vim.g.y = 2\n",
+            "vim.g.x = 1\n\n\nvim.g.y = 2",
+        ));
+    }
+
+    #[test]
+    fn essentially_same_distinguishes_real_differences() {
+        assert!(!essentially_same("vim.g.x = 1", "vim.g.x = 2",));
+        assert!(!essentially_same(
+            "require('foo').setup({})",
+            "require('foo').setup({ enabled = true })",
+        ));
     }
 }
