@@ -233,8 +233,26 @@ async fn run_chat_loop(
                 });
             }
             ChatAction::HandOff => {
-                // refine 済み文脈を維持: 最後に投げた prompt をそのまま handoff に渡す。
-                run_handoff(backend, &last_prompt).await?;
+                // refine 済み文脈 + **直近の AI 提案** を統合して handoff prompt を作る。
+                //
+                // user 報告: 旧実装は `last_prompt` (= AI に *次に* 投げる用の prompt)
+                // をそのまま渡していたが、これだと AI が「直近どんな提案をしたか」を
+                // 知らない状態で対話を始めるため、handoff 先 CLI が最初から違うことを
+                // 提案し直す事故が起きる。`proposal_to_xml(&proposal)` で構造化済みの
+                // 提案を末尾に追記して、引き継ぎ先 AI が即座に文脈を継承できるようにする。
+                let proposal_xml = proposal_to_xml(&proposal);
+                let handoff_prompt = format!(
+                    "{last_prompt}\n\n\
+                     ---\n\n\
+                     # rvpm's latest proposal (already shown to the user)\n\n\
+                     The user just picked **Hand off** in rvpm after seeing the \
+                     proposal below. **Continue from here** — apply parts of \
+                     this proposal, refine specific sections, or revise it as \
+                     the user directs. Use the absolute paths from the \
+                     \"On-disk paths\" section above when you write files.\n\n\
+                     {proposal_xml}\n"
+                );
+                run_handoff(backend, &handoff_prompt).await?;
                 return Ok(AiAddOutcome {
                     outcome: ChatOutcome::HandedOff,
                     plugin_entry_toml: None,

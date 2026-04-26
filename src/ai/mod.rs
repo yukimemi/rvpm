@@ -387,15 +387,24 @@ pub fn validate_proposal_toml(toml_src: &str) -> Result<()> {
 /// **interactive モードで** 起動する (stdin / stdout / stderr とも親 TTY を継承)。
 /// rvpm は CLI 終了まで `wait` するだけで、それ以降の状態は CLI 側に委譲する。
 ///
-/// **prompt の事前注入は意図的に行わない**: stdin pipe + drop すると claude-code
-/// などは EOF を受けて即座に exit するため、interactive にならない (Gemini High)。
+/// **prompt の事前注入 (stdin pipe) はしない**: stdin pipe + drop すると claude-code
+/// などは EOF を受けて即座に exit するため、interactive にならない。
 /// 代わりに prompt をテンポラリ MD ファイルに保存してパスを announce する。
-/// user は CLI 内で `/file <path>` (claude-code) や `cat <path>` を使って
-/// 読み込めばよい。
+///
+/// **CLI 別の "first message" 戦略**:
+///   - `claude` は `claude "<msg>"` の positional arg で interactive を継続しつつ
+///     最初の user message を投げられるので、起動時に「この file を読んで」と
+///     伝えて対話開始できる (user 報告対応 — 引き継ぎ先 CLI が temp file を
+///     読まないまま全く別のことを始める事故を防ぐ)。
+///   - `gemini` (v0.39 等) は positional arg だと `-p` モード相当 (= one-shot
+///     non-interactive) に切り替わって即終了するリスクがある。`codex` も同様に
+///     挙動が version で不安定。これらは argless で interactive 起動 + コピペ案内に留める。
 ///
 /// CLI 終了まで blocking wait するが、`spawn_blocking` で別 thread に逃がして
 /// Tokio executor は塞がない。
 pub async fn run_handoff(backend: Backend, prompt_text: &str) -> Result<()> {
+    use console::style;
+
     ensure_cli_installed(backend)?;
     let resolved = resolve_cli(backend.cli_name())
         .ok_or_else(|| anyhow!("AI CLI `{}` is not on PATH", backend.cli_name()))?;
@@ -410,19 +419,50 @@ pub async fn run_handoff(backend: Backend, prompt_text: &str) -> Result<()> {
     std::fs::write(&tmp_path, prompt_text)
         .with_context(|| format!("failed to write prompt to {}", tmp_path.display()))?;
 
+    let path_str = tmp_path.to_string_lossy().into_owned();
+    let first_message = format!(
+        "Read the file at `{path_str}` — it contains rvpm's full context plus \
+         the latest proposal as XML tags (`<rvpm:plugin_entry>`, `<rvpm:after_lua>`, etc.). \
+         Continue our conversation from there: apply parts of the proposal, \
+         refine specific sections, or revise it as I direct."
+    );
+
     eprintln!();
     eprintln!(
-        "\u{1f4dd} Prompt saved to: {}\n\
-         Starting `{}` interactively. Paste the prompt or load it via your CLI's file-reading mechanism.\n",
-        tmp_path.display(),
-        backend.cli_name()
+        "\u{1f4dd} Hand-off prompt saved to:\n   {}",
+        style(&path_str).cyan()
     );
+    eprintln!();
+
+    let send_first_message = matches!(backend, Backend::Claude);
+    if send_first_message {
+        eprintln!(
+            "Starting `{}` interactively. The first message asking it to read \
+             the file above will be sent automatically.\n",
+            backend.cli_name()
+        );
+    } else {
+        eprintln!(
+            "Starting `{}` interactively. Once the prompt opens, paste this as \
+             your first message:\n",
+            backend.cli_name()
+        );
+        eprintln!("  {}", style(&first_message).bold());
+        eprintln!();
+    }
 
     // 子プロセスを spawn_blocking 内で起動 + wait (std::process は async に乗らないため)。
     let label = backend.cli_name().to_string();
+    let program = resolved.program.clone();
+    let prefix_args = resolved.prefix_args.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let status = std::process::Command::new(&resolved.program)
-            .args(&resolved.prefix_args)
+        let mut cmd = std::process::Command::new(&program);
+        cmd.args(&prefix_args);
+        if send_first_message {
+            // claude "<msg>" — 最初の user message として送りつつ interactive を継続
+            cmd.arg(&first_message);
+        }
+        let status = cmd
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
