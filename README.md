@@ -302,15 +302,26 @@ What it does:
 
 1. Clones the plugin (same as the regular path).
 2. Builds a prompt from rvpm's TOML schema, the plugin's `README` + `doc/`,
-   and your current `config.toml` + `plugins/` tree.
+   your current `config.toml` + `plugins/` tree, and any **existing
+   per-plugin hook files** already on disk.
 3. Invokes the chosen CLI one-shot (`claude -p` / `gemini -p` / `codex exec`).
 4. Parses the response (XML tags `<rvpm:plugin_entry>`, `<rvpm:init_lua>`,
-   `<rvpm:before_lua>`, `<rvpm:after_lua>`, `<rvpm:explanation>`).
+   `<rvpm:before_lua>`, `<rvpm:after_lua>`, `<rvpm:explanation>`, plus
+   `<rvpm:..._merged>` variants when existing content was provided).
 5. Shows you the proposal and asks: **Apply / Chat / Hand off / Skip**.
 
-**Apply** writes the proposed entry to `config.toml` and creates the proposed
-hook files under `{config_root}/plugins/<host>/<owner>/<repo>/`. Existing
-hook files are never overwritten.
+**Apply** writes the proposed entry to `config.toml` and creates/updates
+hook files under `{config_root}/plugins/<host>/<owner>/<repo>/`. When
+existing files are present, you get a per-section choice for each hook
+file (and for the `[[plugins]]` entry under `tune`):
+
+- **Use FRESH** — overwrite with the AI's clean greenfield proposal.
+- **Use MERGED** — overwrite with the AI's conservative variant that
+  preserves your existing edits and adds AI suggestions on top.
+- **Keep existing** — leave the file (or entry) untouched.
+
+If a section has no existing content, only **Use FRESH** vs **Skip** is
+offered.
 
 **Chat** lets you give one-line feedback ("also add depends on plenary",
 "actually, I want this eager"); rvpm rebuilds the prompt with your message
@@ -356,19 +367,22 @@ rvpm tune telescope             # fuzzy match on URL
 rvpm tune folke/snacks.nvim --ai gemini
 ```
 
-The AI sees your **current `[[plugins]]` block** plus the cloned plugin's
-README/doc and proposes an improved entry — adjusted lazy triggers,
-trimmed redundant fields, refined hook files, etc.
+The AI sees your **current `[[plugins]]` block**, the cloned plugin's
+README/doc, **and any existing per-plugin hook files** on disk. It
+returns two parallel proposals per section: a **fresh** clean redesign
+and a **merged** conservative variant that preserves your edits.
 
-**`tune` is destructive by default.** The AI proposal **fully replaces**
-the selected `[[plugins]]` entry: any field the AI omits is dropped. So
-if your existing entry has `on_cmd = ["Foo"]` and the AI proposes a
-config without `on_cmd`, the field is removed (the AI is signalling that
-trigger is no longer needed). If you want a particular field left alone,
-tell the AI in **Chat** ("don't change `rev`") — the AI will keep it in
-the next proposal. The chat / apply / hand-off / skip actions are
-identical to `add --ai`, and existing per-plugin hook files are still
-never overwritten.
+At Apply time you get a per-section choice for the `[[plugins]]` entry
+and each hook file: **Use FRESH** (overwrite with the clean redesign),
+**Use MERGED** (overwrite while preserving your edits), or **Keep
+existing** (no change).
+
+If you choose **Use FRESH** for the `[[plugins]]` entry, that variant
+**fully replaces** the existing entry — any field the AI omits is
+dropped. The **Use MERGED** variant is the AI's best-effort to keep
+your custom fields intact while applying targeted improvements. If
+neither variant is right, pick **Keep existing** and refine via **Chat**
+("don't change `rev`", "drop the build_lua line") then re-Apply.
 
 `tune` is AI-only — `--no-ai` errors out. Use `rvpm set` for
 non-AI tweaks.
