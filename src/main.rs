@@ -184,15 +184,16 @@ enum Commands {
     /// Like `add --ai`, but for plugins **already configured** in
     /// `config.toml`. Picks one entry (by `[query]` fuzzy match or
     /// interactive select), feeds the current `[[plugins]]` block plus
-    /// the cloned plugin's README/doc to the AI CLI, and lets the AI
-    /// propose an improved entry + per-plugin hook files.
+    /// the cloned plugin's README/doc and any existing per-plugin hook
+    /// files to the AI CLI, and asks for two parallel proposals per
+    /// section: a fresh redesign and a merged variant that preserves
+    /// your edits.
     ///
-    /// DESTRUCTIVE BY DEFAULT. The AI proposal fully replaces the
-    /// selected `[[plugins]]` entry — fields the AI omits are dropped
-    /// (e.g. an old `on_cmd` is removed if the AI thinks it's no longer
-    /// needed). Use the Chat action to tell the AI to keep a particular
-    /// field. Existing per-plugin hook files are never overwritten —
-    /// they're shown as `[SKIPPED]` in the preview.
+    /// At Apply time you pick per-section: `Use FRESH` (overwrite),
+    /// `Use MERGED` (overwrite, keep your edits), or `Keep existing`
+    /// (no change). Same choice applies to the `[[plugins]]` entry
+    /// itself. Use the Chat action to tell the AI to keep a particular
+    /// field, or just pick `Keep existing` for that section.
     Tune {
         /// Fuzzy match plugin url (omit to pick interactively)
         query: Option<String>,
@@ -2970,14 +2971,14 @@ async fn run_add(
                                         )
                                         .await?;
                                         println!(
-                                            "Applied AI-proposed config for {} ({} hook file(s) created).",
+                                            "Applied AI-proposed config for {} ({} hook file(s) created/overwritten).",
                                             plugin.display_name(),
                                             written_hooks.len()
                                         );
                                     }
                                 } else {
                                     println!(
-                                        "Kept existing entry for {} ({} hook file(s) created).",
+                                        "Kept existing entry for {} ({} hook file(s) created/overwritten).",
                                         plugin.display_name(),
                                         written_hooks.len()
                                     );

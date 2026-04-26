@@ -80,7 +80,7 @@ pub async fn run_ai_add(
         plugin_config_dir,
         user_config_toml_path,
         existing_hooks,
-        /* tune_mode */ false,
+        /* existing_plugin_entry */ None,
         chezmoi_enabled,
     )
     .await
@@ -132,7 +132,7 @@ pub async fn run_ai_tune(
         plugin_config_dir,
         user_config_toml_path,
         existing_hooks,
-        /* tune_mode */ true,
+        /* existing_plugin_entry */ Some(current_entry_toml.to_string()),
         chezmoi_enabled,
     )
     .await
@@ -175,6 +175,11 @@ fn read_existing_hooks(plugin_dir: &Path) -> ExistingHooks {
 /// `initial_prompt` を最初に投げ、Apply / Chat / HandOff / Skip の選択を loop し、
 /// Apply で per-section の user 選択を確定 → hook ファイル書き込み + config 用
 /// `plugin_entry_toml` を `AiAddOutcome` に詰めて返す。
+///
+/// `existing_plugin_entry`: tune mode で current `[[plugins]]` 本文を渡す
+/// (Gemini PR #104 指摘 — preview の `plugin_entry` セクションに既存値も並べて
+/// 比較できるようにする)。`None` は add mode (まだ stub のみ) の意味も兼ねる:
+/// pick dialog では `None` を「fresh しか提示しない (= 自動採用)」シグナルに使う。
 #[allow(clippy::too_many_arguments)]
 async fn run_chat_loop(
     backend: Backend,
@@ -182,7 +187,7 @@ async fn run_chat_loop(
     plugin_config_dir: &Path,
     user_config_toml_path: &Path,
     existing_hooks: ExistingHooks,
-    tune_mode: bool,
+    existing_plugin_entry: Option<String>,
     chezmoi_enabled: bool,
 ) -> Result<AiAddOutcome> {
     // chat 履歴を反映して handoff に渡せるよう、最後に AI に投げた prompt を覚えておく。
@@ -200,10 +205,12 @@ async fn run_chat_loop(
             plugin_config_dir,
             user_config_toml_path,
             &existing_hooks,
+            existing_plugin_entry.as_deref(),
         );
 
         match prompt_chat_action().await? {
             ChatAction::Apply => {
+                let tune_mode = existing_plugin_entry.is_some();
                 let (decisions, plugin_entry_toml) =
                     resolve_user_decisions(&proposal, &existing_hooks, tune_mode).await?;
                 let written =
@@ -329,9 +336,12 @@ async fn ask_followup() -> Result<String> {
 }
 
 fn parse_and_validate(response: &str) -> Result<Proposal> {
-    let proposal = parse_proposal(response)?;
+    let mut proposal = parse_proposal(response)?;
     // 少なくとも fresh または merged のどちらかが TOML として valid であれば OK。
-    // 両方とも無いケースは `parse_proposal` が既に弾く。
+    // **invalid な variant は提示前に `None` に落とす** — そうしないと user が pick
+    // dialog で invalid variant を選んでしまい、`replace_plugin_entry_with_ai_toml`
+    // が malformed TOML を config.toml に書き込んで次回 `parse_config` を破壊する
+    // (CodeRabbit PR #104 指摘)。
     let fresh_ok = proposal
         .plugin_entry
         .fresh
@@ -347,7 +357,7 @@ fn parse_and_validate(response: &str) -> Result<Proposal> {
         .map(|r| r.is_ok())
         .unwrap_or(false);
     if !fresh_ok && !merged_ok {
-        // どちらも valid でなければ、より informative な error を再度実行して返す。
+        // どちらも valid でなければ、より informative な error を返すために再実行。
         if let Some(s) = proposal.plugin_entry.fresh.as_deref() {
             return Err(validate_proposal_toml(s).unwrap_err());
         }
@@ -355,6 +365,12 @@ fn parse_and_validate(response: &str) -> Result<Proposal> {
             return Err(validate_proposal_toml(s).unwrap_err());
         }
         return Err(anyhow::anyhow!("AI proposal had no valid plugin entry"));
+    }
+    if !fresh_ok {
+        proposal.plugin_entry.fresh = None;
+    }
+    if !merged_ok {
+        proposal.plugin_entry.merged = None;
     }
     Ok(proposal)
 }
@@ -563,6 +579,7 @@ fn print_proposal_preview(
     plugin_config_dir: &Path,
     config_toml_path: &Path,
     existing: &ExistingHooks,
+    existing_plugin_entry: Option<&str>,
 ) {
     let rule = "\u{2500}".repeat(60);
     eprintln!();
@@ -570,10 +587,12 @@ fn print_proposal_preview(
         "\u{1f4dd} [[plugins]] entry to write into {}:",
         config_toml_path.display()
     );
+    // Gemini PR #104 指摘: tune mode で既存 entry を AI 提案と並べて見せると比較しやすい。
+    // add mode (existing_plugin_entry = None) では従来通り FRESH のみ表示。
     print_section_block(
         "plugin_entry",
         &p.plugin_entry,
-        /* existing */ None,
+        existing_plugin_entry,
         &rule,
     );
 
@@ -797,5 +816,62 @@ on_cmd = ["Foo"]"#
         assert!(hooks.init_lua.is_none());
         assert!(hooks.before_lua.is_none());
         assert_eq!(hooks.after_lua.as_deref(), Some("USER CONTENT\n"));
+    }
+
+    #[test]
+    fn parse_and_validate_drops_invalid_fresh_keeps_valid_merged() {
+        // CodeRabbit PR #104 指摘: 片方が invalid TOML だった場合、それを `None` に
+        // 落として user dialog に提示しないこと。さもないと user が pick して
+        // malformed TOML が config.toml に書き込まれる。
+        let response = r#"
+<rvpm:plugin_entry>
+this is not valid TOML at all
+</rvpm:plugin_entry>
+<rvpm:plugin_entry_merged>
+[[plugins]]
+url = "owner/repo"
+</rvpm:plugin_entry_merged>
+<rvpm:explanation>fresh broken, merged ok</rvpm:explanation>
+"#;
+        let p = parse_and_validate(response).unwrap();
+        assert!(
+            p.plugin_entry.fresh.is_none(),
+            "invalid fresh must be dropped to None"
+        );
+        assert!(
+            p.plugin_entry.merged.is_some(),
+            "valid merged must be retained"
+        );
+    }
+
+    #[test]
+    fn parse_and_validate_drops_invalid_merged_keeps_valid_fresh() {
+        let response = r#"
+<rvpm:plugin_entry>
+[[plugins]]
+url = "owner/repo"
+</rvpm:plugin_entry>
+<rvpm:plugin_entry_merged>
+also not valid TOML
+</rvpm:plugin_entry_merged>
+<rvpm:explanation>fresh ok, merged broken</rvpm:explanation>
+"#;
+        let p = parse_and_validate(response).unwrap();
+        assert!(p.plugin_entry.fresh.is_some());
+        assert!(p.plugin_entry.merged.is_none());
+    }
+
+    #[test]
+    fn parse_and_validate_errors_when_both_variants_invalid() {
+        let response = r#"
+<rvpm:plugin_entry>
+not toml
+</rvpm:plugin_entry>
+<rvpm:plugin_entry_merged>
+also not toml
+</rvpm:plugin_entry_merged>
+<rvpm:explanation>both broken</rvpm:explanation>
+"#;
+        assert!(parse_and_validate(response).is_err());
     }
 }
