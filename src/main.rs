@@ -5157,16 +5157,9 @@ async fn run_log(query: Option<String>, last: usize, full: bool, diff: bool) -> 
                 };
                 let dst_path = resolve_plugin_dst(plugin, &cache_root);
                 for file in &change.doc_files_changed {
-                    let output = tokio::process::Command::new("git")
-                        .arg("-C")
-                        .arg(&dst_path)
-                        .args(["diff", &format!("{}..{}", from, change.to), "--", file])
-                        .output()
-                        .await;
-                    if let Ok(out) = output
-                        && out.status.success()
+                    if let Some(patch) =
+                        crate::git::doc_file_patch(&dst_path, from, &change.to, file)
                     {
-                        let patch = String::from_utf8_lossy(&out.stdout).to_string();
                         diffs.insert(
                             crate::update_log::DiffKey {
                                 url: change.url.clone(),
