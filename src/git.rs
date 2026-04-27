@@ -373,12 +373,14 @@ fn split_subject_body(msg: &str) -> (&str, &str) {
 }
 
 /// `<from>..<to>` で変更があった README/CHANGELOG/doc 系ファイルの相対パス一覧を返す。
-/// `gix::Repository::diff_tree_to_tree` で tree-walk し、ファイル名で filter する。
 /// 失敗時 (repo open / rev parse / tree peel) は空 Vec (resilience)。
 fn doc_files_changed(dst: &Path, from: &str, to: &str) -> Vec<String> {
-    let mut files: Vec<String> = tree_changes(dst, from, to)
+    let Some((_repo, changes)) = open_and_diff(dst, from, to) else {
+        return Vec::new();
+    };
+    let mut files: Vec<String> = changes
         .into_iter()
-        .flat_map(change_paths)
+        .map(change_location)
         .filter(|p| is_doc_path(p))
         .collect();
     files.sort();
@@ -386,38 +388,43 @@ fn doc_files_changed(dst: &Path, from: &str, to: &str) -> Vec<String> {
     files
 }
 
-/// `<from>..<to>` の tree diff を返す共通ヘルパー。
-/// repo open / rev parse / tree peel のいずれかで失敗したら空 Vec (resilience)。
-fn tree_changes(dst: &Path, from: &str, to: &str) -> Vec<gix::object::tree::diff::ChangeDetached> {
-    fn inner(
-        dst: &Path,
-        from: &str,
-        to: &str,
-    ) -> Result<Vec<gix::object::tree::diff::ChangeDetached>> {
-        let repo = gix::open(dst)?;
-        let from_id = repo.rev_parse_single(from)?;
-        let to_id = repo.rev_parse_single(to)?;
-        let from_tree = repo.find_commit(from_id)?.tree()?;
-        let to_tree = repo.find_commit(to_id)?.tree()?;
-        Ok(repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)?)
-    }
-    inner(dst, from, to).unwrap_or_default()
+/// repo open / rev parse / tree peel / tree diff をまとめて行うヘルパー。
+/// 失敗時は `None` (resilience)。Rewrite tracking は明示的に無効化することで、
+/// rename を Deletion + Addition の 2 件として返させる
+/// (旧 `git diff --name-only` (rename detection 無し) と等価な挙動)。
+fn open_and_diff(
+    dst: &Path,
+    from: &str,
+    to: &str,
+) -> Option<(
+    gix::Repository,
+    Vec<gix::object::tree::diff::ChangeDetached>,
+)> {
+    let repo = gix::open(dst).ok()?;
+    // `from_tree` / `to_tree` borrow from `repo`; scope them in a block so they
+    // drop before we move `repo` into the returned tuple.
+    let changes = {
+        let from_id = repo.rev_parse_single(from).ok()?;
+        let to_id = repo.rev_parse_single(to).ok()?;
+        let from_tree = repo.find_commit(from_id).ok()?.tree().ok()?;
+        let to_tree = repo.find_commit(to_id).ok()?.tree().ok()?;
+        let options = gix::diff::Options::default().with_rewrites(None);
+        repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(options))
+            .ok()?
+    };
+    Some((repo, changes))
 }
 
-/// `ChangeDetached` から path を 1 つ以上取り出す。
-/// Rewrite (rename / copy) は source / dest の両方を返し、`git diff --name-only` の
-/// rewrite-tracking 無効時の挙動 (deletion + addition の 2 行) と等価な情報量にする。
-fn change_paths(change: gix::object::tree::diff::ChangeDetached) -> Vec<String> {
+/// `ChangeDetached` から destination path を返す。Rewrite tracking は
+/// `open_and_diff` で無効化しているのでこの実装で出会わない想定だが、
+/// 保険として location を返しておく (パスの重複は呼び出し側で `dedup`)。
+fn change_location(change: gix::object::tree::diff::ChangeDetached) -> String {
     use gix::object::tree::diff::ChangeDetached;
     match change {
         ChangeDetached::Addition { location, .. }
         | ChangeDetached::Deletion { location, .. }
-        | ChangeDetached::Modification { location, .. } => vec![location.to_string()],
-        ChangeDetached::Rewrite {
-            source_location,
-            location,
-            ..
-        } => vec![source_location.to_string(), location.to_string()],
+        | ChangeDetached::Modification { location, .. }
+        | ChangeDetached::Rewrite { location, .. } => location.to_string(),
     }
 }
 
@@ -437,59 +444,80 @@ fn is_doc_path(path: &str) -> bool {
     false
 }
 
-/// `<from>..<to>` で変更があった `path` の unified diff を返す。
-/// `path` が変化していない / repo open 失敗時は `None` (resilience)。
-/// バイナリは "Binary files ... differ" の 1 行に丸める (git の挙動と同じ)。
-pub fn doc_file_patch(dst: &Path, from: &str, to: &str, path: &str) -> Option<String> {
+/// `<from>..<to>` で `paths` に含まれるファイルそれぞれの unified diff をまとめて返す。
+/// repo を 1 度だけ open して tree diff も 1 度だけ計算するので、`run_log --diff` が
+/// 1 plugin × 多数 doc ファイルを処理するときの I/O を抑える。
+/// repo open / rev parse / blob lookup 失敗時は当該 path の entry を結果に含めない
+/// (resilience: 偽の空 diff を作らない)。
+pub fn doc_file_patches(
+    dst: &Path,
+    from: &str,
+    to: &str,
+    paths: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Some((repo, changes)) = open_and_diff(dst, from, to) else {
+        return out;
+    };
+    for path in paths {
+        if let Some(patch) = build_patch_for_path(&repo, &changes, path) {
+            out.insert(path.clone(), patch);
+        }
+    }
+    out
+}
+
+/// 単一ファイルの patch 生成 (テスト用 thin wrapper)。本番経路は
+/// `doc_file_patches` を使ってまとめて取得する。
+#[cfg(test)]
+fn doc_file_patch(dst: &Path, from: &str, to: &str, path: &str) -> Option<String> {
+    doc_file_patches(dst, from, to, std::slice::from_ref(&path.to_string())).remove(path)
+}
+
+fn build_patch_for_path(
+    repo: &gix::Repository,
+    changes: &[gix::object::tree::diff::ChangeDetached],
+    path: &str,
+) -> Option<String> {
     use gix::object::tree::diff::ChangeDetached;
 
-    let repo = gix::open(dst).ok()?;
-    let from_id = repo.rev_parse_single(from).ok()?;
-    let to_id = repo.rev_parse_single(to).ok()?;
-    let from_tree = repo.find_commit(from_id).ok()?.tree().ok()?;
-    let to_tree = repo.find_commit(to_id).ok()?.tree().ok()?;
-    let changes = repo
-        .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
-        .ok()?;
-
     let path_bytes = path.as_bytes();
-    let change = changes.into_iter().find(|c| match c {
+    let change = changes.iter().find(|c| match c {
         ChangeDetached::Addition { location, .. }
         | ChangeDetached::Deletion { location, .. }
-        | ChangeDetached::Modification { location, .. } => location.as_slice() == path_bytes,
-        ChangeDetached::Rewrite {
-            source_location,
-            location,
-            ..
-        } => location.as_slice() == path_bytes || source_location.as_slice() == path_bytes,
+        | ChangeDetached::Modification { location, .. }
+        | ChangeDetached::Rewrite { location, .. } => location.as_slice() == path_bytes,
     })?;
 
     let read_blob = |oid: gix::ObjectId| repo.find_blob(oid).ok().map(|b| b.detach().data);
 
-    let (before, after, before_oid, after_oid) = match change {
+    let (before, after, before_oid, after_oid) = match *change {
         ChangeDetached::Modification {
             previous_id, id, ..
         } => (
-            read_blob(previous_id).unwrap_or_default(),
-            read_blob(id).unwrap_or_default(),
+            read_blob(previous_id)?,
+            read_blob(id)?,
             previous_id.to_string(),
             id.to_string(),
         ),
         ChangeDetached::Addition { id, .. } => (
             Vec::new(),
-            read_blob(id).unwrap_or_default(),
+            read_blob(id)?,
             "0000000".to_string(),
             id.to_string(),
         ),
         ChangeDetached::Deletion { id, .. } => (
-            read_blob(id).unwrap_or_default(),
+            read_blob(id)?,
             Vec::new(),
             id.to_string(),
             "0000000".to_string(),
         ),
+        // Rewrite tracking は `open_and_diff` で無効化済み。万一 rename が
+        // Rewrite で来たら destination → destination で素直に diff する
+        // (source 側は Deletion として別 entry に分離されるはず)。
         ChangeDetached::Rewrite { source_id, id, .. } => (
-            read_blob(source_id).unwrap_or_default(),
-            read_blob(id).unwrap_or_default(),
+            read_blob(source_id)?,
+            read_blob(id)?,
             source_id.to_string(),
             id.to_string(),
         ),
@@ -1791,6 +1819,170 @@ mod tests {
         let patch = doc_file_patch(&src, &from, &to, "CHANGELOG.md").expect("patch");
         assert!(patch.contains("diff --git a/CHANGELOG.md b/CHANGELOG.md"));
         assert!(patch.contains("+first release"));
+    }
+
+    /// バイナリ blob は `Binary files ... differ` の 1 行に丸める。
+    #[tokio::test]
+    async fn test_doc_file_patch_handles_binary_blob() {
+        let root = tempdir().unwrap();
+        let src = root.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        // null-byte を含む binary 風 blob (現実的には PNG / dat 等の `doc/` 内画像)。
+        fs::create_dir_all(src.join("doc")).unwrap();
+        fs::write(
+            src.join("doc/asset.bin"),
+            [0xFFu8, 0x00, 0xAB, 0x00, b'd', b'\n'],
+        )
+        .unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        let from = String::from_utf8(
+            git_cmd(&src)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .await
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        fs::write(src.join("doc/asset.bin"), [0x00u8, 0x01, 0x02, 0x03, b'\n']).unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "bump"])
+            .output()
+            .await
+            .unwrap();
+        let to = String::from_utf8(
+            git_cmd(&src)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .await
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let patch = doc_file_patch(&src, &from, &to, "doc/asset.bin").expect("patch");
+        assert!(patch.contains("diff --git a/doc/asset.bin b/doc/asset.bin"));
+        assert!(patch.contains("Binary files a/doc/asset.bin and b/doc/asset.bin differ"));
+        // bin だと unified hunk は出ない (early return)。
+        assert!(!patch.contains("@@"));
+    }
+
+    /// blob 取得が失敗してもパス自体が tree diff に含まれていない (= 無関係) なら
+    /// `None`。`unwrap_or_default` を使っていないことを担保する回帰テスト。
+    #[tokio::test]
+    async fn test_doc_file_patches_skips_paths_not_in_diff() {
+        let root = tempdir().unwrap();
+        let src = root.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("README.md"), "v1\n").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        let from = String::from_utf8(
+            git_cmd(&src)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .await
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        fs::write(src.join("README.md"), "v2\n").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "bump"])
+            .output()
+            .await
+            .unwrap();
+        let to = String::from_utf8(
+            git_cmd(&src)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .await
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let paths = vec!["README.md".to_string(), "ghost.md".to_string()];
+        let patches = doc_file_patches(&src, &from, &to, &paths);
+        assert!(patches.contains_key("README.md"));
+        assert!(!patches.contains_key("ghost.md"));
+    }
+
+    /// `gix_diff::blob::sources::byte_lines` は token に改行を含むので、
+    /// unified diff の output で行と行が連結しない。retro-fix 防止。
+    #[tokio::test]
+    async fn test_doc_file_patch_lines_are_separated() {
+        let root = tempdir().unwrap();
+        let src = root.path().join("repo");
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("README.md"), "alpha\nbeta\n").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        let from = String::from_utf8(
+            git_cmd(&src)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .await
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        fs::write(src.join("README.md"), "ALPHA\nBETA\n").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "bump"])
+            .output()
+            .await
+            .unwrap();
+        let to = String::from_utf8(
+            git_cmd(&src)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .await
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let patch = doc_file_patch(&src, &from, &to, "README.md").expect("patch");
+        // 行が `-alpha-beta` のように連結していたら byte_lines が改行を切り捨てている。
+        assert!(patch.contains("-alpha\n"));
+        assert!(patch.contains("-beta\n"));
+        assert!(patch.contains("+ALPHA\n"));
+        assert!(patch.contains("+BETA\n"));
     }
 
     /// 該当ファイルが diff に含まれない場合は `None`。
