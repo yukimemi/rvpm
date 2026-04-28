@@ -40,6 +40,8 @@ Selecting the `[user config]` pseudo-plugin swaps the detail pane for a **requir
 - **Diagnostics & history** — `rvpm doctor` reports config / state / env in one
   shot; `rvpm log` shows what commits landed on the last sync, with `⚠ BREAKING`
   highlight and optional inline `--diff`
+- **Pure-Rust git via `gix`** — clone, fetch, checkout, status, and diff all run
+  in-process; no `git` binary required at runtime
 - **Resilient** — cyclic dependencies, missing plugins, and config errors emit
   warnings, not crashes
 

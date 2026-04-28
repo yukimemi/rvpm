@@ -926,22 +926,22 @@ pub async fn check_tool_nvim(resolver: &dyn VersionResolver) -> Diagnostic {
     }
 }
 
-/// `git` コマンドの存在とバージョン。必須。
+/// `git` コマンドの存在とバージョン。rvpm 自体は gix で動くので runtime 依存ではなく
+/// 任意。インストール済みかどうかを情報として表示する。
 pub async fn check_tool_git(resolver: &dyn VersionResolver) -> Diagnostic {
     match resolver.version("git").await {
         Some(v) => Diagnostic::new(
             Severity::Ok,
             CAT_TOOLS,
             "git",
-            format!("{}            (required)", shorten_version(&v)),
+            format!("{}            (optional)", shorten_version(&v)),
         ),
         None => Diagnostic::new(
-            Severity::Error,
+            Severity::Ok,
             CAT_TOOLS,
             "git",
-            "not found             (required)",
-        )
-        .with_hint("install git"),
+            "not found             (optional)",
+        ),
     }
 }
 
@@ -2026,6 +2026,16 @@ mod tests {
         let d = check_tool_git(&r).await;
         assert_eq!(d.severity, Severity::Ok);
         assert!(d.summary.contains("v2.49.1"));
+        assert!(d.summary.contains("optional"));
+    }
+
+    /// git は runtime 依存ではないので、未インストールでも Severity::Ok。
+    #[tokio::test]
+    async fn test_check_tool_git_missing_is_ok() {
+        let r = MockResolver::new();
+        let d = check_tool_git(&r).await;
+        assert_eq!(d.severity, Severity::Ok);
+        assert!(d.summary.contains("optional"));
     }
 
     #[tokio::test]

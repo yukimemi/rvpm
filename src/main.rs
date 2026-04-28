@@ -5156,17 +5156,15 @@ async fn run_log(query: Option<String>, last: usize, full: bool, diff: bool) -> 
                     continue;
                 };
                 let dst_path = resolve_plugin_dst(plugin, &cache_root);
+                // 1 plugin 分の patch をまとめて取得 (repo open / tree diff は 1 回)。
+                let patches = crate::git::doc_file_patches(
+                    &dst_path,
+                    from,
+                    &change.to,
+                    &change.doc_files_changed,
+                );
                 for file in &change.doc_files_changed {
-                    let output = tokio::process::Command::new("git")
-                        .arg("-C")
-                        .arg(&dst_path)
-                        .args(["diff", &format!("{}..{}", from, change.to), "--", file])
-                        .output()
-                        .await;
-                    if let Ok(out) = output
-                        && out.status.success()
-                    {
-                        let patch = String::from_utf8_lossy(&out.stdout).to_string();
+                    if let Some(patch) = patches.get(file) {
                         diffs.insert(
                             crate::update_log::DiffKey {
                                 url: change.url.clone(),
@@ -5174,7 +5172,7 @@ async fn run_log(query: Option<String>, last: usize, full: bool, diff: bool) -> 
                                 to: change.to.clone(),
                                 file: file.clone(),
                             },
-                            patch,
+                            patch.clone(),
                         );
                     }
                 }
