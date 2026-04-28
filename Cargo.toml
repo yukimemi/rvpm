@@ -76,7 +76,7 @@ dirs = "6.0"
 walkdir = "2.5"
 
 # Git (in-process, no fork)
-gix = { version = "0.82", default-features = false, features = [
+gix = { version = "0.83", default-features = false, features = [
     "sha1",
     "blocking-network-client",
     "blocking-http-transport-reqwest-rust-tls",
