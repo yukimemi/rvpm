@@ -2,110 +2,110 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## コンセプト
+## Concept
 
-- **Extremely Fast**: Rust の並行処理 (Tokio) と merge 済みディレクトリ + 事前コンパイル済み loader.lua による爆速起動。
-- **Type Safe & Robust**: TOML ベースの設定を serde で型付け、`resilience` 原則で 1 プラグインの失敗が全体を止めない。
-- **Convention over Configuration**: `{config_root}/<host>/<owner>/<repo>/` 配下の `init.lua` / `before.lua` / `after.lua` を規約に従って自動読み込み。
-- **Hybrid CLI**: 引数による一発操作 + `FuzzySelect` / TUI によるインタラクティブ操作を両立。
-- **Pre-compiled loader**: `vim.go.loadplugins = false` で Neovim の plugin loading を無効化し、generate 時に静的な loader.lua を生成。merge 最適化と事前 glob で起動時 I/O を削減。
+- **Extremely Fast**: Blazing-fast startup via Rust concurrency (Tokio), a merged directory layout, and a pre-compiled loader.lua.
+- **Type Safe & Robust**: TOML-based configuration typed with serde. The `resilience` principle ensures that one plugin's failure does not stop the whole system.
+- **Convention over Configuration**: `init.lua` / `before.lua` / `after.lua` placed under `{config_root}/<host>/<owner>/<repo>/` are auto-loaded by convention.
+- **Hybrid CLI**: One-shot operations via arguments alongside interactive operations through `FuzzySelect` / TUI.
+- **Pre-compiled loader**: Disables Neovim's plugin loading with `vim.go.loadplugins = false` and emits a static loader.lua at generate time. Reduces startup I/O via merge optimization and pre-resolved globs.
 
-## Git ワークフロー
+## Git Workflow
 
-- **main ブランチに直接 push しない。** 変更は必ずフィーチャーブランチを切り、Pull Request を作成する。
-- 例外: `chore: bump version to ...` や `chore: release vX.Y.Z` のようなリリース関連 chore commit、および `git tag vX.Y.Z` の push は直接 main に push してよい (既存履歴もそのパターン)。
-- ブランチ名は変更内容を端的に表す (例: `feat/add-only-sync-new-plugin`)。
-- **PR のタイトル・本文は英語で書く。** コミットメッセージも英語。
+- **Do not push directly to the main branch.** Always cut a feature branch and open a Pull Request.
+- Exception: release-related chore commits like `chore: bump version to ...` or `chore: release vX.Y.Z`, and pushing `git tag vX.Y.Z`, may be pushed directly to main (existing history follows this pattern).
+- Branch names should concisely describe the change (e.g. `feat/add-only-sync-new-plugin`).
+- **Write PR titles and bodies in English.** Commit messages are also in English.
 
-### PR レビューサイクル
+### PR Review Cycle
 
-- 全 PR で **Gemini Code Assist** と **CodeRabbit** がレビューを走らせる。両 bot の投稿を待ち、コメントに対処 (fix を PR branch に push) して、フィードバックが解消してからマージする。
-- **fix を push したらレビュアーに返信する。** 対応した review comment のスレッドに、**@-mention (`@gemini-code-assist` / `@coderabbitai`)** 付きで reply する。silent な fix はレビュアーから見えず、盲目的に re-review されて監査トレイル (どの fix がどの指摘に応じたか) も失われる。
-- **fix + reply を送ったらそこで止まらず、能動的に bot の再発言を監視する。** 数分おき (目安 5 分程度) に `gh pr view` / `gh api .../pulls/<n>/comments` を叩いて bot の返答を確認。新しい actionable コメントが来ていれば即 fix → @-mention → 監視再開、の loop を回す。Agent 環境なら `/loop` や `ScheduleWakeup` で自動化してよい。
-- **スレッド settle の判定**: 1 つの review thread は、**最新の bot 返信が ack-only** ("Thank you" / "Understood" / "Acknowledged" / 新指摘なしの re-review サマリなど) になった時点で settle。`--diff` の再指摘や追加の actionable コメントが来たら未 settle に戻す。
-- **監視ストップ条件**:
-  1. **すべての open thread が settle** → その PR は quiet。両 PR (or 対象 PR 全部) が quiet になった瞬間にループを抜けてオーナーに merge 判断を仰ぐ。bot が素早く ack を返した場合、30 分待つ必要はない。
-  2. **bot が返信を返さないまま最後の actionable コメントから 30 分経過** → timeout としてその thread を settle 扱いにする。bot が静かに諦めるケース (actionable を止めて何も返さないモード) を拾う fallback。短すぎ (<10 分) だと遅延投稿を取りこぼし、長すぎ (>1 時間) だと merge が無意味に遅れる。
-- **Merge gating.** 以下の **両方** を満たすまで merge しない:
-  1. レビュー bot (Gemini / CodeRabbit) が新しい actionable コメントを出さなくなった — fix → @-mention → 沈黙、のサイクルを回し続ける。
-     Bot からの "Understood" / "Thank you" のような ack のみの返信はその thread の quiet pass とみなす。新しい actionable な指摘が来たら loop を再開。
-  2. リポジトリオーナー (@yukimemi) が明示的に merge を承認している。
-- **例外: bot-authored PR (Renovate, Dependabot).** Gemini と CodeRabbit はデフォルトでこれらを skip するので、"bot review を待つ" gate は適用しない。CI が green で owner 承認があれば merge OK。
+- Every PR runs reviews from **Gemini Code Assist** and **CodeRabbit**. Wait for both bots to post, address their comments (push fixes to the PR branch), and merge only after feedback is resolved.
+- **Reply to reviewers after pushing a fix.** Reply on the corresponding review comment thread with an **@-mention (`@gemini-code-assist` / `@coderabbitai`)**. Silent fixes are invisible to reviewers, trigger blind re-reviews, and lose the audit trail (which fix addressed which comment).
+- **After sending fix + reply, don't stop there — actively monitor for the bot's next response.** Every few minutes (about 5 minutes is a good cadence), poll `gh pr view` / `gh api .../pulls/<n>/comments` to check for bot replies. If a new actionable comment arrives, immediately fix → @-mention → resume monitoring. In an Agent environment, automate this with `/loop` or `ScheduleWakeup`.
+- **Thread settle criteria**: A review thread is considered settled the moment **the latest bot reply is ack-only** ("Thank you" / "Understood" / "Acknowledged" / a re-review summary with no new findings, etc.). If the bot posts a `--diff` re-flag or another actionable comment, the thread reverts to unsettled.
+- **Monitoring stop conditions**:
+  1. **All open threads have settled** → the PR is quiet. When several PRs are being monitored concurrently (e.g. running fixes against two PRs in parallel), exit the polling loop and ask the owner for merge decisions only once **every** target PR has gone quiet — waiting on the slowest one. If the bot acks quickly, there is no need to wait 30 minutes.
+  2. **30 minutes elapsed since the last actionable comment with no bot reply** → treat the thread as settled by timeout. This is a fallback for the case where the bot quietly gives up (stops emitting actionable comments and posts nothing). Too short (<10 min) misses delayed posts; too long (>1 hour) needlessly delays merges.
+- **Merge gating.** Do not merge until **both** of the following are satisfied:
+  1. Review bots (Gemini / CodeRabbit) stop emitting new actionable comments — keep the fix → @-mention → silence cycle running.
+     Ack-only replies like "Understood" / "Thank you" from a bot count as the thread's quiet pass. If a new actionable comment arrives, restart the loop.
+  2. The repository owner (@yukimemi) has explicitly approved the merge.
+- **Exception: bot-authored PRs (Renovate, Dependabot).** Gemini and CodeRabbit skip these by default, so the "wait for bot review" gate does not apply. If CI is green and the owner approves, the PR may be merged.
 
 ## Development Commands
 
 ```bash
-# ビルド
+# Build
 cargo build
 
-# テスト全実行
+# Run all tests
 cargo test
 
-# 単一テストの実行 (モジュール名::テスト関数名 で絞り込み)
+# Run a single test (filter by module::function)
 cargo test test_generate_loader_with_cond
 cargo test loader::tests
 cargo test git::tests::test_git_update_method_pulls_latest
 
-# リリースビルド
+# Release build
 cargo build --release
 
-# loader.lua の目視デバッグ (ignored test)
+# Visual debugging of loader.lua (ignored test)
 cargo test dump_full_sample_loader -- --ignored --nocapture
 ```
 
-## 設計原則
+## Design Principles
 
-**必ず TDD で実装を進める。** テストを先に書いてから (失敗することを確認して) 実装する。
+**Always implement using TDD.** Write tests first (and confirm they fail) before implementing.
 
-**Resilience (障害耐性):** 1 つのプラグインの失敗がシステム全体を止めてはならない。同期失敗や設定ミス (依存関係の欠如など) は警告として報告し、可能な限り後続の処理 (`generate` 等) を継続する。Neovim 起動時の安全性を最優先し、不完全な設定であっても最小限の起動を保証する。
+**Resilience:** A single plugin's failure must not bring down the whole system. Sync failures and config mistakes (e.g. missing dependencies) are reported as warnings, and subsequent processing (`generate`, etc.) continues whenever possible. Safety at Neovim startup is the top priority — even an incomplete configuration must guarantee a minimal startup.
 
-## TOML 設定スキーマ
+## TOML Configuration Schema
 
 ```toml
 [vars]
-# ユーザー定義の変数。TOML 内 Tera テンプレートから {{ vars.xxx }} で参照できる。
+# User-defined variables. Reference them from Tera templates inside the TOML as {{ vars.xxx }}.
 repo_base   = "~/.cache/nvim/rvpm"
 nvim_rc = "~/.config/nvim/rc"
 
 [options]
-# per-plugin の init/before/after.lua を置くディレクトリの root
-# 未指定なら ~/.config/rvpm/<appname>/plugins
+# Root directory holding per-plugin init/before/after.lua.
+# Defaults to ~/.config/rvpm/<appname>/plugins when unset.
 config_root = "{{ vars.nvim_rc }}/plugins"
-# 並列数上限 (デフォルト 13、GitHub rate limit 回避のため控えめ)
+# Max parallelism (default 13, kept conservative to avoid GitHub rate limits).
 concurrency = 16
-# config.toml から外したプラグインディレクトリを sync / generate 完了時に
-# 自動削除 (デフォルト false)。毎回 `sync --prune` を指定する代わり。
+# Auto-delete plugin directories that were dropped from config.toml on sync /
+# generate completion (default false). Replaces having to pass `sync --prune` every time.
 # auto_clean = true
-# sync / generate 完了時に nvim --headless で helptags を自動生成する
-# (デフォルト true)。lazy プラグインは runtimepath に載らないため、rvpm 側で
-# 対象 doc/ ディレクトリを列挙して :helptags <path> を個別実行する。
+# Auto-generate helptags via nvim --headless on sync / generate completion
+# (default true). Lazy plugins are not on runtimepath, so rvpm enumerates the
+# target doc/ directories itself and runs :helptags <path> for each.
 # auto_helptags = false
-# `rvpm add` の URL 書き込み形式: "short" (owner/repo, デフォルト) か
-# "full" (https://github.com/owner/repo)。重複検出は両形式を正規化して比較。
+# URL form written by `rvpm add`: "short" (owner/repo, default) or
+# "full" (https://github.com/owner/repo). Duplicate detection normalizes both forms before comparing.
 # url_style = "full"
-# rvpm のデータ置き場 root を上書き (未指定なら ~/.cache/rvpm/<appname>)。
-# repos / merged / loader.lua 全部 `{cache_root}/plugins/` 配下にまとまる。
+# Override rvpm's data root (defaults to ~/.cache/rvpm/<appname> when unset).
+# repos / merged / loader.lua all live under `{cache_root}/plugins/`.
 # cache_root = "~/.cache/nvim/rvpm"
-# `rvpm add` のスキャン後 auto-lazy 提案ポリシー:
-#   "ask" (default) — TTY 対話プロンプト / 非 TTY は skip
-#   "always"        — scan 結果を無条件採用 (スクリプト用)
-#   "never"         — scan skip、eager add
+# Post-scan auto-lazy suggestion policy for `rvpm add`:
+#   "ask" (default) — TTY interactive prompt / skipped on non-TTY
+#   "always"        — accept scan results unconditionally (for scripts)
+#   "never"         — skip scanning, eager add
 # auto_lazy = "ask"
-# `rvpm add` を AI CLI に委譲する場合のバックエンド (#93)。
-#   "off" (default) — 静的 scan + auto_lazy フローを使う
-#   "claude" / "gemini" / "codex" — 該当 CLI を subprocess で起動
-# CLI が未インストールならエラー。`auto_lazy` は無視される。
-# CLI flag `--ai claude` / `--no-ai` で per-call 上書き可能。
+# Backend used to delegate `rvpm add` to an AI CLI (#93).
+#   "off" (default) — use the static scan + auto_lazy flow
+#   "claude" / "gemini" / "codex" — spawn the corresponding CLI as a subprocess
+# Errors out if the CLI is not installed. `auto_lazy` is ignored.
+# CLI flags `--ai claude` / `--no-ai` allow per-call overrides.
 # ai = "claude"
-# AI 出力の自然言語 (explanation 本文 + chat 応答)。default "en"。
-# XML tag 構造そのものは英語固定 (parse 安定性のため)。
+# Natural language used in AI output (explanation prose + chat replies). Default "en".
+# The XML tag structure itself is fixed in English (for parse stability).
 # ai_language = "ja"
 
 [options.browse]
-# README 表示を外部コマンドに委譲する (browse TUI 専用)。
-# stdin に raw markdown、stdout の ANSI エスケープを ansi-to-tui 経由で
-# ratatui Text に変換。失敗/タイムアウト時は tui-markdown 内蔵パスに fallback。
-# placeholder は Tera 風の `{{ name }}` 記法 (rvpm 他箇所と統一):
+# Delegate README rendering to an external command (browse TUI only).
+# Pipes raw markdown on stdin and converts ANSI escapes from stdout into
+# ratatui Text via ansi-to-tui. Falls back to the built-in tui-markdown path on failure/timeout.
+# Placeholders use Tera-style `{{ name }}` syntax (consistent with the rest of rvpm):
 #   {{ width }} / {{ height }} / {{ file_path }} / {{ file_dir }}
 #   {{ file_name }} / {{ file_stem }} / {{ file_ext }}
 # readme_command = ["mdcat"]
@@ -114,162 +114,164 @@ concurrency = 16
 [[plugins]]
 name  = "snacks"
 url   = "folke/snacks.nvim"
-# on_* なし → eager (起動時にロード)
+# No on_* → eager (loaded at startup)
 
 [[plugins]]
 name = "telescope"
 url  = "nvim-telescope/telescope.nvim"
 depends = ["snacks.nvim"]
-# rev: ブランチ / タグ / コミットハッシュ
+# rev: branch / tag / commit hash
 # rev = "v0.1.0"
-# build: shell コマンド (sync / update 完了後に実行、5 分 timeout)
+# build: shell command (run after sync / update completes, 5 min timeout)
 # build = "cargo build --release"
-# build_lua: nvim --headless -u NONE -l で実行する Lua スニペット (#97)
-# rtp に self + transitive depends を append、stdpath() は real env なので
-# blink.cmp 等の native lib install もちゃんと user の data dir に入る
+# build_lua: Lua snippet executed via nvim --headless -u NONE -l (#97)
+# Appends self + transitive depends to rtp; stdpath() reflects the real env, so
+# native lib installs (e.g. blink.cmp) land properly in the user's data dir.
 # build_lua = "require('blink.cmp').build():wait(60000)"
 
-# 遅延読み込みトリガー (いずれか 1 つでも書けば lazy は自動で true に推論される)
-on_cmd    = ["Telescope", "/^Chezmoi/"]      # exact 名 or /regex/ (rvpm generate で展開)
+# Lazy-loading triggers (writing any one of these auto-infers lazy = true)
+on_cmd    = ["Telescope", "/^Chezmoi/"]      # exact name or /regex/ (expanded by rvpm generate)
 on_ft     = ["rust", "toml"]                 # string | string[]
-on_event  = ["BufReadPre", "User LazyDone", "/^User Chezmoi/"]  # exact "User Xxx" or /regex/ も可
-on_path   = ["*.rs", "Cargo.toml"]           # BufRead/BufNewFile の glob
-on_source = ["snacks.nvim"]                  # 他プラグインのロード完了 User イベントで起動 (display_name で指定)
-# on_map は string (単純) / table (mode + desc 指定) 混在可。
-# lhs に `/regex/` を書くと plugin の <Plug>(...) 一覧と match して展開される (#88)。
+on_event  = ["BufReadPre", "User LazyDone", "/^User Chezmoi/"]  # exact "User Xxx" or /regex/ also OK
+on_path   = ["*.rs", "Cargo.toml"]           # BufRead/BufNewFile glob
+on_source = ["snacks.nvim"]                  # triggered by another plugin's load-completion User event (specify by display_name)
+# on_map allows mixing string (simple) and table (mode + desc) forms.
+# Writing `/regex/` for lhs expands by matching against the plugin's <Plug>(...) list (#88).
 on_map = [
   "<leader>f",                                              # mode = ["n"] (default)
   { lhs = "<leader>v",  mode = ["n", "x"] },
   { lhs = "<leader>g",  mode = ["n", "x"], desc = "Grep" },
-  { lhs = "/^<Plug>\\(Chezmoi/", mode = ["n"] },           # <Plug> 系を一括 lazy
+  { lhs = "/^<Plug>\\(Chezmoi/", mode = ["n"] },           # bulk-lazy <Plug> family
 ]
-# 条件付き読み込み (Lua 式)
+# Conditional loading (Lua expression)
 cond = "vim.fn.has('win32') == 1"
 ```
 
-## グローバル hooks
+## Global hooks
 
-`<config_root>/` 直下 (デフォルト `~/.config/rvpm/<appname>/`) に置くだけで自動適用される。設定ファイルへの記述不要 (Convention over Configuration)。
+Auto-applied just by placing files directly under `<config_root>/` (default `~/.config/rvpm/<appname>/`). No entries in the config file are needed (Convention over Configuration).
 
-| ファイル | Phase | 実行タイミング |
+| File | Phase | Timing |
 |---|---|---|
-| `<config_root>/before.lua` | 3 | `load_lazy` helper 定義後、全プラグインの `init.lua` より前 |
-| `<config_root>/after.lua` | 9 | 全 lazy trigger 登録後 |
+| `<config_root>/before.lua` | 3 | After the `load_lazy` helper is defined, before any plugin's `init.lua` |
+| `<config_root>/after.lua` | 9 | After all lazy triggers are registered |
 
-`<config_root>` は `options.config_root` 未指定時 `~/.config/rvpm/<appname>` (`<appname>` = `$RVPM_APPNAME` → `$NVIM_APPNAME` → `nvim`)。
+When `options.config_root` is unset, `<config_root>` is `~/.config/rvpm/<appname>` (`<appname>` = `$RVPM_APPNAME` → `$NVIM_APPNAME` → `nvim`).
 
-`generate_loader()` は `LoaderOptions` 構造体 (`global_before: Option<PathBuf>`, `global_after: Option<PathBuf>`) を受け取り、ファイルが存在する場合だけ `dofile(...)` を埋め込む。
+`generate_loader()` takes a `LoaderOptions` struct (`global_before: Option<PathBuf>`, `global_after: Option<PathBuf>`) and embeds `dofile(...)` only when the file exists.
 
-## per-plugin 設定ファイル (config_root)
+## per-plugin config files (config_root)
 
-`options.config_root` 配下に `<host>/<owner>/<repo>/` の階層でプラグインごとの Lua 設定ファイルを配置できる。例: `~/.config/nvim/rc/plugins/github.com/nvim-telescope/telescope.nvim/`。
+Per-plugin Lua config files can be placed under `options.config_root` using the `<host>/<owner>/<repo>/` hierarchy. Example: `~/.config/nvim/rc/plugins/github.com/nvim-telescope/telescope.nvim/`.
 
-| ファイル | 実行タイミング | 典型用途 |
+| File | Timing | Typical use |
 |---|---|---|
-| `init.lua` | **RTP 追加前** (全プラグイン共通の pre-rtp phase) | `vim.g.xxx_setting = ...` 等の事前変数設定 |
-| `before.lua` | **RTP 追加直後、`plugin/*` source 前** | setup を変える、lua/ モジュールの `require` など |
-| `after.lua` | **`plugin/*` source 後** | plugin の関数を呼ぶ post-setup、keymap 設定 |
+| `init.lua` | **Before RTP append** (the pre-rtp phase, common to all plugins) | Pre-set variables like `vim.g.xxx_setting = ...` |
+| `before.lua` | **Right after RTP append, before sourcing `plugin/*`** | Override setup, `require` lua/ modules, etc. |
+| `after.lua` | **After sourcing `plugin/*`** | Post-setup that calls plugin functions, keymap configuration |
 
-rvpm は generate 時に各ファイルの存在確認を行い、存在するものだけ `dofile(...)` を loader.lua に埋め込む (事前コンパイル)。
+At generate time rvpm checks each file's existence and embeds `dofile(...)` in loader.lua only for ones that exist (pre-compiled).
 
-## アーキテクチャ
+## Architecture
 
-### 全体構成
+### Overall structure
 
-`src/main.rs` がエントリポイントかつコマンドハンドラ。各コマンドは `run_*()` 関数として実装され、Tokio の非同期ランタイム上で動作する。
+`src/main.rs` is the entry point and command handler. Each command is implemented as a `run_*()` function and runs on the Tokio async runtime.
 
 ```
 src/
-  main.rs       — CLI 定義 (clap)、全コマンドの run_*() 実装、ヘルパー関数
-  config.rs     — TOML 設定のパース (Tera テンプレート展開込み)、MapSpec 型、sort_plugins
-  doctor.rs     — `rvpm doctor` — 17 診断 × 4 カテゴリ + render (nerd/unicode/ascii)
-  git.rs        — git clone/pull/fetch/checkout の非同期ラッパー (Repo 構造体) + GitChange 記録
-  helptags.rs   — nvim --headless で :helptags を実行して tags を生成
-  link.rs       — merged ディレクトリへのファイル単位リンク (hard link、衝突 first-wins)、`placed` で勝者追跡用に新規配置ファイルを返す
-  loader.rs     — Neovim の loader.lua を生成するロジック
-  merge_conflicts.rs — `<cache_root>/merge_conflicts.json` の read/write (直近 sync 分のみ、doctor が読む)
-  lockfile.rs   — `<config_root>/rvpm.lock` の read/write (reproducible plugin versions、dotfiles にコミットする前提)
-  tui.rs        — ratatui による進捗・一覧表示 TUI
-  update_log.rs — `<cache_root>/update_log.json` の read/append、BREAKING 判定、render
+  main.rs       — CLI definitions (clap), run_*() implementations for every command, helper functions
+  config.rs     — TOML config parsing (with Tera template expansion), MapSpec type, sort_plugins
+  doctor.rs     — `rvpm doctor` — 17 diagnostics × 4 categories + render (nerd/unicode/ascii)
+  git.rs        — async wrappers for git clone/pull/fetch/checkout (Repo struct) + GitChange recording
+  helptags.rs   — runs :helptags via nvim --headless to generate tags
+  link.rs       — file-level linking into the merged directory (hard link, first-wins on conflict); `placed` returns newly placed files for winner tracking
+  loader.rs     — logic that generates Neovim's loader.lua
+  merge_conflicts.rs — read/write of `<cache_root>/merge_conflicts.json` (most recent sync only; consumed by doctor)
+  lockfile.rs   — read/write of `<config_root>/rvpm.lock` (reproducible plugin versions; intended to be committed to dotfiles)
+  tui.rs        — ratatui-based progress / list display TUI
+  update_log.rs — read/append of `<cache_root>/update_log.json`, BREAKING detection, render
 ```
 
-### データフロー
+### Data flow
 
-1. `parse_config()` — TOML を読み込み、Tera テンプレートを展開してから `Config` 構造体にデシリアライズ
-2. `sort_plugins()` — `depends` フィールドに基づいてトポロジカルソート (循環依存は警告のみ)
-3. `run_sync()` — `JoinSet` + `Semaphore` で並列 git clone/pull → `merge_plugin()` で merged ディレクトリへリンク → `build_plugin_scripts()` で事前 glob → `generate_loader()` で loader.lua 生成 (この中で eager→lazy 依存の昇格 pre-pass も実行) → `build_helptags()` で nvim --headless を起動して `:helptags` 実行 (options.auto_helptags=true 時のみ)
+1. `parse_config()` — reads the TOML, expands Tera templates, then deserializes into the `Config` struct
+2. `sort_plugins()` — topological sort based on the `depends` field (cycles produce only a warning)
+3. `run_sync()` — parallel git clone/pull via `JoinSet` + `Semaphore` → link into the merged directory via `merge_plugin()` → pre-glob via `build_plugin_scripts()` → generate loader.lua via `generate_loader()` (which also runs the eager→lazy dependency promotion pre-pass) → `build_helptags()` launches `nvim --headless` to run `:helptags` (only when `options.auto_helptags=true`)
 
-### loader.lua の生成戦略 (`src/loader.rs`)
+### loader.lua generation strategy (`src/loader.rs`)
 
-rvpm は **plugin loading の完全制御** + **merge 最適化** + **generate 時の事前 glob** を行う。loader.lua の構造:
+rvpm performs **full control over plugin loading** + **merge optimization** + **pre-glob at generate time**. Structure of loader.lua:
 
 ```
-Pre-pass:  eager→lazy 依存昇格                ← eager プラグインが lazy dep を持つ場合、
-                                               その dep を eager に昇格して stderr に警告
-Phase 1:   vim.go.loadplugins = false          ← Neovim の auto-source 無効化
-Phase 2:   load_lazy helper 定義               ← lazy 用の実行時ローダー (二重ロードガード付き)
-Phase 3:   global before.lua                   ← <config_root>/before.lua (存在する場合)
-Phase 4:   全プラグインの init.lua (依存順)   ← pre-rtp phase
-Phase 5:   merged/ を rtp に 1 回 append       ← merge=true プラグインがあれば
-Phase 6:   eager プラグインを依存順で処理:
-             非 merge は vim.opt.rtp:append(plugin.path)
+Pre-pass:  eager→lazy dependency promotion    ← if an eager plugin depends on a lazy one,
+                                               promote that dep to eager and warn on stderr
+Phase 1:   vim.go.loadplugins = false          ← disable Neovim's auto-source
+Phase 2:   define load_lazy helper             ← runtime loader for lazy plugins (with double-load guard)
+Phase 3:   global before.lua                   ← <config_root>/before.lua (when present)
+Phase 4:   init.lua of every plugin (in dep order) ← pre-rtp phase
+Phase 5:   append merged/ to rtp once          ← if any merge=true plugin exists
+Phase 6:   process eager plugins in dep order:
+             non-merge: vim.opt.rtp:append(plugin.path)
              before.lua
-             plugin/**/*.{vim,lua} を事前 glob 済みファイル名で直接 source
-             ftdetect/**/*.{vim,lua} を augroup filetypedetect 内で source
-             after/plugin/**/*.{vim,lua} を source
+             source plugin/**/*.{vim,lua} directly using pre-globbed file names
+             source ftdetect/**/*.{vim,lua} inside augroup filetypedetect
+             source after/plugin/**/*.{vim,lua}
              after.lua
-             User autocmd "rvpm_loaded_<name>" 発火 (on_source チェーン用)
-Phase 7:   lazy プラグインの trigger 登録     ← on_cmd / on_ft / on_map / on_event / on_path / on_source
-             lazy→lazy 依存: トリガーコールバック内で dep を先行 load_lazy 呼び出し
-Phase 8:   ColorSchemePre handler 登録        ← generate 時に colors/*.{vim,lua} が検出された
-                                               lazy プラグインに自動登録。設定不要。
-Phase 9:   global after.lua                   ← <config_root>/after.lua (存在する場合)
+             fire User autocmd "rvpm_loaded_<name>" (for on_source chaining)
+Phase 7:   register lazy plugin triggers      ← on_cmd / on_ft / on_map / on_event / on_path / on_source
+             lazy→lazy dependency: trigger callback pre-loads the dep via load_lazy
+Phase 8:   register ColorSchemePre handlers   ← auto-registered for lazy plugins where
+                                               colors/*.{vim,lua} were detected at generate time. No config needed.
+Phase 9:   global after.lua                   ← <config_root>/after.lua (when present)
 ```
 
-重要な設計ポイント:
+Key design points:
 
-- `vim.go.loadplugins = false` で Neovim のデフォルト plugin loading を止めるため、loader.lua が全ての source を明示的に行う。これで二重 source が起きない。
-- plugin 配下のファイル (`plugin/`, `ftdetect/`, `after/plugin/`) は **generate 時にディスクから walk** し、ファイルパスを loader.lua に直接埋め込む。起動時の glob 呼び出しゼロ。
-- `ftdetect/` は `augroup filetypedetect` 内で source しないと filetype 検出が正しく動かない。
-- `load_lazy()` helper はプラグインロード後に `vim.api.nvim_exec_autocmds("User", { pattern = "rvpm_loaded_<name>" })` を発火する。これは `on_source` の連鎖依存のため必須。また `loaded["<name>"] = true` による二重ロードガードを内包する。
-- `depends` フィールドはロード順序だけでなく**ロードそのもの**にも影響する: eager プラグインが lazy dep を参照する場合、generate 時の pre-pass でその dep を eager に昇格する (stderr に警告)。lazy プラグインが lazy dep を参照する場合、生成されるトリガーコールバック内で dep を先行 `load_lazy` 呼び出しする。
-- `cond` フィールドは Lua 式として `if cond then ... end` でラップされる。eager/lazy 両方で機能する。
-- **カラースキームの自動検出**: lazy プラグインのクローン先に `colors/*.{vim,lua}` が存在する場合、`generate_loader()` が generate 時にそのファイル名を走査し、`ColorSchemePre` autocmd ハンドラを phase 8 として自動生成する。設定ファイルへの追記は不要。eager プラグインは `colors/` が既に RTP 上にあるため影響を受けない。
-- **denops プラグインの自動登録**: lazy プラグインのクローン先に `denops/<name>/main.{ts,js}` が存在する場合、`generate_loader()` が generate 時にそのパスを走査し、`load_lazy()` 呼び出しの末尾引数に `{ {"<name>", "<abs main>"}, ... }` を渡す。load_lazy 内で `pcall(vim.fn["denops#plugin#load"], name, script)` を発行するため、rtp append + plugin/* source 後に denops daemon へ明示登録される (denops.vim の auto-discover は VimEnter 一発のみで lazy load 後に rtp が拡張されても新しいプラグインを拾わないため、明示登録が必要)。denops.vim 本体が未ロードでも `pcall` で silently skip する。eager プラグインは VimEnter 時の denops discover が rtp 全走査するため手当て不要。
+- Setting `vim.go.loadplugins = false` halts Neovim's default plugin loading, so loader.lua sources everything explicitly. This avoids double-sourcing.
+- Files under a plugin (`plugin/`, `ftdetect/`, `after/plugin/`) are **walked from disk at generate time**, with file paths embedded directly into loader.lua. Zero glob calls at startup.
+- `ftdetect/` must be sourced inside `augroup filetypedetect`; otherwise filetype detection misbehaves.
+- After loading a plugin, the `load_lazy()` helper fires `vim.api.nvim_exec_autocmds("User", { pattern = "rvpm_loaded_<name>" })`. This is required for `on_source` chaining. It also embeds a double-load guard via `loaded["<name>"] = true`.
+- The `depends` field affects not only load order but **whether a plugin is loaded at all**: if an eager plugin references a lazy dep, the generate-time pre-pass promotes the dep to eager (with a stderr warning). If a lazy plugin references a lazy dep, the generated trigger callback pre-loads the dep via `load_lazy`.
+- The `cond` field is wrapped as a Lua expression in `if cond then ... end`. Works for both eager and lazy plugins.
+- **Auto-detected colorschemes**: when `colors/*.{vim,lua}` exists in the clone path of a lazy plugin, `generate_loader()` scans for those file names at generate time and auto-emits a phase 8 `ColorSchemePre` autocmd handler. No config file edits required. Eager plugins are unaffected because `colors/` is already on the RTP.
+- **Auto-registered denops plugins**: when `denops/<name>/main.{ts,js}` exists in the clone path of a lazy plugin, `generate_loader()` scans for those paths at generate time and passes `{ {"<name>", "<abs main>"}, ... }` as the trailing argument to the `load_lazy()` call. Inside `load_lazy`, `pcall(vim.fn["denops#plugin#load"], name, script)` is issued so that after the rtp append + plugin/* source the plugin is explicitly registered with the denops daemon (denops.vim's auto-discover only fires once at VimEnter and does not pick up plugins that arrive on rtp later via lazy loading, so explicit registration is required). When denops.vim itself is not yet loaded, `pcall` silently skips it. Eager plugins do not need this because the VimEnter-time denops discovery walks the entire rtp.
 
-### update_log.json による変更履歴 (`src/update_log.rs`)
+### Change history via update_log.json (`src/update_log.rs`)
 
-`sync` / `update` / `add` で git pull 完了直後に「変化があったプラグイン」を
-`<cache_root>/update_log.json` へ append する。`rvpm log` はこれを読み出して
-人間可読な digest を出力する。
+After a git pull during `sync` / `update` / `add`, "plugins that changed" are
+appended to `<cache_root>/update_log.json`. `rvpm log` reads it back and emits
+a human-readable digest.
 
-スキーマ:
+Schema:
 - `UpdateLog { runs: Vec<RunRecord> }`
 - `RunRecord { timestamp, command, changes: Vec<ChangeRecord> }`
 - `ChangeRecord { name, url, from, to, subjects, breaking_subjects, doc_files_changed }`
 
-重要な設計:
-- 履歴は **最大 20 runs** で cap (古いものから drop)。長大化しない。
-- 書き込みは tempfile + atomic rename で race 耐性を確保。
-- changes が空の run (pull したが HEAD 変わらず) は記録するが `rvpm log` では
-  省略 (表示ノイズを減らすため)。
-- **BREAKING 検出** は `is_breaking(subject, body) -> bool` の pure 関数で行う:
-  - subject が `<type>!:` / `<type>(<scope>)!:` の Conventional Commits 形式
-  - body / footer に `BREAKING CHANGE:` (case-insensitive) 行を含む
-- **doc 変更検出** は `git diff --name-only <from>..<to> -- README* CHANGELOG* doc/`
-  を subprocess で実行し、ファイル名リストを記録。patch 自体は記録せず、
-  `rvpm log --diff` 実行時に `git diff` から都度取得 (容量爆発回避)。
-- git 側の HEAD 取得 / commit walk / BREAKING 判定は `src/git.rs` の `Repo::sync`
-  / `Repo::update` 内で gix を使用し、`Option<GitChange>` を返す。記録失敗 (disk full
-  等) でも本処理は止めない (resilience)。
+Key design:
+- History is capped at **at most 20 runs** (oldest dropped). It does not grow unbounded.
+- Writes use tempfile + atomic rename for race resilience.
+- A run with empty changes (pull happened but HEAD did not move) is recorded but
+  omitted by `rvpm log` (to reduce display noise).
+- **BREAKING detection** is performed by the pure function `is_breaking(subject, body) -> bool`:
+  - subject in Conventional Commits form `<type>!:` / `<type>(<scope>)!:`
+  - body / footer contains a `BREAKING CHANGE:` (case-insensitive) line
+- **Doc-change detection** runs `git diff --name-only <from>..<to> -- README* CHANGELOG* doc/`
+  as a subprocess and records the file name list. The patch itself is not stored;
+  it is fetched on demand from `git diff` when `rvpm log --diff` runs (avoiding
+  size explosion).
+- HEAD retrieval / commit walk / BREAKING detection on the git side use gix
+  inside `Repo::sync` / `Repo::update` in `src/git.rs`, and return
+  `Option<GitChange>`. Recording failures (e.g. disk full) do not stop the main
+  flow (resilience).
 
-### rvpm.lock による再現性 (`src/lockfile.rs`)
+### Reproducibility via rvpm.lock (`src/lockfile.rs`)
 
-`lazy.nvim` の `lazy-lock.json` と同じ思想。`<config_root>/rvpm.lock` に
-プラグイン単位で pin した commit hash を記録し、dotfiles にコミットすることで
-他マシン / fresh clone でも同じ commit 構成を再現できる。
+Same idea as `lazy.nvim`'s `lazy-lock.json`. `<config_root>/rvpm.lock` records
+per-plugin pinned commit hashes; committing it with the dotfiles lets other
+machines / fresh clones reproduce the same commit set.
 
-スキーマ (TOML):
+Schema (TOML):
 ```toml
 version = 1
 
@@ -279,206 +281,212 @@ url = "folke/snacks.nvim"
 commit = "abc123..."
 ```
 
-優先順位: **config の `rev` > lockfile の commit > 最新 HEAD**。config.toml に
-`rev = "v1.2.3"` があるプラグインは explicit pin として最優先、次に lockfile の
-commit、それも無ければ default branch の HEAD を pull する。
+Priority order: **`rev` in config > `commit` in lockfile > latest HEAD**. A
+plugin with `rev = "v1.2.3"` in config.toml takes top priority as an explicit
+pin, then the lockfile commit, and finally — if neither — the default branch
+HEAD is pulled.
 
-コマンド別の挙動:
-- `rvpm sync`: lockfile を load → 各プラグインで上記優先順位で rev を決めて
-  `gix_checkout` → sync 完了後の HEAD を upsert → 末尾で `retain_by_names` して
-  config から外れたプラグインの entry を drop → atomic save。
-- `rvpm sync --frozen`: sync 開始前に config の全 non-dev プラグインが lockfile に
-  存在するかを確認。1 件でも欠けていれば即 `anyhow::bail!` — CI / fresh clone
-  で strict reproducibility を要求するケース。
-- `rvpm sync --no-lock`: lockfile の load/save 両方をスキップ。既存 dotfile の
-  lockfile はそのまま残る (触らない)。
-- `rvpm update [query]`: lockfile を checkout には**使わない** (常に pull latest)
-  が、pull 完了後の新 HEAD で lockfile を上書き。部分 update (query 指定) でも
-  対象外プラグインの entry は保持。
-- `rvpm add <repo>`: 追加した 1 プラグインのみ lockfile に upsert + save。
+Per-command behavior:
+- `rvpm sync`: load lockfile → choose rev for each plugin per the priority
+  above → `gix_checkout` → upsert post-sync HEAD → call `retain_by_names` at
+  the end to drop entries for plugins removed from config → atomic save.
+- `rvpm sync --frozen`: before sync starts, verify that all non-dev plugins in
+  the config exist in the lockfile. Even one missing entry triggers an
+  immediate `anyhow::bail!` — for cases requiring strict reproducibility on CI
+  / fresh clones.
+- `rvpm sync --no-lock`: skip both load and save of the lockfile. An existing
+  dotfile lockfile is left untouched (not modified).
+- `rvpm update [query]`: does **not** use the lockfile for checkout (always
+  pull latest) but overwrites the lockfile with the new HEAD after the pull.
+  Even on partial update (with query), entries for non-target plugins are
+  preserved.
+- `rvpm add <repo>`: upserts and saves only the single newly added plugin into
+  the lockfile.
 
-実装上のポイント:
-- `Repo::sync()` は no-op (HEAD 動かず) 時 `None` を返すので、lockfile 記録用に
-  `Repo::head_commit()` を別途呼んで現 HEAD を取得 (fresh clone + no-op 両ケース
-  で entry を確定させる)。
-- `LockFile::save` 時に name で安定 sort → dotfile diff が最小化される。
-- malformed / missing file は warn を stderr に流して empty LockFile に
-  fallback (resilience)。
-- `dev = true` プラグインは lockfile 対象外 (ローカル work in progress なので
-  commit hash を pin する意味が無い)。
-- `options.chezmoi = true` のとき、lockfile も config.toml / hook と同じく
-  `chezmoi::write_path` + `chezmoi::apply` 経由で source 側に書いてから target に
-  反映する。これをやらないと chezmoi の「source が truth」原則と衝突して、
-  次回 `chezmoi apply` で古い lockfile に巻き戻る。
-- `chezmoi::write_path` / `chezmoi::apply` は **async + 2 秒タイムアウト** で実装
-  (`tokio::process::Command` + `tokio::time::timeout`)。`run_doctor` の外部コマンド
-  probe と同じ思想で、壊れた PATH shim や応答しない subprocess で rvpm 全体が
-  hang するのを防ぐ。`write_path` は `is_chezmoi_available` + 祖先を遡る複数の
-  `chezmoi source-path` 全体に **単一の 2 秒 budget** をかぶせる (個別 timeout が
-  累積して桁違いに膨らむのを防ぐため)。タイムアウト時は warn を stderr に流して
-  target 側を返す (resilience)。
+Implementation notes:
+- `Repo::sync()` returns `None` on no-op (HEAD did not move), so for lockfile
+  recording we additionally call `Repo::head_commit()` to get the current HEAD
+  (ensuring an entry is established for both fresh-clone and no-op cases).
+- `LockFile::save` performs a stable sort by name → minimizes dotfile diffs.
+- Malformed / missing files emit a warning on stderr and fall back to an empty
+  LockFile (resilience).
+- `dev = true` plugins are excluded from the lockfile (they are local
+  works-in-progress, so pinning a commit hash is meaningless).
+- When `options.chezmoi = true`, the lockfile — like config.toml / hooks —
+  goes through `chezmoi::write_path` + `chezmoi::apply` to write to the source
+  side first and then propagate to the target. Skipping this collides with
+  chezmoi's "source is truth" principle and would revert the lockfile to its
+  old contents on the next `chezmoi apply`.
+- `chezmoi::write_path` / `chezmoi::apply` are implemented as **async + 2s
+  timeout** (`tokio::process::Command` + `tokio::time::timeout`). Same idea as
+  the external-command probes in `run_doctor`: prevent rvpm from hanging due
+  to a broken PATH shim or an unresponsive subprocess. `write_path` wraps
+  `is_chezmoi_available` plus the multiple ancestor `chezmoi source-path`
+  calls under a **single 2s budget** (so that individual timeouts do not
+  accumulate into something orders of magnitude larger). On timeout, a warning
+  is emitted on stderr and the target-side path is returned (resilience).
 
-### helptags 自動生成 (`src/helptags.rs`)
+### Automatic helptags generation (`src/helptags.rs`)
 
-`sync` / `generate` 完了時に `nvim --headless --clean -c "source <tmp.vim>" -c "qa!"` を 1 回起動して `:helptags <path>` を対象 `doc/` 全てに対して実行する。`options.auto_helptags = false` で無効化可。
+On `sync` / `generate` completion, launch `nvim --headless --clean -c "source <tmp.vim>" -c "qa!"` once and run `:helptags <path>` against every target `doc/`. Disable via `options.auto_helptags = false`.
 
-loader.lua に組み込まない理由: rvpm のコンセプトは **Neovim 起動時の速度を最優先**。helptags 生成は nvim プロセス起動コストを伴うため、Neovim 起動時ではなく rvpm 側 (sync/generate) で事前実行する。
+Why not embed it in loader.lua: rvpm's concept is to **prioritize Neovim startup speed above all else**. Generating helptags incurs an nvim process startup cost, so it is performed up-front on the rvpm side (sync/generate) rather than at Neovim startup.
 
-対象 `doc/` の列挙ルール (`collect_helptag_targets`):
-- `merged_dir/doc/` が存在すれば最初に追加 — merge=true & !lazy プラグインの doc が 1 箇所にまとまるので `:helptags` 1 回で全部処理できる
-- **lazy プラグインは merge=true でも個別追加が必要** — `main.rs:566-568` の条件で lazy は merged/ に入らないため、各プラグイン単体の `doc/` を処理する必要がある
-- merge=false な eager プラグインも個別追加
-- `cond` は Lua runtime 評価で Rust からは判定不可なので全プラグインを候補にする (= `rvpm list` に載っているもの = 対象)
+Rules used by `collect_helptag_targets` to enumerate target `doc/`:
+- If `merged_dir/doc/` exists, add it first — docs of merge=true & !lazy plugins are aggregated in one place, so a single `:helptags` call processes all of them.
+- **Lazy plugins must be added individually even when merge=true** — the condition at `main.rs:566-568` keeps lazy plugins out of merged/, so each plugin's own `doc/` must be processed.
+- Eager plugins with merge=false are also added individually.
+- `cond` is evaluated at Lua runtime and cannot be judged from Rust, so all plugins are candidates (= those visible in `rvpm list` = targets).
 
-コマンドライン引数長対策: Windows の `CreateProcess` 上限 (8KB 程度) に当たらないよう、`-c "helptags d1" -c "helptags d2" ...` を並べるのではなく、tempfile に Vim script (`try/catch` でラップ) を書き出して `-c "source <tmp>"` で一括 source する。
+Working around command-line argument length: to avoid hitting Windows' `CreateProcess` limit (~8KB), instead of stringing `-c "helptags d1" -c "helptags d2" ...` together, the tool writes a Vim script (wrapped in `try/catch`) to a tempfile and sources it in one go via `-c "source <tmp>"`.
 
-resilience: `nvim` が PATH に無ければ warn のみで rvpm 全体は続行。nvim プロセスが非 0 終了でも Ok を返す。`:helptags` の重複警告 (E154 など) は stderr にそのまま流す — merge を明示的に選んでいるユーザーへの改善シグナルとしての価値があるため抑制しない。
+Resilience: if `nvim` is not on PATH, only a warning is emitted and rvpm continues. Even if the nvim process exits non-zero, Ok is returned. Duplicate-tag warnings from `:helptags` (E154 etc.) are passed through to stderr — they carry value as an improvement signal for users who explicitly opt into merge, so they are not suppressed.
 
-### lazy trigger の実装
+### lazy trigger implementation
 
-各トリガーの実装:
+Implementation per trigger:
 
-| トリガー | 特徴 |
+| Trigger | Notes |
 |---|---|
-| `on_cmd` | `bang = true`, `range = true`, `nargs = "*"`, `complete` callback。callback 内で `event.bang / smods / fargs / range / count` を復元して `vim.cmd(cmd_table)` で dispatch。`:Foo!`, `:%Foo`, `:5Foo`, `:tab Foo` 全対応。`"/regex/"` 記法で、プラグインが `plugin/`/`ftplugin/`/`after/plugin/`/`lua/` に定義するコマンド名を `rvpm generate` 時に正規表現マッチで展開 (`src/plugin_scan.rs` が `vim.api.nvim_create_user_command("Foo", …)` / `command! Foo` を静的スキャン)。展開結果は exact 名の列と同じ emit path に流すので runtime コストゼロ + completion 壊れない (stub が全部登録済み)。動的定義コマンド (`vim.fn.input()` で名前決定等) は拾えないので exact 名を併記するか literal で fallback |
-| `on_ft` | ロード後に `exec_autocmds("FileType", { buffer = ev.buf })` で再発火 → 新しくロードされたプラグインの `ftplugin/<ft>.vim` が current buffer に対して発火する |
-| `on_event` | `"User Xxx"` シンタックスで User event + pattern に展開。ロード後に `exec_autocmds(ev.event, { buffer, data })` で再発火。`"/regex/"` 記法で、プラグインが静的に fire する User event 名 (`nvim_exec_autocmds("User", { pattern = "Foo" })` 等) に対し regex match で展開 (#88)。`/regex/` は `"User <name>"` 合成文字列に対してマッチするので `/^User Chezmoi/` のように書く。標準イベント (`BufRead` 等) は静的列挙不可なので literal 通過のみ |
-| `on_path` | `BufRead` / `BufNewFile` の glob パターン。同じく `exec_autocmds(ev.event, ...)` で再発火 |
-| `on_map` | `vim.keymap.set({modes}, lhs, ..., { desc })`。MapSpec 型で `lhs + mode[] + desc` 対応。replay は `<Ignore>` prefix + feedkeys で安全化。lhs に `"/regex/"` を書くと、プラグインが定義する `<Plug>(...)` 一覧と match して展開 (#88)。`<Plug>` 系は plugin が公式に exposing する API なので命名が揃いやすく regex 化の恩恵が大きい (例: `/^<Plug>\(Chezmoi/`)。元 spec の `mode` / `desc` は展開後の各 entry に継承される。zero-match / invalid regex は drop + warn (literal emit すると stub keymap 経路が壊れるため) |
-| `on_source` | 他プラグインの `rvpm_loaded_<name>` User autocmd を受けて連鎖ロード |
+| `on_cmd` | `bang = true`, `range = true`, `nargs = "*"`, `complete` callback. The callback restores `event.bang / smods / fargs / range / count` and dispatches via `vim.cmd(cmd_table)`. Fully supports `:Foo!`, `:%Foo`, `:5Foo`, `:tab Foo`. The `"/regex/"` notation regex-matches at `rvpm generate` time against command names defined by the plugin in `plugin/`/`ftplugin/`/`after/plugin/`/`lua/` (`src/plugin_scan.rs` statically scans for `vim.api.nvim_create_user_command("Foo", …)` / `command! Foo`). Expansion results flow through the same emit path as the exact-name list — zero runtime cost, completion is not broken (all stubs are pre-registered). Dynamically defined commands (e.g. names decided via `vim.fn.input()`) cannot be picked up; specify them as exact names alongside, or fall back to literal. |
+| `on_ft` | After loading, re-fires via `exec_autocmds("FileType", { buffer = ev.buf })` → the freshly loaded plugin's `ftplugin/<ft>.vim` fires for the current buffer. |
+| `on_event` | The `"User Xxx"` syntax expands into a User event + pattern. After loading, re-fires via `exec_autocmds(ev.event, { buffer, data })`. The `"/regex/"` notation regex-matches against User event names that the plugin statically fires (`nvim_exec_autocmds("User", { pattern = "Foo" })` etc.) and expands them (#88). The `/regex/` matches against the synthesized `"User <name>"` string, so write things like `/^User Chezmoi/`. Standard events (`BufRead` etc.) cannot be enumerated statically and only pass through literally. |
+| `on_path` | `BufRead` / `BufNewFile` glob patterns. Same re-fire via `exec_autocmds(ev.event, ...)`. |
+| `on_map` | `vim.keymap.set({modes}, lhs, ..., { desc })`. The MapSpec type supports `lhs + mode[] + desc`. Replay is made safe by prefixing `<Ignore>` and using feedkeys. Writing `"/regex/"` for lhs expands by matching against the plugin's `<Plug>(...)` list (#88). The `<Plug>` family is the plugin's officially exposed API, so naming tends to be consistent and regex-ization pays off (e.g. `/^<Plug>\(Chezmoi/`). The original spec's `mode` / `desc` is inherited by each expanded entry. Zero matches / invalid regex are dropped + warned (emitting them literally would break the stub keymap path). |
+| `on_source` | Chains loading off another plugin's `rvpm_loaded_<name>` User autocmd. |
 
-on_map は `rhs` を spec に持たない設計。理由:
+By design `on_map` does not carry an `rhs` in its spec. Reasons:
 
-- replay + after.lua の組み合わせで「プラグイン or ユーザーが最終的に set する keymap」を拾える (load_lazy 内で after.lua → feedkeys の順に走るため)
-- プラグイン内部の keymap を静的解析するのは実用上困難
-- `rhs` が必要な count / operator の edge case は `"m"` mode feedkeys でほぼカバー
-- 将来必要になれば後方互換で `rhs` フィールドを足せる
+- The combination of replay + after.lua picks up "the keymap that the plugin or user ultimately sets" (inside load_lazy, after.lua runs first, then feedkeys).
+- Statically analyzing a plugin's internal keymaps is impractical.
+- Edge cases that need `rhs` (count / operator) are largely covered by `"m"` mode feedkeys.
+- An `rhs` field can be added later in a backward-compatible way if needed.
 
-ただし `mode` は必須概念: rvpm の stub keymap が install される mode と、最終的にユーザー/プラグインが set する keymap の mode が一致しないとトリガーが反応しない。デフォルトは `["n"]`。
+That said, `mode` is essential: if the mode in which rvpm installs its stub keymap does not match the mode of the keymap the user/plugin ultimately sets, the trigger never fires. The default is `["n"]`.
 
-### 並列実行と Semaphore
+### Parallel execution and Semaphore
 
-`run_sync()` と `run_update()` は `tokio::task::JoinSet` でタスクを並列スポーン。`config.options.concurrency` が設定されている場合、`tokio::sync::Semaphore` でタスク数を制限する。
+`run_sync()` and `run_update()` spawn parallel tasks via `tokio::task::JoinSet`. When `config.options.concurrency` is set, task count is bounded by `tokio::sync::Semaphore`.
 
 ```rust
 let concurrency = resolve_concurrency(config.options.concurrency);
 let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-// 各タスク内の冒頭:
+// At the top of each task:
 let _permit = sem.acquire_owned().await.unwrap();
 ```
 
-### TOML 設定のテンプレート
+### TOML config templating
 
-`parse_config()` は 2 段階でパースする: まず vars セクションのみ取り出し → Tera コンテキストに `vars`, `env`, `is_windows` を登録 → TOML 文字列全体をレンダリング → 最終パース。これにより `{{ vars.base }}` や `{{ env.HOME }}` が設定ファイル内で使える。
+`parse_config()` parses in two passes: first extract the vars section only → register `vars`, `env`, `is_windows` into a Tera context → render the entire TOML string → final parse. This makes `{{ vars.base }}` and `{{ env.HOME }}` usable inside the config file.
 
-### 可変スキーマ (`string | string[]` / `MapSpec` / etc)
+### Flexible schemas (`string | string[]` / `MapSpec` / etc)
 
-`config.rs` の `deserialize_string_or_vec` と `deserialize_map_specs` は `serde(untagged)` enum を使って柔軟な TOML 形式を受け付ける。
+`deserialize_string_or_vec` and `deserialize_map_specs` in `config.rs` use `serde(untagged)` enums to accept multiple TOML shapes.
 
-- `on_cmd = "Foo"` も `on_cmd = ["Foo", "Bar"]` も両方 OK
-- `on_map = ["<leader>f"]` も `on_map = [{ lhs = "...", mode = ["n", "x"] }]` も両方 OK
+- Both `on_cmd = "Foo"` and `on_cmd = ["Foo", "Bar"]` are OK.
+- Both `on_map = ["<leader>f"]` and `on_map = [{ lhs = "...", mode = ["n", "x"] }]` are OK.
 
-書き込み側 (`set_plugin_list_field`) は 1 要素なら string、複数なら array で書き戻す (最小の表現)。
+The write side (`set_plugin_list_field`) writes back as a string for one element and as an array for multiple (the minimal representation).
 
-### merge 戦略 (`src/link.rs`)
+### merge strategy (`src/link.rs`)
 
-`merge_plugin()` は **ファイル単位** で merged ディレクトリにリンクする。設計のポイント:
+`merge_plugin()` links into the merged directory **at file granularity**. Design highlights:
 
-- **ファイルは hard link** で張る (Windows でも管理者権限不要、Unix でも安定)。同一ボリューム必須だが repos / merged が同じ `<cache_root>` 配下なので OK。別ボリューム等で hard link が失敗したら `std::fs::copy` にフォールバック。junction はディレクトリ専用なのでファイルには使えない。symbolic link は Windows で admin 権限が要るので不採用
-- **ディレクトリは作るだけ** (`create_dir_all`)。ディレクトリ自体は実体を作り、その中身をファイル単位で再帰してリンクする。ディレクトリを junction で張る方式 (旧実装) だと、複数 plugin が同じ階層下にファイルを置くケース (例: 複数の cmp 系 plugin が `lua/cmp/` を共有) で後勝ち上書きになり前の内容が消える
-- **first-wins + 衝突サマリ** — 衝突したら新しい方を skip して `MergeConflict { relative }` を集める。`MergeResult.placed` は今回新規配置したファイルリストを返し、main.rs 側で `HashMap<PathBuf, String>` を維持して **勝者 plugin 名を lookup** する (loser だけだと「誰と被ったの？」が分からないため)。`run_sync` / `run_generate` の末尾で `print_merge_conflicts` がプラグインごとにグループ化し、各行に `(kept: <winner>)` を付けて stderr 表示 + `<cache_root>/merge_conflicts.json` に毎回上書き保存。`rvpm doctor` が後者を読み出して warn にする
-- **plugin ルート直下のファイルは無視** — README.md / LICENSE / Makefile / package.json / *.toml 等のメタファイルは rtp に置く意味が無く、plugin 横断で同名衝突するだけのノイズ
-- **plugin ルート直下のディレクトリは rtp 慣習 + denops のみ allowlist** — `plugin/`, `lua/`, `doc/`, `ftplugin/`, `ftdetect/`, `syntax/`, `indent/`, `colors/`, `compiler/`, `autoload/`, `after/`, `queries/`, `parser/`, `rplugin/`, `spell/`, `keymap/`, `lang/`, `pack/`, `tutor/` (`:Tutor` 用)、`denops/` (denops.vim の TypeScript plugin 用)。`tests/` `scripts/` `examples/` `src/` 等は rtp 無関係なので除外
-- **全階層で dotfile (`.gitignore`, `.luarc.json`, `.editorconfig`, `.gitkeep` 等) を skip** — Neovim 起動に無関係で、`doc/.gitignore` のように深い階層でも plugin 横断で名前が被って衝突警告のノイズになる
+- **Files are hard-linked** (no admin rights required on Windows; stable on Unix). Same volume is required, but since repos / merged are both under `<cache_root>` this is fine. If hard-link fails (e.g. cross-volume), fall back to `std::fs::copy`. Junctions are directory-only and cannot be used for files. Symbolic links require admin rights on Windows and are therefore not used.
+- **Directories are just created** (`create_dir_all`). The directory itself is a real directory; its contents are recursively linked file by file. The previous junction-per-directory scheme would, when multiple plugins place files under the same hierarchy (e.g. several cmp plugins sharing `lua/cmp/`), cause last-writer-wins overwrites and clobber earlier contents.
+- **First-wins + conflict summary** — on conflict, the new file is skipped and a `MergeConflict { relative }` is collected. `MergeResult.placed` returns the list of files newly placed in this run, and main.rs maintains a `HashMap<PathBuf, String>` to **look up the winner plugin name** (loser-only would not tell you "which plugin did it collide with?"). At the end of `run_sync` / `run_generate`, `print_merge_conflicts` groups results by plugin, displays each line on stderr with `(kept: <winner>)` appended, and overwrites `<cache_root>/merge_conflicts.json` each time. `rvpm doctor` reads the latter and surfaces it as a warning.
+- **Files at the plugin root are ignored** — README.md / LICENSE / Makefile / package.json / *.toml and other meta files have no place on the rtp; they would only become noise that collides across plugins.
+- **Directories at the plugin root are allow-listed to rtp conventions + denops** — `plugin/`, `lua/`, `doc/`, `ftplugin/`, `ftdetect/`, `syntax/`, `indent/`, `colors/`, `compiler/`, `autoload/`, `after/`, `queries/`, `parser/`, `rplugin/`, `spell/`, `keymap/`, `lang/`, `pack/`, `tutor/` (for `:Tutor`), and `denops/` (for denops.vim TypeScript plugins). `tests/` `scripts/` `examples/` `src/` etc. are unrelated to the rtp and are excluded.
+- **Skip dotfiles at every level** (`.gitignore`, `.luarc.json`, `.editorconfig`, `.gitkeep`, etc.) — they are unrelated to Neovim startup, and at deep levels (e.g. `doc/.gitignore`) would just collide across plugins and add conflict-warning noise.
 
-### Windows 対応
+### Windows support
 
-merge 戦略がファイル単位 hard link に切り替わって以降、Windows でも管理者権限要らず・junction も symbolic link も使わない構成になった。`std::fs::hard_link` は NTFS 上で動き、admin 不要。ディレクトリは `create_dir_all` で実体を作るので junction は不要。シンボリックリンクの権限問題は回避済み。
+Once the merge strategy switched to file-level hard links, the setup no longer requires admin rights on Windows and uses neither junctions nor symbolic links. `std::fs::hard_link` works on NTFS without admin. Directories are created with `create_dir_all`, so junctions are not needed. The symbolic-link permission issue is avoided.
 
-### パス規約 (固定 + 上書き可能)
+### Path conventions (fixed + overridable)
 
-設定/キャッシュは **全プラットフォーム共通で `~/.config/rvpm/` と `~/.cache/rvpm/` に固定**。Windows でも `dirs::config_dir()` (`%APPDATA%`) は使わない。理由:
+Config / cache are **fixed at `~/.config/rvpm/` and `~/.cache/rvpm/` across all platforms**. Even on Windows, `dirs::config_dir()` (`%APPDATA%`) is not used. Reasons:
 
-- Neovim の慣習と揃う (`~/.config/nvim`)
-- dotfiles を WSL / Linux / Windows で同じパス構造で共有できる
-- 単一の mental model で済む
+- Aligns with Neovim's convention (`~/.config/nvim`).
+- Lets dotfiles share an identical path layout across WSL / Linux / Windows.
+- A single mental model is enough.
 
-#### パスヘルパー (src/main.rs)
+#### Path helpers (src/main.rs)
 
-| ヘルパー | 用途 | 上書き方法 |
+| Helper | Purpose | Override |
 |---|---|---|
-| `rvpm_config_path()` | `~/.config/rvpm/config.toml` | **固定** (chicken-and-egg 回避) |
-| `resolve_cache_root(opt)` | `~/.cache/rvpm/<appname>` or `opt` の tilde 展開 | `options.cache_root` |
+| `rvpm_config_path()` | `~/.config/rvpm/config.toml` | **Fixed** (avoids chicken-and-egg) |
+| `resolve_cache_root(opt)` | `~/.cache/rvpm/<appname>` or tilde-expanded `opt` | `options.cache_root` |
 | `resolve_repos_dir(cache_root)` | `{cache_root}/plugins/repos` | — |
 | `resolve_merged_dir(cache_root)` | `{cache_root}/plugins/merged` | — |
 | `resolve_loader_path(cache_root)` | `{cache_root}/plugins/loader.lua` | — |
 | `resolve_config_root(opt)` | `~/.config/rvpm/<appname>/plugins/` or `opt` | `options.config_root` |
-| `expand_tilde(s)` | `~` / `~/...` / `~\...` を home dir に展開する汎用ヘルパー | — |
+| `expand_tilde(s)` | General-purpose helper that expands `~` / `~/...` / `~\...` to home dir | — |
 
-コード内で `.config/rvpm/...` や `.cache/rvpm/...` を文字列リテラルで直書きしないこと。必ずヘルパー経由。
+Do not write `.config/rvpm/...` or `.cache/rvpm/...` as string literals in code. Always go through a helper.
 
-#### 解決順序
+#### Resolution order
 
-- **cache_root**: `options.cache_root` (tilde 展開) → default `~/.cache/rvpm/<appname>`
-- **config_root**: `options.config_root` (tilde 展開) → `~/.config/rvpm/<appname>/plugins`
-- **repos**: 常に `{cache_root}/plugins/repos/<canonical>/` (plugin 単位の上書きは `plugin.dst`)
-- **merged**: 常に `{cache_root}/plugins/merged/`
-- **loader**: 常に `{cache_root}/plugins/loader.lua`
+- **cache_root**: `options.cache_root` (tilde-expanded) → default `~/.cache/rvpm/<appname>`
+- **config_root**: `options.config_root` (tilde-expanded) → `~/.config/rvpm/<appname>/plugins`
+- **repos**: always `{cache_root}/plugins/repos/<canonical>/` (per-plugin override is `plugin.dst`)
+- **merged**: always `{cache_root}/plugins/merged/`
+- **loader**: always `{cache_root}/plugins/loader.lua`
 
-つまり `options.cache_root` だけ指定すれば repos / merged / loader.lua が全部連動する。`options.config_root` は per-plugin init/before/after.lua の置き場の上書きで、デフォルトは config.toml と隣合わせの `~/.config/rvpm/<appname>/plugins/`。
+In other words, setting just `options.cache_root` moves repos / merged / loader.lua together. `options.config_root` overrides only the per-plugin init/before/after.lua location, and defaults to `~/.config/rvpm/<appname>/plugins/` next to config.toml.
 
-### CLI コマンド一覧
+### CLI command list
 
-| コマンド | 関数 | 説明 |
+| Command | Function | Description |
 |---------|------|------|
-| `sync [--prune] [--frozen] [--no-lock] [--rebuild [QUERY]]` | `run_sync()` | clone/pull + merged + loader.lua 生成。`--prune` で未使用プラグインディレクトリも削除。無指定でも未使用があれば末尾で警告表示。lockfile (`<config_root>/rvpm.lock`) を読み込んで pin された commit に寄せ、sync 完了後に新 HEAD を書き戻す。`--frozen` で未登録プラグインがあれば即エラー (CI / fresh machine)、`--no-lock` で完全スキップ。**build 実行は git HEAD が動いたときのみ** (no-op pull で `:TSUpdate` 等を毎回回さない高速化)、`--rebuild` で常に build する従来挙動に戻す。`--rebuild <QUERY>` で rebuild スコープを url / name 部分一致のプラグインに絞る (build コマンド試行錯誤中の単一プラグイン rebuild 用) — `matches_rebuild_filter` で判定、closure spawn 前に bool に解決して async move に引き込まない |
-| `generate` | `run_generate()` | loader.lua のみ再生成 |
-| `clean` | `run_clean()` | config.toml から外したプラグインの `{cache_root}/plugins/repos/<host>/<owner>/<repo>/` を削除。git 操作なしで `sync --prune` より高速 (200+ プラグインでの所要時間対策)。共有ヘルパー `prune_unused_repos()` を `sync --prune` と共用 |
-| `add <repo> [--auto-lazy \| --no-lazy]` | `run_add()` | TOML 追加 + 当該プラグインだけ clone + generate。重複検出は `installed_full_name` で正規化 (https / owner/repo / ssh / 大文字小文字 / `.git` / 末尾 `/` の揺れを吸収し、`rvpm browse` の installed マークと同じロジックを共用)。書き込み URL 形式は `options.url_style` (`short` / `full`) に従う。**clone 後に `plugin_scan::scan_plugin` を走らせて plugin の `plugin/` / `ftplugin/` / `after/plugin/` / `lua/` から user-facing なコマンド / keymap を拾い**、`options.auto_lazy` (または `--auto-lazy` / `--no-lazy` で上書き) に従って対話プロンプト / 無条件採用 / skip を選ぶ (`AutoLazyPolicy::Ask/Always/Never`)。採用時は `suggest_cmd_triggers_smart` でコマンド群を LCP クラスタ化 (3 文字以上共通 prefix で `/^Prefix/` regex 化)、keymap は enumerate、`config.toml` の該当 `[[plugins]]` entry に `on_cmd` / `on_map` を in-place patch |
-| `tune [query] [--ai <backend>] [--no-ai]` | `run_tune()` | **既に config に登録済みの** プラグインに対して AI chat loop (`run_ai_tune`) を回す。`add --ai` との違いは clone を skip + 既存 entry & 既存 hook 本文を AI に見せて「fresh 案 (clean redesign) と merged 案 (既存を保持しつつ改善) の 2 通り」を要求すること。Apply 時は per-section に user が **fresh / merged / keep existing** を選択 (`pick_plugin_entry_decision` / `pick_hook_decision`)。`Replace` mode で AI が omit した stale field (e.g. 古い `on_cmd`) を消す。user の guardrail は Chat ループ中に "X は触らないで" と AI に伝える、または preview で keep existing を選ぶ運用。AI 専用 — `effective_ai == Off` なら明示 error (非 AI tweak は `set` で代替) |
-| `update [query]` | `run_update()` | 既存プラグインの pull (clone しない)。完了後に lockfile を新 HEAD で上書き (部分 update 時も対象外の entry は残す) |
-| `remove [query]` | `run_remove()` | TOML + ディレクトリ削除 + generate |
-| `edit [query] [--init\|--before\|--after] [--global]` | `run_edit()` | per-plugin init/before/after.lua をエディタで編集。フラグ指定でファイル選択をスキップ。`--global` で global hooks を編集 — **`--init` は Neovim 本体の `init.lua` (`nvim_init_lua_path()`) を直接開き**、`--before` / `--after` は `<config_root>/before.lua` / `after.lua`。これで per-plugin と global で `init/before/after` の 3 択 UX が揃う。インタラクティブ選択時は `[ Global hooks ]` sentinel でも同じ動作 |
-| `set [query] [flags]` | `run_set()` | lazy/merge/on_* などを対話式 or 引数で変更。`on_cmd` 等は comma-separated / JSON array 両対応、`--on-map` は JSON object/array で table 形式もサポート。`[ Open config.toml in $EDITOR ]` sentinel で TOML 直接編集に逃げられる |
-| `config` | `run_config()` | `config.toml` を `$EDITOR` で直接開く (終了後に generate のみ実行。新規プラグイン追加した場合は `rvpm sync` 明示実行) |
-| `init [--write]` | `run_init()` | Neovim `init.lua` に loader.lua を繋ぐ `dofile(...)` スニペットを案内。`--write` で自動追記 (init.lua がなければ新規作成)。`$NVIM_APPNAME` を尊重 |
-| `list [--no-tui]` | `run_list()` | プラグイン一覧表示。デフォルトは TUI で `[S] sync / [R] sync --rebuild / [u/U] update / [d] remove / [e] edit / [s] set / [t] tune / [c] config.toml / [b] browse / [?] help` のアクションキー対応。**1 行目は `[ Global hooks ]` sentinel** — `e` で global edit (init/before/after) に飛べる、`u/d/s/t` は no-op。ナビ: `j/k/g/G/Ctrl-d/u/f/b`、検索: `/n/N`。`--no-tui` で pipe-friendly な plain text 出力 |
-| `browse` | `run_browse()` | GitHub `neovim-plugin` トピックのプラグインブラウザ TUI (最大 300 件、3 ページ取得)。README は tui-markdown で GFM レンダ (`options.browse.readme_command` を設定すれば外部 renderer = mdcat / glow 等に委譲可、fallback 込み)。行頭の `✓` でインストール済みを表示し、`Enter` で installed plugin は警告して add をスキップ。`/` ローカルインクリメンタル検索 (name + description + topics) + `n`/`N` でマッチジャンプ。`S` で GitHub API 検索。`Tab` でリスト/README フォーカス切替。`o` でブラウザ、`s` でソート切替、`R` でキャッシュクリア+再取得、`c` で config.toml をエディタで開く、`l` で list TUI に遷移、`?` でヘルプ |
-| `doctor` | `run_doctor()` | 設定 / 状態 / Neovim 連携 / 外部ツールの 16 項目を診断する one-shot コマンド。4 カテゴリ (plugin config / state integrity / Neovim integration / external tools)、出力は `options.icons` (nerd/unicode/ascii) に従う。exit code: `0` = 全 ok、`1` = error あり、`2` = warn のみ。外部コマンド (nvim/git/chezmoi) の `--version` 実行は `tokio::process::Command` + 2s timeout で hang しない |
-| `profile [--runs N (1..=20)] [--top N] [--json] [--no-tui] [--no-merge] [--no-instrument]` (`--json` と `--no-tui` は併用不可) | `run_profile()` | `nvim --headless --startuptime` を N 回 (デフォルト 3) 実行して startup 時間をプラグイン単位に集計。デフォルトで loader.lua を **phase-instrumented 版** に一時差し替え (`LoaderSwapGuard` + atomic rename、panic / Ctrl-C でも原本復元)。phase 境界 + per-plugin init/trig 空 `.vim` marker を `tmp/rvpm-profile-markers-*/` に事前配置し、`vim.cmd("source <marker>")` の clock 差から phase 4/6/7 の per-plugin 時間を抽出。`--no-merge` で `force_unmerge=true` を渡し全 plugin を merge=false 扱いに (merged/ は触らず rtp の append 経路だけ変える)。`--no-instrument` で swap を skip し v1 と同じ raw `--startuptime` のみ。起動時に前回 crash 由来の `loader.lua.bak` を検出したら自動復元 (`recover_stale_loader_backup`)。TUI は phase timeline + init/load/trig 列 + sort cycle (`s` キー) で情報量増 |
-| `log [query] [--last N] [--full] [--diff]` | `run_log()` | `sync` / `update` / `add` 実行時に記録される変更履歴 (`<cache_root>/update_log.json`) を表示。`[query]` で plugin 名部分一致フィルタ、`--last N` (default 1、max 20) で直近 N 回の run 表示、`--diff` で README / CHANGELOG / doc/ の patch 埋め込み、`--full` は将来の body 表示用予約。Conventional Commits の `<type>!:` / `BREAKING CHANGE:` footer は `⚠ BREAKING` プレフィックスで強調 |
+| `sync [--prune] [--frozen] [--no-lock] [--rebuild [QUERY]]` | `run_sync()` | clone/pull + merged + loader.lua generation. `--prune` also deletes unused plugin directories. Even without it, a warning is shown at the end if any are unused. Loads the lockfile (`<config_root>/rvpm.lock`) to align to pinned commits, and writes back the new HEAD on completion. `--frozen` errors immediately if any plugin is not registered (CI / fresh machine); `--no-lock` skips lockfile entirely. **Build runs only when git HEAD moved** (avoids re-running e.g. `:TSUpdate` on every no-op pull); `--rebuild` restores the previous always-build behavior. `--rebuild <QUERY>` narrows the rebuild scope to plugins whose url / name partially matches (for iterating on a single plugin's build command) — `matches_rebuild_filter` decides this, resolved into a bool before closure spawn so it does not get pulled into the async move. |
+| `generate` | `run_generate()` | Regenerate loader.lua only. |
+| `clean` | `run_clean()` | Delete `{cache_root}/plugins/repos/<host>/<owner>/<repo>/` for plugins removed from config.toml. No git ops, faster than `sync --prune` (matters on configs with 200+ plugins). Shares the helper `prune_unused_repos()` with `sync --prune`. |
+| `add <repo> [--auto-lazy \| --no-lazy]` | `run_add()` | TOML add + clone of just that plugin + generate. Duplicate detection normalizes via `installed_full_name` (absorbs https / owner/repo / ssh / case / `.git` / trailing `/` variation, sharing the same logic as the installed marker in `rvpm browse`). The written URL form follows `options.url_style` (`short` / `full`). **After clone, `plugin_scan::scan_plugin` runs to pick up user-facing commands / keymaps from the plugin's `plugin/` / `ftplugin/` / `after/plugin/` / `lua/`**, and based on `options.auto_lazy` (or `--auto-lazy` / `--no-lazy` overrides) chooses an interactive prompt / unconditional accept / skip (`AutoLazyPolicy::Ask/Always/Never`). On accept, `suggest_cmd_triggers_smart` LCP-clusters command groups (regex-izes them as `/^Prefix/` when there is a 3+ character common prefix); keymaps are enumerated; the corresponding `[[plugins]]` entry in `config.toml` gets `on_cmd` / `on_map` patched in place. |
+| `tune [query] [--ai <backend>] [--no-ai]` | `run_tune()` | Run an AI chat loop (`run_ai_tune`) against **plugins already registered in the config**. Differences from `add --ai`: skips clone, shows the AI both the existing entry and existing hook bodies, and asks for "two variants — a fresh proposal (clean redesign) and a merged proposal (keep existing while improving)." On apply, the user picks **fresh / merged / keep existing** per section (`pick_plugin_entry_decision` / `pick_hook_decision`). `Replace` mode removes stale fields the AI omitted (e.g. an outdated `on_cmd`). User guardrails are exercised either by telling the AI "do not touch X" inside the chat loop or by selecting keep existing in preview. AI-only — if `effective_ai == Off`, errors explicitly (use `set` for non-AI tweaks). |
+| `update [query]` | `run_update()` | Pull existing plugins (does not clone). On completion, overwrites the lockfile with the new HEAD (entries for non-target plugins are preserved even on partial update). |
+| `remove [query]` | `run_remove()` | TOML + directory deletion + generate. |
+| `edit [query] [--init\|--before\|--after] [--global]` | `run_edit()` | Edit per-plugin init/before/after.lua in the editor. Flags skip file selection. `--global` edits global hooks — **`--init` directly opens Neovim's main `init.lua` (`nvim_init_lua_path()`)**, while `--before` / `--after` open `<config_root>/before.lua` / `after.lua`. This gives a consistent `init/before/after` 3-way UX between per-plugin and global. The `[ Global hooks ]` sentinel in interactive selection behaves the same. |
+| `set [query] [flags]` | `run_set()` | Change lazy/merge/on_* etc. interactively or via arguments. `on_cmd` and friends accept comma-separated or JSON array; `--on-map` also supports JSON object/array for the table form. The `[ Open config.toml in $EDITOR ]` sentinel is an escape hatch for direct TOML editing. |
+| `config` | `run_config()` | Open `config.toml` directly in `$EDITOR` (only `generate` runs on exit; if you added a new plugin, run `rvpm sync` explicitly). |
+| `init [--write]` | `run_init()` | Show the `dofile(...)` snippet that wires loader.lua into Neovim's `init.lua`. `--write` appends it automatically (creates init.lua if absent). Honors `$NVIM_APPNAME`. |
+| `list [--no-tui]` | `run_list()` | Plugin list display. Defaults to a TUI with action keys `[S] sync / [R] sync --rebuild / [u/U] update / [d] remove / [e] edit / [s] set / [t] tune / [c] config.toml / [b] browse / [?] help`. **The first row is the `[ Global hooks ]` sentinel** — `e` jumps to global edit (init/before/after); `u/d/s/t` are no-ops there. Navigation: `j/k/g/G/Ctrl-d/u/f/b`; search: `/n/N`. `--no-tui` outputs pipe-friendly plain text. |
+| `browse` | `run_browse()` | Plugin browser TUI for the GitHub `neovim-plugin` topic (up to 300 entries, fetched in 3 pages). README is rendered as GFM via tui-markdown (set `options.browse.readme_command` to delegate to an external renderer like mdcat / glow, with a fallback). A leading `✓` marks installed entries; pressing `Enter` on an installed plugin warns and skips add. `/` is local incremental search (name + description + topics) with `n`/`N` for match jumps. `S` runs a GitHub API search. `Tab` toggles list/README focus. `o` opens the browser; `s` cycles sort; `R` clears cache and refetches; `c` opens config.toml in the editor; `l` jumps to the list TUI; `?` shows help. |
+| `doctor` | `run_doctor()` | One-shot command that diagnoses 16 items across config / state / Neovim integration / external tools. 4 categories (plugin config / state integrity / Neovim integration / external tools); output respects `options.icons` (nerd/unicode/ascii). Exit codes: `0` = all ok, `1` = errors present, `2` = warnings only. External commands (nvim/git/chezmoi) are probed via `tokio::process::Command` + 2s timeout so they cannot hang. |
+| `profile [--runs N (1..=20)] [--top N] [--json] [--no-tui] [--no-merge] [--no-instrument]` (`--json` and `--no-tui` cannot be combined) | `run_profile()` | Run `nvim --headless --startuptime` N times (default 3) and aggregate startup time per plugin. By default, temporarily swaps loader.lua for a **phase-instrumented build** (`LoaderSwapGuard` + atomic rename, restoring the original even on panic / Ctrl-C). Empty `.vim` markers for phase boundaries + per-plugin init/trig are placed in `tmp/rvpm-profile-markers-*/` ahead of time, and per-plugin times for phases 4/6/7 are extracted from the clock deltas of `vim.cmd("source <marker>")`. `--no-merge` passes `force_unmerge=true` to treat all plugins as merge=false (merged/ is left untouched; only the rtp append path changes). `--no-instrument` skips the swap and uses raw `--startuptime` only (same as v1). On startup, a stale `loader.lua.bak` from a prior crash is auto-restored (`recover_stale_loader_backup`). The TUI adds info via a phase timeline, init/load/trig columns, and a sort cycle (`s`). |
+| `log [query] [--last N] [--full] [--diff]` | `run_log()` | Display the change history (`<cache_root>/update_log.json`) recorded during `sync` / `update` / `add`. `[query]` partially matches plugin names; `--last N` (default 1, max 20) shows the last N runs; `--diff` embeds README / CHANGELOG / doc/ patches; `--full` is reserved for future body display. Conventional Commits' `<type>!:` / `BREAKING CHANGE:` footers are highlighted with a `⚠ BREAKING` prefix. |
 
-**廃止コマンド:**
-- `status` → `list --no-tui` に統合 (plain text 出力で機能同等)
+**Removed commands:**
+- `status` → folded into `list --no-tui` (plain text output is feature-equivalent).
 
-### CLI フラグ / サブコマンド追加時のチェックリスト
+### Checklist when adding CLI flags / subcommands
 
-サブコマンドフラグ (`--prune` / `--ai` / `--no-tui` 等) を **追加・改名・削除** したり、**新規サブコマンド** を追加したりした場合、[rvpm.nvim](https://github.com/yukimemi/rvpm.nvim) の `lua/rvpm/command.lua` も同期更新すること。具体的には:
+When you **add, rename, or remove** a subcommand flag (`--prune` / `--ai` / `--no-tui` etc.) or **add a new subcommand**, also keep `lua/rvpm/command.lua` in [rvpm.nvim](https://github.com/yukimemi/rvpm.nvim) in sync. Specifically:
 
-- 新規サブコマンド: `SUBCOMMANDS` 配列に追加。TUI に流すなら `TUI` テーブル、plugin 名引数を取るなら `PLUGIN_ARG_SUBS` テーブルにも登録。フラグを持つなら `FLAGS` テーブルにエントリ追加。`lua/rvpm/init.lua` の便利 Lua API も検討。
-- 既存サブコマンドへのフラグ追加/改名/削除: 該当する `FLAGS[<sub>]` エントリを更新。
+- New subcommand: add it to the `SUBCOMMANDS` array. If it should be routed to the TUI, register it in the `TUI` table; if it takes a plugin-name argument, register it in the `PLUGIN_ARG_SUBS` table; if it has flags, add an entry to the `FLAGS` table. Consider adding a convenience Lua API in `lua/rvpm/init.lua` as well.
+- Adding/renaming/removing a flag on an existing subcommand: update the relevant `FLAGS[<sub>]` entry.
 
-rvpm.nvim 側は `:Rvpm <sub> --<Tab>` の補完候補のために rvpm core のフラグ一覧を **ハードコードでミラー**している (動的な `--help` parse は Neovim 起動時のコスト観点から採用していない)。同期し忘れると Neovim 上で「実在するフラグが補完候補に出ない」または「廃止済みフラグが候補に残る」という silent な drift が発生する。CLI 関連 PR の self-review checklist に含めること。
+The rvpm.nvim side **hardcodes a mirror** of rvpm core's flag list to power `:Rvpm <sub> --<Tab>` completion (parsing `--help` dynamically was rejected on Neovim startup-cost grounds). Forgetting to sync causes silent drift in Neovim where "an existing flag is missing from completion" or "a removed flag still appears as a candidate." Add this to your CLI-PR self-review checklist.
 
-### ディレクトリレイアウト (デフォルト)
+### Directory layout (default)
 
-| パス | 用途 |
+| Path | Purpose |
 |------|------|
-| `~/.config/rvpm/config.toml` | メイン設定ファイル (**appname に関わらず固定** — chicken-and-egg 回避のため) |
-| `~/.config/rvpm/<appname>/before.lua` | グローバル before hook (phase 3、全 init.lua より前。存在すれば自動適用) |
-| `~/.config/rvpm/<appname>/after.lua` | グローバル after hook (phase 9、全 lazy trigger 登録後。存在すれば自動適用) |
-| `~/.config/rvpm/<appname>/plugins/<host>/<owner>/<repo>/` | per-plugin init/before/after.lua (`options.config_root` で上書き) |
-| `~/.config/rvpm/<appname>/rvpm.lock` | プラグイン commit pin の lockfile (`options.config_root` で上書き)。dotfiles にコミットして他マシンで再現する |
-| `~/.cache/rvpm/<appname>/plugins/repos/<host>/<owner>/<repo>/` | プラグインのクローン先 |
-| `~/.cache/rvpm/<appname>/plugins/merged/` | merge=true プラグインのリンク集約先 |
-| `~/.cache/rvpm/<appname>/plugins/loader.lua` | 生成された Neovim 用ローダー |
-| `~/.cache/rvpm/<appname>/plugins/merged/doc/tags` | `:helptags` で生成された merge=true プラグインの統合 tags |
-| `~/.cache/rvpm/<appname>/plugins/repos/<host>/<owner>/<repo>/doc/tags` | lazy / merge=false プラグインの個別 tags |
-| `~/.cache/rvpm/<appname>/update_log.json` | `sync` / `update` / `add` 実行時の変更履歴 (`rvpm log` が読み出す、最大 20 runs) |
-| `~/.cache/rvpm/<appname>/merge_conflicts.json` | 直近 `sync` / `generate` の merge 衝突 snapshot (`rvpm doctor` が読み出す)。履歴ではなく毎回上書き |
+| `~/.config/rvpm/config.toml` | Main configuration file (**fixed regardless of appname** — to avoid chicken-and-egg) |
+| `~/.config/rvpm/<appname>/before.lua` | Global before hook (phase 3, before all init.lua; auto-applied if present) |
+| `~/.config/rvpm/<appname>/after.lua` | Global after hook (phase 9, after all lazy triggers are registered; auto-applied if present) |
+| `~/.config/rvpm/<appname>/plugins/<host>/<owner>/<repo>/` | Per-plugin init/before/after.lua (override via `options.config_root`) |
+| `~/.config/rvpm/<appname>/rvpm.lock` | Lockfile of plugin commit pins (override via `options.config_root`). Commit it with your dotfiles to reproduce on other machines. |
+| `~/.cache/rvpm/<appname>/plugins/repos/<host>/<owner>/<repo>/` | Plugin clone destination |
+| `~/.cache/rvpm/<appname>/plugins/merged/` | Aggregated link target for merge=true plugins |
+| `~/.cache/rvpm/<appname>/plugins/loader.lua` | Generated Neovim loader |
+| `~/.cache/rvpm/<appname>/plugins/merged/doc/tags` | Aggregated tags for merge=true plugins (generated by `:helptags`) |
+| `~/.cache/rvpm/<appname>/plugins/repos/<host>/<owner>/<repo>/doc/tags` | Per-plugin tags for lazy / merge=false plugins |
+| `~/.cache/rvpm/<appname>/update_log.json` | Change history of `sync` / `update` / `add` runs (read by `rvpm log`, max 20 runs) |
+| `~/.cache/rvpm/<appname>/merge_conflicts.json` | Snapshot of merge conflicts from the latest `sync` / `generate` (read by `rvpm doctor`). Not history — overwritten each run. |
 
-`<appname>` は `$RVPM_APPNAME` → `$NVIM_APPNAME` → `"nvim"` の順で決まる。`options.cache_root` を指定すると `~/.cache/rvpm/<appname>/` 全体 (repos/merged/loader.lua) が移動する。`options.config_root` は per-plugin 設定ディレクトリの置き場を個別に移動する。
+`<appname>` is determined as `$RVPM_APPNAME` → `$NVIM_APPNAME` → `"nvim"`, in that order. Setting `options.cache_root` moves the entire `~/.cache/rvpm/<appname>/` (repos/merged/loader.lua). `options.config_root` independently moves the per-plugin config directory.
 
-### 初回導入サポート
+### First-run support
 
-`rvpm sync` / `rvpm generate` は末尾で `print_init_lua_hint_if_missing()` を呼び、`$NVIM_APPNAME` を考慮した Neovim `init.lua` が loader.lua を参照していない (or 未作成) 場合に案内を表示する。ユーザーは `rvpm init --write` を実行すると init.lua がなければ新規作成、あれば末尾追記 (冪等) してくれる。コメント付きで「これは rvpm が書き加えた」と分かる形で挿入される。
+`rvpm sync` / `rvpm generate` call `print_init_lua_hint_if_missing()` at the end and print guidance when Neovim's `init.lua` (resolved with `$NVIM_APPNAME`) does not reference loader.lua (or has not been created yet). Running `rvpm init --write` then either creates init.lua if absent or appends to its end (idempotently). The insertion is annotated so it is clearly identifiable as "added by rvpm."
