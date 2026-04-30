@@ -65,6 +65,22 @@ pub struct Options {
     /// 個別実行する。`nvim` が PATH に無い場合は警告して skip (resilience)。
     #[serde(default = "default_auto_helptags")]
     pub auto_helptags: bool,
+    /// `true` なら lazy プラグインの `doc/` も `merged/doc/` にリンクする。
+    /// デフォルト `false`。
+    ///
+    /// lazy プラグインは trigger 前は runtimepath に乗らないので、
+    /// `:help <topic>` でその plugin の help tag を引けない (tags ファイルは
+    /// `auto_helptags` 経由で生成されているが、`merged/` 以外にあるので
+    /// `:help` の rtp 走査からは見えない)。
+    /// この option を有効にすると、lazy plugin の `doc/` 配下のファイルだけを
+    /// `merged/doc/` にも hard-link し、`:help <topic>` で全 plugin の tag を
+    /// 引けるようになる。`lua/` 等の他のディレクトリは引き続き merged に
+    /// 流れないので、lazy 性は維持される。
+    ///
+    /// トレードオフ: 未ロードの plugin の help も引けるようになる (人によっては
+    /// feature、人によっては気持ち悪い)。tag 名衝突は first-wins。
+    #[serde(default)]
+    pub merge_lazy_doc: bool,
     /// `rvpm add` が `config.toml` に書き込む URL の形式。
     /// - `"short"` (デフォルト): `owner/repo`
     /// - `"full"`: `https://github.com/owner/repo`
@@ -162,6 +178,7 @@ impl Default for Options {
             chezmoi: false,
             auto_clean: false,
             auto_helptags: default_auto_helptags(),
+            merge_lazy_doc: false,
             url_style: UrlStyle::default(),
             browse: BrowseOptions::default(),
             fetch_interval: None,
@@ -744,6 +761,31 @@ url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
         assert!(!config.options.auto_helptags);
+    }
+
+    #[test]
+    fn test_parse_config_merge_lazy_doc_defaults_to_false() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(!config.options.merge_lazy_doc);
+    }
+
+    #[test]
+    fn test_parse_config_accepts_merge_lazy_doc_true() {
+        let toml = r#"
+[options]
+merge_lazy_doc = true
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(config.options.merge_lazy_doc);
     }
 
     #[test]

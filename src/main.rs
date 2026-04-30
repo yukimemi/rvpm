@@ -1337,13 +1337,16 @@ async fn run_sync(
     for plugin in config.plugins.iter().filter(|p| p.dev) {
         let dst_path = resolve_plugin_dst(plugin, &cache_root);
         let plugin_config_dir = resolve_plugin_config_dir(&config_root, plugin);
-        if plugin.merge && !plugin.lazy {
+        if let Some(doc_only) =
+            decide_merge_mode(plugin.merge, plugin.lazy, config.options.merge_lazy_doc)
+        {
             merge_and_record(
                 &dst_path,
                 &merged_dir,
                 &plugin.display_name(),
                 &mut merge_ownership,
                 &mut merge_conflicts,
+                doc_only,
             );
         }
         plugin_scripts.push(build_plugin_scripts(plugin, &dst_path, &plugin_config_dir));
@@ -1402,15 +1405,23 @@ async fn run_sync(
                             commit,
                         });
                     }
-                    // lazy プラグインは merge しない (trigger 前に merged/ 経由で
-                    // lua モジュールが rtp に漏れて lazy の意味がなくなるため)
-                    if plugin.merge && !plugin.lazy {
+                    // lazy プラグインは通常 merge しない (trigger 前に merged/ 経由で
+                    // lua モジュールが rtp に漏れて lazy の意味がなくなるため)。
+                    // ただし `options.merge_lazy_doc = true` のときは `doc/` のみ
+                    // 部分マージし、`:help <topic>` を引けるようにする (lua/ 等は
+                    // 引き続き merge しないので lazy 性は維持)。
+                    if let Some(doc_only) = decide_merge_mode(
+                        plugin.merge,
+                        plugin.lazy,
+                        config.options.merge_lazy_doc,
+                    ) {
                         merge_and_record(
                             &dst_path,
                             &merged_dir,
                             &plugin.display_name(),
                             &mut merge_ownership,
                             &mut merge_conflicts,
+                            doc_only,
                         );
                     }
                     let config_root = resolve_config_root(config.options.config_root.as_deref());
@@ -1447,6 +1458,7 @@ async fn run_sync(
                     &ps.name,
                     &mut merge_ownership,
                     &mut merge_conflicts,
+                    false,
                 );
             }
         }
@@ -1693,7 +1705,8 @@ async fn run_generate() -> Result<()> {
     let mut merge_ownership: std::collections::HashMap<PathBuf, String> =
         std::collections::HashMap::new();
     for ps in &plugin_scripts {
-        if !ps.lazy && ps.merge {
+        if let Some(doc_only) = decide_merge_mode(ps.merge, ps.lazy, config.options.merge_lazy_doc)
+        {
             let dst = PathBuf::from(&ps.path);
             if dst.exists() {
                 merge_and_record(
@@ -1702,6 +1715,7 @@ async fn run_generate() -> Result<()> {
                     &ps.name,
                     &mut merge_ownership,
                     &mut merge_conflicts,
+                    doc_only,
                 );
             }
         }
@@ -4472,6 +4486,27 @@ fn resolve_merged_dir(cache_root: &Path) -> PathBuf {
     cache_root.join("plugins").join("merged")
 }
 
+/// プラグインの merge モードを決定する純粋関数。
+/// 返り値:
+///   - `Some(false)` — full merge (eager + merge=true)
+///   - `Some(true)`  — doc-only merge (lazy + merge=true + merge_lazy_doc=true)
+///   - `None`        — merge しない (merge=false、または lazy だが merge_lazy_doc=false)
+///
+/// 3 箇所 (run_sync の dev 用 / 通常 task 用 / run_generate) で同じ判定を
+/// 行う必要があったので、Gemini Code Assist の指摘 (#116) を受けて関数化。
+fn decide_merge_mode(plugin_merge: bool, plugin_lazy: bool, merge_lazy_doc: bool) -> Option<bool> {
+    if !plugin_merge {
+        return None;
+    }
+    if !plugin_lazy {
+        Some(false)
+    } else if merge_lazy_doc {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 /// link.rs::merge_plugin を呼び出して、発生した衝突を勝者 (先に同じ path を
 /// 置いた plugin) とセットで `conflicts` に積む。merge 自体が失敗した場合は
 /// stderr に warn を流すがエラーにはしない (resilience)。
@@ -4479,14 +4514,23 @@ fn resolve_merged_dir(cache_root: &Path) -> PathBuf {
 /// `ownership` は merged/ 上の relative path → 勝者 plugin 名の shared map。
 /// 各 plugin 処理前に呼び出し側で 1 つだけ作り、順次 merge_and_record に
 /// 渡すことで、後続 plugin の衝突時に勝者を lookup できる。
+///
+/// `doc_only = true` で呼ぶと `<src>/doc/` 配下のファイルだけを merged にリンク
+/// する (lazy plugin に対して `:help` を引けるようにするための部分マージ)。
 fn merge_and_record(
     src: &Path,
     dst_root: &Path,
     plugin_name: &str,
     ownership: &mut std::collections::HashMap<PathBuf, String>,
     conflicts: &mut Vec<crate::merge_conflicts::MergeConflictReport>,
+    doc_only: bool,
 ) {
-    match crate::link::merge_plugin(src, dst_root) {
+    let result = if doc_only {
+        crate::link::merge_plugin_doc_only(src, dst_root)
+    } else {
+        crate::link::merge_plugin(src, dst_root)
+    };
+    match result {
         Ok(result) => {
             // 今回新規配置したファイルを ownership に登録 (勝者 = この plugin)。
             for placed in result.placed {
@@ -7303,6 +7347,34 @@ url = "owner/repo"
         let result = resolve_concurrency(None);
         assert_eq!(result, DEFAULT_CONCURRENCY);
         assert_eq!(result, 13);
+    }
+
+    #[test]
+    fn test_decide_merge_mode_eager_merge_returns_full_merge() {
+        // eager + merge=true → full merge (lazy_doc 設定の影響を受けない)
+        assert_eq!(decide_merge_mode(true, false, false), Some(false));
+        assert_eq!(decide_merge_mode(true, false, true), Some(false));
+    }
+
+    #[test]
+    fn test_decide_merge_mode_lazy_with_doc_merge_returns_doc_only() {
+        // lazy + merge=true + merge_lazy_doc=true → doc only
+        assert_eq!(decide_merge_mode(true, true, true), Some(true));
+    }
+
+    #[test]
+    fn test_decide_merge_mode_lazy_without_doc_merge_returns_none() {
+        // lazy + merge=true + merge_lazy_doc=false → no merge (現状の挙動)
+        assert_eq!(decide_merge_mode(true, true, false), None);
+    }
+
+    #[test]
+    fn test_decide_merge_mode_no_merge_always_none() {
+        // merge=false なら何があっても merge しない (lazy_doc 設定にも従わない)
+        assert_eq!(decide_merge_mode(false, false, false), None);
+        assert_eq!(decide_merge_mode(false, false, true), None);
+        assert_eq!(decide_merge_mode(false, true, false), None);
+        assert_eq!(decide_merge_mode(false, true, true), None);
     }
 
     #[test]

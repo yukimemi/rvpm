@@ -80,6 +80,11 @@ concurrency = 16
 # (default true). Lazy plugins are not on runtimepath, so rvpm enumerates the
 # target doc/ directories itself and runs :helptags <path> for each.
 # auto_helptags = false
+# Also link the doc/ files of lazy plugins into merged/doc/ so that
+# `:help <topic>` can find their tags before the plugin loads (default false).
+# Only the doc/ subdirectory is linked — lua/ and plugin/ stay out of merged/,
+# so lazy semantics are preserved. Tag-name conflicts are first-wins.
+# merge_lazy_doc = true
 # URL form written by `rvpm add`: "short" (owner/repo, default) or
 # "full" (https://github.com/owner/repo). Duplicate detection normalizes both forms before comparing.
 # url_style = "full"
