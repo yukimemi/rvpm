@@ -9,7 +9,7 @@ rationale.
 rvpm performs **full control over plugin loading** + **merge optimization** +
 **pre-glob at generate time**. Structure of loader.lua:
 
-```
+```text
 Pre-pass:  eager→lazy dependency promotion    ← if an eager plugin depends on a lazy one,
                                                promote that dep to eager and warn on stderr
 Phase 1:   vim.go.loadplugins = false          ← disable Neovim's auto-source

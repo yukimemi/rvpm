@@ -186,7 +186,7 @@ At generate time rvpm checks each file's existence and embeds `dofile(...)` in l
 
 `src/main.rs` is the entry point and command handler. Each command is implemented as a `run_*()` function and runs on the Tokio async runtime.
 
-```
+```text
 src/
   main.rs       — CLI definitions (clap), run_*() implementations for every command, helper functions
   config.rs     — TOML config parsing (with Tera template expansion), MapSpec type, sort_plugins
@@ -209,7 +209,7 @@ src/
 
 ### loader.lua phase outline
 
-```
+```text
 Pre-pass:  eager→lazy dependency promotion
 Phase 1:   vim.go.loadplugins = false
 Phase 2:   define load_lazy helper
