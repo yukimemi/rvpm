@@ -661,7 +661,10 @@ mod tests {
         let content = fs::read_to_string(merged.join("doc/foo.txt")).unwrap();
         assert_eq!(content, "from a");
         assert_eq!(r2.conflicts.len(), 1);
-        assert_eq!(r2.conflicts[0].relative, PathBuf::from("doc").join("foo.txt"));
+        assert_eq!(
+            r2.conflicts[0].relative,
+            PathBuf::from("doc").join("foo.txt")
+        );
     }
 
     #[test]
