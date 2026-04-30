@@ -74,6 +74,36 @@ pub fn merge_plugin(src: &Path, dst_root: &Path) -> Result<MergeResult> {
     Ok(result)
 }
 
+/// プラグインの `doc/` ディレクトリだけを merged にリンクする。`merge_plugin` の
+/// subset 版。
+///
+/// 用途: lazy プラグインは `merge_plugin` から外しているので
+/// `<plugin>/doc/` が runtimepath に乗らず、trigger 前は `:help <topic>` で
+/// 見つけられない。`doc/` だけを `merged/doc/` にリンクすれば、
+/// `merged/` は常に rtp に乗っているので `:help` が引けるようになる。
+/// `lua/` 等は引き続き merged に流れないので lazy 性は維持される。
+///
+/// 挙動:
+/// - `<src>/doc/` が無ければ何もせず空 `MergeResult` を返す。
+/// - 衝突 / 隠しファイル / `doc/tags` 系の skip ルールは `merge_plugin` と共通
+///   (内部で同じ `walk` を再利用)。
+pub fn merge_plugin_doc_only(src: &Path, dst_root: &Path) -> Result<MergeResult> {
+    let mut result = MergeResult::default();
+    let src_doc = src.join("doc");
+    if !src_doc.is_dir() {
+        return Ok(result);
+    }
+    if !dst_root.exists() {
+        std::fs::create_dir_all(dst_root)?;
+    }
+    let dst_doc = dst_root.join("doc");
+    if !dst_doc.exists() {
+        std::fs::create_dir_all(&dst_doc)?;
+    }
+    walk(src, &src_doc, dst_root, &mut result)?;
+    Ok(result)
+}
+
 fn walk(plugin_root: &Path, dir: &Path, dst_root: &Path, result: &mut MergeResult) -> Result<()> {
     let at_plugin_root = dir == plugin_root;
     for entry in std::fs::read_dir(dir)? {
@@ -571,6 +601,116 @@ mod tests {
             "unexpected content: {}",
             merged_content
         );
+    }
+
+    #[test]
+    fn test_doc_only_links_doc_files_only() {
+        // lazy プラグインに対して doc/ だけ merged に流す。lua/ や plugin/ は
+        // 流れない (lazy 性を保つため)。
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        let p = root.path().join("plug");
+        write(&p.join("doc/foo.txt"), "*foo*");
+        write(&p.join("doc/bar.txt"), "*bar*");
+        write(&p.join("lua/foo/init.lua"), "return {}");
+        write(&p.join("plugin/foo.vim"), "echo 'foo'");
+
+        let r = merge_plugin_doc_only(&p, &merged).unwrap();
+
+        // doc 配下は merged に来る
+        assert!(merged.join("doc/foo.txt").exists());
+        assert!(merged.join("doc/bar.txt").exists());
+        // lua / plugin は来ない (lazy 性維持)
+        assert!(!merged.join("lua").exists());
+        assert!(!merged.join("plugin").exists());
+        assert!(r.conflicts.is_empty());
+        assert_eq!(r.placed.len(), 2);
+    }
+
+    #[test]
+    fn test_doc_only_no_doc_dir_is_noop() {
+        // doc/ が無いプラグインに対しては何もしない (エラーにもならない)。
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        let p = root.path().join("plug");
+        write(&p.join("lua/foo/init.lua"), "return {}");
+
+        let r = merge_plugin_doc_only(&p, &merged).unwrap();
+
+        assert!(r.conflicts.is_empty());
+        assert!(r.placed.is_empty());
+        assert!(!merged.join("doc").exists());
+    }
+
+    #[test]
+    fn test_doc_only_first_wins_with_existing_merged() {
+        // 既に merged/doc/foo.txt が居る (merge=true な eager プラグインが配置済) ところに
+        // 別の lazy プラグインが doc only で来る → first-wins で skip + conflict 記録。
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        let a = root.path().join("plug_a");
+        let b = root.path().join("plug_b");
+        write(&a.join("doc/foo.txt"), "from a");
+        write(&b.join("doc/foo.txt"), "from b");
+
+        // 先に A を full-merge で配置
+        let _ = merge_plugin(&a, &merged).unwrap();
+        // B は doc-only で後から来る
+        let r2 = merge_plugin_doc_only(&b, &merged).unwrap();
+
+        let content = fs::read_to_string(merged.join("doc/foo.txt")).unwrap();
+        assert_eq!(content, "from a");
+        assert_eq!(r2.conflicts.len(), 1);
+        assert_eq!(r2.conflicts[0].relative, PathBuf::from("doc").join("foo.txt"));
+    }
+
+    #[test]
+    fn test_doc_only_skips_committed_doc_tags() {
+        // doc/tags は merge_plugin と同じく skip (後段の :helptags merged/doc が再生成する)。
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        let p = root.path().join("plug");
+        write(&p.join("doc/foo.txt"), "*foo*");
+        write(&p.join("doc/tags"), "stale-tags");
+
+        let r = merge_plugin_doc_only(&p, &merged).unwrap();
+
+        assert!(merged.join("doc/foo.txt").exists());
+        assert!(!merged.join("doc/tags").exists());
+        assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_doc_only_skips_dotfiles_in_doc() {
+        // doc/.gitignore のような dotfile は skip (merge_plugin と同じ)。
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        let p = root.path().join("plug");
+        write(&p.join("doc/foo.txt"), "*foo*");
+        write(&p.join("doc/.gitignore"), "tags");
+
+        let r = merge_plugin_doc_only(&p, &merged).unwrap();
+
+        assert!(merged.join("doc/foo.txt").exists());
+        assert!(!merged.join("doc/.gitignore").exists());
+        assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_doc_only_handles_nested_doc_subdirs() {
+        // 一部 plugin は doc/<lang>/<topic>.txt のように doc 配下にサブディレクトリを
+        // 持つ。再帰的にリンクされる。
+        let root = tempdir().unwrap();
+        let merged = root.path().join("merged");
+        let p = root.path().join("plug");
+        write(&p.join("doc/main.txt"), "*main*");
+        write(&p.join("doc/sub/extra.txt"), "*extra*");
+
+        let r = merge_plugin_doc_only(&p, &merged).unwrap();
+
+        assert!(merged.join("doc/main.txt").exists());
+        assert!(merged.join("doc/sub/extra.txt").exists());
+        assert!(r.conflicts.is_empty());
     }
 
     #[test]

@@ -1344,6 +1344,16 @@ async fn run_sync(
                 &plugin.display_name(),
                 &mut merge_ownership,
                 &mut merge_conflicts,
+                false,
+            );
+        } else if plugin.merge && plugin.lazy && config.options.merge_lazy_doc {
+            merge_and_record(
+                &dst_path,
+                &merged_dir,
+                &plugin.display_name(),
+                &mut merge_ownership,
+                &mut merge_conflicts,
+                true,
             );
         }
         plugin_scripts.push(build_plugin_scripts(plugin, &dst_path, &plugin_config_dir));
@@ -1403,7 +1413,10 @@ async fn run_sync(
                         });
                     }
                     // lazy プラグインは merge しない (trigger 前に merged/ 経由で
-                    // lua モジュールが rtp に漏れて lazy の意味がなくなるため)
+                    // lua モジュールが rtp に漏れて lazy の意味がなくなるため)。
+                    // ただし `options.merge_lazy_doc = true` のときは `doc/` のみ
+                    // 部分マージし、`:help <topic>` を引けるようにする (lua/ 等は
+                    // 引き続き merge しないので lazy 性は維持)。
                     if plugin.merge && !plugin.lazy {
                         merge_and_record(
                             &dst_path,
@@ -1411,6 +1424,16 @@ async fn run_sync(
                             &plugin.display_name(),
                             &mut merge_ownership,
                             &mut merge_conflicts,
+                            false,
+                        );
+                    } else if plugin.merge && plugin.lazy && config.options.merge_lazy_doc {
+                        merge_and_record(
+                            &dst_path,
+                            &merged_dir,
+                            &plugin.display_name(),
+                            &mut merge_ownership,
+                            &mut merge_conflicts,
+                            true,
                         );
                     }
                     let config_root = resolve_config_root(config.options.config_root.as_deref());
@@ -1447,6 +1470,7 @@ async fn run_sync(
                     &ps.name,
                     &mut merge_ownership,
                     &mut merge_conflicts,
+                    false,
                 );
             }
         }
@@ -1702,6 +1726,19 @@ async fn run_generate() -> Result<()> {
                     &ps.name,
                     &mut merge_ownership,
                     &mut merge_conflicts,
+                    false,
+                );
+            }
+        } else if ps.lazy && ps.merge && config.options.merge_lazy_doc {
+            let dst = PathBuf::from(&ps.path);
+            if dst.exists() {
+                merge_and_record(
+                    &dst,
+                    &merged_dir,
+                    &ps.name,
+                    &mut merge_ownership,
+                    &mut merge_conflicts,
+                    true,
                 );
             }
         }
@@ -4479,14 +4516,23 @@ fn resolve_merged_dir(cache_root: &Path) -> PathBuf {
 /// `ownership` は merged/ 上の relative path → 勝者 plugin 名の shared map。
 /// 各 plugin 処理前に呼び出し側で 1 つだけ作り、順次 merge_and_record に
 /// 渡すことで、後続 plugin の衝突時に勝者を lookup できる。
+///
+/// `doc_only = true` で呼ぶと `<src>/doc/` 配下のファイルだけを merged にリンク
+/// する (lazy plugin に対して `:help` を引けるようにするための部分マージ)。
 fn merge_and_record(
     src: &Path,
     dst_root: &Path,
     plugin_name: &str,
     ownership: &mut std::collections::HashMap<PathBuf, String>,
     conflicts: &mut Vec<crate::merge_conflicts::MergeConflictReport>,
+    doc_only: bool,
 ) {
-    match crate::link::merge_plugin(src, dst_root) {
+    let result = if doc_only {
+        crate::link::merge_plugin_doc_only(src, dst_root)
+    } else {
+        crate::link::merge_plugin(src, dst_root)
+    };
+    match result {
         Ok(result) => {
             // 今回新規配置したファイルを ownership に登録 (勝者 = この plugin)。
             for placed in result.placed {
