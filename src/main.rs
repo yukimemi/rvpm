@@ -586,12 +586,21 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
-/// cond + merge=true の組み合わせを検出し、silent に merge を無効化する。
-/// (cond が false のとき merged rtp に中身が残ると矛盾するため。警告は
-/// 出さない — 自明に整合させているだけで、ユーザーアクションは不要。)
+/// `cond` 指定時の整合性を取るプリパス (#119)。
+/// - `merge=true` を `false` に強制 (cond=false のとき merged rtp に中身が残る矛盾を防ぐ)
+/// - `merge_doc` は per-plugin が **明示指定なし (None)** のときだけ `Some(false)` 化する。
+///   ユーザーが per-plugin で `merge_doc = true` を明示した場合は cond でも尊重し、
+///   "Windows 限定 plugin だけど help は引きたい" ようなケースを許す。
+///   global `options.merge_doc = true` の sweep が cond plugin を巻き込むのを止めたい場合
+///   は per-plugin で `merge_doc = false` を明示 (こちらも `None` でない値なので尊重される)。
 fn disable_merge_if_cond(plugin: &mut crate::config::Plugin) {
-    if plugin.cond.is_some() && plugin.merge {
-        plugin.merge = false;
+    if plugin.cond.is_some() {
+        if plugin.merge {
+            plugin.merge = false;
+        }
+        if plugin.merge_doc.is_none() {
+            plugin.merge_doc = Some(false);
+        }
     }
 }
 
@@ -998,6 +1007,7 @@ async fn run_sync(
 
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
     let merged_dir = resolve_merged_dir(&cache_root);
+    let views_dir = resolve_views_dir(&cache_root);
 
     // lockfile: sync 前に load、各 plugin 処理時に効く rev を引き、sync 後の HEAD
     // で上書きして終端で save。`--no-lock` 時は load/save 両方スキップ。
@@ -1333,23 +1343,63 @@ async fn run_sync(
     // 後続 plugin の衝突時に勝者を lookup するのに使う。
     let mut merge_ownership: std::collections::HashMap<PathBuf, String> =
         std::collections::HashMap::new();
+    // 今回の sync で「期待される」view の集合。 sync 末尾の `prune_stale_views`
+    // でこの集合に居ない `views/<plug>/` を削除する (#119)。
+    //
+    // **重要**: sync タスクの成功ブロック内で populate するのではなく、 config 上の
+    // 全 plugin から事前計算する。 sync が失敗した (= 通信エラー等) plugin の
+    // view を誤削除しない (resilience: 既存 loader.lua はそこを参照しているので、
+    // 削除すると次回 Neovim 起動時に壊れる)。 Gemini Code Assist の指摘 (#120) を
+    // 反映。
+    let mut expected_views: std::collections::HashSet<PathBuf> = config
+        .plugins
+        .iter()
+        .filter_map(|plugin| {
+            let mode = decide_merge_mode(
+                plugin.merge,
+                plugin.lazy,
+                plugin.merge_doc,
+                config.options.merge_doc,
+            );
+            if matches!(
+                mode,
+                PluginMergeMode::ViewWithDoc | PluginMergeMode::ViewWithoutDoc
+            ) {
+                Some(resolve_plugin_view_dir(&views_dir, plugin))
+            } else {
+                None
+            }
+        })
+        .collect();
     let config_root = resolve_config_root(config.options.config_root.as_deref());
     for plugin in config.plugins.iter().filter(|p| p.dev) {
         let dst_path = resolve_plugin_dst(plugin, &cache_root);
         let plugin_config_dir = resolve_plugin_config_dir(&config_root, plugin);
-        if let Some(doc_only) =
-            decide_merge_mode(plugin.merge, plugin.lazy, config.options.merge_lazy_doc)
-        {
-            merge_and_record(
-                &dst_path,
-                &merged_dir,
-                &plugin.display_name(),
-                &mut merge_ownership,
-                &mut merge_conflicts,
-                doc_only,
-            );
-        }
-        plugin_scripts.push(build_plugin_scripts(plugin, &dst_path, &plugin_config_dir));
+        let view_dir = resolve_plugin_view_dir(&views_dir, plugin);
+        let mode = decide_merge_mode(
+            plugin.merge,
+            plugin.lazy,
+            plugin.merge_doc,
+            config.options.merge_doc,
+        );
+        // expected_views は config 全体から事前計算済 (上の collect)。 ここでは
+        // dispatch のみ行う。
+        dispatch_plugin_merge(
+            mode,
+            &dst_path,
+            &merged_dir,
+            &view_dir,
+            &plugin.display_name(),
+            &mut merge_ownership,
+            &mut merge_conflicts,
+        );
+        plugin_scripts.push(build_plugin_scripts(
+            plugin,
+            &dst_path,
+            &plugin_config_dir,
+            &view_dir,
+            mode,
+        ));
     }
 
     let mut build_warnings: Vec<(String, String)> = Vec::new();
@@ -1405,28 +1455,35 @@ async fn run_sync(
                             commit,
                         });
                     }
-                    // lazy プラグインは通常 merge しない (trigger 前に merged/ 経由で
-                    // lua モジュールが rtp に漏れて lazy の意味がなくなるため)。
-                    // ただし `options.merge_lazy_doc = true` のときは `doc/` のみ
-                    // 部分マージし、`:help <topic>` を引けるようにする (lua/ 等は
-                    // 引き続き merge しないので lazy 性は維持)。
-                    if let Some(doc_only) = decide_merge_mode(
+                    // 統一案 (#119): MergeMode に従って merged/ または views/<plug>/ に
+                    // tree を構築する。 Full → merged/ 全部、 ViewWithDoc → view 全部、
+                    // ViewWithoutDoc → view (doc 抜き) + merged/doc/ に doc 集約。
+                    let view_dir = resolve_plugin_view_dir(&views_dir, &plugin);
+                    let mode = decide_merge_mode(
                         plugin.merge,
                         plugin.lazy,
-                        config.options.merge_lazy_doc,
-                    ) {
-                        merge_and_record(
-                            &dst_path,
-                            &merged_dir,
-                            &plugin.display_name(),
-                            &mut merge_ownership,
-                            &mut merge_conflicts,
-                            doc_only,
-                        );
-                    }
+                        plugin.merge_doc,
+                        config.options.merge_doc,
+                    );
+                    // expected_views は run_sync 冒頭で config 全体から事前計算済。
+                    dispatch_plugin_merge(
+                        mode,
+                        &dst_path,
+                        &merged_dir,
+                        &view_dir,
+                        &plugin.display_name(),
+                        &mut merge_ownership,
+                        &mut merge_conflicts,
+                    );
                     let config_root = resolve_config_root(config.options.config_root.as_deref());
                     let plugin_config_dir = resolve_plugin_config_dir(&config_root, &plugin);
-                    let scripts = build_plugin_scripts(&plugin, &dst_path, &plugin_config_dir);
+                    let scripts = build_plugin_scripts(
+                        &plugin,
+                        &dst_path,
+                        &plugin_config_dir,
+                        &view_dir,
+                        mode,
+                    );
                     plugin_scripts.push(scripts);
                 }
             }
@@ -1449,20 +1506,44 @@ async fn run_sync(
     // eager に昇格されるプラグインは merged/ にリンクが必要。
     let promoted = crate::loader::promote_lazy_to_eager(&mut plugin_scripts);
     if !promoted.is_empty() {
-        for ps in &plugin_scripts {
+        for ps in &mut plugin_scripts {
             if promoted.contains(&ps.name) && ps.merge {
                 let dst = PathBuf::from(&ps.path);
-                merge_and_record(
+                // 昇格された plugin は eager + merge=true 扱い → Full merge。
+                // sync 一巡目で `views/<plug>/` (場合により merged/doc/ にも) に
+                // 配置済みの可能性あり。 自己 conflict は record_merge_result が
+                // フィルタするので false-positive にはならない。
+                //
+                // PluginScripts.view_path は build_plugin_scripts で正しく解決済の
+                // `views/<host>/<owner>/<repo>/`。 fragile な path 再構築を経由しない。
+                let view_dir = PathBuf::from(&ps.view_path);
+                dispatch_plugin_merge(
+                    PluginMergeMode::Full,
                     &dst,
                     &merged_dir,
+                    &view_dir,
                     &ps.name,
                     &mut merge_ownership,
                     &mut merge_conflicts,
-                    false,
                 );
+                // promoted 後は Full merge → views は不要。 sync 末尾の
+                // `prune_stale_views` で削除されるよう expected_views から除外
+                // (もう view を期待しない)。 ついでに ps.view_path も merged/ に
+                // 切り替える: load_lazy 側はもう呼ばれないが、 phase 6 の
+                // eager 経路で `vim.opt.rtp:append` が走らないこと (= merge=true
+                // なので skip される) を担保するため、 view_path は使われないが
+                // 念のため `merged_dir` に統一しておく。
+                expected_views.remove(&view_dir);
+                ps.view_path = merged_dir.to_string_lossy().replace('\\', "/");
             }
         }
     }
+
+    // 統一案 (#119): 期待されない views/<plug>/ を sweep。
+    // - config から削除された plugin の view
+    // - promote_lazy_to_eager で View → Full に切り替わった plugin の view
+    // 両方が一括で消える。
+    prune_stale_views(&views_dir, &expected_views);
 
     terminal.draw(|f| tui_state.draw(f, "syncing...", &icons))?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1650,7 +1731,15 @@ fn run_clean() -> Result<()> {
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
-    let config = parse_config(&toml_content)?;
+    let mut config = parse_config(&toml_content)?;
+    // sync / generate と同じ正規化パイプラインを通す: cond プリパスで
+    // `merge` / `merge_doc` の相互整合を取り、 後段で promote も適用する
+    // (CodeRabbit PR #120 指摘 — 正規化を飛ばすと cond plugin の生きた view を
+    // 誤削除したり、 promoted plugin の stale view が残ったりする)。
+    crate::config::sort_plugins(&mut config.plugins)?;
+    for plugin in config.plugins.iter_mut() {
+        disable_merge_if_cond(plugin);
+    }
 
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
     let repos_dir = resolve_repos_dir(&cache_root);
@@ -1670,6 +1759,53 @@ fn run_clean() -> Result<()> {
             repos_dir.display()
         );
     }
+
+    // views/ も同じ要領で sweep (#119)。 sync / generate と整合する expected を
+    // 計算するため、 PluginScripts に変換してから promote_lazy_to_eager を通す。
+    // 昇格された (元 lazy → eager + Full) plugin は view を持たないので expected から
+    // 自動的に除外される。
+    let views_dir = resolve_views_dir(&cache_root);
+    if views_dir.exists() {
+        let config_root = resolve_config_root(config.options.config_root.as_deref());
+        let mut plugin_scripts: Vec<crate::loader::PluginScripts> = config
+            .plugins
+            .iter()
+            .map(|plugin| {
+                let dst = resolve_plugin_dst(plugin, &cache_root);
+                let plugin_config_dir = resolve_plugin_config_dir(&config_root, plugin);
+                let view_dir = resolve_plugin_view_dir(&views_dir, plugin);
+                let mode = decide_merge_mode(
+                    plugin.merge,
+                    plugin.lazy,
+                    plugin.merge_doc,
+                    config.options.merge_doc,
+                );
+                build_plugin_scripts(plugin, &dst, &plugin_config_dir, &view_dir, mode)
+            })
+            .collect();
+        crate::loader::promote_lazy_to_eager(&mut plugin_scripts);
+
+        // 正規化後の plugin_scripts から expected を組み立てる。 promote 後は
+        // ps.merge=true && ps.lazy=false (= Full) になるので、 ここでの再判定で
+        // ViewWith* には倒れない (= 自然に view から外れる)。 generate と一致。
+        let expected: std::collections::HashSet<PathBuf> = plugin_scripts
+            .iter()
+            .filter_map(|ps| {
+                let mode =
+                    decide_merge_mode(ps.merge, ps.lazy, ps.merge_doc, config.options.merge_doc);
+                if matches!(
+                    mode,
+                    PluginMergeMode::ViewWithDoc | PluginMergeMode::ViewWithoutDoc
+                ) {
+                    Some(PathBuf::from(&ps.view_path))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        prune_stale_views(&views_dir, &expected);
+    }
+
     Ok(())
 }
 
@@ -1684,6 +1820,7 @@ async fn run_generate() -> Result<()> {
     }
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
     let merged_dir = resolve_merged_dir(&cache_root);
+    let views_dir = resolve_views_dir(&cache_root);
     let loader_path = resolve_loader_path(&cache_root);
 
     let mut plugin_scripts = Vec::new();
@@ -1691,34 +1828,52 @@ async fn run_generate() -> Result<()> {
     for plugin in &config.plugins {
         let dst_path = resolve_plugin_dst(plugin, &cache_root);
         let plugin_config_dir = resolve_plugin_config_dir(&config_root, plugin);
-        plugin_scripts.push(build_plugin_scripts(plugin, &dst_path, &plugin_config_dir));
+        let view_dir = resolve_plugin_view_dir(&views_dir, plugin);
+        let mode = decide_merge_mode(
+            plugin.merge,
+            plugin.lazy,
+            plugin.merge_doc,
+            config.options.merge_doc,
+        );
+        plugin_scripts.push(build_plugin_scripts(
+            plugin,
+            &dst_path,
+            &plugin_config_dir,
+            &view_dir,
+            mode,
+        ));
     }
 
-    // lazy → eager 昇格を適用。generate 単独実行時は merged/ が stale な可能性が
-    // あるため、全 eager + merge プラグインを再構築する。
+    // lazy → eager 昇格を適用。generate 単独実行時は merged/ や views/ が stale
+    // な可能性があるため、全 plugin の view tree を再構築する。
     crate::loader::promote_lazy_to_eager(&mut plugin_scripts);
     if merged_dir.exists() {
         let _ = std::fs::remove_dir_all(&merged_dir);
     }
     std::fs::create_dir_all(&merged_dir)?;
+    if views_dir.exists() {
+        let _ = std::fs::remove_dir_all(&views_dir);
+    }
+    std::fs::create_dir_all(&views_dir)?;
     let mut merge_conflicts: Vec<crate::merge_conflicts::MergeConflictReport> = Vec::new();
     let mut merge_ownership: std::collections::HashMap<PathBuf, String> =
         std::collections::HashMap::new();
     for ps in &plugin_scripts {
-        if let Some(doc_only) = decide_merge_mode(ps.merge, ps.lazy, config.options.merge_lazy_doc)
-        {
-            let dst = PathBuf::from(&ps.path);
-            if dst.exists() {
-                merge_and_record(
-                    &dst,
-                    &merged_dir,
-                    &ps.name,
-                    &mut merge_ownership,
-                    &mut merge_conflicts,
-                    doc_only,
-                );
-            }
+        let dst = PathBuf::from(&ps.path);
+        if !dst.exists() {
+            continue;
         }
+        let view_dir = PathBuf::from(&ps.view_path);
+        let mode = decide_merge_mode(ps.merge, ps.lazy, ps.merge_doc, config.options.merge_doc);
+        dispatch_plugin_merge(
+            mode,
+            &dst,
+            &merged_dir,
+            &view_dir,
+            &ps.name,
+            &mut merge_ownership,
+            &mut merge_conflicts,
+        );
     }
 
     println!("Generating loader.lua...");
@@ -1845,15 +2000,33 @@ async fn run_doctor() -> Result<i32> {
     // merged + lazy + non-merge eager だけが個別の `:helptags` 対象になる。
     // lazy → eager 昇格も考慮するため、build_plugin_scripts → promote まで通す。
     let config_root_for_scripts = resolve_config_root(config.options.config_root.as_deref());
+    let views_dir_for_scripts = resolve_views_dir(&cache_root);
     let mut plugin_scripts: Vec<crate::loader::PluginScripts> = Vec::new();
     for plugin in &config.plugins {
         let dst = resolve_plugin_dst(plugin, &cache_root);
         let plugin_config_dir = resolve_plugin_config_dir(&config_root_for_scripts, plugin);
-        plugin_scripts.push(build_plugin_scripts(plugin, &dst, &plugin_config_dir));
+        let view_dir = resolve_plugin_view_dir(&views_dir_for_scripts, plugin);
+        let mode = decide_merge_mode(
+            plugin.merge,
+            plugin.lazy,
+            plugin.merge_doc,
+            config.options.merge_doc,
+        );
+        plugin_scripts.push(build_plugin_scripts(
+            plugin,
+            &dst,
+            &plugin_config_dir,
+            &view_dir,
+            mode,
+        ));
     }
     crate::loader::promote_lazy_to_eager(&mut plugin_scripts);
     let helptag_targets = crate::helptags::collect_helptag_targets(&plugin_scripts, &merged_dir);
     // collect_helptag_targets と同じイテレーションでラベルを並べる (順序を揃える)。
+    // ラベルの判定根拠も collect_helptag_targets と一致させる: clone path 直下の
+    // `doc/` ではなく **`view_path` 配下の `doc/`** で判定する (#119, CodeRabbit
+    // PR #120)。 ViewWithoutDoc plugin は view に doc が無いので自動的に skip
+    // され、 target list と label list の長さも一致する。
     let mut helptag_target_labels: Vec<String> = Vec::with_capacity(helptag_targets.len());
     if merged_dir.join("doc").is_dir() {
         helptag_target_labels.push("merged".to_string());
@@ -1862,7 +2035,7 @@ async fn run_doctor() -> Result<i32> {
         if ps.merge && !ps.lazy {
             continue;
         }
-        if PathBuf::from(&ps.path).join("doc").is_dir() {
+        if PathBuf::from(&ps.view_path).join("doc").is_dir() {
             helptag_target_labels.push(ps.name.clone());
         }
     }
@@ -3710,6 +3883,77 @@ fn maybe_prune_unused_repos(
     }
 }
 
+/// `views/<host>/<owner>/<repo>/` 配下で、 期待されない (= 現 sync で
+/// `views/` 経由になっていない / config から消えた) plugin の view を削除する (#119)。
+///
+/// `expected_views`: 今回 sync / generate で実際に build_view した path の集合 (絶対 path)。
+///
+/// 集合に含まれない view subdirectory を削除する。 削除失敗は warn 出すだけで続行
+/// (resilience)。 promote_lazy_to_eager で View → Full に切り替わった plugin の
+/// stale view も自動的に消える。
+fn prune_stale_views(views_dir: &Path, expected_views: &std::collections::HashSet<PathBuf>) {
+    if !views_dir.exists() {
+        return;
+    }
+    // views/<host>/<owner>/<repo>/ の 3 階層 fixed depth を walk
+    // (canonical_path 形式に従う)。
+    let host_iter = match std::fs::read_dir(views_dir) {
+        Ok(it) => it,
+        Err(_) => return,
+    };
+    for host_entry in host_iter.flatten() {
+        let host_path = host_entry.path();
+        if !host_path.is_dir() {
+            continue;
+        }
+        let owner_iter = match std::fs::read_dir(&host_path) {
+            Ok(it) => it,
+            Err(_) => continue,
+        };
+        let mut host_empty = true;
+        for owner_entry in owner_iter.flatten() {
+            let owner_path = owner_entry.path();
+            if !owner_path.is_dir() {
+                continue;
+            }
+            let repo_iter = match std::fs::read_dir(&owner_path) {
+                Ok(it) => it,
+                Err(_) => continue,
+            };
+            let mut owner_empty = true;
+            for repo_entry in repo_iter.flatten() {
+                let repo_path = repo_entry.path();
+                if !repo_path.is_dir() {
+                    continue;
+                }
+                if expected_views.contains(&repo_path) {
+                    owner_empty = false;
+                    host_empty = false;
+                    continue;
+                }
+                if let Err(e) = std::fs::remove_dir_all(&repo_path) {
+                    eprintln!(
+                        "\u{26a0} failed to prune stale view {}: {}",
+                        repo_path.display(),
+                        e
+                    );
+                    owner_empty = false;
+                    host_empty = false;
+                }
+            }
+            // 空になった owner ディレクトリも削除 (best-effort)
+            if owner_empty {
+                let _ = std::fs::remove_dir(&owner_path);
+            } else {
+                host_empty = false;
+            }
+        }
+        if host_empty {
+            let _ = std::fs::remove_dir(&host_path);
+        }
+    }
+}
+
 /// 未使用 repo ディレクトリを削除する共通処理。`sync --prune` と `clean` 両方から呼ばれる。
 /// 削除失敗は eprintln で警告のみ出し、処理を続ける (resilience 原則)。
 fn prune_unused_repos(unused: &[PathBuf]) {
@@ -4486,59 +4730,98 @@ fn resolve_merged_dir(cache_root: &Path) -> PathBuf {
     cache_root.join("plugins").join("merged")
 }
 
-/// プラグインの merge モードを決定する純粋関数。
-/// 返り値:
-///   - `Some(false)` — full merge (eager + merge=true)
-///   - `Some(true)`  — doc-only merge (lazy + merge=true + merge_lazy_doc=true)
-///   - `None`        — merge しない (merge=false、または lazy だが merge_lazy_doc=false)
+/// per-plugin view ディレクトリのルート。`<cache_root>/plugins/views`。
+/// `merge=true && eager` 以外の全プラグインがここに自身の rtp tree を持つ (#119)。
+fn resolve_views_dir(cache_root: &Path) -> PathBuf {
+    cache_root.join("plugins").join("views")
+}
+
+/// 個別プラグインの view ディレクトリ。
+/// `<cache_root>/plugins/views/<host>/<owner>/<repo>/`。
+fn resolve_plugin_view_dir(views_dir: &Path, plugin: &crate::config::Plugin) -> PathBuf {
+    views_dir.join(plugin.canonical_path())
+}
+
+/// プラグインの merge モードを決定する純粋関数 (#119)。
 ///
-/// 3 箇所 (run_sync の dev 用 / 通常 task 用 / run_generate) で同じ判定を
-/// 行う必要があったので、Gemini Code Assist の指摘 (#116) を受けて関数化。
-fn decide_merge_mode(plugin_merge: bool, plugin_lazy: bool, merge_lazy_doc: bool) -> Option<bool> {
-    if !plugin_merge {
-        return None;
+/// 戻り値の 4 状態がそのまま「sync 時に何を作って rtp に何を載せるか」と
+/// 1:1 対応する:
+///
+/// | 戻り値                  | sync で配置する物                         | rtp に乗せる path                     |
+/// |-------------------------|-------------------------------------------|---------------------------------------|
+/// | `Full`                  | `merged/` 配下に全 rtp dir を集約         | `merged/` (Phase 5 で 1 度)            |
+/// | `ViewWithDoc`           | `views/<plug>/` (`doc/` 含む全 rtp dir)   | `views/<plug>/` (eager: 起動時 / lazy: trigger) |
+/// | `ViewWithoutDoc`        | `views/<plug>/` (`doc/` 除く) + `merged/doc/` への doc hard-link | 同上 (但し doc は merged/ 経由で常時) |
+/// | `None`                  | 何もしない                                | (リソースに該当しない)                |
+///
+/// 解決ルール:
+/// - `merge=true && eager` は無条件で `Full` (per-plugin/ global の `merge_doc` 設定は無視)
+/// - それ以外は `effective_merge_doc = pp_merge_doc.unwrap_or(global_merge_doc)`:
+///   - true なら `ViewWithoutDoc`
+///   - false なら `ViewWithDoc`
+/// - ただし `merge=false` で `effective_merge_doc=false` の組合せは `ViewWithDoc`
+///   (= clone と等価な doc 入り view) になる。挙動は今までの「clone path を rtp に append」
+///   と等価だが、 rtp は常に `views/` 経由で入るので mental model がシンプル化される。
+///
+/// `cond` プリパスは呼び出し側 (`disable_merge_if_cond`) で適用済みである前提。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum PluginMergeMode {
+    /// eager + merge=true: `merged/` に全部集約。
+    Full,
+    /// `views/<plug>/` を doc/ 込みで build、 rtp に view を載せる。
+    /// 旧来の clone path 直 rtp:append と等価な挙動だが view 経由に統一。
+    ViewWithDoc,
+    /// `views/<plug>/` を doc/ 抜きで build。 doc/ ファイルは別途
+    /// `merged/doc/` に hard-link で集約する (= 主目的)。
+    ViewWithoutDoc,
+}
+
+fn decide_merge_mode(
+    plugin_merge: bool,
+    plugin_lazy: bool,
+    plugin_merge_doc: Option<bool>,
+    merge_doc_default: bool,
+) -> PluginMergeMode {
+    if plugin_merge && !plugin_lazy {
+        return PluginMergeMode::Full;
     }
-    if !plugin_lazy {
-        Some(false)
-    } else if merge_lazy_doc {
-        Some(true)
+    let effective = plugin_merge_doc.unwrap_or(merge_doc_default);
+    if effective {
+        PluginMergeMode::ViewWithoutDoc
     } else {
-        None
+        PluginMergeMode::ViewWithDoc
     }
 }
 
-/// link.rs::merge_plugin を呼び出して、発生した衝突を勝者 (先に同じ path を
-/// 置いた plugin) とセットで `conflicts` に積む。merge 自体が失敗した場合は
-/// stderr に warn を流すがエラーにはしない (resilience)。
+/// `crate::link` の各 merge ヘルパを呼び、衝突を勝者 (先に同じ path を置いた plugin)
+/// とセットで `conflicts` に積む共通処理。 merge 自体が失敗した場合は stderr に
+/// warn を流すがエラーにはしない (resilience)。
 ///
-/// `ownership` は merged/ 上の relative path → 勝者 plugin 名の shared map。
-/// 各 plugin 処理前に呼び出し側で 1 つだけ作り、順次 merge_and_record に
-/// 渡すことで、後続 plugin の衝突時に勝者を lookup できる。
-///
-/// `doc_only = true` で呼ぶと `<src>/doc/` 配下のファイルだけを merged にリンク
-/// する (lazy plugin に対して `:help` を引けるようにするための部分マージ)。
-fn merge_and_record(
-    src: &Path,
-    dst_root: &Path,
+/// `ownership` は merged/ (もしくは views/<plug>/) 上の relative path → 勝者
+/// plugin 名の shared map。 ただし views は per-plugin に独立なので衝突は通常
+/// 発生しない (全 view に固有 dst を渡す)。 merged/ 用は呼び出し側で同じ map を
+/// 使い回して、 後続 plugin の衝突時に勝者を lookup する。
+fn record_merge_result(
     plugin_name: &str,
+    result: anyhow::Result<crate::link::MergeResult>,
     ownership: &mut std::collections::HashMap<PathBuf, String>,
     conflicts: &mut Vec<crate::merge_conflicts::MergeConflictReport>,
-    doc_only: bool,
 ) {
-    let result = if doc_only {
-        crate::link::merge_plugin_doc_only(src, dst_root)
-    } else {
-        crate::link::merge_plugin(src, dst_root)
-    };
     match result {
-        Ok(result) => {
-            // 今回新規配置したファイルを ownership に登録 (勝者 = この plugin)。
-            for placed in result.placed {
+        Ok(r) => {
+            for placed in r.placed {
                 ownership.insert(placed, plugin_name.to_string());
             }
-            // 衝突の勝者を ownership から lookup。
-            for c in result.conflicts {
+            for c in r.conflicts {
                 let winner = ownership.get(&c.relative).cloned();
+                // 自己 conflict (winner == loser) は記録しない:
+                // ViewWithoutDoc で既に merged/doc/ に doc を配置した plugin が
+                // promote_lazy_to_eager で eager に昇格して Full merge を再実行する
+                // ようなケース。 同じ plugin が再度同じファイルを置こうとして
+                // first-wins skip するだけなので、 ユーザーには false-positive。
+                if winner.as_deref() == Some(plugin_name) {
+                    continue;
+                }
                 let rel = c.relative.to_string_lossy().replace('\\', "/");
                 conflicts.push(crate::merge_conflicts::MergeConflictReport {
                     loser: plugin_name.to_string(),
@@ -4549,6 +4832,55 @@ fn merge_and_record(
         }
         Err(e) => {
             eprintln!("\u{26a0} merge failed for {}: {}", plugin_name, e);
+        }
+    }
+}
+
+/// `PluginMergeMode` に従って sync 時のリンク tree を作る (#119 統一案)。
+///
+/// - `Full` → `merged/` に全 rtp dir を集約
+/// - `ViewWithDoc` → `views/<plug>/` に全 rtp dir (doc/ 込み) を集約。 merged/ には何も置かない。
+/// - `ViewWithoutDoc` → `views/<plug>/` に全 rtp dir (doc/ 抜き) を集約 +
+///   `merged/doc/` に doc/ を集約。
+///
+/// 既存ファイルは別 view への上書きの心配が無い (view dir は per-plugin に新規) ので
+/// view 側の衝突は通常発生しない。 merged/ 側だけが ownership 共有の対象。
+fn dispatch_plugin_merge(
+    mode: PluginMergeMode,
+    src: &Path,
+    merged_dir: &Path,
+    view_dir: &Path,
+    plugin_name: &str,
+    ownership: &mut std::collections::HashMap<PathBuf, String>,
+    conflicts: &mut Vec<crate::merge_conflicts::MergeConflictReport>,
+) {
+    // View 系の rebuild では既存 view_dir を削除してから link し直す:
+    // `merge_plugin*` は first-wins + hard-link only なので、 残骸が残ったままだと
+    // (a) upstream で削除されたファイルが view にゴミとして残る、
+    // (b) 旧 mode で置かれた `doc/` が ViewWithoutDoc に切り替わっても残ってしまい
+    //     rtp に再度 doc が漏れる、 という汚染が起きる。 CodeRabbit PR #120 指摘。
+    // Full は merged/ に向くので個別 view 削除は不要 (run_generate 側で全消し済か、
+    // それ以外の plugin との衝突報告に乗る)。
+    match mode {
+        PluginMergeMode::Full => {
+            let r = crate::link::merge_plugin(src, merged_dir);
+            record_merge_result(plugin_name, r, ownership, conflicts);
+        }
+        PluginMergeMode::ViewWithDoc => {
+            // view 側は per-plugin 専用 dir なので、 別 plugin との衝突は発生しない。
+            // ownership / conflicts は便宜上同じ map を渡すが、 通常空のまま戻る。
+            let _ = std::fs::remove_dir_all(view_dir);
+            let r = crate::link::merge_plugin(src, view_dir);
+            record_merge_result(plugin_name, r, ownership, conflicts);
+        }
+        PluginMergeMode::ViewWithoutDoc => {
+            let _ = std::fs::remove_dir_all(view_dir);
+            // 1) view (doc 抜き) を per-plugin に
+            let r = crate::link::merge_plugin_no_doc(src, view_dir);
+            record_merge_result(plugin_name, r, ownership, conflicts);
+            // 2) doc/ だけ merged/ に集約 (これが merge_doc=true の本命)
+            let r = crate::link::merge_plugin_doc_only(src, merged_dir);
+            record_merge_result(plugin_name, r, ownership, conflicts);
         }
     }
 }
@@ -4977,19 +5309,32 @@ fn collect_source_files(plugin_path: &Path, subdir: &str) -> Vec<String> {
 
 /// Plugin の実ディスク情報から PluginScripts を構築するヘルパー。
 /// run_sync / run_generate で重複していたロジックを集約。
+///
+/// `view_path` は `views/<host>/<owner>/<repo>/` (#119)。 Full merge 対象 (eager+merge=true)
+/// では loader 側で `merged/` を rtp:append するのでこの値は使われないが、 後段で
+/// MergeMode を見て分岐するためにレコードに保持しておく。
 fn build_plugin_scripts(
     plugin: &crate::config::Plugin,
     plugin_path: &Path,
     plugin_config_dir: &Path,
+    view_path: &Path,
+    mode: PluginMergeMode,
 ) -> crate::loader::PluginScripts {
     // on_cmd / on_map / on_event の /regex/ 展開用に 1 回だけ静的スキャン (#85, #88)。
     // 対象は plugin/, ftplugin/, after/plugin/, lua/ 配下の .vim / .lua のみで、
     // load 経路に影響しないので dead plugin でもコストは小さい。
     let scan = crate::plugin_scan::scan_plugin(plugin_path);
+    let uses_merged = matches!(
+        mode,
+        PluginMergeMode::Full | PluginMergeMode::ViewWithoutDoc
+    );
     crate::loader::PluginScripts {
         name: plugin.display_name(),
         path: plugin_path.to_string_lossy().replace('\\', "/"),
+        view_path: view_path.to_string_lossy().replace('\\', "/"),
         merge: plugin.merge,
+        merge_doc: plugin.merge_doc,
+        uses_merged,
         init: find_lua(plugin_config_dir, "init.lua"),
         before: find_lua(plugin_config_dir, "before.lua"),
         after: find_lua(plugin_config_dir, "after.lua"),
@@ -5427,11 +5772,25 @@ async fn run_profile(
         let tmp_path = tmp.path().to_path_buf();
 
         let config_root = resolve_config_root(config.options.config_root.as_deref());
+        let views_dir = resolve_views_dir(&cache_root);
         let mut plugin_scripts = Vec::new();
         for plugin in &config.plugins {
             let dst_path = resolve_plugin_dst(plugin, &cache_root);
             let plugin_config_dir = resolve_plugin_config_dir(&config_root, plugin);
-            plugin_scripts.push(build_plugin_scripts(plugin, &dst_path, &plugin_config_dir));
+            let view_dir = resolve_plugin_view_dir(&views_dir, plugin);
+            let mode = decide_merge_mode(
+                plugin.merge,
+                plugin.lazy,
+                plugin.merge_doc,
+                config.options.merge_doc,
+            );
+            plugin_scripts.push(build_plugin_scripts(
+                plugin,
+                &dst_path,
+                &plugin_config_dir,
+                &view_dir,
+                mode,
+            ));
         }
         crate::loader::promote_lazy_to_eager(&mut plugin_scripts);
 
@@ -7349,32 +7708,134 @@ url = "owner/repo"
         assert_eq!(result, 13);
     }
 
-    #[test]
-    fn test_decide_merge_mode_eager_merge_returns_full_merge() {
-        // eager + merge=true → full merge (lazy_doc 設定の影響を受けない)
-        assert_eq!(decide_merge_mode(true, false, false), Some(false));
-        assert_eq!(decide_merge_mode(true, false, true), Some(false));
+    fn mk_test_plugin() -> crate::config::Plugin {
+        // toml::from_str で必須 default を埋めた素の Plugin を作る (テスト用)
+        toml::from_str::<crate::config::Plugin>(r#"url = "owner/repo""#).unwrap()
     }
 
     #[test]
-    fn test_decide_merge_mode_lazy_with_doc_merge_returns_doc_only() {
-        // lazy + merge=true + merge_lazy_doc=true → doc only
-        assert_eq!(decide_merge_mode(true, true, true), Some(true));
+    fn test_disable_merge_if_cond_no_cond_passthrough() {
+        let mut p = mk_test_plugin();
+        p.merge = true;
+        p.merge_doc = Some(true);
+        disable_merge_if_cond(&mut p);
+        assert!(p.merge);
+        assert_eq!(p.merge_doc, Some(true));
     }
 
     #[test]
-    fn test_decide_merge_mode_lazy_without_doc_merge_returns_none() {
-        // lazy + merge=true + merge_lazy_doc=false → no merge (現状の挙動)
-        assert_eq!(decide_merge_mode(true, true, false), None);
+    fn test_disable_merge_if_cond_forces_merge_false() {
+        let mut p = mk_test_plugin();
+        p.cond = Some("vim.fn.has('win32') == 1".to_string());
+        p.merge = true;
+        disable_merge_if_cond(&mut p);
+        assert!(!p.merge);
     }
 
     #[test]
-    fn test_decide_merge_mode_no_merge_always_none() {
-        // merge=false なら何があっても merge しない (lazy_doc 設定にも従わない)
-        assert_eq!(decide_merge_mode(false, false, false), None);
-        assert_eq!(decide_merge_mode(false, false, true), None);
-        assert_eq!(decide_merge_mode(false, true, false), None);
-        assert_eq!(decide_merge_mode(false, true, true), None);
+    fn test_disable_merge_if_cond_explicit_per_plugin_merge_doc_survives() {
+        // per-plugin Some(true) は cond でも尊重 (Windows 限定 plugin の help を
+        // クロスプラットフォームで引きたいケース)
+        let mut p = mk_test_plugin();
+        p.cond = Some("vim.fn.has('win32') == 1".to_string());
+        p.merge_doc = Some(true);
+        disable_merge_if_cond(&mut p);
+        assert_eq!(p.merge_doc, Some(true));
+    }
+
+    #[test]
+    fn test_disable_merge_if_cond_unset_merge_doc_forced_false() {
+        // per-plugin 未指定 (None) は global default を継ぐので、
+        // cond が立っているなら sweep を防ぐため Some(false) に固定する。
+        let mut p = mk_test_plugin();
+        p.cond = Some("vim.fn.has('win32') == 1".to_string());
+        p.merge_doc = None;
+        disable_merge_if_cond(&mut p);
+        assert_eq!(p.merge_doc, Some(false));
+    }
+
+    #[test]
+    fn test_disable_merge_if_cond_explicit_false_unchanged() {
+        let mut p = mk_test_plugin();
+        p.cond = Some("false".to_string());
+        p.merge_doc = Some(false);
+        disable_merge_if_cond(&mut p);
+        assert_eq!(p.merge_doc, Some(false));
+    }
+
+    #[test]
+    fn test_decide_merge_mode_eager_merge_is_full() {
+        // eager + merge=true → 常に Full (per-plugin / global の merge_doc は影響しない)
+        assert_eq!(
+            decide_merge_mode(true, false, None, false),
+            PluginMergeMode::Full
+        );
+        assert_eq!(
+            decide_merge_mode(true, false, None, true),
+            PluginMergeMode::Full
+        );
+        assert_eq!(
+            decide_merge_mode(true, false, Some(false), true),
+            PluginMergeMode::Full
+        );
+        assert_eq!(
+            decide_merge_mode(true, false, Some(true), false),
+            PluginMergeMode::Full
+        );
+    }
+
+    #[test]
+    fn test_decide_merge_mode_global_default_lazy() {
+        // lazy + merge=true + per-plugin None → global で決まる
+        assert_eq!(
+            decide_merge_mode(true, true, None, false),
+            PluginMergeMode::ViewWithDoc
+        );
+        assert_eq!(
+            decide_merge_mode(true, true, None, true),
+            PluginMergeMode::ViewWithoutDoc
+        );
+    }
+
+    #[test]
+    fn test_decide_merge_mode_per_plugin_override_wins() {
+        // per-plugin Some(true) は global=false でも勝つ
+        assert_eq!(
+            decide_merge_mode(true, true, Some(true), false),
+            PluginMergeMode::ViewWithoutDoc
+        );
+        // per-plugin Some(false) は global=true でも勝つ
+        assert_eq!(
+            decide_merge_mode(true, true, Some(false), true),
+            PluginMergeMode::ViewWithDoc
+        );
+    }
+
+    #[test]
+    fn test_decide_merge_mode_eager_non_merge_uses_view() {
+        // eager + merge=false: view 経由で扱う (clone path 直 rtp:append しない統一案)
+        assert_eq!(
+            decide_merge_mode(false, false, None, false),
+            PluginMergeMode::ViewWithDoc
+        );
+        // merge_doc=true なら eager + merge=false でも doc を merged/ に集約
+        assert_eq!(
+            decide_merge_mode(false, false, Some(true), false),
+            PluginMergeMode::ViewWithoutDoc
+        );
+    }
+
+    #[test]
+    fn test_decide_merge_mode_lazy_non_merge_uses_view() {
+        // lazy + merge=false: view 経由で扱う
+        assert_eq!(
+            decide_merge_mode(false, true, None, false),
+            PluginMergeMode::ViewWithDoc
+        );
+        assert_eq!(
+            decide_merge_mode(false, true, Some(true), false),
+            PluginMergeMode::ViewWithoutDoc
+        );
     }
 
     #[test]

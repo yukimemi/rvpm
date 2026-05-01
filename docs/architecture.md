@@ -194,16 +194,56 @@ let _permit = sem.acquire_owned().await.unwrap();
 
 The write side (`set_plugin_list_field`) writes back as a string for one element and as an array for multiple (the minimal representation).
 
-## Merge strategy (`src/link.rs`)
+## Merge strategy (`src/link.rs` + `src/main.rs::decide_merge_mode`)
 
-`merge_plugin()` links into the merged directory **at file granularity**. Design highlights:
+rvpm builds **at most two** rtp source directories (#119):
 
-- **Files are hard-linked** (no admin rights required on Windows; stable on Unix). Same volume is required, but since repos / merged are both under `<cache_root>` this is fine. If hard-link fails (e.g. cross-volume), fall back to `std::fs::copy`. Junctions are directory-only and cannot be used for files. Symbolic links require admin rights on Windows and are therefore not used.
+- `<cache_root>/plugins/merged/` — single shared rtp entry for Full-merged plugins (and the doc tag store).
+- `<cache_root>/plugins/views/<host>/<owner>/<repo>/` — per-plugin rtp view; doc-stripped or doc-included depending on `merge_doc`.
+
+The plugin clone at `<cache_root>/plugins/repos/<host>/<owner>/<repo>/` is **never** on rtp. Anything that needs to be reachable at runtime is hard-linked into one of the two locations above.
+
+### `PluginMergeMode` (per plugin)
+
+`decide_merge_mode(plugin.merge, plugin.lazy, plugin.merge_doc, options.merge_doc)` returns one of:
+
+| Result            | Sync output                                                                 | rtp at runtime                                                  |
+|-------------------|-----------------------------------------------------------------------------|-----------------------------------------------------------------|
+| `Full`            | `merged/` aggregates every rtp dir of the plugin                            | `merged/` (appended once at startup)                            |
+| `ViewWithDoc`     | `views/<plug>/` aggregates every rtp dir **including `doc/`**               | `views/<plug>/` (eager: startup; lazy: at trigger via load_lazy)|
+| `ViewWithoutDoc`  | `views/<plug>/` aggregates every rtp dir **except `doc/`**, plus `merged/doc/` collects the plugin's `doc/` files | `views/<plug>/` (no doc) + `merged/` (provides the doc tag store) |
+
+Resolution rule:
+
+- `merge=true && eager` → `Full` (per-plugin / global `merge_doc` is ignored — full merge already covers `doc/`).
+- otherwise → `effective_merge_doc = plugin.merge_doc.unwrap_or(options.merge_doc)`:
+  - `true`  → `ViewWithoutDoc`
+  - `false` → `ViewWithDoc`
+
+`disable_merge_if_cond` runs first as a pre-pass: when `cond` is set, `merge=true` is forced to `false`, and `merge_doc=None` is forced to `Some(false)` (explicit `Some(true)` survives — that's the "Windows-only plugin but help findable cross-platform" use case).
+
+### File-level link mechanics
+
+`merge_plugin()` (and `merge_plugin_no_doc()` for the doc-stripped view, `merge_plugin_doc_only()` for the doc-only aggregation into `merged/doc/`) link into the destination directory **at file granularity**. Design highlights:
+
+- **Files are hard-linked** (no admin rights required on Windows; stable on Unix). Same volume is required, but since repos / merged / views are all under `<cache_root>` this is fine. If hard-link fails (e.g. cross-volume), fall back to `std::fs::copy`. Junctions are directory-only and cannot be used for files. Symbolic links require admin rights on Windows and are therefore not used.
 - **Directories are just created** (`create_dir_all`). The directory itself is a real directory; its contents are recursively linked file by file. The previous junction-per-directory scheme would, when multiple plugins place files under the same hierarchy (e.g. several cmp plugins sharing `lua/cmp/`), cause last-writer-wins overwrites and clobber earlier contents.
-- **First-wins + conflict summary** — on conflict, the new file is skipped and a `MergeConflict { relative }` is collected. `MergeResult.placed` returns the list of files newly placed in this run, and main.rs maintains a `HashMap<PathBuf, String>` to **look up the winner plugin name** (loser-only would not tell you "which plugin did it collide with?"). At the end of `run_sync` / `run_generate`, `print_merge_conflicts` groups results by plugin, displays each line on stderr with `(kept: <winner>)` appended, and overwrites `<cache_root>/merge_conflicts.json` each time. `rvpm doctor` reads the latter and surfaces it as a warning.
+- **First-wins + conflict summary** — on conflict, the new file is skipped and a `MergeConflict { relative }` is collected. `MergeResult.placed` returns the list of files newly placed in this run, and main.rs maintains a `HashMap<PathBuf, String>` to **look up the winner plugin name** (loser-only would not tell you "which plugin did it collide with?"). Self-conflicts (winner == loser, e.g. when a plugin promoted from `ViewWithoutDoc` to `Full` re-links its already-placed `doc/` files) are filtered out by `record_merge_result`. At the end of `run_sync` / `run_generate`, `print_merge_conflicts` groups results by plugin, displays each line on stderr with `(kept: <winner>)` appended, and overwrites `<cache_root>/merge_conflicts.json` each time. `rvpm doctor` reads the latter and surfaces it as a warning.
 - **Files at the plugin root are ignored** — README.md / LICENSE / Makefile / package.json / *.toml and other meta files have no place on the rtp; they would only become noise that collides across plugins.
 - **Directories at the plugin root are allow-listed to rtp conventions + denops** — `plugin/`, `lua/`, `doc/`, `ftplugin/`, `ftdetect/`, `syntax/`, `indent/`, `colors/`, `compiler/`, `autoload/`, `after/`, `queries/`, `parser/`, `rplugin/`, `spell/`, `keymap/`, `lang/`, `pack/`, `tutor/` (for `:Tutor`), and `denops/` (for denops.vim TypeScript plugins). `tests/` `scripts/` `examples/` `src/` etc. are unrelated to the rtp and are excluded.
 - **Skip dotfiles at every level** (`.gitignore`, `.luarc.json`, `.editorconfig`, `.gitkeep`, etc.) — they are unrelated to Neovim startup, and at deep levels (e.g. `doc/.gitignore`) would just collide across plugins and add conflict-warning noise.
+
+### View cleanup
+
+`prune_stale_views()` walks `views/` after each `sync` and removes any
+`<host>/<owner>/<repo>/` directory whose plugin no longer expects a view
+(removed from config, or promoted from `View*` to `Full` by
+`promote_lazy_to_eager`). `run_clean` re-derives the expected set from
+config alone and applies the same sweep.
+
+### Profile `--no-merge` (`force_unmerge=true`)
+
+The loader's `force_unmerge` flag (set when `rvpm profile --no-merge` runs) skips the `merged/` rtp:append and emits an individual `vim.opt.rtp:append(plugin.path)` per plugin — using **clone path**, not view path. The merge state on disk is left untouched; only the emitted loader changes. This restores the pre-#119 baseline so the profiler can measure "no merge optimization" startup honestly. `:help` keeps working because the clone tree includes `doc/`.
 
 ## Windows support
 
@@ -225,6 +265,8 @@ Config / cache are **fixed at `~/.config/rvpm/` and `~/.cache/rvpm/` across all 
 | `resolve_cache_root(opt)` | `~/.cache/rvpm/<appname>` or tilde-expanded `opt` | `options.cache_root` |
 | `resolve_repos_dir(cache_root)` | `{cache_root}/plugins/repos` | — |
 | `resolve_merged_dir(cache_root)` | `{cache_root}/plugins/merged` | — |
+| `resolve_views_dir(cache_root)` | `{cache_root}/plugins/views` (per-plugin rtp views, #119) | — |
+| `resolve_plugin_view_dir(views_dir, plugin)` | `{views_dir}/<host>/<owner>/<repo>/` | — |
 | `resolve_loader_path(cache_root)` | `{cache_root}/plugins/loader.lua` | — |
 | `resolve_config_root(opt)` | `~/.config/rvpm/<appname>/plugins/` or `opt` | `options.config_root` |
 | `expand_tilde(s)` | General-purpose helper that expands `~` / `~/...` / `~\...` to home dir | — |
@@ -237,9 +279,10 @@ Do not write `.config/rvpm/...` or `.cache/rvpm/...` as string literals in code.
 - **config_root**: `options.config_root` (tilde-expanded) → `~/.config/rvpm/<appname>/plugins`
 - **repos**: always `{cache_root}/plugins/repos/<canonical>/` (per-plugin override is `plugin.dst`)
 - **merged**: always `{cache_root}/plugins/merged/`
+- **views**: always `{cache_root}/plugins/views/<canonical>/` (#119 — per-plugin rtp view)
 - **loader**: always `{cache_root}/plugins/loader.lua`
 
-In other words, setting just `options.cache_root` moves repos / merged / loader.lua together. `options.config_root` overrides only the per-plugin init/before/after.lua location, and defaults to `~/.config/rvpm/<appname>/plugins/` next to config.toml.
+In other words, setting just `options.cache_root` moves repos / merged / views / loader.lua together. `options.config_root` overrides only the per-plugin init/before/after.lua location, and defaults to `~/.config/rvpm/<appname>/plugins/` next to config.toml.
 
 ## Directory layout (default)
 
@@ -250,11 +293,12 @@ In other words, setting just `options.cache_root` moves repos / merged / loader.
 | `~/.config/rvpm/<appname>/after.lua` | Global after hook (phase 9, after all lazy triggers are registered; auto-applied if present) |
 | `~/.config/rvpm/<appname>/plugins/<host>/<owner>/<repo>/` | Per-plugin init/before/after.lua (override via `options.config_root`) |
 | `~/.config/rvpm/<appname>/rvpm.lock` | Lockfile of plugin commit pins (override via `options.config_root`). Commit it with your dotfiles to reproduce on other machines. |
-| `~/.cache/rvpm/<appname>/plugins/repos/<host>/<owner>/<repo>/` | Plugin clone destination |
-| `~/.cache/rvpm/<appname>/plugins/merged/` | Aggregated link target for merge=true plugins |
+| `~/.cache/rvpm/<appname>/plugins/repos/<host>/<owner>/<repo>/` | Plugin clone destination (never on rtp; #119) |
+| `~/.cache/rvpm/<appname>/plugins/merged/` | Full-merge target (eager + merge=true) and the doc tag store for `merge_doc=true` plugins |
+| `~/.cache/rvpm/<appname>/plugins/views/<host>/<owner>/<repo>/` | Per-plugin rtp view (#119). Doc-stripped or doc-included depending on effective `merge_doc` |
 | `~/.cache/rvpm/<appname>/plugins/loader.lua` | Generated Neovim loader |
-| `~/.cache/rvpm/<appname>/plugins/merged/doc/tags` | Aggregated tags for merge=true plugins (generated by `:helptags`) |
-| `~/.cache/rvpm/<appname>/plugins/repos/<host>/<owner>/<repo>/doc/tags` | Per-plugin tags for lazy / merge=false plugins |
+| `~/.cache/rvpm/<appname>/plugins/merged/doc/tags` | Aggregated help tags (`:helptags merged/doc` covers Full + DocOnly plugins in one pass) |
+| `~/.cache/rvpm/<appname>/plugins/views/<host>/<owner>/<repo>/doc/tags` | Per-plugin help tags for `ViewWithDoc` plugins (those that opted out of doc-merge) |
 | `~/.cache/rvpm/<appname>/update_log.json` | Change history of `sync` / `update` / `add` runs (read by `rvpm log`, max 20 runs) |
 | `~/.cache/rvpm/<appname>/merge_conflicts.json` | Snapshot of merge conflicts from the latest `sync` / `generate` (read by `rvpm doctor`). Not history — overwritten each run. |
 

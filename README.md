@@ -101,11 +101,12 @@ concurrency = 16
 # Default: true. Set to false to skip.
 # auto_helptags = false
 
-# For lazy plugins with `merge = true`, also link their doc/ files into
-# merged/doc/ so `:help <topic>` can find their tags before the plugin loads.
-# Default: false. Only doc/ is linked — lua/ and plugin/ stay out, so lazy
-# semantics survive. Filename conflicts inside doc/ are first-wins.
-# merge_lazy_doc = true
+# Aggregate every non-Full plugin's doc/ into merged/doc/ so `:help <topic>`
+# resolves their tags before the plugin loads. Default: false. The plugin's
+# rtp entry routes through views/<plug>/ (a doc-stripped, hard-link tree of
+# the clone) so :tselect shows no duplicate. Eager+merge=true (Full merge) is
+# unaffected. Per-plugin override: [[plugins]] merge_doc = true|false.
+# merge_doc = true
 
 # How `rvpm add` records GitHub plugin URLs in config.toml.
 # "short" (default) → owner/repo ; "full" → https://github.com/owner/repo
@@ -154,7 +155,7 @@ for fully isolated test configs.
 | `chezmoi` | `boolean` | `false` | Route writes through chezmoi source state. See [Advanced → chezmoi integration](#advanced) |
 | `auto_clean` | `boolean` | `false` | `sync` / `generate` auto-delete plugin dirs no longer in `config.toml` (= always `--prune`) |
 | `auto_helptags` | `boolean` | `true` | `sync` / `generate` run `nvim --headless` once at the end to build helptags for every plugin's `doc/`. Skipped with a warning if `nvim` is missing |
-| `merge_lazy_doc` | `boolean` | `false` | For lazy plugins with `merge = true`, also hard-link their `doc/` into `merged/doc/` so `:help <topic>` resolves their tags before the trigger fires. Only `doc/` is linked — `lua/` and `plugin/` stay out, so lazy semantics survive. Filename conflicts inside `doc/` are first-wins |
+| `merge_doc` | `boolean` | `false` | Aggregate every non-Full plugin's `doc/` into `merged/doc/` so `:help <topic>` resolves their tags before the plugin loads. The plugin's rtp entry routes through `views/<plug>/` (a doc-stripped hard-link tree of the clone) so `:tselect` shows no duplicate post-trigger. Eager + `merge = true` (Full merge) is unaffected. Per-plugin override: `[[plugins]] merge_doc = true` / `merge_doc = false`. Filename conflicts inside `doc/` are first-wins |
 | `url_style` | `"short"` \| `"full"` | `"short"` | How `rvpm add` writes GitHub plugin URLs. Duplicate detection normalizes between styles |
 | `fetch_interval` | duration string (`"6h"`, `"30m"`, `"45s"`, `"1d"`, `"0"`) | `"6h"` | Per-plugin fetch cache window. `sync` skips `git fetch` for plugins pulled within the last *fetch_interval*. Accepted units: `s` / `m` / `h` / `d`. Set to `"0"` to disable caching (pre-v3.19 behavior). Override per-run with `rvpm sync --refresh` / `--no-refresh` |
 | `auto_lazy` | `"ask"` \| `"always"` \| `"never"` | `"ask"` | How `rvpm add` (and `rvpm browse → Enter`) handles the post-clone scan that looks for `nvim_create_user_command` / keymaps in the plugin's `plugin/` + `ftplugin/` + `after/plugin/` + `lua/` dirs. `"ask"` (default) prompts interactively on TTY and skips silently on non-TTY. `"always"` accepts the suggestion unconditionally. `"never"` skips the scan entirely. Per-call override via `--auto-lazy` / `--no-lazy` on `rvpm add`. Accepted suggestions cluster commands by 3-char LCP (3+ char shared prefix becomes `/^Prefix/` regex so future commands in that family auto-load) and enumerate keymaps (maps don't LCP well). **Ignored when `ai != "off"`** — the AI handles the design end-to-end |
