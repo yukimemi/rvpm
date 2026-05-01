@@ -216,6 +216,37 @@ pub async fn write_routed(
     Ok(())
 }
 
+/// `write_routed` の対称操作 — chezmoi-aware にファイルを削除する (#115)。
+///
+/// - chezmoi 有効 + target が managed → `write_path` が source を返す
+///   (`dot_init.lua` 等のリネームを解決済) → そこを `remove_file`。 念のため
+///   target 側 (chezmoi apply で自動消えない場合のフォールバック) も同じく削除。
+/// - chezmoi 無効 / unmanaged → `write_path` が target をそのまま返す → 1 回の
+///   `remove_file` のみ。
+///
+/// **冪等**: 対象ファイルが存在しない場合は `Ok(())` を返す (NotFound を吸収)。
+/// AI が「omit = remove」シグナルを出した hook をユーザが Remove 選択した時、
+/// 既に他経路で消えていても warn にせず素直に通せるようにするため。
+pub async fn delete_routed(enabled: bool, target: &Path) -> std::io::Result<()> {
+    fn remove_ignore_missing(p: &Path) -> std::io::Result<()> {
+        match std::fs::remove_file(p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    let primary = write_path(enabled, target).await;
+    remove_ignore_missing(&primary)?;
+    // primary == target なら chezmoi 無効 / unmanaged なので 1 回で済む。
+    // primary != target (= source 側の resolved path) なら chezmoi apply は
+    // managed → unmanaged 遷移時に target を勝手に消さない仕様なので明示削除。
+    if primary != target {
+        remove_ignore_missing(target)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

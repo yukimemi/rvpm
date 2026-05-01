@@ -3198,7 +3198,7 @@ async fn run_add(
                     .await
                     {
                         Ok(outcome) => match outcome.outcome {
-                            crate::ai::ChatOutcome::Applied { written_hooks } => {
+                            crate::ai::ChatOutcome::Applied { hook_changes } => {
                                 // user が `[[plugins]]` セクションで "Keep existing" を選んだら
                                 // `plugin_entry_toml` は None — stub entry をそのまま残す。
                                 if let Some(entry_toml) = outcome.plugin_entry_toml {
@@ -3223,9 +3223,10 @@ async fn run_add(
                                         )
                                         .await?;
                                         println!(
-                                            "Applied AI-proposed config for {} ({} hook file(s) created/overwritten).",
+                                            "Applied AI-proposed config for {} ({} hook(s) written, {} removed).",
                                             plugin.display_name(),
-                                            written_hooks.len()
+                                            hook_changes.written.len(),
+                                            hook_changes.removed.len()
                                         );
                                     }
                                 } else {
@@ -4236,7 +4237,7 @@ async fn run_tune(
     .await
     {
         Ok(outcome) => match outcome.outcome {
-            crate::ai::ChatOutcome::Applied { written_hooks } => {
+            crate::ai::ChatOutcome::Applied { hook_changes } => {
                 // user が `[[plugins]]` セクションで "Keep existing entry" を選んだら
                 // `plugin_entry_toml` は None — config.toml は触らず、hook ファイル更新のみ。
                 if let Some(entry_toml) = outcome.plugin_entry_toml {
@@ -4259,16 +4260,18 @@ async fn run_tune(
                         chezmoi::write_routed(config.options.chezmoi, &config_path, &patched)
                             .await?;
                         println!(
-                            "Tuned {} ({} hook file(s) created/overwritten).",
+                            "Tuned {} ({} hook(s) written, {} removed).",
                             plugin.display_name(),
-                            written_hooks.len()
+                            hook_changes.written.len(),
+                            hook_changes.removed.len()
                         );
                     }
                 } else {
                     println!(
-                        "Kept existing entry for {} ({} hook file(s) created/overwritten).",
+                        "Kept existing entry for {} ({} hook(s) written, {} removed).",
                         plugin.display_name(),
-                        written_hooks.len()
+                        hook_changes.written.len(),
+                        hook_changes.removed.len()
                     );
                 }
             }

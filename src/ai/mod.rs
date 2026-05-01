@@ -576,15 +576,10 @@ pub enum HookChoice {
     /// 指定の body をファイルに書く (既存があれば上書き)。chat loop が `fresh` /
     /// `merged` どちらを選ぶかは事前に解決済みで、ここには本文だけが渡る。
     Write(String),
-}
-
-impl HookChoice {
-    pub fn body(&self) -> Option<&str> {
-        match self {
-            HookChoice::Keep => None,
-            HookChoice::Write(s) => Some(s.as_str()),
-        }
-    }
+    /// 既存ファイルがあれば削除する (#115)。 AI が tag を omit した
+    /// (= 「この hook はもう要らない」のシグナル) ケースを user が拾って
+    /// 採用した時に出る。 既存が無ければ no-op (冪等)。
+    Remove,
 }
 
 /// `write_hook_files` の引数。3 hook ファイル分の決定を持つ。
@@ -615,36 +610,75 @@ pub async fn write_hook_files(
     plugin_dir: &Path,
     decisions: &HookWriteDecisions,
     chezmoi_enabled: bool,
-) -> Result<Vec<PathBuf>> {
+) -> Result<HookWriteResult> {
     // 全 Keep なら作業ディレクトリの create も不要 (no-op)。
-    if matches!(decisions.init_lua, HookChoice::Keep)
-        && matches!(decisions.before_lua, HookChoice::Keep)
-        && matches!(decisions.after_lua, HookChoice::Keep)
-    {
-        return Ok(Vec::new());
+    let all_keep = [
+        &decisions.init_lua,
+        &decisions.before_lua,
+        &decisions.after_lua,
+    ]
+    .iter()
+    .all(|c| matches!(c, HookChoice::Keep));
+    if all_keep {
+        return Ok(HookWriteResult::default());
     }
 
-    std::fs::create_dir_all(plugin_dir).with_context(|| {
-        format!(
-            "failed to create plugin config dir {}",
-            plugin_dir.display()
-        )
-    })?;
+    // Write 選択がある場合のみディレクトリを作る (Remove のみだと plugin_dir 不要)。
+    let any_write = [
+        &decisions.init_lua,
+        &decisions.before_lua,
+        &decisions.after_lua,
+    ]
+    .iter()
+    .any(|c| matches!(c, HookChoice::Write(_)));
+    if any_write {
+        std::fs::create_dir_all(plugin_dir).with_context(|| {
+            format!(
+                "failed to create plugin config dir {}",
+                plugin_dir.display()
+            )
+        })?;
+    }
 
-    let mut written = Vec::new();
+    let mut result = HookWriteResult::default();
     for (name, choice) in [
         ("init.lua", &decisions.init_lua),
         ("before.lua", &decisions.before_lua),
         ("after.lua", &decisions.after_lua),
     ] {
-        let Some(body) = choice.body() else { continue };
         let target = plugin_dir.join(name);
-        crate::chezmoi::write_routed(chezmoi_enabled, &target, format!("{}\n", body.trim_end()))
-            .await
-            .with_context(|| format!("failed to write {}", target.display()))?;
-        written.push(target);
+        match choice {
+            HookChoice::Keep => {}
+            HookChoice::Write(body) => {
+                crate::chezmoi::write_routed(
+                    chezmoi_enabled,
+                    &target,
+                    format!("{}\n", body.trim_end()),
+                )
+                .await
+                .with_context(|| format!("failed to write {}", target.display()))?;
+                result.written.push(target);
+            }
+            HookChoice::Remove => {
+                crate::chezmoi::delete_routed(chezmoi_enabled, &target)
+                    .await
+                    .with_context(|| format!("failed to remove {}", target.display()))?;
+                result.removed.push(target);
+            }
+        }
     }
-    Ok(written)
+    Ok(result)
+}
+
+/// `write_hook_files` の戻り値 (#115)。
+/// 旧シグネチャの `Vec<PathBuf>` (= 書き込んだファイル) との互換性を残しつつ、
+/// 削除されたファイルを別フィールドに分けて呼び出し側がサマリ表示できるようにする。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookWriteResult {
+    /// 新規作成または上書きされたファイルパス。
+    pub written: Vec<PathBuf>,
+    /// 削除されたファイルパス (chezmoi-aware: source / target 両方を扱う、 #115)。
+    pub removed: Vec<PathBuf>,
 }
 
 #[cfg(test)]
@@ -997,10 +1031,11 @@ url = "c/d"
             before_lua: HookChoice::Keep,
             after_lua: HookChoice::Write("require('o').setup({})".to_string()),
         };
-        let written = write_hook_files(&plugin_dir, &decisions, false)
+        let result = write_hook_files(&plugin_dir, &decisions, false)
             .await
             .unwrap();
-        assert_eq!(written.len(), 2);
+        assert_eq!(result.written.len(), 2);
+        assert!(result.removed.is_empty());
         assert!(plugin_dir.join("init.lua").exists());
         assert!(!plugin_dir.join("before.lua").exists());
         assert!(plugin_dir.join("after.lua").exists());
@@ -1032,12 +1067,66 @@ url = "c/d"
         std::fs::create_dir_all(&plugin_dir).unwrap();
         std::fs::write(plugin_dir.join("after.lua"), "USER\n").unwrap();
         let decisions = HookWriteDecisions::default(); // all Keep
-        let written = write_hook_files(&plugin_dir, &decisions, false)
+        let result = write_hook_files(&plugin_dir, &decisions, false)
             .await
             .unwrap();
-        assert!(written.is_empty());
+        assert!(result.written.is_empty());
+        assert!(result.removed.is_empty());
         let body = std::fs::read_to_string(plugin_dir.join("after.lua")).unwrap();
         assert_eq!(body, "USER\n");
+    }
+
+    #[tokio::test]
+    async fn write_hook_files_remove_deletes_existing_file() {
+        // #115: HookChoice::Remove should delete the existing hook file.
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("p");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("after.lua"), "STALE\n").unwrap();
+        let decisions = HookWriteDecisions {
+            after_lua: HookChoice::Remove,
+            ..Default::default()
+        };
+        let result = write_hook_files(&plugin_dir, &decisions, false)
+            .await
+            .unwrap();
+        assert!(result.written.is_empty());
+        assert_eq!(result.removed.len(), 1);
+        assert!(!plugin_dir.join("after.lua").exists());
+    }
+
+    #[tokio::test]
+    async fn write_hook_files_remove_idempotent_when_file_absent() {
+        // Remove on a non-existent file is a no-op (no error).
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("p");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let decisions = HookWriteDecisions {
+            after_lua: HookChoice::Remove,
+            ..Default::default()
+        };
+        let result = write_hook_files(&plugin_dir, &decisions, false)
+            .await
+            .unwrap();
+        assert!(result.written.is_empty());
+        // removed list still records the path, but the file simply isn't there.
+        assert_eq!(result.removed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn write_hook_files_remove_alone_does_not_create_plugin_dir() {
+        // If only Remove is requested and plugin_dir doesn't exist, we shouldn't
+        // create it just to delete a file inside it (cleaner side-effects).
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("p"); // does not exist
+        let decisions = HookWriteDecisions {
+            after_lua: HookChoice::Remove,
+            ..Default::default()
+        };
+        write_hook_files(&plugin_dir, &decisions, false)
+            .await
+            .unwrap();
+        assert!(!plugin_dir.exists());
     }
 
     #[test]
