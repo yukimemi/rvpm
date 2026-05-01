@@ -218,13 +218,17 @@ pub async fn write_routed(
 
 /// `write_routed` の対称操作 — chezmoi-aware にファイルを削除する (#115)。
 ///
-/// - chezmoi 有効 + target が managed → `write_path` が source を返す
-///   (`dot_init.lua` 等のリネームを解決済) → そこを `remove_file`。 念のため
-///   target 側 (chezmoi apply で自動消えない場合のフォールバック) も同じく削除。
-/// - chezmoi 無効 / unmanaged → `write_path` が target をそのまま返す → 1 回の
-///   `remove_file` のみ。
+/// - chezmoi 無効 → target を 1 回 `remove_file` する。
+/// - chezmoi 有効 + target が **明確に** managed (`chezmoi source-path` 解決成功)
+///   → source と target を両方 `remove_file`。
+/// - chezmoi 有効 + 明確に **unmanaged** → target だけ `remove_file`。
+/// - chezmoi 有効 + 解決自体が失敗 (CLI 不在 / 2 秒 timeout) → **delete を中止して
+///   `Err` を返す**。 ここで silent に target だけ消すと、 source 側に hook が
+///   残ったまま次の `chezmoi apply` で復活し「Remove したのに戻ってくる」現象に
+///   なる (CodeRabbit PR #122 指摘)。 `write_routed` は同じ状況で target 直書きに
+///   フォールバックするが、 削除側は逆方向の整合性が壊れるので fail-fast にする。
 ///
-/// **冪等**: 対象ファイルが存在しない場合は `Ok(())` を返す (NotFound を吸収)。
+/// **冪等**: 対象ファイルが存在しない場合は `Ok(())` を返す (NotFound 吸収)。
 /// AI が「omit = remove」シグナルを出した hook をユーザが Remove 選択した時、
 /// 既に他経路で消えていても warn にせず素直に通せるようにするため。
 pub async fn delete_routed(enabled: bool, target: &Path) -> std::io::Result<()> {
@@ -236,15 +240,43 @@ pub async fn delete_routed(enabled: bool, target: &Path) -> std::io::Result<()> 
         }
     }
 
-    let primary = write_path(enabled, target).await;
-    remove_ignore_missing(&primary)?;
-    // primary == target なら chezmoi 無効 / unmanaged なので 1 回で済む。
-    // primary != target (= source 側の resolved path) なら chezmoi apply は
-    // managed → unmanaged 遷移時に target を勝手に消さない仕様なので明示削除。
-    if primary != target {
-        remove_ignore_missing(target)?;
+    if !enabled {
+        return remove_ignore_missing(target);
     }
-    Ok(())
+
+    // chezmoi 有効: 解決を 2 秒 budget でやる。 budget exhausted / CLI gone は
+    // unmanaged と区別できない結果なので fail-fast (上の doc コメント参照)。
+    let work = async {
+        if !is_chezmoi_available().await {
+            return Err("chezmoi binary not available on PATH");
+        }
+        Ok(resolve_source_path(target, |p| async move { chezmoi_source_path(&p).await }).await)
+    };
+    let source: Option<PathBuf> = match tokio::time::timeout(CHEZMOI_TIMEOUT, work).await {
+        Ok(Ok(opt)) => opt,
+        Ok(Err(reason)) => {
+            return Err(std::io::Error::other(format!(
+                "cannot determine chezmoi source for {}: {}; \
+                 refusing to delete to avoid leaving the source side stale \
+                 (next `chezmoi apply` would resurrect the file)",
+                target.display(),
+                reason,
+            )));
+        }
+        Err(_) => {
+            return Err(std::io::Error::other(format!(
+                "chezmoi resolution for {} timed out after {}s; \
+                 refusing to delete to avoid leaving the source side stale",
+                target.display(),
+                CHEZMOI_TIMEOUT.as_secs(),
+            )));
+        }
+    };
+
+    if let Some(src) = source.as_deref() {
+        remove_ignore_missing(src)?;
+    }
+    remove_ignore_missing(target)
 }
 
 #[cfg(test)]
