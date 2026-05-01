@@ -410,6 +410,30 @@ enum Commands {
         #[arg(long)]
         diff: bool,
     },
+
+    /// Print a shell completion script to stdout (#114)
+    ///
+    /// Pipe the output into the appropriate location for your shell.
+    /// Examples:
+    ///
+    ///   # bash (system-wide)
+    ///   rvpm completion bash | sudo tee /etc/bash_completion.d/rvpm
+    ///   # bash (user)
+    ///   rvpm completion bash > ~/.local/share/bash-completion/completions/rvpm
+    ///
+    ///   # zsh — put it on $fpath, then `compinit`
+    ///   rvpm completion zsh > ~/.zfunc/_rvpm
+    ///
+    ///   # fish
+    ///   rvpm completion fish > ~/.config/fish/completions/rvpm.fish
+    ///
+    ///   # PowerShell — append to your $PROFILE
+    ///   rvpm completion powershell >> $PROFILE
+    Completion {
+        /// Target shell (bash / zsh / fish / powershell / elvish)
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[tokio::main]
@@ -573,9 +597,25 @@ async fn main() -> Result<()> {
         } => {
             run_profile(runs, top, json, no_tui, no_merge, no_instrument).await?;
         }
+        Commands::Completion { shell } => {
+            run_completion(shell);
+        }
     }
 
     Ok(())
+}
+
+/// `rvpm completion <SHELL>` — clap_complete に CLI 定義を渡して
+/// stdout に補完スクリプトを書き出す (#114)。
+///
+/// 補完スクリプトの内容は CLI 定義 (Cli / Commands enum) から自動生成されるので、
+/// サブコマンドや flag を追加した時点で自動的に反映される。 `rvpm.nvim` 側の
+/// `lua/rvpm/command.lua` (Neovim 用 :Rvpm 補完) は別管理なので、 そちらは
+/// CLAUDE.md のチェックリスト通り手動で sync する必要がある。
+fn run_completion(shell: clap_complete::Shell) {
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    let bin = cmd.get_name().to_string();
+    clap_complete::generate(shell, &mut cmd, bin, &mut std::io::stdout());
 }
 
 use crate::tui::{PluginStatus, TuiState};
@@ -7761,6 +7801,34 @@ url = "owner/repo"
         p.merge_doc = Some(false);
         disable_merge_if_cond(&mut p);
         assert_eq!(p.merge_doc, Some(false));
+    }
+
+    #[test]
+    fn test_completion_generation_succeeds_for_all_shells() {
+        // `rvpm completion <SHELL>` が clap_complete に渡る CLI 定義を毎回 panic
+        // 無く読めることを確認 (#114)。 出力内容自体は clap_complete の責務なので
+        // 中身は assert しないが、 何かしら出力されることだけは確認する。
+        use clap::CommandFactory;
+        use clap_complete::Shell;
+
+        let shells = [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ];
+        for shell in shells {
+            let mut cmd = Cli::command();
+            let bin = cmd.get_name().to_string();
+            let mut out: Vec<u8> = Vec::new();
+            clap_complete::generate(shell, &mut cmd, bin, &mut out);
+            assert!(
+                !out.is_empty(),
+                "completion output for {:?} should not be empty",
+                shell
+            );
+        }
     }
 
     #[test]

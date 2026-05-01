@@ -269,7 +269,7 @@ File-level hard links (`std::fs::hard_link`) on NTFS — no admin rights, no jun
 
 ## CLI commands
 
-`rvpm sync / generate / clean / add / tune / update / remove / edit / set / config / init / list / browse / doctor / profile / log`. Full flag-by-flag reference and the contributor checklist for adding flags is in [`docs/cli.md`](docs/cli.md).
+`rvpm sync / generate / clean / add / tune / update / remove / edit / set / config / init / list / browse / doctor / profile / log / completion`. Full flag-by-flag reference and the contributor checklist for adding flags is in [`docs/cli.md`](docs/cli.md).
 
 ## First-run support
 

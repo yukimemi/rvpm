@@ -239,6 +239,37 @@ Everything below is folded by default — open only the topics relevant to
 what you're doing.
 
 <details>
+<summary><b>Shell completion (<code>rvpm completion &lt;SHELL&gt;</code>)</b></summary>
+
+Completion scripts are generated on the fly from the live CLI definition,
+so new subcommands and flags are picked up the moment you upgrade rvpm.
+Pipe the output into the right location for your shell:
+
+```sh
+# bash (user, no sudo)
+mkdir -p ~/.local/share/bash-completion/completions
+rvpm completion bash > ~/.local/share/bash-completion/completions/rvpm
+
+# zsh — put it on $fpath, then `compinit`
+mkdir -p ~/.zfunc
+rvpm completion zsh > ~/.zfunc/_rvpm
+# add `fpath=(~/.zfunc $fpath)` and `autoload -U compinit && compinit` to ~/.zshrc
+
+# fish
+rvpm completion fish > ~/.config/fish/completions/rvpm.fish
+
+# PowerShell — append to your $PROFILE
+rvpm completion powershell >> $PROFILE
+```
+
+Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
+
+The Neovim-side `:Rvpm` completion (used inside `rvpm.nvim`) is a
+separate, hand-maintained list and is not affected by this command.
+
+</details>
+
+<details>
 <summary><b>Plugin spec — all <code>[[plugins]]</code> fields</b></summary>
 
 | Key | Type | Default | Description |
