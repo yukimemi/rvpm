@@ -30,6 +30,15 @@ pub struct PluginScripts {
     /// `Plugin.merge_doc` (per-plugin override) のコピー (#119)。
     /// generate 単独実行 (sync を経由しない) の merge 判定に必要。
     pub merge_doc: Option<bool>,
+    /// この plugin の content が `merged/` に何か乗るか (#119, CodeRabbit PR #120)。
+    /// - `Full` (eager + merge=true)             → true (全 rtp dir が merged/ に)
+    /// - `ViewWithoutDoc` (effective merge_doc=true) → true (doc/ が merged/doc/ に)
+    /// - `ViewWithDoc`                           → false (merged/ には何も寄与しない)
+    ///
+    /// loader.rs phase 5 の「merged/ を rtp:append するか」判定に使う。
+    /// `merge=true` だけでは `merge=false && merge_doc=true` の case を取り逃すので
+    /// 別フィールドとして持つ。
+    pub uses_merged: bool,
     pub init: Option<String>,
     pub before: Option<String>,
     pub after: Option<String>,
@@ -77,6 +86,7 @@ impl PluginScripts {
             view_path: path.to_string(),
             merge: true,
             merge_doc: None,
+            uses_merged: true, // for_test の従来挙動 (merge=true → Full) と整合
             init: None,
             before: None,
             after: None,
@@ -614,11 +624,16 @@ end
     emit_marker(&mut lua, profile, "phase-5-begin");
 
     // ======================================================
-    // merged rtp append (merge=true プラグインがあれば 1 回)
+    // merged rtp append (merged/ に何か乗ってる plugin があれば 1 回)
     // `force_unmerge=true` 時は skip (各プラグインを個別に rtp:append する)。
+    //
+    // `s.merge` (= Full merge plugin) だけでなく、 `merge=false && merge_doc=true` の
+    // ViewWithoutDoc plugin (= doc/ だけ merged/ に集約してるケース) も merged/ を
+    // rtp に乗せる必要がある。 そうしないと doc/ が rtp 不在になり `:help` が引け
+    // なくなる。 PluginScripts.uses_merged が両ケースをカバー (CodeRabbit PR #120)。
     // ======================================================
     let force_unmerge = profile.map(|p| p.force_unmerge).unwrap_or(false);
-    if !force_unmerge && scripts.iter().any(|s| s.merge) {
+    if !force_unmerge && scripts.iter().any(|s| s.uses_merged) {
         let merged_path = merged_dir.to_string_lossy().replace('\\', "/");
         lua.push_str(&format!("vim.opt.rtp:append(\"{}\")\n\n", merged_path));
     }
@@ -2105,9 +2120,26 @@ mod tests {
     }
 
     #[test]
+    fn test_loader_merged_rtp_when_view_without_doc_only() {
+        // CodeRabbit PR #120 regression: merge=false + merge_doc=true (=
+        // ViewWithoutDoc) は doc/ を merged/doc/ に集約するので、 たとえ
+        // merge=true な plugin が 1 つも無くても merged/ を rtp に乗せる必要がある。
+        // 乗せ忘れると `:help` が引けなくなる。
+        let mut a = PluginScripts::for_test("a", "/path/a");
+        a.merge = false; // ViewWithoutDoc は merge=false でも来うる
+        a.uses_merged = true; // doc が merged/ に居る
+        let lua = gen_loader(Path::new("/merged"), &[a]);
+        assert!(
+            lua.contains("vim.opt.rtp:append(\"/merged\")"),
+            "merged/ must be on rtp when any plugin uses_merged (e.g. ViewWithoutDoc)"
+        );
+    }
+
+    #[test]
     fn test_loader_no_merged_rtp_when_all_non_merge() {
         let mut a = PluginScripts::for_test("a", "/path/a");
         a.merge = false;
+        a.uses_merged = false; // ViewWith* なので merged/ には何も寄与しない
         let lua = gen_loader(Path::new("/merged"), &[a]);
         assert!(
             !lua.contains("vim.opt.rtp:append(\"/merged\")"),
@@ -2119,6 +2151,7 @@ mod tests {
     fn test_loader_non_merge_eager_appends_own_rtp() {
         let mut a = PluginScripts::for_test("solo", "/path/solo");
         a.merge = false;
+        a.uses_merged = false;
         let lua = gen_loader(Path::new("/merged"), &[a]);
         assert!(
             lua.contains("vim.opt.rtp:append(\"/path/solo\")"),
@@ -2192,6 +2225,7 @@ mod tests {
         let mut a = PluginScripts::for_test("a", "/path/a");
         a.lazy = true;
         a.merge = false;
+        a.uses_merged = false;
         a.on_cmd = Some(vec!["Foo".to_string()]);
         a.plugin_files = vec!["/path/a/plugin/a.vim".to_string()];
         let lua = gen_loader(Path::new("/merged"), &[a]);
@@ -2801,6 +2835,7 @@ mod tests {
             "/cache/rvpm/repos/github.com/nvim-treesitter/nvim-treesitter",
         );
         treesitter.merge = false; // non-merge eager
+        treesitter.uses_merged = false;
         treesitter.before = Some("/config/ts/before.lua".to_string());
         treesitter.after = Some("/config/ts/after.lua".to_string());
         treesitter.plugin_files = vec![

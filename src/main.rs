@@ -1398,6 +1398,7 @@ async fn run_sync(
             &dst_path,
             &plugin_config_dir,
             &view_dir,
+            mode,
         ));
     }
 
@@ -1481,6 +1482,7 @@ async fn run_sync(
                         &dst_path,
                         &plugin_config_dir,
                         &view_dir,
+                        mode,
                     );
                     plugin_scripts.push(scripts);
                 }
@@ -1729,7 +1731,15 @@ fn run_clean() -> Result<()> {
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
-    let config = parse_config(&toml_content)?;
+    let mut config = parse_config(&toml_content)?;
+    // sync / generate と同じ正規化パイプラインを通す: cond プリパスで
+    // `merge` / `merge_doc` の相互整合を取り、 後段で promote も適用する
+    // (CodeRabbit PR #120 指摘 — 正規化を飛ばすと cond plugin の生きた view を
+    // 誤削除したり、 promoted plugin の stale view が残ったりする)。
+    crate::config::sort_plugins(&mut config.plugins)?;
+    for plugin in config.plugins.iter_mut() {
+        disable_merge_if_cond(plugin);
+    }
 
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
     let repos_dir = resolve_repos_dir(&cache_root);
@@ -1750,21 +1760,44 @@ fn run_clean() -> Result<()> {
         );
     }
 
-    // views/ も同じ要領で sweep。 sync 時の expected_views を再計算し、
-    // 該当する view を保護、 それ以外を削除する (#119)。
+    // views/ も同じ要領で sweep (#119)。 sync / generate と整合する expected を
+    // 計算するため、 PluginScripts に変換してから promote_lazy_to_eager を通す。
+    // 昇格された (元 lazy → eager + Full) plugin は view を持たないので expected から
+    // 自動的に除外される。
     let views_dir = resolve_views_dir(&cache_root);
     if views_dir.exists() {
-        let expected: std::collections::HashSet<PathBuf> = config
+        let config_root = resolve_config_root(config.options.config_root.as_deref());
+        let mut plugin_scripts: Vec<crate::loader::PluginScripts> = config
             .plugins
             .iter()
-            .filter_map(|p| {
+            .map(|plugin| {
+                let dst = resolve_plugin_dst(plugin, &cache_root);
+                let plugin_config_dir = resolve_plugin_config_dir(&config_root, plugin);
+                let view_dir = resolve_plugin_view_dir(&views_dir, plugin);
+                let mode = decide_merge_mode(
+                    plugin.merge,
+                    plugin.lazy,
+                    plugin.merge_doc,
+                    config.options.merge_doc,
+                );
+                build_plugin_scripts(plugin, &dst, &plugin_config_dir, &view_dir, mode)
+            })
+            .collect();
+        crate::loader::promote_lazy_to_eager(&mut plugin_scripts);
+
+        // 正規化後の plugin_scripts から expected を組み立てる。 promote 後は
+        // ps.merge=true && ps.lazy=false (= Full) になるので、 ここでの再判定で
+        // ViewWith* には倒れない (= 自然に view から外れる)。 generate と一致。
+        let expected: std::collections::HashSet<PathBuf> = plugin_scripts
+            .iter()
+            .filter_map(|ps| {
                 let mode =
-                    decide_merge_mode(p.merge, p.lazy, p.merge_doc, config.options.merge_doc);
+                    decide_merge_mode(ps.merge, ps.lazy, ps.merge_doc, config.options.merge_doc);
                 if matches!(
                     mode,
                     PluginMergeMode::ViewWithDoc | PluginMergeMode::ViewWithoutDoc
                 ) {
-                    Some(resolve_plugin_view_dir(&views_dir, p))
+                    Some(PathBuf::from(&ps.view_path))
                 } else {
                     None
                 }
@@ -1796,11 +1829,18 @@ async fn run_generate() -> Result<()> {
         let dst_path = resolve_plugin_dst(plugin, &cache_root);
         let plugin_config_dir = resolve_plugin_config_dir(&config_root, plugin);
         let view_dir = resolve_plugin_view_dir(&views_dir, plugin);
+        let mode = decide_merge_mode(
+            plugin.merge,
+            plugin.lazy,
+            plugin.merge_doc,
+            config.options.merge_doc,
+        );
         plugin_scripts.push(build_plugin_scripts(
             plugin,
             &dst_path,
             &plugin_config_dir,
             &view_dir,
+            mode,
         ));
     }
 
@@ -1966,16 +2006,27 @@ async fn run_doctor() -> Result<i32> {
         let dst = resolve_plugin_dst(plugin, &cache_root);
         let plugin_config_dir = resolve_plugin_config_dir(&config_root_for_scripts, plugin);
         let view_dir = resolve_plugin_view_dir(&views_dir_for_scripts, plugin);
+        let mode = decide_merge_mode(
+            plugin.merge,
+            plugin.lazy,
+            plugin.merge_doc,
+            config.options.merge_doc,
+        );
         plugin_scripts.push(build_plugin_scripts(
             plugin,
             &dst,
             &plugin_config_dir,
             &view_dir,
+            mode,
         ));
     }
     crate::loader::promote_lazy_to_eager(&mut plugin_scripts);
     let helptag_targets = crate::helptags::collect_helptag_targets(&plugin_scripts, &merged_dir);
     // collect_helptag_targets と同じイテレーションでラベルを並べる (順序を揃える)。
+    // ラベルの判定根拠も collect_helptag_targets と一致させる: clone path 直下の
+    // `doc/` ではなく **`view_path` 配下の `doc/`** で判定する (#119, CodeRabbit
+    // PR #120)。 ViewWithoutDoc plugin は view に doc が無いので自動的に skip
+    // され、 target list と label list の長さも一致する。
     let mut helptag_target_labels: Vec<String> = Vec::with_capacity(helptag_targets.len());
     if merged_dir.join("doc").is_dir() {
         helptag_target_labels.push("merged".to_string());
@@ -1984,7 +2035,7 @@ async fn run_doctor() -> Result<i32> {
         if ps.merge && !ps.lazy {
             continue;
         }
-        if PathBuf::from(&ps.path).join("doc").is_dir() {
+        if PathBuf::from(&ps.view_path).join("doc").is_dir() {
             helptag_target_labels.push(ps.name.clone());
         }
     }
@@ -4803,6 +4854,13 @@ fn dispatch_plugin_merge(
     ownership: &mut std::collections::HashMap<PathBuf, String>,
     conflicts: &mut Vec<crate::merge_conflicts::MergeConflictReport>,
 ) {
+    // View 系の rebuild では既存 view_dir を削除してから link し直す:
+    // `merge_plugin*` は first-wins + hard-link only なので、 残骸が残ったままだと
+    // (a) upstream で削除されたファイルが view にゴミとして残る、
+    // (b) 旧 mode で置かれた `doc/` が ViewWithoutDoc に切り替わっても残ってしまい
+    //     rtp に再度 doc が漏れる、 という汚染が起きる。 CodeRabbit PR #120 指摘。
+    // Full は merged/ に向くので個別 view 削除は不要 (run_generate 側で全消し済か、
+    // それ以外の plugin との衝突報告に乗る)。
     match mode {
         PluginMergeMode::Full => {
             let r = crate::link::merge_plugin(src, merged_dir);
@@ -4811,10 +4869,12 @@ fn dispatch_plugin_merge(
         PluginMergeMode::ViewWithDoc => {
             // view 側は per-plugin 専用 dir なので、 別 plugin との衝突は発生しない。
             // ownership / conflicts は便宜上同じ map を渡すが、 通常空のまま戻る。
+            let _ = std::fs::remove_dir_all(view_dir);
             let r = crate::link::merge_plugin(src, view_dir);
             record_merge_result(plugin_name, r, ownership, conflicts);
         }
         PluginMergeMode::ViewWithoutDoc => {
+            let _ = std::fs::remove_dir_all(view_dir);
             // 1) view (doc 抜き) を per-plugin に
             let r = crate::link::merge_plugin_no_doc(src, view_dir);
             record_merge_result(plugin_name, r, ownership, conflicts);
@@ -5258,17 +5318,23 @@ fn build_plugin_scripts(
     plugin_path: &Path,
     plugin_config_dir: &Path,
     view_path: &Path,
+    mode: PluginMergeMode,
 ) -> crate::loader::PluginScripts {
     // on_cmd / on_map / on_event の /regex/ 展開用に 1 回だけ静的スキャン (#85, #88)。
     // 対象は plugin/, ftplugin/, after/plugin/, lua/ 配下の .vim / .lua のみで、
     // load 経路に影響しないので dead plugin でもコストは小さい。
     let scan = crate::plugin_scan::scan_plugin(plugin_path);
+    let uses_merged = matches!(
+        mode,
+        PluginMergeMode::Full | PluginMergeMode::ViewWithoutDoc
+    );
     crate::loader::PluginScripts {
         name: plugin.display_name(),
         path: plugin_path.to_string_lossy().replace('\\', "/"),
         view_path: view_path.to_string_lossy().replace('\\', "/"),
         merge: plugin.merge,
         merge_doc: plugin.merge_doc,
+        uses_merged,
         init: find_lua(plugin_config_dir, "init.lua"),
         before: find_lua(plugin_config_dir, "before.lua"),
         after: find_lua(plugin_config_dir, "after.lua"),
@@ -5712,11 +5778,18 @@ async fn run_profile(
             let dst_path = resolve_plugin_dst(plugin, &cache_root);
             let plugin_config_dir = resolve_plugin_config_dir(&config_root, plugin);
             let view_dir = resolve_plugin_view_dir(&views_dir, plugin);
+            let mode = decide_merge_mode(
+                plugin.merge,
+                plugin.lazy,
+                plugin.merge_doc,
+                config.options.merge_doc,
+            );
             plugin_scripts.push(build_plugin_scripts(
                 plugin,
                 &dst_path,
                 &plugin_config_dir,
                 &view_dir,
+                mode,
             ));
         }
         crate::loader::promote_lazy_to_eager(&mut plugin_scripts);
