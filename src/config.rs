@@ -65,22 +65,25 @@ pub struct Options {
     /// 個別実行する。`nvim` が PATH に無い場合は警告して skip (resilience)。
     #[serde(default = "default_auto_helptags")]
     pub auto_helptags: bool,
-    /// `true` なら lazy プラグインの `doc/` も `merged/doc/` にリンクする。
-    /// デフォルト `false`。
+    /// `true` なら "Full merge" 対象 (eager + merge=true) **以外** の全プラグインで
+    /// `doc/` を `merged/doc/` に hard-link 集約し、 rtp は doc 抜きの
+    /// `views/<plug>/` 経由で投入する (#119)。デフォルト `false`。
     ///
-    /// lazy プラグインは trigger 前は runtimepath に乗らないので、
-    /// `:help <topic>` でその plugin の help tag を引けない (tags ファイルは
-    /// `auto_helptags` 経由で生成されているが、`merged/` 以外にあるので
-    /// `:help` の rtp 走査からは見えない)。
-    /// この option を有効にすると、lazy plugin の `doc/` 配下のファイルだけを
-    /// `merged/doc/` にも hard-link し、`:help <topic>` で全 plugin の tag を
-    /// 引けるようになる。`lua/` 等の他のディレクトリは引き続き merged に
-    /// 流れないので、lazy 性は維持される。
+    /// 効果:
+    /// - lazy plugin でも trigger 発火**前**から `:help <topic>` が引ける
+    ///   (元々 trigger 後にしか引けなかったやつが起動時から見える)
+    /// - lazy / eager+merge=false 問わず `:tselect` で重複候補が出ない
+    ///   (rtp 投入が doc を持たない view 経由になるため、`<plugin>/doc/` が
+    ///   rtp と重ならない)
+    /// - 集約された `merged/doc/tags` を 1 回の `:helptags` で生成できる
     ///
-    /// トレードオフ: 未ロードの plugin の help も引けるようになる (人によっては
-    /// feature、人によっては気持ち悪い)。tag 名衝突は first-wins。
+    /// トレードオフ: 未ロードプラグインの help も引けるようになる (人による)。
+    /// `doc/` 同名ファイルの衝突は first-wins (`merge_conflicts.json` で記録)。
+    ///
+    /// per-plugin override は `[[plugins]] merge_doc = true|false` で。
+    /// `cond` が指定された plugin では未指定 (None) の場合のみ自動で `false` 化される。
     #[serde(default)]
-    pub merge_lazy_doc: bool,
+    pub merge_doc: bool,
     /// `rvpm add` が `config.toml` に書き込む URL の形式。
     /// - `"short"` (デフォルト): `owner/repo`
     /// - `"full"`: `https://github.com/owner/repo`
@@ -178,7 +181,7 @@ impl Default for Options {
             chezmoi: false,
             auto_clean: false,
             auto_helptags: default_auto_helptags(),
-            merge_lazy_doc: false,
+            merge_doc: false,
             url_style: UrlStyle::default(),
             browse: BrowseOptions::default(),
             fetch_interval: None,
@@ -259,6 +262,14 @@ pub struct Plugin {
     pub lazy: bool,
     #[serde(default = "default_merge")]
     pub merge: bool,
+    /// `merge_doc` の per-plugin override (#119)。
+    /// - `Some(true)` → `merge=true && eager` (=Full merge) でない限り、
+    ///   `doc/` を `merged/doc/` に集約し rtp は `views/<plug>/` 経由
+    /// - `Some(false)` → 集約しない (たとえ `options.merge_doc=true` でも)
+    /// - `None` → `options.merge_doc` の値を継承 (`cond` 指定時はこの場合のみ
+    ///   自動 false 化される)
+    #[serde(default)]
+    pub merge_doc: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub on_cmd: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
@@ -764,7 +775,7 @@ url = "owner/repo"
     }
 
     #[test]
-    fn test_parse_config_merge_lazy_doc_defaults_to_false() {
+    fn test_parse_config_merge_doc_defaults_to_false() {
         let toml = r#"
 [options]
 
@@ -772,20 +783,58 @@ url = "owner/repo"
 url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
-        assert!(!config.options.merge_lazy_doc);
+        assert!(!config.options.merge_doc);
     }
 
     #[test]
-    fn test_parse_config_accepts_merge_lazy_doc_true() {
+    fn test_parse_config_accepts_merge_doc_true() {
         let toml = r#"
 [options]
-merge_lazy_doc = true
+merge_doc = true
 
 [[plugins]]
 url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
-        assert!(config.options.merge_lazy_doc);
+        assert!(config.options.merge_doc);
+    }
+
+    #[test]
+    fn test_parse_config_per_plugin_merge_doc_defaults_to_none() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins[0].merge_doc, None);
+    }
+
+    #[test]
+    fn test_parse_config_per_plugin_merge_doc_explicit_true() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+merge_doc = true
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins[0].merge_doc, Some(true));
+    }
+
+    #[test]
+    fn test_parse_config_per_plugin_merge_doc_explicit_false() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+merge_doc = false
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins[0].merge_doc, Some(false));
     }
 
     #[test]

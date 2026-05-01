@@ -1304,7 +1304,7 @@ mod tests {
                 chezmoi: false,
                 auto_clean: false,
                 auto_helptags: false,
-                merge_lazy_doc: false,
+                merge_doc: false,
                 url_style: UrlStyle::Short,
                 browse: BrowseOptions::default(),
                 fetch_interval: None,

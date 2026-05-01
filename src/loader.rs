@@ -15,8 +15,20 @@ pub struct DenopsPlugin {
 #[derive(Clone)]
 pub struct PluginScripts {
     pub name: String,
+    /// プラグインの clone path (`<cache_root>/plugins/repos/<host>/<owner>/<repo>`)。
+    /// ファイルの実体ありき (init/before/after.lua のソース等) はこちらを起点に
+    /// 解決する。 rtp に乗る path は `view_path` 側を使う (#119)。
     pub path: String,
+    /// rtp に乗る path。 統一案 (#119) では:
+    /// - Full merge (`merge=true && eager`) → `merged/` (生成後に一括で 1 回 rtp:append)
+    /// - それ以外 → `views/<host>/<owner>/<repo>/` (per-plugin view)
+    /// load_lazy / phase 6 の `rtp:append` はこの path を使う。 sync 時に decide
+    /// された MergeMode と整合する。
+    pub view_path: String,
     pub merge: bool,
+    /// `Plugin.merge_doc` (per-plugin override) のコピー (#119)。
+    /// generate 単独実行 (sync を経由しない) の merge 判定に必要。
+    pub merge_doc: Option<bool>,
     pub init: Option<String>,
     pub before: Option<String>,
     pub after: Option<String>,
@@ -61,7 +73,9 @@ impl PluginScripts {
         Self {
             name: name.to_string(),
             path: path.to_string(),
+            view_path: path.to_string(),
             merge: true,
+            merge_doc: None,
             init: None,
             before: None,
             after: None,
@@ -621,11 +635,25 @@ end
             continue;
         }
         let mut body = String::new();
-        let path = s.path.replace('\\', "/");
+        // rtp は `view_path` (= `views/<plug>/`) 経由で乗せる (#119)。
+        // clone path 直 append から view 経由に統一することで、 doc 抜きを徹底
+        // (DocOnly 時) + clone 直下のメタファイル / `.git` が rtp に漏れない、
+        // という二段の整理になる。 Full merge は `merged/` 1 経路なのでこの行は
+        // 走らない (`s.merge && !force_unmerge` でスキップ)。
+        //
+        // ただし `force_unmerge=true` (profile `--no-merge` ベンチマーク baseline)
+        // のときは clone path をそのまま使う: 「merge 最適化を全部切ったとき」
+        // の比較対象が pre-#119 と等価になるよう、 view 経由ではなく clone を
+        // rtp に乗せる (clone は doc/ も持っているので `:help` も従来通り効く)。
+        let rtp_path = if force_unmerge {
+            s.path.replace('\\', "/")
+        } else {
+            s.view_path.replace('\\', "/")
+        };
 
         // `force_unmerge=true` 時は merge=true でも個別 rtp:append する
         if !s.merge || force_unmerge {
-            body.push_str(&format!("vim.opt.rtp:append(\"{}\")\n", path));
+            body.push_str(&format!("vim.opt.rtp:append(\"{}\")\n", rtp_path));
         }
 
         // before
@@ -678,7 +706,13 @@ end
         if !s.lazy {
             continue;
         }
-        let path = s.path.replace('\\', "/");
+        // load_lazy 第 2 引数 (= rtp:append 先) は view_path を使う (#119)。
+        // ただし force_unmerge 時は clone path にフォールバック (上の phase 6 と同じ)。
+        let path = if force_unmerge {
+            s.path.replace('\\', "/")
+        } else {
+            s.view_path.replace('\\', "/")
+        };
         if profile.is_some() {
             let safe = sanitize_name(&s.name);
             emit_marker(&mut lua, profile, &format!("trig-{}-begin", safe));
@@ -730,7 +764,12 @@ end
         if let Some(deps) = lazy_deps_map.get(&s.name) {
             for dep in deps {
                 if let Some(dep_script) = scripts.iter().find(|ds| ds.name == *dep) {
-                    let dp = dep_script.path.replace('\\', "/");
+                    // dep の rtp:append も view 経由 (#119)。 force_unmerge 時は clone 経由。
+                    let dp = if force_unmerge {
+                        dep_script.path.replace('\\', "/")
+                    } else {
+                        dep_script.view_path.replace('\\', "/")
+                    };
                     let db = dep_script
                         .before
                         .as_ref()
@@ -970,7 +1009,13 @@ end
             if !s.lazy || s.colorschemes.is_empty() {
                 continue;
             }
-            let path = s.path.replace('\\', "/");
+            // ColorSchemePre 経由でも load_lazy には view_path を渡す (#119)。
+            // force_unmerge 時は clone path に切り替え。
+            let path = if force_unmerge {
+                s.path.replace('\\', "/")
+            } else {
+                s.view_path.replace('\\', "/")
+            };
             let before = s
                 .before
                 .as_ref()

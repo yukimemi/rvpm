@@ -84,12 +84,14 @@ concurrency = 16
 # (default true). Lazy plugins are not on runtimepath, so rvpm enumerates the
 # target doc/ directories itself and runs :helptags <path> for each.
 # auto_helptags = false
-# For lazy plugins with `merge = true`, also link their doc/ files into
-# merged/doc/ so `:help <topic>` can find their tags before the plugin loads
-# (default false). Only the doc/ subdirectory is linked — lua/ and plugin/
-# stay out of merged/, so lazy semantics are preserved. Filename conflicts
-# inside doc/ are first-wins.
-# merge_lazy_doc = true
+# Aggregate every non-Full plugin's `doc/` into `merged/doc/` so `:help <topic>`
+# can find their tags before the plugin loads (default false). The plugin's
+# rtp entry routes through `views/<plug>/` (a doc-stripped, hard-link tree of
+# the clone) so `:tselect` shows no duplicate. Eager + merge=true (Full merge)
+# is unaffected — those still go entirely into `merged/`. Per-plugin override
+# is `[[plugins]] merge_doc = true|false`. Filename conflicts inside `doc/`
+# are first-wins (recorded in `merge_conflicts.json`). #119
+# merge_doc = true
 # URL form written by `rvpm add`: "short" (owner/repo, default) or
 # "full" (https://github.com/owner/repo). Duplicate detection normalizes both forms before comparing.
 # url_style = "full"
@@ -155,6 +157,12 @@ on_map = [
 ]
 # Conditional loading (Lua expression)
 cond = "vim.fn.has('win32') == 1"
+# Per-plugin override of `options.merge_doc` (#119).
+# - Some(true)  → for this plugin, merge `doc/` into `merged/doc/` and route rtp through `views/<plug>/`
+# - Some(false) → opt out of doc-merge even when global default is true
+# - omitted     → follow `options.merge_doc`. With `cond` set, an unset value is auto-forced false
+#                 (only sweeps cond plugins out of the global default — explicit Some(true) is honored)
+# merge_doc = true
 ```
 
 ## Global hooks
@@ -237,13 +245,19 @@ See [`docs/architecture.md`](docs/architecture.md) for design rationale, lazy tr
 
 ### Merge strategy summary
 
-`merge_plugin()` hard-links files into `<cache_root>/plugins/merged/` at file granularity (first-wins on conflict, dotfiles skipped, only rtp-relevant directories allow-listed). Lazy plugins are not merged (their `lua/` would leak onto rtp before the trigger fires). Conflicts are recorded in `merge_conflicts.json` and surfaced by `rvpm doctor`. Full rules in [`docs/architecture.md`](docs/architecture.md).
+`decide_merge_mode(plugin.merge, plugin.lazy, plugin.merge_doc, options.merge_doc)` chooses one of three actions per plugin (#119):
+
+- **Full** (`merge=true && eager`) → all rtp dirs hard-linked into `<cache_root>/plugins/merged/`; rtp gets `merged/` once at startup.
+- **ViewWithDoc** (everything else, `merge_doc=false`) → all rtp dirs (incl. `doc/`) hard-linked into `<cache_root>/plugins/views/<plug>/`; rtp gets that view path (eager: startup; lazy: at trigger).
+- **ViewWithoutDoc** (everything else, `merge_doc=true`) → view tree minus `doc/`, plus the plugin's `doc/` files aggregated into `merged/doc/`. rtp gets the doc-stripped view; `:help` works through `merged/` from startup, no `:tselect` duplicate after trigger.
+
+`repos/<plug>/` is **never on rtp** — only `merged/` and `views/<plug>/` are. Conflicts are first-wins, recorded in `merge_conflicts.json` (self-conflicts filtered), surfaced by `rvpm doctor`. `cond` plugins get `merge=false` forced by `disable_merge_if_cond`, and `merge_doc=None` is forced to `Some(false)` (explicit per-plugin `Some(true)` survives — Windows-only-but-help-findable use case). Full rules in [`docs/architecture.md`](docs/architecture.md).
 
 ### Path conventions
 
 Config / cache are **fixed at `~/.config/rvpm/` and `~/.cache/rvpm/` across all platforms** (no `%APPDATA%` on Windows — keeps dotfile layouts identical across WSL / Linux / Windows).
 
-- `cache_root` (override: `options.cache_root`) → default `~/.cache/rvpm/<appname>` — moves repos / merged / loader.lua together.
+- `cache_root` (override: `options.cache_root`) → default `~/.cache/rvpm/<appname>` — moves repos / merged / views / loader.lua together.
 - `config_root` (override: `options.config_root`) → default `~/.config/rvpm/<appname>/plugins` — per-plugin init/before/after.lua.
 - `<appname>` resolves as `$RVPM_APPNAME` → `$NVIM_APPNAME` → `"nvim"`.
 

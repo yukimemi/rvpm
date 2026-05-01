@@ -12,18 +12,20 @@ pub struct HelptagsReport {
     pub exit_code: Option<i32>,
 }
 
-/// `nvim --headless` に渡すべき `doc/` ディレクトリを列挙する。
+/// `nvim --headless` に渡すべき `doc/` ディレクトリを列挙する (#119 統一案)。
 ///
 /// ルール:
-/// - `merged_dir/doc/` が存在すれば最初に追加 (複数プラグインの doc が 1 箇所に
-///   まとまるので `:helptags` 1 回で済む)
-/// - eager + merge=true なプラグインは merged/doc/ に含まれるので個別に追加しない
-/// - それ以外 (lazy プラグイン全般 / merge=false な eager) は
-///   `<plugin.path>/doc/` を存在チェック付きで追加
+/// - `merged_dir/doc/` が存在すれば最初に追加 (Full merge と DocOnly merge 両方の
+///   doc がここに集約される — `:helptags` 1 回で全員分の tags が引ける)
+/// - View 経由の plugin は `view_path/doc/` を確認:
+///   - `ViewWithDoc` → view 配下に doc/ がある (clone から hard-link 済) ので追加
+///   - `ViewWithoutDoc` → view には doc/ が入らない (merged/doc/ 集約済) のでここでは skip
+///   - `Full` (merge=true && eager) → そもそも view を作らない / 使わない、 skip
+/// - 判定は「view dir に doc/ が物理存在するか」だけで OK (各 mode の差はそこに反映)
 ///
-/// `cond` フィールドは Lua runtime 評価のため Rust 側からは判定できず、全プラグイン
-/// (cond が false となるもの含む) を候補にする。`rvpm list` に現れるプラグインが
-/// そのまま対象、というのが分かりやすい mental model。
+/// `cond` は Lua runtime 評価で Rust から判定できないが、 disable_merge_if_cond で
+/// プリパス済みなので merge_doc 整合は取れている。 全 plugin を候補にする mental
+/// model は `rvpm list` に現れるものとそろう。
 pub fn collect_helptag_targets(
     plugin_scripts: &[PluginScripts],
     merged_dir: &Path,
@@ -34,10 +36,16 @@ pub fn collect_helptag_targets(
         targets.push(merged_doc);
     }
     for ps in plugin_scripts {
+        // Full merge plugin (eager + merge=true) は merged/doc/ で集約済 → skip
         if ps.merge && !ps.lazy {
             continue;
         }
-        let doc = PathBuf::from(&ps.path).join("doc");
+        // それ以外は view_path/doc/ が物理存在するときだけ追加。
+        // ViewWithoutDoc は view に doc/ が入っていないので自動的に弾かれる。
+        // `view_path` が clone path のまま (build_plugin_scripts でデフォルト初期化された
+        // dev plugin / test fixture 等) のケースも、 clone 直下の doc/ なら同じく
+        // 引っかかるので safety-net としても OK。
+        let doc = PathBuf::from(&ps.view_path).join("doc");
         if doc.is_dir() {
             targets.push(doc);
         }
