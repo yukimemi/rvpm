@@ -1343,9 +1343,34 @@ async fn run_sync(
     // 後続 plugin の衝突時に勝者を lookup するのに使う。
     let mut merge_ownership: std::collections::HashMap<PathBuf, String> =
         std::collections::HashMap::new();
-    // 今回の sync で実際に build_view した path の集合。 sync 末尾に
-    // `prune_stale_views` で「この集合に無い views/<plug>/」を削除する (#119)。
-    let mut expected_views: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // 今回の sync で「期待される」view の集合。 sync 末尾の `prune_stale_views`
+    // でこの集合に居ない `views/<plug>/` を削除する (#119)。
+    //
+    // **重要**: sync タスクの成功ブロック内で populate するのではなく、 config 上の
+    // 全 plugin から事前計算する。 sync が失敗した (= 通信エラー等) plugin の
+    // view を誤削除しない (resilience: 既存 loader.lua はそこを参照しているので、
+    // 削除すると次回 Neovim 起動時に壊れる)。 Gemini Code Assist の指摘 (#120) を
+    // 反映。
+    let mut expected_views: std::collections::HashSet<PathBuf> = config
+        .plugins
+        .iter()
+        .filter_map(|plugin| {
+            let mode = decide_merge_mode(
+                plugin.merge,
+                plugin.lazy,
+                plugin.merge_doc,
+                config.options.merge_doc,
+            );
+            if matches!(
+                mode,
+                PluginMergeMode::ViewWithDoc | PluginMergeMode::ViewWithoutDoc
+            ) {
+                Some(resolve_plugin_view_dir(&views_dir, plugin))
+            } else {
+                None
+            }
+        })
+        .collect();
     let config_root = resolve_config_root(config.options.config_root.as_deref());
     for plugin in config.plugins.iter().filter(|p| p.dev) {
         let dst_path = resolve_plugin_dst(plugin, &cache_root);
@@ -1357,12 +1382,8 @@ async fn run_sync(
             plugin.merge_doc,
             config.options.merge_doc,
         );
-        if matches!(
-            mode,
-            PluginMergeMode::ViewWithDoc | PluginMergeMode::ViewWithoutDoc
-        ) {
-            expected_views.insert(view_dir.clone());
-        }
+        // expected_views は config 全体から事前計算済 (上の collect)。 ここでは
+        // dispatch のみ行う。
         dispatch_plugin_merge(
             mode,
             &dst_path,
@@ -1443,12 +1464,7 @@ async fn run_sync(
                         plugin.merge_doc,
                         config.options.merge_doc,
                     );
-                    if matches!(
-                        mode,
-                        PluginMergeMode::ViewWithDoc | PluginMergeMode::ViewWithoutDoc
-                    ) {
-                        expected_views.insert(view_dir.clone());
-                    }
+                    // expected_views は run_sync 冒頭で config 全体から事前計算済。
                     dispatch_plugin_merge(
                         mode,
                         &dst_path,
@@ -1495,7 +1511,10 @@ async fn run_sync(
                 // sync 一巡目で `views/<plug>/` (場合により merged/doc/ にも) に
                 // 配置済みの可能性あり。 自己 conflict は record_merge_result が
                 // フィルタするので false-positive にはならない。
-                let view_dir = resolve_plugin_view_dir_for_script(&views_dir, ps);
+                //
+                // PluginScripts.view_path は build_plugin_scripts で正しく解決済の
+                // `views/<host>/<owner>/<repo>/`。 fragile な path 再構築を経由しない。
+                let view_dir = PathBuf::from(&ps.view_path);
                 dispatch_plugin_merge(
                     PluginMergeMode::Full,
                     &dst,
@@ -4670,32 +4689,6 @@ fn resolve_views_dir(cache_root: &Path) -> PathBuf {
 /// `<cache_root>/plugins/views/<host>/<owner>/<repo>/`。
 fn resolve_plugin_view_dir(views_dir: &Path, plugin: &crate::config::Plugin) -> PathBuf {
     views_dir.join(plugin.canonical_path())
-}
-
-/// PluginScripts から view ディレクトリを引く (post-promote / generate 後の再 merge 等で
-/// `Plugin` が手元に無い文脈用)。 `ps.name` は `display_name` と一致するので
-/// canonical_path 相当の `<host>/<owner>/<repo>` を直接組み立てて使う。
-fn resolve_plugin_view_dir_for_script(
-    views_dir: &Path,
-    ps: &crate::loader::PluginScripts,
-) -> PathBuf {
-    // PluginScripts には canonical_path が無いので url ベースで再計算する
-    // ことになるが、 そもそも PluginScripts 経由で view 参照したい箇所では
-    // promoted 等の文脈なので Plugin から作った canonical を素直に渡せるよう
-    // build_plugin_scripts 側で canonical_path をフィールド化する余地もあり。
-    // 現状は `ps.path` (= clone path) から `<host>/<owner>/<repo>` を取り出す。
-    let p = std::path::Path::new(&ps.path);
-    // clone path: `.../plugins/repos/<host>/<owner>/<repo>` の末尾 3 階層
-    let comps: Vec<&std::ffi::OsStr> = p.iter().collect();
-    let len = comps.len();
-    if len >= 3 {
-        let host = comps[len - 3];
-        let owner = comps[len - 2];
-        let repo = comps[len - 1];
-        views_dir.join(host).join(owner).join(repo)
-    } else {
-        views_dir.join(&ps.name)
-    }
 }
 
 /// プラグインの merge モードを決定する純粋関数 (#119)。
