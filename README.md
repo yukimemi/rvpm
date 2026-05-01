@@ -212,15 +212,22 @@ more example invocations are in [Advanced](#advanced).
 
 ~/.cache/rvpm/<appname>/                     ← cache_root
 ├── plugins/
-│   ├── repos/<host>/<owner>/<repo>/         ← plugin clones
-│   │   └── doc/tags                         ← helptags for lazy / merge=false plugins
-│   ├── merged/                              ← hard-linked rtp for merge=true
-│   │   └── doc/tags                         ← helptags shared across merged plugins
+│   ├── repos/<host>/<owner>/<repo>/         ← plugin clones (never on rtp)
+│   ├── merged/                              ← Full merge target (eager + merge=true)
+│   │   └── doc/                             ← also collects doc/ from `merge_doc=true` plugins
+│   │       └── tags                         ← single :helptags pass covers all merged docs
+│   ├── views/<host>/<owner>/<repo>/         ← per-plugin rtp view (everything except Full merge)
+│   │   └── doc/tags                         ← helptags for plugins that opted out of doc-merge
 │   └── loader.lua                           ← generated loader
 ├── browse/                                  ← `rvpm browse` cache (search + README)
 ├── update_log.json                          ← `rvpm log` history (last 20 runs)
 └── merge_conflicts.json                     ← last sync's merge conflicts (read by `rvpm doctor`)
 ```
+
+> **Note (3.31.0+)**: rtp is sourced from `merged/` (Full merge) or
+> `views/<plug>/` (everything else) — never from `repos/<plug>/`. Upgrading
+> from an earlier version regenerates these on the next `rvpm sync`; the
+> `repos/` clones are unchanged.
 
 Windows uses the same `.config` / `.cache` paths under `%USERPROFILE%`
 (no `%APPDATA%`), so the same layout is portable across Linux / macOS /
@@ -240,7 +247,8 @@ what you're doing.
 | `name` | `string` | repo name from `url` (e.g. `telescope.nvim`) | Friendly name used in `rvpm_loaded_<name>` User autocmd, `on_source` chain, and log messages. Auto-derived by taking the last path component of the URL and stripping `.git` |
 | `dst` | `string` | `{cache_root}/plugins/repos/<host>/<owner>/<repo>` | Custom clone destination (overrides the default path layout) |
 | `lazy` | `bool` | auto | **Auto-inferred**: if any `on_*` trigger is set, defaults to `true`; otherwise `false`. Write `lazy = false` explicitly to force eager loading even with triggers |
-| `merge` | `bool` | `true` | If `true`, the plugin's runtime files are hard-linked into `{cache_root}/plugins/merged/` and share a single runtimepath entry |
+| `merge` | `bool` | `true` | If `true` **and** the plugin loads eagerly, the plugin's runtime files are hard-linked into `{cache_root}/plugins/merged/` and share a single runtimepath entry. Otherwise the plugin gets a per-plugin view at `{cache_root}/plugins/views/<host>/<owner>/<repo>/` (also a hard-link tree of the clone) |
+| `merge_doc` | `bool` | inherits `options.merge_doc` | Per-plugin override of the global `merge_doc`. `true` aggregates this plugin's `doc/` into `merged/doc/` and routes its rtp through a doc-stripped view (so `:help` works pre-trigger and `:tselect` doesn't dupe). `false` opts out even when the global default is `true`. Ignored for `Full` merge plugins (eager + `merge = true`) — those already include `doc/` in `merged/`. With `cond` set, an unset value is auto-forced `false` (only sweeps `cond` plugins out of the global default — explicit `true` is honored) |
 | `rev` | `string` | HEAD | Branch, tag, or commit hash to check out after clone/pull |
 | `depends` | `string[]` | none | Plugins that must be loaded before this one. Accepts `display_name` (e.g. `"snacks.nvim"`) or `url` (e.g. `"folke/snacks.nvim"`). Eager → lazy dep auto-promotes the dep to eager (with a warning); lazy → lazy dep loads dep first inside the trigger callback |
 | `cond` | `string` | none | Lua expression. When set, the plugin's loader code is wrapped in `if <cond> then ... end` |
