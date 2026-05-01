@@ -22,6 +22,7 @@ pub struct PluginScripts {
     /// rtp に乗る path。 統一案 (#119) では:
     /// - Full merge (`merge=true && eager`) → `merged/` (生成後に一括で 1 回 rtp:append)
     /// - それ以外 → `views/<host>/<owner>/<repo>/` (per-plugin view)
+    ///
     /// load_lazy / phase 6 の `rtp:append` はこの path を使う。 sync 時に decide
     /// された MergeMode と整合する。
     pub view_path: String,
