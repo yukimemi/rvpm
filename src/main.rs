@@ -4879,6 +4879,23 @@ fn record_merge_result(
     }
 }
 
+/// View 系 dispatch 前に既存 `views/<plug>/` を削除する。 NotFound は無視 (初回 sync 時)、
+/// それ以外のエラー (permission denied / busy 等) は warn を stderr に出すが abort はしない
+/// (resilience: 後続の `merge_plugin_view*` が first-wins で動くので、 残骸があっても
+/// upstream で削除されたファイルがゴミとして残るだけで、 致命的では無い)。
+/// CodeRabbit PR #124 指摘: silent な `let _ =` を避けて user に見える形にする。
+fn clear_view_dir_or_warn(view_dir: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(view_dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "\u{26a0} failed to clear view dir {}: {} (relinking will proceed but stale files may remain)",
+            view_dir.display(),
+            e
+        );
+    }
+}
+
 /// `PluginMergeMode` に従って sync 時のリンク tree を作る (#119 統一案)。
 ///
 /// - `Full` → `merged/` に全 rtp dir を集約
@@ -4911,16 +4928,37 @@ fn dispatch_plugin_merge(
         }
         PluginMergeMode::ViewWithDoc => {
             // view 側は per-plugin 専用 dir なので、 別 plugin との衝突は発生しない。
-            // ownership / conflicts は便宜上同じ map を渡すが、 通常空のまま戻る。
-            let _ = std::fs::remove_dir_all(view_dir);
-            let r = crate::link::merge_plugin(src, view_dir);
-            record_merge_result(plugin_name, r, ownership, conflicts);
+            // `merge_plugin_view` は RTP_DIRS の絞り込みをせず、 ルート直下のメタファイル
+            // (README.md / Cargo.toml / Makefile) や rtp 慣習外ディレクトリ
+            // (target/ build/ tests/ src/ examples/) も含めて全部 link する。
+            // これは build / build_lua を持つ plugin が build artifact を view 経由で
+            // 参照できるようにするため (#119 fix)。
+            clear_view_dir_or_warn(view_dir);
+            let r = crate::link::merge_plugin_view(src, view_dir);
+            // ownership map は merged/ 用 (cross-plugin first-wins winner attribution)
+            // なので、 view-only placement で同名 path の attribution を上書きしないよう
+            // 隔離した temp map に流す (CodeRabbit PR #124 指摘)。
+            // view dir は per-plugin 専用なので、 view 内で別 plugin と衝突することは無く、
+            // conflicts も基本空のまま戻る (root file vs dir collision のみ捕捉される)。
+            let mut view_ownership: std::collections::HashMap<PathBuf, String> =
+                std::collections::HashMap::new();
+            let mut view_conflicts: Vec<crate::merge_conflicts::MergeConflictReport> = Vec::new();
+            record_merge_result(plugin_name, r, &mut view_ownership, &mut view_conflicts);
+            // view 内で発生した root collision (まれ) は merged/ の conflicts と
+            // 区別せずユーザーに見せる方が親切なので、 そのまま append する。
+            conflicts.extend(view_conflicts);
         }
         PluginMergeMode::ViewWithoutDoc => {
-            let _ = std::fs::remove_dir_all(view_dir);
-            // 1) view (doc 抜き) を per-plugin に
-            let r = crate::link::merge_plugin_no_doc(src, view_dir);
-            record_merge_result(plugin_name, r, ownership, conflicts);
+            clear_view_dir_or_warn(view_dir);
+            // 1) view (doc 抜き) を per-plugin に。 RTP_DIRS の絞り込みなしで
+            //    全 entry (build artifact 含む) を link する。
+            let r = crate::link::merge_plugin_view_no_doc(src, view_dir);
+            // ownership 隔離は ViewWithDoc と同じ理由 (#124 指摘)。
+            let mut view_ownership: std::collections::HashMap<PathBuf, String> =
+                std::collections::HashMap::new();
+            let mut view_conflicts: Vec<crate::merge_conflicts::MergeConflictReport> = Vec::new();
+            record_merge_result(plugin_name, r, &mut view_ownership, &mut view_conflicts);
+            conflicts.extend(view_conflicts);
             // 2) doc/ だけ merged/ に集約 (これが merge_doc=true の本命)
             let r = crate::link::merge_plugin_doc_only(src, merged_dir);
             record_merge_result(plugin_name, r, ownership, conflicts);
