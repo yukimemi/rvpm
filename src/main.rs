@@ -2192,6 +2192,25 @@ async fn run_generate() -> Result<()> {
         );
     }
 
+    // config から消えた plugin の views/<plug>/ を掃除 (CodeRabbit PR #129)。
+    // sync 末尾でも同等の処理が走るが、 generate 単独実行時 (rvpm list TUI で
+    // `c` 編集等) でも orphaned view を即座に sweep するために重複起動。
+    let expected_views: std::collections::HashSet<PathBuf> = plugin_scripts
+        .iter()
+        .filter_map(|ps| {
+            let mode = decide_merge_mode(ps.merge, ps.lazy, ps.merge_doc, config.options.merge_doc);
+            if matches!(
+                mode,
+                PluginMergeMode::ViewWithDoc | PluginMergeMode::ViewWithoutDoc
+            ) {
+                Some(PathBuf::from(&ps.view_path))
+            } else {
+                None
+            }
+        })
+        .collect();
+    prune_stale_views(&views_dir, &expected_views);
+
     println!("Generating loader.lua...");
     write_loader_to_path(
         &merged_dir,
@@ -3643,7 +3662,8 @@ use dialoguer::{FuzzySelect, Select};
 
 /// `rvpm config` — config.toml を $EDITOR で直接開く。
 /// ファイルが無ければテンプレートで自動作成してから開く。
-/// 常に `Ok(true)` を返すので呼び出し側で sync を走らせる前提。
+/// 編集前後の mtime を比較して、 **実際に変更があった場合のみ `Ok(true)` を返す**。
+/// 呼び出し側 (rvpm list TUI の `c` キー等) は戻り値で sync / generate を条件実行する。
 async fn run_config() -> Result<bool> {
     let config_path = rvpm_config_path();
     ensure_config_exists(&config_path)?;
