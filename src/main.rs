@@ -2151,38 +2151,44 @@ async fn run_generate() -> Result<()> {
         ));
     }
 
-    // lazy → eager 昇格を適用。 merged/ は各 plugin が hard-link で書き戻すため、
-    // stale 防止のため事前に全消し → 再作成する。
-    // **views/ は wholesale 削除しない** (#129 CodeRabbit 指摘): Neovim が走ってる
-    // 状態で `rvpm generate` が動いた瞬間に lazy plugin の load_lazy が require/
-    // autoload を発火すると、 view dir が空 (削除直後 / 再 link 完了前) で失敗する
-    // race が起きる。 各 plugin の view は `dispatch_plugin_merge` 内の
-    // `atomic_replace_view_dir` で per-view atomic に置き換え、 stale な view dir
-    // (config から消えた plugin) は末尾の `prune_stale_views` で個別に掃除する。
+    // lazy → eager 昇格を適用。
+    // **merged/ も views/<plug>/ も wholesale 削除しない** (#129 CodeRabbit 指摘):
+    // Neovim が走ってる状態で `rvpm generate` が動いた瞬間に Full plugin の lua
+    // module require / merged/doc 経由の `:help` lookup / lazy plugin の load_lazy が
+    // 走ると、 wipe → relink の間にファイルが消えて race するため。
+    // 対策: per-plugin view は `atomic_replace_view_dir` で個別 atomic 置換、
+    // 共有 merged/ は dispatch ループ全体を `atomic_replace_view_dir(merged_dir, ...)`
+    // で囲んで全 plugin 分の hard-link を tmp dir に積んでから atomic rename する。
     crate::loader::promote_lazy_to_eager(&mut plugin_scripts);
-    if merged_dir.exists() {
-        let _ = std::fs::remove_dir_all(&merged_dir);
-    }
-    std::fs::create_dir_all(&merged_dir)?;
     std::fs::create_dir_all(&views_dir)?;
     let mut merge_conflicts: Vec<crate::merge_conflicts::MergeConflictReport> = Vec::new();
     let mut merge_ownership: std::collections::HashMap<PathBuf, String> =
         std::collections::HashMap::new();
-    for ps in &plugin_scripts {
-        let dst = PathBuf::from(&ps.path);
-        if !dst.exists() {
-            continue;
+    let merged_atomic_res = atomic_replace_view_dir(&merged_dir, |tmp_merged| {
+        std::fs::create_dir_all(tmp_merged)?;
+        for ps in &plugin_scripts {
+            let dst = PathBuf::from(&ps.path);
+            if !dst.exists() {
+                continue;
+            }
+            let view_dir = PathBuf::from(&ps.view_path);
+            let mode = decide_merge_mode(ps.merge, ps.lazy, ps.merge_doc, config.options.merge_doc);
+            dispatch_plugin_merge(
+                mode,
+                &dst,
+                tmp_merged,
+                &view_dir,
+                &ps.name,
+                &mut merge_ownership,
+                &mut merge_conflicts,
+            );
         }
-        let view_dir = PathBuf::from(&ps.view_path);
-        let mode = decide_merge_mode(ps.merge, ps.lazy, ps.merge_doc, config.options.merge_doc);
-        dispatch_plugin_merge(
-            mode,
-            &dst,
-            &merged_dir,
-            &view_dir,
-            &ps.name,
-            &mut merge_ownership,
-            &mut merge_conflicts,
+        Ok(())
+    });
+    if let Err(e) = merged_atomic_res {
+        eprintln!(
+            "\u{26a0} atomic merged/ replace failed: {} (falling back to direct write)",
+            e
         );
     }
 
