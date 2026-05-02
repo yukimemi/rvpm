@@ -2151,16 +2151,19 @@ async fn run_generate() -> Result<()> {
         ));
     }
 
-    // lazy → eager 昇格を適用。generate 単独実行時は merged/ や views/ が stale
-    // な可能性があるため、全 plugin の view tree を再構築する。
+    // lazy → eager 昇格を適用。 merged/ は各 plugin が hard-link で書き戻すため、
+    // stale 防止のため事前に全消し → 再作成する。
+    // **views/ は wholesale 削除しない** (#129 CodeRabbit 指摘): Neovim が走ってる
+    // 状態で `rvpm generate` が動いた瞬間に lazy plugin の load_lazy が require/
+    // autoload を発火すると、 view dir が空 (削除直後 / 再 link 完了前) で失敗する
+    // race が起きる。 各 plugin の view は `dispatch_plugin_merge` 内の
+    // `atomic_replace_view_dir` で per-view atomic に置き換え、 stale な view dir
+    // (config から消えた plugin) は末尾の `prune_stale_views` で個別に掃除する。
     crate::loader::promote_lazy_to_eager(&mut plugin_scripts);
     if merged_dir.exists() {
         let _ = std::fs::remove_dir_all(&merged_dir);
     }
     std::fs::create_dir_all(&merged_dir)?;
-    if views_dir.exists() {
-        let _ = std::fs::remove_dir_all(&views_dir);
-    }
     std::fs::create_dir_all(&views_dir)?;
     let mut merge_conflicts: Vec<crate::merge_conflicts::MergeConflictReport> = Vec::new();
     let mut merge_ownership: std::collections::HashMap<PathBuf, String> =
@@ -5156,6 +5159,16 @@ fn record_merge_result(
     }
 }
 
+/// suffix-付き sibling path を生成する。 `view_dir.with_extension(suffix)` だと
+/// `plugin.nvim` と `plugin.vim` が両方 `plugin.<suffix>` に化けて衝突するので
+/// (Gemini PR #129 指摘)、 末尾に `.<suffix>` を appending する形で安全に作る。
+fn sibling_with_suffix(p: &Path, suffix: &str) -> PathBuf {
+    let mut s = p.as_os_str().to_os_string();
+    s.push(".");
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
 /// View dir を atomic に置き換えるためのヘルパ。
 ///
 /// 旧実装は `remove_dir_all(view_dir)` → `merge_plugin_view*` で再 link、 という
@@ -5163,41 +5176,48 @@ fn record_merge_result(
 /// になる窓ができる。 Neovide が走ってる状態で `rvpm generate` (例: `:Rvpm` TUI
 /// から `c` キーで config 編集後) が動くと、 その瞬間に lazy plugin の load_lazy
 /// が `dofile(after)` で view 配下の lua module を require した場合、 `No such
-/// file or directory` で失敗する race が観測された。
+/// file or directory` で失敗する race が観測された (#128)。
 ///
-/// 修正アプローチ:
-/// 1. tmp dir (`<view_dir>.tmp`) に新規 build (link)
-/// 2. 既存 view を `<view_dir>.old` にリネーム (atomic)
-/// 3. tmp を view_dir にリネーム (atomic)
-/// 4. `.old` を削除 (失敗しても致命じゃない)
-///
-/// NTFS でも 同 volume 内 `MoveFileEx(REPLACE_EXISTING)` 相当が使えるので、
-/// view_dir が常に「古い tree」か「新しい tree」のどちらかを指す状態になる
-/// (空の窓が消える)。
-fn atomic_replace_view_dir<F>(view_dir: &Path, build: F) -> std::io::Result<()>
+/// 修正アプローチ (POSIX / Windows で 2 経路):
+/// - **POSIX**: `rename(tmp, view)` は existing dir を atomic 置換できる。
+///   tmp に build → 直接 rename で 1-step 置換。 view_dir が空になる瞬間ゼロ。
+/// - **Windows**: `rename` で existing dir を replace できないので 2-step:
+///   既存 view を `.rvpm-old` に退避 → tmp を view に rename → `.rvpm-old` 削除。
+///   退避と rename の間に小さい window はあるが、 旧実装の delete→build より
+///   遥かに短い (rename はメタデータ更新のみ)。
+fn atomic_replace_view_dir<F>(view_dir: &Path, build: F) -> anyhow::Result<()>
 where
-    F: FnOnce(&Path) -> std::io::Result<()>,
+    F: FnOnce(&Path) -> anyhow::Result<()>,
 {
-    let tmp_dir = view_dir.with_extension("rvpm-tmp");
-    let old_dir = view_dir.with_extension("rvpm-old");
+    let tmp_dir = sibling_with_suffix(view_dir, "rvpm-tmp");
+    let old_dir = sibling_with_suffix(view_dir, "rvpm-old");
     // 前回の sync が中途で死んでて残骸が残ってるケースに備えて事前 cleanup。
     let _ = std::fs::remove_dir_all(&tmp_dir);
     let _ = std::fs::remove_dir_all(&old_dir);
     // Step 1: tmp に新規 build。
     build(&tmp_dir)?;
-    // Step 2 + 3: 既存 view を .old に退避してから tmp を view に rename。
-    // view_dir が無い場合 (初回 sync) は退避不要なので skip。
-    if view_dir.exists() {
-        std::fs::rename(view_dir, &old_dir)?;
+    // Step 2 (POSIX): 直接 rename で existing dir を atomic 置換。
+    #[cfg(unix)]
+    {
+        if let Err(e) = std::fs::rename(&tmp_dir, view_dir) {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(e.into());
+        }
     }
-    if let Err(e) = std::fs::rename(&tmp_dir, view_dir) {
-        // Step 3 失敗時は .old を view に戻して整合保つ (best-effort)。
-        let _ = std::fs::rename(&old_dir, view_dir);
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        return Err(e);
+    // Step 2 (Windows): 既存 view を .old に退避 → tmp を view に rename。
+    #[cfg(not(unix))]
+    {
+        if view_dir.exists() {
+            std::fs::rename(view_dir, &old_dir)?;
+        }
+        if let Err(e) = std::fs::rename(&tmp_dir, view_dir) {
+            // Step 3 失敗時は .old を view に戻して整合保つ (best-effort)。
+            let _ = std::fs::rename(&old_dir, view_dir);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(e.into());
+        }
+        let _ = std::fs::remove_dir_all(&old_dir);
     }
-    // Step 4: .old を後始末 (失敗しても致命じゃない)。
-    let _ = std::fs::remove_dir_all(&old_dir);
     Ok(())
 }
 
@@ -5241,16 +5261,12 @@ fn dispatch_plugin_merge(
             let mut view_conflicts: Vec<crate::merge_conflicts::MergeConflictReport> = Vec::new();
             let mut merge_result: Option<anyhow::Result<crate::link::MergeResult>> = None;
             let atomic_res = atomic_replace_view_dir(view_dir, |tmp| {
-                match crate::link::merge_plugin_view(src, tmp) {
-                    Ok(m) => {
-                        merge_result = Some(Ok(m));
-                        Ok(())
-                    }
-                    Err(e) => Err(std::io::Error::other(e.to_string())),
-                }
+                let m = crate::link::merge_plugin_view(src, tmp)?;
+                merge_result = Some(Ok(m));
+                Ok(())
             });
             if let Err(e) = atomic_res {
-                merge_result = Some(Err(anyhow::anyhow!("atomic view replace failed: {}", e)));
+                merge_result = Some(Err(e.context("atomic view replace failed")));
             }
             if let Some(r) = merge_result {
                 record_merge_result(plugin_name, r, &mut view_ownership, &mut view_conflicts);
@@ -5263,17 +5279,12 @@ fn dispatch_plugin_merge(
             let mut view_conflicts: Vec<crate::merge_conflicts::MergeConflictReport> = Vec::new();
             let mut merge_result: Option<anyhow::Result<crate::link::MergeResult>> = None;
             let atomic_res = atomic_replace_view_dir(view_dir, |tmp| {
-                let r = crate::link::merge_plugin_view_no_doc(src, tmp);
-                match r {
-                    Ok(m) => {
-                        merge_result = Some(Ok(m));
-                        Ok(())
-                    }
-                    Err(e) => Err(std::io::Error::other(e.to_string())),
-                }
+                let m = crate::link::merge_plugin_view_no_doc(src, tmp)?;
+                merge_result = Some(Ok(m));
+                Ok(())
             });
             if let Err(e) = atomic_res {
-                merge_result = Some(Err(anyhow::anyhow!("atomic view replace failed: {}", e)));
+                merge_result = Some(Err(e.context("atomic view replace failed")));
             }
             if let Some(r) = merge_result {
                 record_merge_result(plugin_name, r, &mut view_ownership, &mut view_conflicts);
