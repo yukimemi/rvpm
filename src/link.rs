@@ -70,21 +70,56 @@ pub fn merge_plugin(src: &Path, dst_root: &Path) -> Result<MergeResult> {
     if !dst_root.exists() {
         std::fs::create_dir_all(dst_root)?;
     }
-    walk(src, src, dst_root, &mut result)?;
+    walk(
+        src,
+        src,
+        dst_root,
+        &mut result,
+        WalkOptions { rtp_only: true },
+    )?;
     Ok(result)
 }
 
-/// `merge_plugin` の **`doc/` 抜き** 版。 `views/<plug>/` 用 (#119)。
+/// 指定したプラグインの全ファイルを `views/<plug>/` ディレクトリにファイル単位で
+/// リンクする (`#119` の view 戦略)。
 ///
-/// 用途: `PluginMergeMode::ViewWithoutDoc` のとき、 plugin の rtp dir を
+/// `merge_plugin` との違い: `RTP_DIRS` の絞り込みも、 ルート直下のメタファイル
+/// (README.md / Cargo.toml 等) の除外も **しない**。 views/<plug>/ は per-plugin で
+/// cross-plugin の衝突は発生しないので、 絞り込みノイズ抑制が不要。
+///
+/// 重要: `build` / `build_lua` を持つ plugin の build artifact (`target/release/...`,
+/// `build/` 等の plugin 任意のディレクトリ) も拾うために rtp 慣習外を含めて全部 link
+/// する。 これが無いと blink.cmp 等の `debug.getinfo()` ベースで自分の lua module
+/// 位置から相対参照する plugin が build 出力を見つけられない。
+///
+/// `.git/` 等のドットファイルと `doc/tags` の上書き対策は引き続き skip する
+/// (内部で同じ `walk` を `rtp_only: false` で呼び分け)。
+pub fn merge_plugin_view(src: &Path, dst_root: &Path) -> Result<MergeResult> {
+    let mut result = MergeResult::default();
+    if !dst_root.exists() {
+        std::fs::create_dir_all(dst_root)?;
+    }
+    walk(
+        src,
+        src,
+        dst_root,
+        &mut result,
+        WalkOptions { rtp_only: false },
+    )?;
+    Ok(result)
+}
+
+/// `merge_plugin_view` の **`doc/` 抜き** 版。 `views/<plug>/` 用 (`#119`)。
+///
+/// 用途: `PluginMergeMode::ViewWithoutDoc` のとき、 plugin の全 entry を
 /// `views/<plug>/` に `doc/` を除いて hard-link する。 doc/ は別途
 /// `merge_plugin_doc_only` で `merged/doc/` に集約される。
 /// 結果として rtp に乗るのは doc を持たない view → `:tselect` の重複が発生せず、
 /// `:help` は集約された `merged/doc/tags` を 1 経路で引ける。
 ///
-/// 衝突検出 / 隠しファイル / `doc/tags` 系の skip ルールは `merge_plugin` と
-/// 共通 (内部で同じ `walk` を再利用)。
-pub fn merge_plugin_no_doc(src: &Path, dst_root: &Path) -> Result<MergeResult> {
+/// `merge_plugin_view` と同じく rtp 慣習外も含めて全部 link する (build artifact
+/// を拾うため)。 doc/ だけ root 直下で除外する点が異なる。
+pub fn merge_plugin_view_no_doc(src: &Path, dst_root: &Path) -> Result<MergeResult> {
     let mut result = MergeResult::default();
     if !dst_root.exists() {
         std::fs::create_dir_all(dst_root)?;
@@ -96,28 +131,38 @@ pub fn merge_plugin_no_doc(src: &Path, dst_root: &Path) -> Result<MergeResult> {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if name_str == "doc" {
-            continue;
-        }
-        // それ以外は plugin ルート相当として walk に渡す
-        // (= `at_plugin_root=true` 相当の filter を効かせる)。
-        let entry_path = entry.path();
         if name_str.starts_with('.') {
             continue;
         }
+        if name_str == "doc" {
+            continue;
+        }
+        let entry_path = entry.path();
         if entry_path.is_file() {
-            // ルート直下のメタファイル (README.md etc.) は merge_plugin と同様 skip
+            // ルート直下のファイル (README.md / Cargo.toml etc.) も link する
+            let dst_path = dst_root.join(&name);
+            if dst_path.exists() {
+                result.conflicts.push(MergeConflict {
+                    relative: PathBuf::from(&name),
+                });
+            } else {
+                hard_link_or_copy(&entry_path, &dst_path)?;
+                result.placed.push(PathBuf::from(&name));
+            }
             continue;
         }
-        if !RTP_DIRS.contains(&name_str.as_ref()) {
-            continue;
-        }
+        // ディレクトリは rtp_only=false で walk (rtp 慣習外も含めて全部)
         let dst_subdir = dst_root.join(name.as_os_str());
         if !dst_subdir.exists() {
             std::fs::create_dir_all(&dst_subdir)?;
         }
-        // 各 rtp dir 配下に再帰 (この時点で `at_plugin_root=false` 相当)
-        walk(src, &entry_path, dst_root, &mut result)?;
+        walk(
+            src,
+            &entry_path,
+            dst_root,
+            &mut result,
+            WalkOptions { rtp_only: false },
+        )?;
     }
     Ok(result)
 }
@@ -148,11 +193,34 @@ pub fn merge_plugin_doc_only(src: &Path, dst_root: &Path) -> Result<MergeResult>
     if !dst_doc.exists() {
         std::fs::create_dir_all(&dst_doc)?;
     }
-    walk(src, &src_doc, dst_root, &mut result)?;
+    walk(
+        src,
+        &src_doc,
+        dst_root,
+        &mut result,
+        WalkOptions { rtp_only: true },
+    )?;
     Ok(result)
 }
 
-fn walk(plugin_root: &Path, dir: &Path, dst_root: &Path, result: &mut MergeResult) -> Result<()> {
+/// `walk` のフィルタオプション。 merged/ 用 (rtp_only=true) と views/ 用
+/// (rtp_only=false) で plugin ルート直下の挙動を切り替える。
+#[derive(Clone, Copy)]
+struct WalkOptions {
+    /// plugin ルート直下で `RTP_DIRS` 縛りと「ファイル除外」を効かせるか。
+    /// `merged/` (cross-plugin 共有) は cross-plugin 衝突ノイズを抑える必要が
+    /// あるので true。 `views/<plug>/` は per-plugin で衝突無し、 build
+    /// artifact (target/, build/ 等) も拾いたいので false。
+    rtp_only: bool,
+}
+
+fn walk(
+    plugin_root: &Path,
+    dir: &Path,
+    dst_root: &Path,
+    result: &mut MergeResult,
+    opts: WalkOptions,
+) -> Result<()> {
     let at_plugin_root = dir == plugin_root;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -167,7 +235,7 @@ fn walk(plugin_root: &Path, dir: &Path, dst_root: &Path, result: &mut MergeResul
             continue;
         }
 
-        if at_plugin_root {
+        if at_plugin_root && opts.rtp_only {
             // plugin ルート直下のファイル (README.md / LICENSE / Makefile /
             // package.json / *.toml 等のメタファイル) は rtp に置く意味が無く、
             // plugin 横断で同名衝突するだけのノイズなので merge しない。
@@ -215,7 +283,7 @@ fn walk(plugin_root: &Path, dir: &Path, dst_root: &Path, result: &mut MergeResul
             if !dst_path.exists() {
                 std::fs::create_dir_all(&dst_path)?;
             }
-            walk(plugin_root, &src_path, dst_root, result)?;
+            walk(plugin_root, &src_path, dst_root, result, opts)?;
         } else if dst_path.exists() {
             // first-wins: 既にファイル / ディレクトリが居る → skip
             // (dst が dir で src が file の対称ケースもここでカバー)
@@ -652,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_doc_links_everything_except_doc() {
+    fn test_view_no_doc_links_everything_except_doc() {
         // ViewWithoutDoc 用: doc/ は触らず、それ以外の rtp dir を全部 link。
         let root = tempdir().unwrap();
         let view = root.path().join("view");
@@ -662,7 +730,7 @@ mod tests {
         write(&p.join("plugin/bar.vim"), "echo 'bar'");
         write(&p.join("ftplugin/rust.vim"), "setl shiftwidth=4");
 
-        let r = merge_plugin_no_doc(&p, &view).unwrap();
+        let r = merge_plugin_view_no_doc(&p, &view).unwrap();
 
         // doc/ は来ない
         assert!(!view.join("doc").exists());
@@ -674,28 +742,147 @@ mod tests {
     }
 
     #[test]
-    fn test_no_doc_skips_root_meta_and_dotfiles() {
-        // merge_plugin と同じくルート直下メタ + dotfile は除外する。
+    fn test_view_no_doc_skips_dotfiles_but_keeps_meta() {
+        // views/ は per-plugin なので衝突発生せず、 root meta files は link する。
+        // dotfile (.git/ など) のみ除外。
         let root = tempdir().unwrap();
         let view = root.path().join("view");
         let p = root.path().join("plug");
         write(&p.join("README.md"), "# plug");
         write(&p.join(".git/config"), "[core]");
         write(&p.join("Makefile"), "all:");
+        write(&p.join("Cargo.toml"), "[package]");
         write(&p.join("lua/foo.lua"), "return {}");
 
-        let r = merge_plugin_no_doc(&p, &view).unwrap();
+        let r = merge_plugin_view_no_doc(&p, &view).unwrap();
 
-        assert!(!view.join("README.md").exists());
+        // dotfile は除外
         assert!(!view.join(".git").exists());
-        assert!(!view.join("Makefile").exists());
+        // root meta files は link される (views は per-plugin なので衝突無し)
+        assert!(view.join("README.md").exists());
+        assert!(view.join("Makefile").exists());
+        assert!(view.join("Cargo.toml").exists());
         assert!(view.join("lua/foo.lua").exists());
         assert!(r.conflicts.is_empty());
     }
 
     #[test]
-    fn test_no_doc_includes_all_rtp_dirs_except_doc() {
-        // RTP_DIRS のうち doc 以外は全部対象。
+    fn test_view_no_doc_links_build_artifacts() {
+        // blink.cmp の build_lua が target/release/ に吐く .dll / .so 等を views/<plug>/
+        // 配下にも link する (#119 fix)。 元々 RTP_DIRS 縛りで除外されてて、 plugin が
+        // debug.getinfo() で自分の lua から相対参照する設計の場合に library が見つからない
+        // 不具合があった。
+        let root = tempdir().unwrap();
+        let view = root.path().join("view");
+        let p = root.path().join("plug");
+        write(&p.join("doc/foo.txt"), "*foo*");
+        write(&p.join("lua/blink/cmp/init.lua"), "return {}");
+        write(&p.join("target/release/blink_cmp_fuzzy.dll"), "DLL");
+        write(&p.join("build/native/lib.so"), "SO");
+
+        let r = merge_plugin_view_no_doc(&p, &view).unwrap();
+
+        // doc/ は来ない
+        assert!(!view.join("doc").exists());
+        // build artifact ディレクトリも link される
+        assert!(view.join("target/release/blink_cmp_fuzzy.dll").exists());
+        assert!(view.join("build/native/lib.so").exists());
+        assert!(view.join("lua/blink/cmp/init.lua").exists());
+        assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_view_no_doc_includes_non_rtp_dirs() {
+        // tests/ scripts/ examples/ 等も link する (rtp 慣習外も含めて全部)。
+        let root = tempdir().unwrap();
+        let view = root.path().join("view");
+        let p = root.path().join("plug");
+        write(&p.join("tests/spec.lua"), "test");
+        write(&p.join("scripts/build.sh"), "#!/bin/sh");
+        write(&p.join("examples/demo.lua"), "demo");
+        write(&p.join("src/main.rs"), "fn main() {}");
+        write(&p.join("plugin/foo.vim"), "echo 'foo'");
+
+        let r = merge_plugin_view_no_doc(&p, &view).unwrap();
+
+        assert!(view.join("tests/spec.lua").exists());
+        assert!(view.join("scripts/build.sh").exists());
+        assert!(view.join("examples/demo.lua").exists());
+        assert!(view.join("src/main.rs").exists());
+        assert!(view.join("plugin/foo.vim").exists());
+        assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_view_links_everything_except_dotfiles() {
+        // ViewWithDoc 用: doc/ も含めて全部 link。 dotfile のみ除外。
+        let root = tempdir().unwrap();
+        let view = root.path().join("view");
+        let p = root.path().join("plug");
+        write(&p.join("doc/foo.txt"), "*foo*");
+        write(&p.join("lua/foo/init.lua"), "return {}");
+        write(&p.join("plugin/bar.vim"), "echo 'bar'");
+        write(&p.join("README.md"), "# plug");
+        write(&p.join("Cargo.toml"), "[package]");
+        write(&p.join(".git/config"), "[core]");
+        write(&p.join(".github/workflows/ci.yml"), "name: CI");
+
+        let r = merge_plugin_view(&p, &view).unwrap();
+
+        // doc/ も含めて link される
+        assert!(view.join("doc/foo.txt").exists());
+        assert!(view.join("lua/foo/init.lua").exists());
+        assert!(view.join("plugin/bar.vim").exists());
+        assert!(view.join("README.md").exists());
+        assert!(view.join("Cargo.toml").exists());
+        // dotfile (.git, .github 等) は除外
+        assert!(!view.join(".git").exists());
+        assert!(!view.join(".github").exists());
+        assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_view_links_build_artifacts() {
+        // ViewWithDoc でも build artifact (target/release/) を view に link する。
+        // blink.cmp が eager + merge=false で自分で build_lua を持つケース。
+        let root = tempdir().unwrap();
+        let view = root.path().join("view");
+        let p = root.path().join("plug");
+        write(&p.join("doc/foo.txt"), "*foo*");
+        write(&p.join("lua/blink/cmp/init.lua"), "return {}");
+        write(&p.join("target/release/blink_cmp_fuzzy.dll"), "DLL");
+
+        let r = merge_plugin_view(&p, &view).unwrap();
+
+        assert!(view.join("doc/foo.txt").exists());
+        assert!(view.join("lua/blink/cmp/init.lua").exists());
+        assert!(view.join("target/release/blink_cmp_fuzzy.dll").exists());
+        assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_view_skips_committed_doc_tags() {
+        // doc/tags の skip ルールは views でも維持 (helptags が view 配下で
+        // 走るとき hard link 経由で repos の tags まで上書きするのを防ぐ)。
+        let root = tempdir().unwrap();
+        let view = root.path().join("view");
+        let p = root.path().join("plug");
+        write(&p.join("doc/foo.txt"), "*foo*");
+        write(&p.join("doc/tags"), "stale-tags");
+
+        let r = merge_plugin_view(&p, &view).unwrap();
+
+        assert!(view.join("doc/foo.txt").exists());
+        assert!(
+            !view.join("doc/tags").exists(),
+            "doc/tags should be skipped in views/"
+        );
+        assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_view_no_doc_includes_all_rtp_dirs_except_doc() {
+        // 旧 test の互換確認: RTP_DIRS のうち doc 以外は全部対象 (views も同じ)。
         let root = tempdir().unwrap();
         let view = root.path().join("view");
         let p = root.path().join("plug");
@@ -703,14 +890,14 @@ mod tests {
             write(&p.join(dir).join("file.txt"), dir);
         }
 
-        let r = merge_plugin_no_doc(&p, &view).unwrap();
+        let r = merge_plugin_view_no_doc(&p, &view).unwrap();
         assert!(r.conflicts.is_empty());
         for dir in RTP_DIRS {
             let expected = view.join(dir).join("file.txt");
             if *dir == "doc" {
                 assert!(
                     !expected.exists(),
-                    "doc/ should be skipped by merge_plugin_no_doc"
+                    "doc/ should be skipped by merge_plugin_view_no_doc"
                 );
             } else {
                 assert!(expected.exists(), "missing rtp dir in view: {}", dir);

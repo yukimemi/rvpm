@@ -4912,14 +4912,20 @@ fn dispatch_plugin_merge(
         PluginMergeMode::ViewWithDoc => {
             // view 側は per-plugin 専用 dir なので、 別 plugin との衝突は発生しない。
             // ownership / conflicts は便宜上同じ map を渡すが、 通常空のまま戻る。
+            // `merge_plugin_view` は RTP_DIRS の絞り込みをせず、 ルート直下のメタファイル
+            // (README.md / Cargo.toml / Makefile) や rtp 慣習外ディレクトリ
+            // (target/ build/ tests/ src/ examples/) も含めて全部 link する。
+            // これは build / build_lua を持つ plugin が build artifact を view 経由で
+            // 参照できるようにするため (#119 fix)。
             let _ = std::fs::remove_dir_all(view_dir);
-            let r = crate::link::merge_plugin(src, view_dir);
+            let r = crate::link::merge_plugin_view(src, view_dir);
             record_merge_result(plugin_name, r, ownership, conflicts);
         }
         PluginMergeMode::ViewWithoutDoc => {
             let _ = std::fs::remove_dir_all(view_dir);
-            // 1) view (doc 抜き) を per-plugin に
-            let r = crate::link::merge_plugin_no_doc(src, view_dir);
+            // 1) view (doc 抜き) を per-plugin に。 RTP_DIRS の絞り込みなしで
+            //    全 entry (build artifact 含む) を link する。
+            let r = crate::link::merge_plugin_view_no_doc(src, view_dir);
             record_merge_result(plugin_name, r, ownership, conflicts);
             // 2) doc/ だけ merged/ に集約 (これが merge_doc=true の本命)
             let r = crate::link::merge_plugin_doc_only(src, merged_dir);
