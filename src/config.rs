@@ -133,6 +133,15 @@ pub struct Options {
     /// (AI が自然言語名で受け付けてくれるので)。
     #[serde(default = "default_ai_language")]
     pub ai_language: String,
+    /// `true` (default) なら `rvpm <subcommand>` 完了時に GitHub releases を
+    /// バックグラウンドで叩いて新版があれば banner で案内する (#125)。
+    /// 自動 install はしない — banner を見た user が `rvpm self-update` を能動的に
+    /// 叩く設計。 ネットワーク失敗 / rate limit は silent skip。
+    #[serde(default = "default_auto_update_check")]
+    pub auto_update_check: bool,
+    /// 自動 update check の throttle 間隔 (humantime 書式: `"24h"` / `"1d"` 等)。
+    /// 未指定なら `"24h"`、 不正値は warn 後 default に fallback。
+    pub update_check_interval: Option<String>,
 }
 
 fn default_ai_language() -> String {
@@ -188,6 +197,8 @@ impl Default for Options {
             auto_lazy: AutoLazyPolicy::default(),
             ai: AiBackend::default(),
             ai_language: default_ai_language(),
+            auto_update_check: default_auto_update_check(),
+            update_check_interval: None,
         }
     }
 }
@@ -392,6 +403,10 @@ fn default_merge() -> bool {
 }
 
 fn default_auto_helptags() -> bool {
+    true
+}
+
+fn default_auto_update_check() -> bool {
     true
 }
 
@@ -772,6 +787,45 @@ url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
         assert!(!config.options.auto_helptags);
+    }
+
+    #[test]
+    fn test_parse_config_auto_update_check_defaults_to_true() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(config.options.auto_update_check);
+        assert_eq!(config.options.update_check_interval, None);
+    }
+
+    #[test]
+    fn test_parse_config_accepts_auto_update_check_false() {
+        let toml = r#"
+[options]
+auto_update_check = false
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert!(!config.options.auto_update_check);
+    }
+
+    #[test]
+    fn test_parse_config_accepts_update_check_interval() {
+        let toml = r#"
+[options]
+update_check_interval = "12h"
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.options.update_check_interval.as_deref(), Some("12h"));
     }
 
     #[test]

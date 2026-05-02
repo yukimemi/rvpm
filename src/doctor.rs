@@ -1311,6 +1311,8 @@ mod tests {
                 auto_lazy: crate::config::AutoLazyPolicy::Ask,
                 ai: crate::config::AiBackend::Off,
                 ai_language: "en".to_string(),
+                auto_update_check: true,
+                update_check_interval: None,
             },
             plugins,
         }

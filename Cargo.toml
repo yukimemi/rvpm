@@ -41,6 +41,21 @@ toml_edit = "0.25"
 # CLI subprocess discovery (`claude` / `gemini` / `codex` on PATH for AI add #93).
 which = "8"
 
+# Self-update (`rvpm self-update`, daily auto-check banner) — #125
+# default-features = false で `reqwest` を rustls 経由に固定する (rvpm 全体の
+# TLS pin と整合)。 `archive-zip` / `archive-tar` / `compression-flate2` で
+# GitHub release artifact (linux .tar.gz / windows .zip) を解凍可能にする。
+self_update = { version = "0.42", default-features = false, features = [
+    "rustls",
+    "compression-flate2",
+    "archive-tar",
+    "archive-zip",
+] }
+# Version 比較 (current `Cargo.toml` の version vs. 取得した `tag_name`)。
+semver = "1"
+# `[options] update_check_interval = "24h"` 等のパース。
+humantime = "2"
+
 # Markdown rendering (for store TUI README preview).
 # `highlight-code` brings in syntect + ansi-to-tui (~4 MB of syntax / theme
 # data) but is the only way to make fenced code blocks readable — without it

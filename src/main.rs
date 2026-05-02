@@ -15,6 +15,7 @@ mod merge_conflicts;
 mod plugin_scan;
 mod profile;
 mod profile_tui;
+mod self_update;
 mod tui;
 mod update_log;
 
@@ -434,11 +435,42 @@ enum Commands {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Update the rvpm binary itself to the latest GitHub release (#125)
+    ///
+    /// Detects how rvpm was installed (cargo install / direct binary / dev build)
+    /// and dispatches accordingly. Exits without changes if already up to date.
+    ///
+    /// EXAMPLES:
+    ///
+    ///   # check + interactive prompt
+    ///   rvpm self-update
+    ///
+    ///   # non-interactive (for scripts) — installs without asking
+    ///   rvpm self-update --yes
+    ///
+    ///   # report availability and exit (no install)
+    ///   rvpm self-update --check
+    SelfUpdate {
+        /// Skip the confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Print availability and exit without installing
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // 自動 update check は最初にバックグラウンド spawn して、 コマンド実行と並列に
+    // GitHub API を fetch する (#125)。 結果は main 末尾で受け取って banner 出力。
+    // SelfUpdate / Completion 時はノイズになるので spawn しない。
+    let auto_update_handle = match cli.command {
+        Some(Commands::SelfUpdate { .. } | Commands::Completion { .. }) => None,
+        _ => maybe_spawn_auto_update_check().await,
+    };
 
     match cli.command.unwrap_or(Commands::List { no_tui: false }) {
         Commands::Sync {
@@ -600,6 +632,16 @@ async fn main() -> Result<()> {
         Commands::Completion { shell } => {
             run_completion(shell);
         }
+        Commands::SelfUpdate { yes, check } => {
+            run_self_update(yes, check).await?;
+        }
+    }
+
+    // バックグラウンドの auto update check を join + banner 出力 (#125)。
+    // 既にコマンドの本体が完了してるので、 fetch がまだ動いてるなら短い timeout で
+    // 切り上げる (1 秒) — banner は「あったら表示する」のスタンス。
+    if let Some(handle) = auto_update_handle {
+        finalize_auto_update_check(handle).await;
     }
 
     Ok(())
@@ -616,6 +658,239 @@ fn run_completion(shell: clap_complete::Shell) {
     let mut cmd = <Cli as clap::CommandFactory>::command();
     let bin = cmd.get_name().to_string();
     clap_complete::generate(shell, &mut cmd, bin, &mut std::io::stdout());
+}
+
+/// 自動 update check の handle。 結果は `finalize_auto_update_check` で消費する。
+enum AutoUpdateHandle {
+    /// throttle window 内で fetch skip、 過去の cache が新版を示しているので
+    /// banner だけ出す。
+    CachedAvailable {
+        current: String,
+        latest: self_update::LatestRelease,
+    },
+    /// バックグラウンドで GitHub API を叩いてる。 join 結果に応じて状態保存 + banner。
+    Pending {
+        current: String,
+        cache_root: std::path::PathBuf,
+        handle: tokio::task::JoinHandle<Result<self_update::LatestRelease, anyhow::Error>>,
+    },
+}
+
+/// `auto_update_check` 設定が ON で、 throttle window を超えてれば background fetch を
+/// 起動する。 throttle 内でも cached `last_known_latest` が現バイナリより新しければ
+/// banner 用の handle (CachedAvailable) を返す。
+///
+/// 失敗時 (config 読めない / network preflight 失敗) は `None` を返して silent skip。
+async fn maybe_spawn_auto_update_check() -> Option<AutoUpdateHandle> {
+    // config が読めない / 失敗するケースもあるので resilience。 panic は絶対にしない。
+    let config_path = config_path_for_auto_check()?;
+    let toml_str = std::fs::read_to_string(&config_path).ok()?;
+    let cfg = parse_config(&toml_str).ok()?;
+    if !cfg.options.auto_update_check {
+        return None;
+    }
+    let interval = cfg
+        .options
+        .update_check_interval
+        .as_deref()
+        .and_then(|s| self_update::parse_interval(s).ok())
+        .unwrap_or_else(self_update::default_interval);
+
+    let cache_root = resolve_cache_root(cfg.options.cache_root.as_deref());
+    let state = self_update::load_check_state(&cache_root);
+    let now = std::time::SystemTime::now();
+    let current = env!("CARGO_PKG_VERSION").to_string();
+
+    if !self_update::should_auto_check(state.as_ref(), interval, now) {
+        // throttle 内 — cache から判定
+        if let Some(state) = state
+            && let Some(cached_tag) = state.last_known_latest.as_ref()
+            && self_update::is_update_available(&current, cached_tag).unwrap_or(false)
+        {
+            return Some(AutoUpdateHandle::CachedAvailable {
+                current,
+                latest: self_update::LatestRelease {
+                    tag_name: cached_tag.clone(),
+                    html_url: String::new(),
+                },
+            });
+        }
+        return None;
+    }
+
+    // fetch を spawn
+    let handle = tokio::spawn(async move { self_update::check_latest_release().await });
+    Some(AutoUpdateHandle::Pending {
+        current,
+        cache_root,
+        handle,
+    })
+}
+
+/// `rvpm` の config file の path を `$RVPM_APPNAME` / `$NVIM_APPNAME` から解決する。
+/// 既存の `resolve_config_path` がある場合はそちらを使うが、 ここでは auto-check 用に
+/// 軽量な lookup を行う。
+fn config_path_for_auto_check() -> Option<std::path::PathBuf> {
+    // `parse_config` は既存の lookup を内蔵してるので、 既知の標準位置を返す。
+    let appname = std::env::var("RVPM_APPNAME")
+        .or_else(|_| std::env::var("NVIM_APPNAME"))
+        .unwrap_or_else(|_| "nvim".to_string());
+    let home = dirs::home_dir()?;
+    let p = home
+        .join(".config")
+        .join("rvpm")
+        .join(appname)
+        .join("config.toml");
+    p.exists().then_some(p)
+}
+
+/// background fetch を join + banner 出力 (#125)。
+/// timeout は 1 秒 — fetch が遅ければ次回に回す。
+async fn finalize_auto_update_check(handle: AutoUpdateHandle) {
+    match handle {
+        AutoUpdateHandle::CachedAvailable { current, latest } => {
+            eprintln!("\n{}", self_update::format_update_banner(&current, &latest));
+        }
+        AutoUpdateHandle::Pending {
+            current,
+            cache_root,
+            handle,
+        } => {
+            // 1 秒 timeout で結果を待つ。 タイムアウトは silent skip。
+            let res = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+            let Ok(Ok(Ok(latest))) = res else {
+                return;
+            };
+            // state を保存
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let state = self_update::UpdateCheckState {
+                last_checked_unix: now_unix,
+                last_known_latest: Some(latest.tag_name.clone()),
+            };
+            let _ = self_update::save_check_state(&cache_root, &state);
+            // banner 出力
+            if self_update::is_update_available(&current, &latest.tag_name).unwrap_or(false) {
+                eprintln!("\n{}", self_update::format_update_banner(&current, &latest));
+            }
+        }
+    }
+}
+
+/// `rvpm self-update` (#125)。
+///
+/// 流れ:
+/// 1. GitHub API から latest を fetch
+/// 2. semver 比較で update 要否を判定 (current = `CARGO_PKG_VERSION`)
+/// 3. `--check` ならここで exit
+/// 4. `--yes` 以外は対話プロンプト (`y/N`)
+/// 5. `current_exe()` から install 方法を検出して dispatch:
+///    - `DevBuild` → 拒否 + manual rebuild 案内
+///    - `CargoInstall` → `cargo install rvpm --force` を spawn
+///    - `DirectBinary` → `self_update` crate で atomic 自己置換
+///
+/// resilience: ネットワーク失敗 / API 失敗時は明示的にエラー終了する
+/// (auto-check と違って、 user が能動的に呼んだので silent skip は親切ではない)。
+async fn run_self_update(yes: bool, check_only: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let latest = self_update::check_latest_release()
+        .await
+        .context("failed to fetch latest release from GitHub")?;
+
+    let available = self_update::is_update_available(current, &latest.tag_name)
+        .context("failed to compare versions")?;
+    if !available {
+        println!("\u{2713} rvpm {} is already up to date.", current);
+        return Ok(());
+    }
+
+    let latest_clean = latest.tag_name.trim_start_matches('v');
+    if check_only {
+        println!(
+            "\u{2699} rvpm {} available (current {}). Run `rvpm self-update` to install.",
+            latest_clean, current
+        );
+        if !latest.html_url.is_empty() {
+            println!("  release notes: {}", latest.html_url);
+        }
+        return Ok(());
+    }
+
+    if !yes {
+        eprint!("Update to v{}? [y/N] ", latest_clean);
+        std::io::Write::flush(&mut std::io::stderr()).ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        let answer = answer.trim().to_ascii_lowercase();
+        if answer != "y" && answer != "yes" {
+            eprintln!("aborted.");
+            return Ok(());
+        }
+    }
+
+    let exe = std::env::current_exe().context("failed to resolve current_exe()")?;
+    let method = self_update::detect_install_method(&exe);
+    match method {
+        self_update::InstallMethod::DevBuild => {
+            eprintln!(
+                "\u{26a0} `{}` looks like a development build (path under `target/`). \
+                 Refusing to self-update — please pull from git and rebuild manually:\n  \
+                 cd <rvpm clone> && git pull && cargo build --release",
+                exe.display()
+            );
+            std::process::exit(1);
+        }
+        self_update::InstallMethod::CargoInstall => {
+            eprintln!("running: cargo install rvpm --force");
+            let status = tokio::process::Command::new("cargo")
+                .args(["install", "rvpm", "--force"])
+                .status()
+                .await
+                .context("failed to spawn `cargo install` (is cargo on PATH?)")?;
+            if !status.success() {
+                return Err(anyhow::anyhow!(
+                    "`cargo install rvpm --force` exited with {}",
+                    status
+                ));
+            }
+            println!("\u{2713} rvpm v{} installed.", latest_clean);
+        }
+        self_update::InstallMethod::DirectBinary => {
+            // 外部 `self_update` crate を blocking で叩く (内部で reqwest blocking を使う)。
+            // tokio runtime 上で blocking 呼び出しを spawn_blocking に逃がす。
+            //
+            // 名前が衝突するので `::self_update` で外部 crate を明示参照する
+            // (rvpm 内部 module は `crate::self_update`)。
+            let latest_owned = latest_clean.to_string();
+            let result = tokio::task::spawn_blocking(move || -> Result<::self_update::Status> {
+                let updater = ::self_update::backends::github::Update::configure()
+                    .repo_owner("yukimemi")
+                    .repo_name("rvpm")
+                    .bin_name("rvpm")
+                    .show_download_progress(true)
+                    .current_version(env!("CARGO_PKG_VERSION"))
+                    .target_version_tag(&format!("v{}", latest_owned))
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("self_update build: {}", e))?;
+                updater
+                    .update()
+                    .map_err(|e| anyhow::anyhow!("self_update run: {}", e))
+            })
+            .await
+            .context("self-update task panicked")??;
+            match result {
+                ::self_update::Status::UpToDate(v) => {
+                    println!("\u{2713} rvpm {} is already up to date.", v);
+                }
+                ::self_update::Status::Updated(v) => {
+                    println!("\u{2713} rvpm v{} installed.", v);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 use crate::tui::{PluginStatus, TuiState};
