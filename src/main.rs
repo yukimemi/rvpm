@@ -3641,9 +3641,19 @@ async fn run_config() -> Result<bool> {
     let chezmoi_enabled = read_chezmoi_flag(&config_path);
     let edit_target = chezmoi::write_path(chezmoi_enabled, &config_path).await;
     println!("Opening {}", edit_target.display());
+    // mtime を編集前後で比較して、 config.toml に変更が無ければ caller (rvpm list
+    // TUI 等) が後続の `run_generate` を skip できるようにする。 todoke 系の
+    // 「open & close せず別 nvim instance に send」ワークフローで、 編集してない
+    // のに毎回 generate が走ると view tree の rebuild race を引き起こす #119。
+    let before_mtime = std::fs::metadata(&edit_target)
+        .and_then(|m| m.modified())
+        .ok();
     open_editor_at_line(&edit_target, 1)?;
+    let after_mtime = std::fs::metadata(&edit_target)
+        .and_then(|m| m.modified())
+        .ok();
     chezmoi::apply(&edit_target, &config_path).await;
-    Ok(true)
+    Ok(before_mtime != after_mtime)
 }
 
 /// `rvpm init` — Neovim init.lua に loader.lua を繋ぐ dofile 行を案内 or 自動追記する。
@@ -5146,21 +5156,49 @@ fn record_merge_result(
     }
 }
 
-/// View 系 dispatch 前に既存 `views/<plug>/` を削除する。 NotFound は無視 (初回 sync 時)、
-/// それ以外のエラー (permission denied / busy 等) は warn を stderr に出すが abort はしない
-/// (resilience: 後続の `merge_plugin_view*` が first-wins で動くので、 残骸があっても
-/// upstream で削除されたファイルがゴミとして残るだけで、 致命的では無い)。
-/// CodeRabbit PR #124 指摘: silent な `let _ =` を避けて user に見える形にする。
-fn clear_view_dir_or_warn(view_dir: &Path) {
-    if let Err(e) = std::fs::remove_dir_all(view_dir)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        eprintln!(
-            "\u{26a0} failed to clear view dir {}: {} (relinking will proceed but stale files may remain)",
-            view_dir.display(),
-            e
-        );
+/// View dir を atomic に置き換えるためのヘルパ。
+///
+/// 旧実装は `remove_dir_all(view_dir)` → `merge_plugin_view*` で再 link、 という
+/// 2 段階でやってたが、 これだと **削除完了から再 link 完了の間 view dir が空**
+/// になる窓ができる。 Neovide が走ってる状態で `rvpm generate` (例: `:Rvpm` TUI
+/// から `c` キーで config 編集後) が動くと、 その瞬間に lazy plugin の load_lazy
+/// が `dofile(after)` で view 配下の lua module を require した場合、 `No such
+/// file or directory` で失敗する race が観測された。
+///
+/// 修正アプローチ:
+/// 1. tmp dir (`<view_dir>.tmp`) に新規 build (link)
+/// 2. 既存 view を `<view_dir>.old` にリネーム (atomic)
+/// 3. tmp を view_dir にリネーム (atomic)
+/// 4. `.old` を削除 (失敗しても致命じゃない)
+///
+/// NTFS でも 同 volume 内 `MoveFileEx(REPLACE_EXISTING)` 相当が使えるので、
+/// view_dir が常に「古い tree」か「新しい tree」のどちらかを指す状態になる
+/// (空の窓が消える)。
+fn atomic_replace_view_dir<F>(view_dir: &Path, build: F) -> std::io::Result<()>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let tmp_dir = view_dir.with_extension("rvpm-tmp");
+    let old_dir = view_dir.with_extension("rvpm-old");
+    // 前回の sync が中途で死んでて残骸が残ってるケースに備えて事前 cleanup。
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&old_dir);
+    // Step 1: tmp に新規 build。
+    build(&tmp_dir)?;
+    // Step 2 + 3: 既存 view を .old に退避してから tmp を view に rename。
+    // view_dir が無い場合 (初回 sync) は退避不要なので skip。
+    if view_dir.exists() {
+        std::fs::rename(view_dir, &old_dir)?;
     }
+    if let Err(e) = std::fs::rename(&tmp_dir, view_dir) {
+        // Step 3 失敗時は .old を view に戻して整合保つ (best-effort)。
+        let _ = std::fs::rename(&old_dir, view_dir);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(e);
+    }
+    // Step 4: .old を後始末 (失敗しても致命じゃない)。
+    let _ = std::fs::remove_dir_all(&old_dir);
+    Ok(())
 }
 
 /// `PluginMergeMode` に従って sync 時のリンク tree を作る (#119 統一案)。
@@ -5195,36 +5233,51 @@ fn dispatch_plugin_merge(
         }
         PluginMergeMode::ViewWithDoc => {
             // view 側は per-plugin 専用 dir なので、 別 plugin との衝突は発生しない。
-            // `merge_plugin_view` は RTP_DIRS の絞り込みをせず、 ルート直下のメタファイル
-            // (README.md / Cargo.toml / Makefile) や rtp 慣習外ディレクトリ
-            // (target/ build/ tests/ src/ examples/) も含めて全部 link する。
-            // これは build / build_lua を持つ plugin が build artifact を view 経由で
-            // 参照できるようにするため (#119 fix)。
-            clear_view_dir_or_warn(view_dir);
-            let r = crate::link::merge_plugin_view(src, view_dir);
-            // ownership map は merged/ 用 (cross-plugin first-wins winner attribution)
-            // なので、 view-only placement で同名 path の attribution を上書きしないよう
-            // 隔離した temp map に流す (CodeRabbit PR #124 指摘)。
-            // view dir は per-plugin 専用なので、 view 内で別 plugin と衝突することは無く、
-            // conflicts も基本空のまま戻る (root file vs dir collision のみ捕捉される)。
+            // atomic_replace_view_dir で tmp に build → atomic rename することで、
+            // Neovim が走ってる状態で `rvpm generate` が動いても、 view dir が
+            // 空になる窓を作らない (lazy plugin の require / autoload race を回避)。
             let mut view_ownership: std::collections::HashMap<PathBuf, String> =
                 std::collections::HashMap::new();
             let mut view_conflicts: Vec<crate::merge_conflicts::MergeConflictReport> = Vec::new();
-            record_merge_result(plugin_name, r, &mut view_ownership, &mut view_conflicts);
-            // view 内で発生した root collision (まれ) は merged/ の conflicts と
-            // 区別せずユーザーに見せる方が親切なので、 そのまま append する。
+            let mut merge_result: Option<anyhow::Result<crate::link::MergeResult>> = None;
+            let atomic_res = atomic_replace_view_dir(view_dir, |tmp| {
+                match crate::link::merge_plugin_view(src, tmp) {
+                    Ok(m) => {
+                        merge_result = Some(Ok(m));
+                        Ok(())
+                    }
+                    Err(e) => Err(std::io::Error::other(e.to_string())),
+                }
+            });
+            if let Err(e) = atomic_res {
+                merge_result = Some(Err(anyhow::anyhow!("atomic view replace failed: {}", e)));
+            }
+            if let Some(r) = merge_result {
+                record_merge_result(plugin_name, r, &mut view_ownership, &mut view_conflicts);
+            }
             conflicts.extend(view_conflicts);
         }
         PluginMergeMode::ViewWithoutDoc => {
-            clear_view_dir_or_warn(view_dir);
-            // 1) view (doc 抜き) を per-plugin に。 RTP_DIRS の絞り込みなしで
-            //    全 entry (build artifact 含む) を link する。
-            let r = crate::link::merge_plugin_view_no_doc(src, view_dir);
-            // ownership 隔離は ViewWithDoc と同じ理由 (#124 指摘)。
             let mut view_ownership: std::collections::HashMap<PathBuf, String> =
                 std::collections::HashMap::new();
             let mut view_conflicts: Vec<crate::merge_conflicts::MergeConflictReport> = Vec::new();
-            record_merge_result(plugin_name, r, &mut view_ownership, &mut view_conflicts);
+            let mut merge_result: Option<anyhow::Result<crate::link::MergeResult>> = None;
+            let atomic_res = atomic_replace_view_dir(view_dir, |tmp| {
+                let r = crate::link::merge_plugin_view_no_doc(src, tmp);
+                match r {
+                    Ok(m) => {
+                        merge_result = Some(Ok(m));
+                        Ok(())
+                    }
+                    Err(e) => Err(std::io::Error::other(e.to_string())),
+                }
+            });
+            if let Err(e) = atomic_res {
+                merge_result = Some(Err(anyhow::anyhow!("atomic view replace failed: {}", e)));
+            }
+            if let Some(r) = merge_result {
+                record_merge_result(plugin_name, r, &mut view_ownership, &mut view_conflicts);
+            }
             conflicts.extend(view_conflicts);
             // 2) doc/ だけ merged/ に集約 (これが merge_doc=true の本命)
             let r = crate::link::merge_plugin_doc_only(src, merged_dir);
