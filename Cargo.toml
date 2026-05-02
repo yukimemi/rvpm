@@ -50,6 +50,9 @@ self_update = { version = "0.42", default-features = false, features = [
     "compression-flate2",
     "archive-tar",
     "archive-zip",
+    # Windows の GitHub release `.zip` artifact は deflate 圧縮されているので、
+    # `archive-zip` だけだと展開時にエラーになる (CodeRabbit PR #126 指摘)。
+    "compression-zip-deflate",
 ] }
 # Version 比較 (current `Cargo.toml` の version vs. 取得した `tag_name`)。
 semver = "1"

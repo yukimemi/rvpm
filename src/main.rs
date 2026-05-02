@@ -727,20 +727,11 @@ async fn maybe_spawn_auto_update_check() -> Option<AutoUpdateHandle> {
     })
 }
 
-/// `rvpm` の config file の path を `$RVPM_APPNAME` / `$NVIM_APPNAME` から解決する。
-/// 既存の `resolve_config_path` がある場合はそちらを使うが、 ここでは auto-check 用に
-/// 軽量な lookup を行う。
+/// `rvpm` の config file の path を解決する (auto-check 用)。
+/// 既存の `rvpm_config_path()` ヘルパに委譲して、 `.config/rvpm/...` のハードコードを
+/// 避ける (CodeRabbit PR #126 指摘の coding guideline 整合)。
 fn config_path_for_auto_check() -> Option<std::path::PathBuf> {
-    // `parse_config` は既存の lookup を内蔵してるので、 既知の標準位置を返す。
-    let appname = std::env::var("RVPM_APPNAME")
-        .or_else(|_| std::env::var("NVIM_APPNAME"))
-        .unwrap_or_else(|_| "nvim".to_string());
-    let home = dirs::home_dir()?;
-    let p = home
-        .join(".config")
-        .join("rvpm")
-        .join(appname)
-        .join("config.toml");
+    let p = rvpm_config_path();
     p.exists().then_some(p)
 }
 
@@ -834,13 +825,14 @@ async fn run_self_update(yes: bool, check_only: bool) -> Result<()> {
     let method = self_update::detect_install_method(&exe);
     match method {
         self_update::InstallMethod::DevBuild => {
-            eprintln!(
+            // anyhow Err を返して main の標準エラーフローに乗せる
+            // (process::exit はバイパスでテスタビリティと整合性を損なう、 Gemini PR #126 指摘)。
+            return Err(anyhow::anyhow!(
                 "\u{26a0} `{}` looks like a development build (path under `target/`). \
                  Refusing to self-update — please pull from git and rebuild manually:\n  \
                  cd <rvpm clone> && git pull && cargo build --release",
                 exe.display()
-            );
-            std::process::exit(1);
+            ));
         }
         self_update::InstallMethod::CargoInstall => {
             eprintln!("running: cargo install rvpm --force");

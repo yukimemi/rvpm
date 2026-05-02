@@ -72,13 +72,32 @@ pub fn parse_interval(s: &str) -> Result<Duration> {
 /// 判定順:
 /// 1. `target/debug/` または `target/release/` を含む → `DevBuild`
 ///    (rvpm の開発中 build、 自己更新を拒否すべき)
-/// 2. `.cargo/bin/` または `cargo/bin/` を含む → `CargoInstall`
-/// 3. それ以外 → `DirectBinary`
+/// 2. `$CARGO_HOME/bin/` (env で resolve、 未設定なら `~/.cargo/bin/`) 配下 → `CargoInstall`
+///    `CARGO_HOME=/opt/rust` 等の custom 配置にも追従する (CodeRabbit PR #126 指摘)。
+/// 3. fallback で `.cargo/bin/` / `cargo/bin/` 文字列を含むパス → `CargoInstall`
+/// 4. それ以外 → `DirectBinary`
 pub fn detect_install_method(exe: &Path) -> InstallMethod {
     let s = exe.to_string_lossy().replace('\\', "/").to_lowercase();
     if s.contains("/target/debug/") || s.contains("/target/release/") {
         return InstallMethod::DevBuild;
     }
+    // CARGO_HOME を尊重する (custom 配置の cargo install を `CargoInstall` 扱いに)。
+    let cargo_bin = std::env::var("CARGO_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cargo")))
+        .map(|p| {
+            p.join("bin")
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_lowercase()
+        });
+    if let Some(bin) = cargo_bin
+        && s.starts_with(&format!("{}/", bin))
+    {
+        return InstallMethod::CargoInstall;
+    }
+    // fallback: 上の resolve で取れなかった環境用 (HOME 不在のテスト等)。
     if s.contains("/.cargo/bin/") || s.contains("/cargo/bin/") {
         return InstallMethod::CargoInstall;
     }
@@ -208,6 +227,29 @@ mod tests {
     fn test_detect_install_method_direct_binary_windows() {
         let p = PathBuf::from(r"C:\tools\rvpm.exe");
         assert_eq!(detect_install_method(&p), InstallMethod::DirectBinary);
+    }
+
+    #[test]
+    fn test_detect_install_method_respects_cargo_home() {
+        // `CARGO_HOME=/opt/rust` 等の custom 配置でも CargoInstall として扱う
+        // (CodeRabbit PR #126 指摘)。
+        // SAFETY: cargo test は thread 並列で env var を触るので、 一意の値で操作 +
+        // 終了時に元に戻す。 detect_install_method は同期関数なので OK。
+        let prev = std::env::var("CARGO_HOME").ok();
+        // SAFETY: tests run in the same process; this `set_var` is a known
+        // hazard for parallel-running env-sensitive tests. Acceptable here
+        // because we restore in the same function.
+        unsafe {
+            std::env::set_var("CARGO_HOME", "/opt/rust");
+        }
+        let result = detect_install_method(&PathBuf::from("/opt/rust/bin/rvpm"));
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CARGO_HOME", v),
+                None => std::env::remove_var("CARGO_HOME"),
+            }
+        }
+        assert_eq!(result, InstallMethod::CargoInstall);
     }
 
     #[test]
