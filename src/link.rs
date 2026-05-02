@@ -153,6 +153,16 @@ pub fn merge_plugin_view_no_doc(src: &Path, dst_root: &Path) -> Result<MergeResu
         }
         // ディレクトリは rtp_only=false で walk (rtp 慣習外も含めて全部)
         let dst_subdir = dst_root.join(name.as_os_str());
+        // dst_subdir に **ファイル** が居るケース (先行 plugin 等が同 path にファイル
+        // を張り済) は first-wins で skip + conflict 記録。 create_dir_all は ENOTDIR
+        // で落ちるので、 walk 内のディレクトリ衝突ハンドリングと整合させる
+        // (CodeRabbit PR #124 指摘)。
+        if dst_subdir.is_file() {
+            result.conflicts.push(MergeConflict {
+                relative: PathBuf::from(&name),
+            });
+            continue;
+        }
         if !dst_subdir.exists() {
             std::fs::create_dir_all(&dst_subdir)?;
         }
@@ -878,6 +888,49 @@ mod tests {
             "doc/tags should be skipped in views/"
         );
         assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_view_no_doc_root_dir_vs_file_collision_is_recorded_as_conflict() {
+        // dst_root に **ファイル** が居るところに src ルート直下の同名 **ディレクトリ** を
+        // 張ろうとした場合、 create_dir_all で ENOTDIR にして全体 abort せず first-wins
+        // で skip + conflict 記録 (CodeRabbit PR #124 MAJOR)。
+        let root = tempdir().unwrap();
+        let view = root.path().join("view");
+        let p = root.path().join("plug");
+        // 先に view/lua という **ファイル** を置く (別 plugin が張った想定)
+        write(&view.join("lua"), "i am a file");
+        // src 側は lua/foo.lua という **ディレクトリ階層**
+        write(&p.join("lua/foo.lua"), "return {}");
+
+        let r = merge_plugin_view_no_doc(&p, &view).unwrap();
+
+        // 既存ファイル lua はそのまま残る (first-wins)
+        assert!(view.join("lua").is_file());
+        // conflict に lua が記録される
+        assert_eq!(r.conflicts.len(), 1);
+        assert_eq!(r.conflicts[0].relative, PathBuf::from("lua"));
+    }
+
+    #[test]
+    fn test_view_no_doc_root_file_vs_file_collision_is_recorded_as_conflict() {
+        // ルート直下のファイル衝突も first-wins。
+        let root = tempdir().unwrap();
+        let view = root.path().join("view");
+        let p = root.path().join("plug");
+        // 先に view/README.md を置く (別 plugin が張った想定)
+        write(&view.join("README.md"), "from a");
+        // src 側も README.md
+        write(&p.join("README.md"), "from b");
+
+        let r = merge_plugin_view_no_doc(&p, &view).unwrap();
+
+        // 既存ファイルは残る
+        let content = fs::read_to_string(view.join("README.md")).unwrap();
+        assert_eq!(content, "from a");
+        // conflict に README.md が記録される
+        assert_eq!(r.conflicts.len(), 1);
+        assert_eq!(r.conflicts[0].relative, PathBuf::from("README.md"));
     }
 
     #[test]
