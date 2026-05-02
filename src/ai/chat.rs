@@ -6,17 +6,18 @@ use crate::ai::prompt::{
     ExistingHooks, build_followup_prompt, build_initial_prompt, collect_plugins_tree,
 };
 use crate::ai::{
-    Backend, HookChoice, HookWriteDecisions, Proposal, ProposalSection, ensure_cli_installed,
-    invoke_oneshot, parse_proposal, run_handoff, should_emit_merged, validate_proposal_toml,
-    write_hook_files,
+    Backend, HookChoice, HookWriteDecisions, HookWriteResult, Proposal, ProposalSection,
+    ensure_cli_installed, invoke_oneshot, parse_proposal, run_handoff, should_emit_merged,
+    validate_proposal_toml, write_hook_files,
 };
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// chat loop の終了アクション。
 pub enum ChatOutcome {
     /// user が apply を選択。AI 提案を config.toml + hook ファイルに反映済み。
-    Applied { written_hooks: Vec<PathBuf> },
+    /// `hook_changes` は書き込み / 削除されたファイル一覧 (#115)。
+    Applied { hook_changes: HookWriteResult },
     /// user が skip を選択。何も反映しない。
     Skipped,
     /// user が handoff を選択。CLI ツールを直接起動済み (rvpm 側の処理は終了)。
@@ -309,12 +310,10 @@ async fn run_chat_loop(
                 let tune_mode = existing_plugin_entry.is_some();
                 let (decisions, plugin_entry_toml) =
                     resolve_user_decisions(&proposal, &existing_hooks, tune_mode).await?;
-                let written =
+                let hook_changes =
                     write_hook_files(plugin_config_dir, &decisions, chezmoi_enabled).await?;
                 return Ok(AiAddOutcome {
-                    outcome: ChatOutcome::Applied {
-                        written_hooks: written,
-                    },
+                    outcome: ChatOutcome::Applied { hook_changes },
                     plugin_entry_toml,
                 });
             }
@@ -664,16 +663,49 @@ enum EntryChoiceKind {
 }
 
 /// 1 hook ファイルの per-section 選択。
+///
+/// シナリオ別の選択肢 (#115):
+///
+/// | section | existing | choices                                                  |
+/// |---------|----------|----------------------------------------------------------|
+/// | empty   | None     | (no prompt, no-op)                                       |
+/// | empty   | Some     | Keep / Remove existing                                   |
+/// | with    | None     | Fresh? / Merged? / Skip                                  |
+/// | with    | Some     | Fresh? / Merged? / Keep / Remove existing                |
+///
+/// "AI が tag を omit した = この hook はもう不要" を user が拾える経路を残しつつ、
+/// 安全側に倒すため default は常に **Keep / Skip** (削除は明示選択が必要)。
 async fn pick_hook_decision(
     name: &str,
     section: &ProposalSection,
     existing: Option<&str>,
 ) -> Result<HookChoice> {
-    // 何も提示されない (AI が両方 (none) で返した) なら何もしない。
-    if section.is_empty() {
+    // section 空 + existing 無し → 何もしない (従来通り)。
+    if section.is_empty() && existing.is_none() {
         return Ok(HookChoice::Keep);
     }
 
+    // section 空 + existing あり: Keep / Remove の二択 (#115 主目的)。
+    if section.is_empty() {
+        let labels = vec![
+            format!("Keep existing {name} (no change)"),
+            format!("Remove existing {name} (AI did not propose anything for it)"),
+        ];
+        let pick = pick_index(
+            &format!(
+                "{name} — AI omitted this hook. Your existing file is left as-is unless you choose Remove:",
+            ),
+            labels,
+        )
+        .await?;
+        return Ok(if pick == 0 {
+            HookChoice::Keep
+        } else {
+            HookChoice::Remove
+        });
+    }
+
+    // section にコンテンツあり: 通常フロー + existing がある場合は Remove も足す。
     let mut choices: Vec<(String, HookChoiceKind)> = Vec::new();
     if section.fresh.is_some() {
         let label = if existing.is_some() {
@@ -695,6 +727,12 @@ async fn pick_hook_decision(
         format!("Skip — don't create {name}")
     };
     choices.push((keep_label, HookChoiceKind::Keep));
+    if existing.is_some() {
+        choices.push((
+            format!("Remove existing {name} (delete the file)"),
+            HookChoiceKind::Remove,
+        ));
+    }
 
     let labels: Vec<String> = choices.iter().map(|(l, _)| l.clone()).collect();
     let pick = pick_index(&format!("{name} — choose:"), labels).await?;
@@ -702,6 +740,7 @@ async fn pick_hook_decision(
         HookChoiceKind::Fresh => HookChoice::Write(section.fresh.clone().unwrap()),
         HookChoiceKind::Merged => HookChoice::Write(section.merged.clone().unwrap()),
         HookChoiceKind::Keep => HookChoice::Keep,
+        HookChoiceKind::Remove => HookChoice::Remove,
     })
 }
 
@@ -710,6 +749,7 @@ enum HookChoiceKind {
     Fresh,
     Merged,
     Keep,
+    Remove,
 }
 
 /// dialoguer の `Select` で 1 choice を選ばせる薄ラッパ。同期 API なので
@@ -855,6 +895,18 @@ fn print_hook_section_block(
         name,
         plugin_dir.join(name).display()
     );
+    // AI が tag を omit した + 既存ファイルあり = 削除候補。 user が見落とすと
+    // 「stale な hook が消えなかった」というバグ #115 になるので明示警告する。
+    // 実際の削除は per-section dialog で「Remove existing」を選んだときだけ行う
+    // (default は Keep — 安全側)。
+    if section.is_empty() && existing.is_some() {
+        use console::style;
+        eprintln!(
+            "  {} AI did not propose anything for this hook. Pick {} in the next prompt to delete it.",
+            style("[OMITTED BY AI]").yellow().bold(),
+            style("Remove existing").yellow()
+        );
+    }
     print_section_block(name, section, existing, rule);
 }
 
