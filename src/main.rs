@@ -887,14 +887,16 @@ async fn run_self_update(yes: bool, check_only: bool) -> Result<()> {
             if let Err(e) = swap_result {
                 // swap 失敗時は temp dir を leak させ、 ユーザーが手動 recover できる
                 // よう new binary の path をエラーメッセージに含める。
+                // path separator を OS 別に正しく出すため、 文字列連結ではなく
+                // `Path::join` で構築する (Gemini PR #131 指摘)。
                 let leaked = tmp.keep();
+                let preserved_path = leaked.join("bin").join(bin_name);
                 return Err(anyhow::anyhow!(
                     "cargo install succeeded but failed to swap running rvpm binary: {}\n\
-                     new binary is preserved at {}\\bin\\{} — \
+                     new binary is preserved at {} — \
                      after closing every running rvpm process you can manually copy it to {}.",
                     e,
-                    leaked.display(),
-                    bin_name,
+                    preserved_path.display(),
                     exe.display()
                 ));
             }
