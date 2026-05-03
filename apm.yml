@@ -1,0 +1,19 @@
+# Required-by-APM but intentionally static. Per the project's "Version
+# lives only in Cargo.toml" policy, this apm.yml is consumer-side and
+# not a publishable APM package, so the version below is a placeholder
+# that should never bump.
+name: rvpm
+version: 0.0.0
+description: |
+  Dev-consumer APM config for the rvpm repo. rvpm itself ships no
+  agent primitives; this apm.yml only exists to install agent skills
+  that contributors want available while working on rvpm — currently
+  just the `renri` skill so AI sessions can manage worktrees / jj
+  workspaces while developing.
+author: yukimemi
+dependencies:
+  apm:
+    - yukimemi/renri#main
+  mcp: []
+includes: auto
+scripts: {}
