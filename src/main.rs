@@ -779,7 +779,9 @@ async fn finalize_auto_update_check(handle: AutoUpdateHandle) {
 /// 4. `--yes` 以外は対話プロンプト (`y/N`)
 /// 5. `current_exe()` から install 方法を検出して dispatch:
 ///    - `DevBuild` → 拒否 + manual rebuild 案内
-///    - `CargoInstall` → `cargo install rvpm --force` を spawn
+///    - `CargoInstall` → `cargo install rvpm --force --root <tmp>` で temp dir に build →
+///      `self_replace` crate で running binary を atomic 置換 (Windows で running
+///      .exe を直接上書きできないため)
 ///    - `DirectBinary` → `self_update` crate で atomic 自己置換
 ///
 /// resilience: ネットワーク失敗 / API 失敗時は明示的にエラー終了する
@@ -835,16 +837,67 @@ async fn run_self_update(yes: bool, check_only: bool) -> Result<()> {
             ));
         }
         self_update::InstallMethod::CargoInstall => {
-            eprintln!("running: cargo install rvpm --force");
+            // Windows では実行中の rvpm.exe を `cargo install --force` が直接 replace
+            // できない (cargo は MoveFile で binary を上書きしようとするが、 Windows は
+            // 実行中 .exe にロックをかけるため `os error 5: アクセスが拒否されました`)。
+            //
+            // 対策: 一旦 temp dir に install して、 self_replace crate (self_update の
+            // re-export) で running binary を atomic 置換する。 self_replace は Windows
+            // では「running .exe を rename → reboot 時 delete を schedule → 元 path に
+            // 新 binary を rename」 という 3 段階で running .exe の安全な swap を実装
+            // しており、 file lock を回避できる。 Linux/macOS でもそのまま動く。
+            let tmp = tempfile::Builder::new()
+                .prefix("rvpm-self-update-")
+                .tempdir()
+                .context("failed to create temp dir for cargo install --root")?;
+            let tmp_root = tmp.path().to_path_buf();
+            eprintln!(
+                "running: cargo install rvpm --force --root {}",
+                tmp_root.display()
+            );
             let status = tokio::process::Command::new("cargo")
-                .args(["install", "rvpm", "--force"])
+                .arg("install")
+                .arg("rvpm")
+                .arg("--force")
+                .arg("--root")
+                .arg(&tmp_root)
                 .status()
                 .await
                 .context("failed to spawn `cargo install` (is cargo on PATH?)")?;
             if !status.success() {
                 return Err(anyhow::anyhow!(
-                    "`cargo install rvpm --force` exited with {}",
+                    "`cargo install rvpm --force --root <tmp>` exited with {}",
                     status
+                ));
+            }
+            let bin_name = if cfg!(windows) { "rvpm.exe" } else { "rvpm" };
+            let new_exe = tmp_root.join("bin").join(bin_name);
+            if !new_exe.exists() {
+                return Err(anyhow::anyhow!(
+                    "cargo install reported success but expected binary not found at {}",
+                    new_exe.display()
+                ));
+            }
+            let new_exe_owned = new_exe.clone();
+            let swap_result = tokio::task::spawn_blocking(move || {
+                ::self_update::self_replace::self_replace(&new_exe_owned)
+            })
+            .await
+            .context("self_replace task panicked")?;
+            if let Err(e) = swap_result {
+                // swap 失敗時は temp dir を leak させ、 ユーザーが手動 recover できる
+                // よう new binary の path をエラーメッセージに含める。
+                // path separator を OS 別に正しく出すため、 文字列連結ではなく
+                // `Path::join` で構築する (Gemini PR #131 指摘)。
+                let leaked = tmp.keep();
+                let preserved_path = leaked.join("bin").join(bin_name);
+                return Err(anyhow::anyhow!(
+                    "cargo install succeeded but failed to swap running rvpm binary: {}\n\
+                     new binary is preserved at {} — \
+                     after closing every running rvpm process you can manually copy it to {}.",
+                    e,
+                    preserved_path.display(),
+                    exe.display()
                 ));
             }
             println!("\u{2713} rvpm v{} installed.", latest_clean);
