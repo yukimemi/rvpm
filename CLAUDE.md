@@ -231,8 +231,9 @@ url   = "folke/snacks.nvim"
 name = "telescope"
 url  = "nvim-telescope/telescope.nvim"
 depends = ["snacks.nvim"]
-# rev: branch / tag / commit hash
+# rev: branch / tag / commit hash, or `/regex/` to pick the highest semver tag matching the pattern
 # rev = "v0.1.0"
+# rev = "/^v1\\..*/"   # picks max semver tag among /^v1\..*/ — re-resolves on every sync
 # build: shell command (run after sync / update completes, 5 min timeout)
 # build = "cargo build --release"
 # build_lua: Lua snippet executed via nvim --headless -u NONE -l (#97)

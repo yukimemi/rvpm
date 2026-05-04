@@ -114,6 +114,17 @@ plugin with `rev = "v1.2.3"` in config.toml takes top priority as an explicit
 pin, then the lockfile commit, and finally — if neither — the default branch
 HEAD is pulled.
 
+`rev` also accepts the `/regex/` form (same delimiter convention as `on_cmd`,
+`on_event`, `on_map`). When matched, rvpm enumerates local tags after fetch,
+filters by the regex, parses each as semver (after stripping a leading `v` /
+`V`), and checks out the **highest semver match**. Tags that fail to parse as
+semver are silently ignored (lazy.nvim-equivalent behavior). Pattern resolution
+runs on every `sync` / `update` (no caching) — so `rev = "/^v1\\..*/"` behaves
+like a moving pin that always tracks the latest matching tag. If you need
+commit-level pinning, use a literal tag instead. `--frozen` does **not**
+override pattern re-resolution; freeze a literal commit by switching to
+`rev = "<sha>"` if strict reproducibility is required for that plugin.
+
 Per-command behavior:
 - `rvpm sync`: load lockfile → choose rev for each plugin per the priority
   above → `gix_checkout` → upsert post-sync HEAD → call `retain_by_names` at

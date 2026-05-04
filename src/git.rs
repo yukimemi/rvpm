@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use gix::bstr::BString;
 use std::path::Path;
 
@@ -161,7 +161,8 @@ fn sync_impl(url: &str, dst: &Path, rev: Option<&str>) -> Result<Option<GitChang
         let before = read_head(dst).ok();
         fetch_impl(dst)?;
         if let Some(rev) = rev {
-            gix_checkout(dst, rev)?;
+            let resolved = resolve_rev_for_checkout(dst, rev)?;
+            gix_checkout(dst, &resolved)?;
         } else {
             gix_reset_to_remote(dst)?;
         }
@@ -176,8 +177,12 @@ fn sync_impl(url: &str, dst: &Path, rev: Option<&str>) -> Result<Option<GitChang
             // `refs/remotes/origin/<rev>` を populate しないと checkout できない。
             // `fetch_impl` 自体が冒頭で `ensure_all_branches_refspec` を呼ぶので、
             // この経路で .git/config も同時に正しい状態になる。
+            // `rev = "/regex/"` (タグ パターン) も同じ経路で OK — タグは shallow clone
+            // でも `refs/tags/*` として一緒に降りてくるので、resolve_rev_for_checkout
+            // が local DB から正しい候補を選べる。
             fetch_impl(dst)?;
-            gix_checkout(dst, rev)?;
+            let resolved = resolve_rev_for_checkout(dst, rev)?;
+            gix_checkout(dst, &resolved)?;
         }
         let after = read_head(dst)?;
         // 新規 clone は from = None。subjects は空のまま。
@@ -198,7 +203,8 @@ fn update_impl(_url: &str, dst: &Path, rev: Option<&str>) -> Result<Option<GitCh
     let before = read_head(dst).ok();
     fetch_impl(dst)?;
     if let Some(rev) = rev {
-        gix_checkout(dst, rev)?;
+        let resolved = resolve_rev_for_checkout(dst, rev)?;
+        gix_checkout(dst, &resolved)?;
     } else {
         gix_reset_to_remote(dst)?;
     }
@@ -215,12 +221,16 @@ fn read_head(dst: &Path) -> Result<String> {
 
 /// 既存 clone に対して fetch せず `rev` を checkout する。
 /// rev が local DB に無い場合は `gix_checkout` がエラーを返す (caller で fallback)。
+/// `rev = "/regex/"` (タグ パターン) は local DB に存在するタグだけから解決する
+/// — 解決失敗 (パターンに合うタグが local に無い) もエラーで、caller は full sync
+/// に fall through する (= sync_impl 経路で fetch 後に再解決される)。
 fn checkout_local_impl(dst: &Path, rev: &str) -> Result<Option<GitChange>> {
     if !dst.exists() {
         anyhow::bail!("Plugin not installed: {}", dst.display());
     }
     let before = read_head(dst).ok();
-    gix_checkout(dst, rev)?;
+    let resolved = resolve_rev_for_checkout(dst, rev)?;
+    gix_checkout(dst, &resolved)?;
     let after = read_head(dst)?;
     Ok(build_change(dst, before, after))
 }
@@ -241,13 +251,24 @@ fn resolve_revision_impl(dst: &Path, rev: &str) -> Result<Option<String>> {
         Ok(r) => r,
         Err(_) => return Ok(None),
     };
-    let peeled = format!("{}^{{commit}}", rev);
+    // `rev = "/regex/"` (タグ パターン) は local タグから semver 最大を解決して
+    // から rev_parse する。解決失敗 (= local DB に該当タグ無し) は caller の
+    // fast-path 比較を「不一致」として落としたいだけなので `Ok(None)` で返す
+    // (= caller は full sync に fall through する)。
+    let resolved: std::borrow::Cow<str> = match parse_rev_pattern(rev) {
+        Some(body) => match resolve_tag_pattern(&repo, body) {
+            Ok(name) => std::borrow::Cow::Owned(name),
+            Err(_) => return Ok(None),
+        },
+        None => std::borrow::Cow::Borrowed(rev),
+    };
+    let peeled = format!("{}^{{commit}}", resolved);
     if let Ok(id) = repo.rev_parse_single(&peeled[..]) {
         return Ok(Some(id.detach().to_string()));
     }
     // `^{commit}` が効かない edge case (gix が記法非対応の revision 形式等) の
     // 保険: plain parse を試す。
-    match repo.rev_parse_single(rev) {
+    match repo.rev_parse_single(resolved.as_ref()) {
         Ok(id) => Ok(Some(id.detach().to_string())),
         Err(_) => Ok(None),
     }
@@ -950,13 +971,119 @@ fn get_status_impl(dst: &Path, rev: Option<&str>) -> RepoStatus {
 
     // rev が指定されている場合、ローカルに存在するか確認
     if let Some(rev) = rev {
-        match repo.rev_parse_single(rev) {
+        // `/regex/` 形式は local タグから semver 最大を解決してから存在確認。
+        // 解決失敗 = local DB に対象タグが無い → Error として表面化させる
+        // (`rvpm doctor` / status 経路で気付けるように)。
+        let target: std::borrow::Cow<str> = match parse_rev_pattern(rev) {
+            Some(body) => match resolve_tag_pattern(&repo, body) {
+                Ok(name) => std::borrow::Cow::Owned(name),
+                Err(e) => {
+                    return RepoStatus::Error(format!(
+                        "rev pattern '{}' unresolved in local repo: {}",
+                        rev, e
+                    ));
+                }
+            },
+            None => std::borrow::Cow::Borrowed(rev),
+        };
+        match repo.rev_parse_single(target.as_ref()) {
             Ok(_) => {}
-            Err(_) => return RepoStatus::Error(format!("rev '{}' not found in local repo", rev)),
+            Err(_) => {
+                return RepoStatus::Error(format!("rev '{}' not found in local repo", target));
+            }
         }
     }
 
     RepoStatus::Clean
+}
+
+// ======================================================
+// rev pattern resolution (`rev = "/regex/"` → semver-max tag)
+// ======================================================
+
+/// `rev` 文字列が `/regex/` 形式かを判定し、内部の regex 本体を返す。
+/// それ以外 (literal タグ / branch / SHA) は `None`。
+///
+/// `on_cmd` / `on_event` / `on_map` の `/regex/` 区切りと同じ構文 (#85, #88) で、
+/// rvpm 全体での一貫性を保つ。空 body (`"//"`) は判定対象外 (None)。
+pub(crate) fn parse_rev_pattern(rev: &str) -> Option<&str> {
+    rev.strip_prefix('/')
+        .and_then(|s| s.strip_suffix('/'))
+        .filter(|s| !s.is_empty())
+}
+
+/// タグ名から先頭の `v` / `V` プレフィックスを 1 個だけ剥がす。
+/// `v1.0.0` / `V2.3.1` → `1.0.0` / `2.3.1`。プレフィックスが無ければそのまま。
+fn strip_v_prefix(tag: &str) -> &str {
+    tag.strip_prefix('v')
+        .or_else(|| tag.strip_prefix('V'))
+        .unwrap_or(tag)
+}
+
+/// 候補タグの iterator から regex マッチ + semver パース可能なものだけを取り、
+/// 最大 semver の tag 名を返す。
+///
+/// パース失敗タグは候補から外す (resilience: `release-pre` のような非 semver
+/// タグが混じっていても黙って無視する。lazy.nvim と同じ挙動)。候補ゼロなら
+/// `Ok(None)` を返し、呼び出し側がエラー文言を組み立てる。
+///
+/// 入力は **owning iterator**: 本番経路は gix の `references().tags()` から直接
+/// 流し込み、 ピーク使用量を O(1) に抑える (Gemini PR #134 指摘の最適化 — 中間
+/// `Vec<String>` を作らない)。 テストは `vec!["v1.0.0".into(), ...]` を渡して
+/// pure helper として呼べる。
+fn pick_max_semver_tag<I>(tags: I, regex_body: &str) -> Result<Option<String>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let re = regex::Regex::new(regex_body)
+        .with_context(|| format!("invalid regex in rev pattern: '/{}/'", regex_body))?;
+    let mut best: Option<(semver::Version, String)> = None;
+    for tag in tags {
+        if !re.is_match(&tag) {
+            continue;
+        }
+        let parsed = match semver::Version::parse(strip_v_prefix(&tag)) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let take = best.as_ref().is_none_or(|(cur, _)| parsed > *cur);
+        if take {
+            best = Some((parsed, tag));
+        }
+    }
+    Ok(best.map(|(_, name)| name))
+}
+
+/// `repo` の local DB にあるタグから、regex にマッチして semver パース可能な
+/// 最大バージョンを選び、タグ名 (e.g. `"v1.6.4"`) を返す。 候補ゼロは error。
+///
+/// gix の references iterator を `pick_max_semver_tag` に直接食わせ、 全タグ名を
+/// 同時に保持する中間 `Vec<String>` を作らない (PR #134 Gemini 指摘)。
+fn resolve_tag_pattern(repo: &gix::Repository, regex_body: &str) -> Result<String> {
+    let platform = repo.references()?;
+    // refs/tags/<name> から `<name>` を抽出。 壊れた ref は無視 (resilience)。
+    let names = platform.tags()?.filter_map(|r| r.ok()).filter_map(|r| {
+        let full = r.name().as_bstr().to_string();
+        full.strip_prefix("refs/tags/").map(str::to_string)
+    });
+    pick_max_semver_tag(names, regex_body)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "rev pattern '/{}/' matched no parseable semver tag",
+            regex_body,
+        )
+    })
+}
+
+/// `rev` がパターンなら local タグから解決、リテラルならそのまま返す。
+/// sync_impl / update_impl / checkout_local_impl で gix_checkout の手前に挟む。
+fn resolve_rev_for_checkout(dst: &Path, rev: &str) -> Result<String> {
+    match parse_rev_pattern(rev) {
+        Some(body) => {
+            let repo = gix::open(dst)?;
+            resolve_tag_pattern(&repo, body)
+        }
+        None => Ok(rev.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -2032,5 +2159,283 @@ mod tests {
         .to_string();
 
         assert!(doc_file_patch(&src, &from, &to, "other.txt").is_none());
+    }
+
+    // ======================================================
+    // rev pattern (`rev = "/regex/"` → semver-max tag)
+    // ======================================================
+
+    #[test]
+    fn test_parse_rev_pattern_detects_slash_delimited() {
+        // `/regex/` = pattern。それ以外 (literal タグ / branch / SHA / 半端な
+        // `/foo` 形式) は None。空 body (`//`) も None (filter で除外)。
+        assert_eq!(parse_rev_pattern("/v1\\..*/"), Some("v1\\..*"));
+        assert_eq!(parse_rev_pattern("/^v1$/"), Some("^v1$"));
+        // literal はそのまま透過 (None)。
+        assert_eq!(parse_rev_pattern("v1.0.0"), None);
+        assert_eq!(parse_rev_pattern("main"), None);
+        assert_eq!(parse_rev_pattern("abcd1234"), None);
+        // 片側だけ slash や空 body は pattern として扱わない。
+        assert_eq!(parse_rev_pattern("/v1"), None);
+        assert_eq!(parse_rev_pattern("v1/"), None);
+        assert_eq!(parse_rev_pattern("//"), None);
+    }
+
+    #[test]
+    fn test_strip_v_prefix_handles_v_and_no_prefix() {
+        assert_eq!(strip_v_prefix("v1.0.0"), "1.0.0");
+        assert_eq!(strip_v_prefix("V2.3.1"), "2.3.1");
+        assert_eq!(strip_v_prefix("1.0.0"), "1.0.0");
+        // 2 文字目の `v` は剥がさない (1 個だけ)。
+        assert_eq!(strip_v_prefix("vv1.0.0"), "v1.0.0");
+    }
+
+    #[test]
+    fn test_pick_max_semver_tag_picks_highest_match() {
+        // `/v1\..*/` で v1.x のみ抽出 → 1.10.0 が最大 (lex sort なら 1.2.0 が
+        // 勝つので、ここで semver 順が効いてることを確認)。
+        let tags = vec![
+            "v1.0.0".to_string(),
+            "v1.2.0".to_string(),
+            "v1.10.0".to_string(),
+            "v2.0.0".to_string(),
+            "v0.9.5".to_string(),
+        ];
+        let pick = pick_max_semver_tag(tags.clone(), r"^v1\.").unwrap();
+        assert_eq!(pick, Some("v1.10.0".to_string()));
+    }
+
+    #[test]
+    fn test_pick_max_semver_tag_ignores_unparseable_tags() {
+        // semver パース不可のタグ (release-pre 等) はマッチしても候補に含めない。
+        // パターン全マッチでも候補ゼロなら None。
+        let tags = vec![
+            "release-1.0".to_string(),
+            "rc-2".to_string(),
+            "v1.0.0".to_string(),
+        ];
+        // `/^v/` で v1.0.0 だけ semver 通る → それを選ぶ。
+        assert_eq!(
+            pick_max_semver_tag(tags.clone(), r"^v").unwrap(),
+            Some("v1.0.0".to_string())
+        );
+        // `/^release/` は release-* がマッチするけど semver 不通 → None。
+        assert_eq!(
+            pick_max_semver_tag(tags.clone(), r"^release").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_pick_max_semver_tag_handles_prerelease_ordering() {
+        // semver の prerelease は通常リリースより小さい (1.0.0-rc1 < 1.0.0)。
+        let tags = vec![
+            "v1.0.0-rc.1".to_string(),
+            "v1.0.0".to_string(),
+            "v1.0.0-rc.2".to_string(),
+        ];
+        assert_eq!(
+            pick_max_semver_tag(tags.clone(), r"^v1\.").unwrap(),
+            Some("v1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_pick_max_semver_tag_invalid_regex_errors() {
+        let tags = vec!["v1.0.0".to_string()];
+        let err = pick_max_semver_tag(tags.clone(), r"[unbalanced").unwrap_err();
+        assert!(err.to_string().contains("invalid regex"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_tag_pattern_against_real_repo() {
+        // タグ列挙経路 (gix references API) も含めて end-to-end で確認。
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("a.txt"), "seed").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        for tag in ["v1.0.0", "v1.2.0", "v1.10.0", "v2.0.0", "wip"] {
+            git_cmd(&src).args(["tag", tag]).output().await.unwrap();
+        }
+
+        let repo = gix::open(&src).unwrap();
+        let pick = resolve_tag_pattern(&repo, r"^v1\.").unwrap();
+        assert_eq!(pick, "v1.10.0");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_tag_pattern_errors_when_no_match() {
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("a.txt"), "seed").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        git_cmd(&src)
+            .args(["tag", "v0.1.0"])
+            .output()
+            .await
+            .unwrap();
+
+        let repo = gix::open(&src).unwrap();
+        let err = resolve_tag_pattern(&repo, r"^v9\.").unwrap_err();
+        assert!(err.to_string().contains("matched no parseable semver tag"));
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_rev_pattern_lands_on_max_tag() {
+        // sync_impl 経路全体で pattern → tag 解決 → checkout が動くこと。
+        // user の典型: `rev = "/^v1\\..*/"` で blink.cmp 系の "must be on a tag"
+        // 警告を回避。
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("a.txt"), "seed").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        // v1.0.0 を打つ。
+        git_cmd(&src)
+            .args(["tag", "v1.0.0"])
+            .output()
+            .await
+            .unwrap();
+        // commit を進めて v1.10.0 を打つ。lex sort なら v1.2 が勝つ並びに
+        // しておく (= semver 順を効かせるテスト)。
+        fs::write(src.join("a.txt"), "v1.10").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "bump"])
+            .output()
+            .await
+            .unwrap();
+        git_cmd(&src)
+            .args(["tag", "v1.10.0"])
+            .output()
+            .await
+            .unwrap();
+        let v1_10_sha = git_head(&src).await;
+        // さらに v2.0.0 を進めて打つ → /^v1\\..*/ で v1.10.0 が選ばれることを確認。
+        fs::write(src.join("a.txt"), "v2").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "v2"])
+            .output()
+            .await
+            .unwrap();
+        git_cmd(&src)
+            .args(["tag", "v2.0.0"])
+            .output()
+            .await
+            .unwrap();
+        // v2 commit に default branch が乗ったままだと shallow clone で v1 commit
+        // が降りないので、default branch を v1 commit に戻しておく
+        // (タグ自体は降りるけど、`refs/tags/v1.10.0 → commit` の `commit` を
+        //  local DB に持ってる必要があるので。実 GitHub 相当 (タグ commit が
+        //  reachable) を再現)。
+        git_cmd(&src)
+            .args(["reset", "--hard", "v1.10.0"])
+            .output()
+            .await
+            .unwrap();
+
+        let url = format!("file://{}", src.display());
+        let repo = Repo::new(&url, &dst, Some("/^v1\\..*/"));
+        repo.sync().await.expect("sync with rev pattern");
+
+        let head = repo.head_commit().await.unwrap();
+        assert_eq!(head, v1_10_sha, "should land on v1.10.0 commit");
+    }
+
+    #[tokio::test]
+    async fn test_sync_with_rev_pattern_errors_when_no_tag_matches() {
+        // パターンに合うタグが remote に無いケース → fetch 後の解決でエラー。
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("a.txt"), "seed").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        git_cmd(&src)
+            .args(["tag", "v0.1.0"])
+            .output()
+            .await
+            .unwrap();
+
+        let url = format!("file://{}", src.display());
+        let repo = Repo::new(&url, &dst, Some("/^v9\\..*/"));
+        let err = repo.sync().await.unwrap_err();
+        assert!(
+            err.to_string().contains("matched no parseable semver tag"),
+            "actual: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_revision_locally_with_pattern() {
+        // fast-path 比較経路: pattern → tag 解決 → commit SHA が返ること。
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_cmd(&src).args(["init"]).output().await.unwrap();
+        fs::write(src.join("a.txt"), "seed").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        git_cmd(&src)
+            .args(["tag", "v1.0.0"])
+            .output()
+            .await
+            .unwrap();
+        let head_sha = git_head(&src).await;
+
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        repo.sync().await.unwrap();
+
+        // pattern も literal タグも同じ commit SHA を返す。
+        assert_eq!(
+            repo.resolve_revision_locally("/^v1\\.")
+                .await
+                .ok()
+                .flatten(),
+            None,
+            "片側 slash は pattern 扱いせず literal として rev_parse → None"
+        );
+        assert_eq!(
+            repo.resolve_revision_locally("/^v1\\..*/").await.unwrap(),
+            Some(head_sha.clone()),
+            "pattern が解決→commit SHA",
+        );
     }
 }
