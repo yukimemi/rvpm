@@ -233,6 +233,19 @@ Resolution rule:
 - **Directories at the plugin root are allow-listed to rtp conventions + denops** — `plugin/`, `lua/`, `doc/`, `ftplugin/`, `ftdetect/`, `syntax/`, `indent/`, `colors/`, `compiler/`, `autoload/`, `after/`, `queries/`, `parser/`, `rplugin/`, `spell/`, `keymap/`, `lang/`, `pack/`, `tutor/` (for `:Tutor`), and `denops/` (for denops.vim TypeScript plugins). `tests/` `scripts/` `examples/` `src/` etc. are unrelated to the rtp and are excluded.
 - **Skip dotfiles at every level** (`.gitignore`, `.luarc.json`, `.editorconfig`, `.gitkeep`, etc.) — they are unrelated to Neovim startup, and at deep levels (e.g. `doc/.gitignore`) would just collide across plugins and add conflict-warning noise.
 
+### `.git` exposure in views (`link_dotgit_into_view`)
+
+The dotfile-skip rule above intentionally drops `.git/` during the merge walk. But some plugins detect their own git state from the rtp directory — blink.cmp, for example, calls `vim.fs.root(plugin_dir, '.git')` followed by `git describe --tags --exact-match HEAD` to decide whether the prebuilt fuzzy library matches the current tag. Without `.git` visible from the view path, that probe sees "not a git repository" and falls back to the Lua implementation with a warning.
+
+`link_dotgit_into_view` adds an indirection at view root pointing back to the plugin clone's real `.git`:
+
+- **Windows**: directory junction via the [`junction`](https://crates.io/crates/junction) crate (native `DeviceIoControl` + `FSCTL_SET_REPARSE_POINT`, no `mklink` cmd-spawn, no admin rights required).
+- **Unix**: `std::os::unix::fs::symlink`.
+
+This is the **only** non-hardlink filesystem operation in the merge pipeline; all other merging stays at file granularity. The link is created inside the `atomic_replace_view_dir` tmp builder so it lands together with the rest of the view via atomic rename. Plugins without `.git` (e.g. `dev = true`) silently skip. Failures are warned but never abort the sync (resilience).
+
+This fix only applies to `ViewWithDoc` / `ViewWithoutDoc` modes. `Full` mode (`merge=true && eager`) cannot expose a single plugin's `.git` because `merged/` is shared across plugins; if such a plugin needs git-state self-detection, the user should set `merge = false` to route it through the View modes.
+
 ### View cleanup
 
 `prune_stale_views()` walks `views/` after each `sync` and removes any

@@ -5335,45 +5335,68 @@ fn dispatch_plugin_merge(
             // atomic_replace_view_dir で tmp に build → atomic rename することで、
             // Neovim が走ってる状態で `rvpm generate` が動いても、 view dir が
             // 空になる窓を作らない (lazy plugin の require / autoload race を回避)。
-            let mut view_ownership: std::collections::HashMap<PathBuf, String> =
-                std::collections::HashMap::new();
-            let mut view_conflicts: Vec<crate::merge_conflicts::MergeConflictReport> = Vec::new();
-            let mut merge_result: Option<anyhow::Result<crate::link::MergeResult>> = None;
-            let atomic_res = atomic_replace_view_dir(view_dir, |tmp| {
-                let m = crate::link::merge_plugin_view(src, tmp)?;
-                merge_result = Some(Ok(m));
-                Ok(())
-            });
-            if let Err(e) = atomic_res {
-                merge_result = Some(Err(e.context("atomic view replace failed")));
-            }
-            if let Some(r) = merge_result {
-                record_merge_result(plugin_name, r, &mut view_ownership, &mut view_conflicts);
-            }
-            conflicts.extend(view_conflicts);
+            build_view_atomically(
+                src,
+                view_dir,
+                plugin_name,
+                conflicts,
+                crate::link::merge_plugin_view,
+            );
         }
         PluginMergeMode::ViewWithoutDoc => {
-            let mut view_ownership: std::collections::HashMap<PathBuf, String> =
-                std::collections::HashMap::new();
-            let mut view_conflicts: Vec<crate::merge_conflicts::MergeConflictReport> = Vec::new();
-            let mut merge_result: Option<anyhow::Result<crate::link::MergeResult>> = None;
-            let atomic_res = atomic_replace_view_dir(view_dir, |tmp| {
-                let m = crate::link::merge_plugin_view_no_doc(src, tmp)?;
-                merge_result = Some(Ok(m));
-                Ok(())
-            });
-            if let Err(e) = atomic_res {
-                merge_result = Some(Err(e.context("atomic view replace failed")));
-            }
-            if let Some(r) = merge_result {
-                record_merge_result(plugin_name, r, &mut view_ownership, &mut view_conflicts);
-            }
-            conflicts.extend(view_conflicts);
+            build_view_atomically(
+                src,
+                view_dir,
+                plugin_name,
+                conflicts,
+                crate::link::merge_plugin_view_no_doc,
+            );
             // 2) doc/ だけ merged/ に集約 (これが merge_doc=true の本命)
             let r = crate::link::merge_plugin_doc_only(src, merged_dir);
             record_merge_result(plugin_name, r, ownership, conflicts);
         }
     }
+}
+
+/// `views/<plug>/` を tmp 経由で atomic rebuild するヘルパー。
+///
+/// `merge_view_fn` で plugin の rtp dir を tmp に集約し、 続けて `link_dotgit_into_view`
+/// で `.git` を repos clone から junction / symlink で露出する (blink.cmp 等が
+/// 自分の tag 状態を `vim.fs.root('.git')` で判定するため。 failure は warn のみ
+/// で続行 = sync 全体を止めない resilience)。
+///
+/// 元々 `dispatch_plugin_merge` の `ViewWithDoc` / `ViewWithoutDoc` で同じ block が
+/// 2 回登場していたので 1 関数に括った (Gemini PR #135 medium)。
+fn build_view_atomically(
+    src: &Path,
+    view_dir: &Path,
+    plugin_name: &str,
+    conflicts: &mut Vec<crate::merge_conflicts::MergeConflictReport>,
+    merge_view_fn: fn(&Path, &Path) -> anyhow::Result<crate::link::MergeResult>,
+) {
+    let mut view_ownership: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
+    let mut view_conflicts: Vec<crate::merge_conflicts::MergeConflictReport> = Vec::new();
+    let mut merge_result: Option<anyhow::Result<crate::link::MergeResult>> = None;
+    let atomic_res = atomic_replace_view_dir(view_dir, |tmp| {
+        let m = merge_view_fn(src, tmp)?;
+        if let Err(e) = crate::link::link_dotgit_into_view(src, tmp) {
+            eprintln!(
+                "\u{26a0} failed to expose .git in view {}: {}",
+                view_dir.display(),
+                e
+            );
+        }
+        merge_result = Some(Ok(m));
+        Ok(())
+    });
+    if let Err(e) = atomic_res {
+        merge_result = Some(Err(e.context("atomic view replace failed")));
+    }
+    if let Some(r) = merge_result {
+        record_merge_result(plugin_name, r, &mut view_ownership, &mut view_conflicts);
+    }
+    conflicts.extend(view_conflicts);
 }
 
 /// 収集した衝突を plugin ごとにグループ化して stderr にサマリ出力する。
