@@ -365,7 +365,9 @@ Always go through the `resolve_*` helpers in `src/main.rs` — never hardcode `.
 
 ### Windows support
 
-File-level hard links (`std::fs::hard_link`) on NTFS — no admin rights, no junctions, no symlinks. Falls back to `std::fs::copy` for cross-volume cases.
+Plugin contents are merged with file-level hard links (`std::fs::hard_link`) on NTFS — no admin rights required. Falls back to `std::fs::copy` for cross-volume cases.
+
+The single exception is the per-view `.git` indirection: `views/<plug>/.git` is a directory junction (Windows; created via the `junction` crate, no `mklink` cmd-spawn) or symlink (Unix) pointing to the plugin's clone `.git` dir. Junctions also need no admin rights. This is required for plugins that detect their own git state from the rtp dir (e.g. blink.cmp's `vim.fs.root('.git')` + `git describe --tags`).
 
 ## CLI commands
 

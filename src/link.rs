@@ -177,6 +177,71 @@ pub fn merge_plugin_view_no_doc(src: &Path, dst_root: &Path) -> Result<MergeResu
     Ok(result)
 }
 
+/// view dir のルートに `.git` を repos clone (`<repos>/<plug>/.git`) から見える
+/// ようにリンクする。
+///
+/// 動機: blink.cmp のように `vim.fs.root(plugin_dir, '.git')` で自分のリポジトリ
+/// 状態を判定するプラグインが、 view 経由で rtp に乗ってると `.git` が見つから
+/// ない問題 (#blink-cmp-tag-warning)。 plugin の clone 本体 (`repos/<plug>/`) には
+/// `.git` があるので、 view からそこへ indirection を張れば plugin 内蔵の git
+/// 検出ロジックがそのまま動く。
+///
+/// 実装:
+/// - Windows: `mklink /J` で directory junction (admin 不要、reparse point)
+/// - Unix: symlink
+///
+/// `<plugin_clone>/.git` が無い場合 (dev = true プラグインなど) は何もせず
+/// `Ok(())` を返す。 リンク作成失敗は anyhow::Error で返す (caller は warn に
+/// 留めて sync 全体を止めない判断ができる)。
+pub fn link_dotgit_into_view(plugin_clone: &Path, view_dir: &Path) -> Result<()> {
+    let src = plugin_clone.join(".git");
+    if !src.exists() {
+        return Ok(());
+    }
+    let dst = view_dir.join(".git");
+    // atomic_replace_view_dir の tmp に build 中なので dst は通常存在しないが、
+    // テストで手動ビルドするケース等のために idempotent にしておく。
+    //
+    // `Path::exists()` は **broken symlink で false を返す** ため、 前回 sync が
+    // 残した壊れた symlink (= clone を別 path に動かした等) があると cleanup を
+    // 飛ばしてしまい、 後段の create_dotgit_link が "file already exists" で失敗
+    // していた (Gemini PR #135 high)。 `symlink_metadata` で symlink を follow せず
+    // type を取り、 ファイル種別ごとに正しい remove API を呼ぶ。
+    if let Ok(meta) = std::fs::symlink_metadata(&dst) {
+        let ft = meta.file_type();
+        let _ = if ft.is_symlink() {
+            // Unix symlink / Windows directory junction (= reparse point) のどちらでも
+            // remove_dir で外せる。 Unix の **file** symlink は remove_file が必要なので
+            // フォールバックも残す。
+            std::fs::remove_dir(&dst).or_else(|_| std::fs::remove_file(&dst))
+        } else if ft.is_dir() {
+            // user が手動で `.git/` ディレクトリを作っていた等の非空ディレクトリにも
+            // 対応する (Gemini PR #135 medium: idempotency 強化)。
+            // CVE-2022-21658 修正済の Rust (>= 1.62) では reparse point を follow しない
+            // ので安全。
+            std::fs::remove_dir_all(&dst)
+        } else {
+            std::fs::remove_file(&dst)
+        };
+    }
+    create_dotgit_link(&src, &dst)
+}
+
+#[cfg(windows)]
+fn create_dotgit_link(src: &Path, dst: &Path) -> Result<()> {
+    // `junction` crate でネイティブ API 経由 (DeviceIoControl + FSCTL_SET_REPARSE_POINT)
+    // で directory junction を作る。 admin 不要、 process spawn コストなし、
+    // `mklink /J` の cmd-tokenizer (path 内 `/` をスイッチ扱いする) 問題も無い。
+    junction::create(src, dst)
+        .map_err(|e| anyhow::anyhow!("junction {} -> {}: {}", dst.display(), src.display(), e))
+}
+
+#[cfg(not(windows))]
+fn create_dotgit_link(src: &Path, dst: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+        .map_err(|e| anyhow::anyhow!("symlink {} -> {}: {}", dst.display(), src.display(), e))
+}
+
 /// プラグインの `doc/` ディレクトリだけを merged にリンクする。`merge_plugin` の
 /// subset 版。
 ///
@@ -1069,6 +1134,113 @@ mod tests {
         assert!(merged.join("doc/main.txt").exists());
         assert!(merged.join("doc/sub/extra.txt").exists());
         assert!(r.conflicts.is_empty());
+    }
+
+    #[test]
+    fn test_link_dotgit_into_view_creates_traversable_link() {
+        // view から `.git/HEAD` が読めれば junction / symlink どちらでも OK。
+        let root = tempdir().unwrap();
+        let plugin_clone = root.path().join("clone");
+        let view = root.path().join("view");
+        // plugin clone 側の .git を作る
+        write(&plugin_clone.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write(&plugin_clone.join(".git/refs/heads/main"), "deadbeef\n");
+        fs::create_dir_all(&view).unwrap();
+
+        link_dotgit_into_view(&plugin_clone, &view).unwrap();
+
+        // view 側から `.git/HEAD` が読めること (= リンクが効いている)
+        let head = fs::read_to_string(view.join(".git/HEAD")).unwrap();
+        assert_eq!(head, "ref: refs/heads/main\n");
+        let main_ref = fs::read_to_string(view.join(".git/refs/heads/main")).unwrap();
+        assert_eq!(main_ref, "deadbeef\n");
+    }
+
+    #[test]
+    fn test_link_dotgit_into_view_is_noop_when_no_git_dir() {
+        // dev = true プラグイン等 .git を持たないソースは静かにスキップ。
+        let root = tempdir().unwrap();
+        let plugin_clone = root.path().join("clone");
+        let view = root.path().join("view");
+        // plugin_clone は存在するが .git は無い
+        fs::create_dir_all(&plugin_clone).unwrap();
+        write(&plugin_clone.join("plugin/foo.vim"), "echo 'foo'");
+        fs::create_dir_all(&view).unwrap();
+
+        link_dotgit_into_view(&plugin_clone, &view).expect("noop should not error");
+
+        assert!(
+            !view.join(".git").exists(),
+            "view/.git should not be created when source has no .git"
+        );
+    }
+
+    #[test]
+    fn test_link_dotgit_into_view_overwrites_existing_link() {
+        // 前回の sync で残った .git を新しい clone のものに張り替えられる
+        // (idempotent)。 上書きで panic しない。
+        let root = tempdir().unwrap();
+        let plugin_clone = root.path().join("clone");
+        let view = root.path().join("view");
+        write(&plugin_clone.join(".git/HEAD"), "ref: refs/heads/main\n");
+        fs::create_dir_all(&view).unwrap();
+
+        link_dotgit_into_view(&plugin_clone, &view).unwrap();
+        // 2 回目も成功すること
+        link_dotgit_into_view(&plugin_clone, &view).unwrap();
+
+        let head = fs::read_to_string(view.join(".git/HEAD")).unwrap();
+        assert_eq!(head, "ref: refs/heads/main\n");
+    }
+
+    #[test]
+    fn test_merge_view_with_dotgit_link_works_together() {
+        // merge_plugin_view と link_dotgit_into_view を順に呼ぶ統合シナリオ。
+        // walk が dotfile を skip するので .git の中身は merge では張られない。
+        // その後 link_dotgit_into_view で .git だけ junction / symlink で露出する。
+        let root = tempdir().unwrap();
+        let plugin_clone = root.path().join("clone");
+        let view = root.path().join("view");
+        write(&plugin_clone.join("lua/foo/init.lua"), "return {}");
+        write(&plugin_clone.join(".git/HEAD"), "ref: refs/heads/main\n");
+        write(&plugin_clone.join(".git/packed-refs"), "# packed-refs v2\n");
+
+        let r = merge_plugin_view(&plugin_clone, &view).unwrap();
+        assert!(r.conflicts.is_empty());
+        // walk は .git を skip するので、 hard-link 配下に .git/HEAD は来ない
+        assert!(
+            !view.join(".git").join("HEAD").exists() || view.join(".git").is_symlink_or_junction(),
+            "before linking, .git/HEAD should not exist in view"
+        );
+
+        link_dotgit_into_view(&plugin_clone, &view).unwrap();
+
+        // lua の hard-link はそのまま、 .git は indirection 越しに読める
+        assert_eq!(
+            fs::read_to_string(view.join("lua/foo/init.lua")).unwrap(),
+            "return {}"
+        );
+        assert_eq!(
+            fs::read_to_string(view.join(".git/HEAD")).unwrap(),
+            "ref: refs/heads/main\n"
+        );
+        assert_eq!(
+            fs::read_to_string(view.join(".git/packed-refs")).unwrap(),
+            "# packed-refs v2\n"
+        );
+    }
+
+    /// テスト中で junction / symlink 判定したいだけのヘルパー。 std には統一 API
+    /// が無いのでここで簡略実装。 実プロダクションパスでは使わない。
+    trait IsSymlinkOrJunction {
+        fn is_symlink_or_junction(&self) -> bool;
+    }
+    impl IsSymlinkOrJunction for std::path::PathBuf {
+        fn is_symlink_or_junction(&self) -> bool {
+            std::fs::symlink_metadata(self)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+        }
     }
 
     #[test]

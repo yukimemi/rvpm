@@ -105,5 +105,13 @@ gix = { version = "0.83", default-features = false, features = [
     "revision",
 ] }
 
+# Windows directory junction (view dir のルートに repos clone の `.git` を露出
+# する用途; #blink.cmp の `vim.fs.root('.git')` 検出対応)。 Windows-only target
+# dep — `mklink /J` の cmd-spawn を避けてネイティブ API で junction 作成。
+# admin 権限不要、 path 内 forward-slash の cmd-tokenizer 問題なし、
+# process spawn コストもゼロ。
+[target.'cfg(windows)'.dependencies]
+junction = "1"
+
 [dev-dependencies]
 tempfile = "3.27"
