@@ -45,7 +45,7 @@ which = "8"
 # default-features = false で `reqwest` を rustls 経由に固定する (rvpm 全体の
 # TLS pin と整合)。 `archive-zip` / `archive-tar` / `compression-flate2` で
 # GitHub release artifact (linux .tar.gz / windows .zip) を解凍可能にする。
-self_update = { version = "0.42", default-features = false, features = [
+self_update = { version = "0.44", default-features = false, features = [
     "rustls",
     "compression-flate2",
     "archive-tar",
