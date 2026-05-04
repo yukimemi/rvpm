@@ -175,6 +175,8 @@ pub enum AiBackend {
     Gemini,
     /// Spawn the `codex` CLI as a subprocess.
     Codex,
+    /// Spawn the `opencode` CLI as a subprocess.
+    Opencode,
 }
 
 impl Default for Options {

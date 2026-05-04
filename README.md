@@ -163,7 +163,7 @@ for fully isolated test configs.
 | `url_style` | `"short"` \| `"full"` | `"short"` | How `rvpm add` writes GitHub plugin URLs. Duplicate detection normalizes between styles |
 | `fetch_interval` | duration string (`"6h"`, `"30m"`, `"45s"`, `"1d"`, `"0"`) | `"6h"` | Per-plugin fetch cache window. `sync` skips `git fetch` for plugins pulled within the last *fetch_interval*. Accepted units: `s` / `m` / `h` / `d`. Set to `"0"` to disable caching (pre-v3.19 behavior). Override per-run with `rvpm sync --refresh` / `--no-refresh` |
 | `auto_lazy` | `"ask"` \| `"always"` \| `"never"` | `"ask"` | How `rvpm add` (and `rvpm browse → Enter`) handles the post-clone scan that looks for `nvim_create_user_command` / keymaps in the plugin's `plugin/` + `ftplugin/` + `after/plugin/` + `lua/` dirs. `"ask"` (default) prompts interactively on TTY and skips silently on non-TTY. `"always"` accepts the suggestion unconditionally. `"never"` skips the scan entirely. Per-call override via `--auto-lazy` / `--no-lazy` on `rvpm add`. Accepted suggestions cluster commands by 3-char LCP (3+ char shared prefix becomes `/^Prefix/` regex so future commands in that family auto-load) and enumerate keymaps (maps don't LCP well). **Ignored when `ai != "off"`** — the AI handles the design end-to-end |
-| `ai` | `"off"` \| `"claude"` \| `"gemini"` \| `"codex"` | `"off"` | Use an AI CLI to design the full `[[plugins]]` block (plus per-plugin hook files) on `rvpm add`. The chosen CLI must already be installed and authenticated (`claude login`, `gemini auth`, etc.) — rvpm doesn't manage API keys. When set, the static-scan + auto-lazy path is skipped entirely. After the AI proposes, you can apply, refine via chat, hand off to the native CLI for free-form follow-up, or skip. Per-call override via `--ai <backend>` / `--no-ai` on `rvpm add` |
+| `ai` | `"off"` \| `"claude"` \| `"gemini"` \| `"codex"` \| `"opencode"` | `"off"` | Use an AI CLI to design the full `[[plugins]]` block (plus per-plugin hook files) on `rvpm add`. The chosen CLI must already be installed and authenticated (`claude login`, `gemini auth`, etc.) — rvpm doesn't manage API keys. When set, the static-scan + auto-lazy path is skipped entirely. After the AI proposes, you can apply, refine via chat, hand off to the native CLI for free-form follow-up, or skip. Per-call override via `--ai <backend>` / `--no-ai` on `rvpm add` |
 | `ai_language` | string | `"en"` | Natural language for the AI's `<rvpm:explanation>` body and chat replies. The XML tag structure itself is always English so parsing stays predictable. Accepts BCP-47-ish codes (`"en"`, `"ja"`, `"zh"`, `"de"`) or free-form names |
 | `auto_update_check` | `boolean` | `true` | Spawn a background GitHub-release check at the start of every command and print a banner to stderr when a newer rvpm version is available, pointing at `rvpm self-update`. Network failures and rate limits are silently swallowed (resilience). Set to `false` to disable entirely |
 | `update_check_interval` | duration string (`"24h"`, `"6h"`, `"1d"`) | `"24h"` | Minimum interval between consecutive auto-update checks. Last-check timestamp is persisted at `<cache_root>/last_update_check.json`. Uses humantime format (`s` / `m` / `h` / `d`). Invalid values fall back to `"24h"` |
@@ -340,14 +340,14 @@ on_map = [
 </details>
 
 <details>
-<summary><b>AI-powered <code>rvpm add</code> (claude / gemini / codex)</b></summary>
+<summary><b>AI-powered <code>rvpm add</code> (claude / gemini / codex / opencode)</b></summary>
 
 Set `options.ai` to a CLI you have installed and authenticated, and `rvpm add`
 delegates the design of the `[[plugins]]` entry to the AI:
 
 ```toml
 [options]
-ai = "claude"           # "off" (default) | "claude" | "gemini" | "codex"
+ai = "claude"           # "off" (default) | "claude" | "gemini" | "codex" | "opencode"
 ai_language = "en"      # explanation language; structural output stays English
 ```
 
@@ -360,7 +360,7 @@ What it does:
 2. Builds a prompt from rvpm's TOML schema, the plugin's `README` + `doc/`,
    your current `config.toml` + `plugins/` tree, and any **existing
    per-plugin hook files** already on disk.
-3. Invokes the chosen CLI one-shot (`claude -p` / `gemini -p` / `codex exec`).
+3. Invokes the chosen CLI one-shot (`claude -p` / `gemini -p` / `codex exec` / `opencode -p`).
 4. Parses the response (XML tags `<rvpm:plugin_entry>`, `<rvpm:init_lua>`,
    `<rvpm:before_lua>`, `<rvpm:after_lua>`, `<rvpm:explanation>`, plus
    `<rvpm:..._merged>` variants when existing content was provided).

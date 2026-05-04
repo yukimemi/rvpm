@@ -27,7 +27,7 @@ pub enum ChatOutcome {
 /// AI mode の add 全体エントリ。
 ///
 /// 引数:
-///   - `backend`: 使う CLI (`Claude` / `Gemini` / `Codex`)
+///   - `backend`: 使う CLI (`Claude` / `Gemini` / `Codex` / `Opencode`)
 ///   - `plugin_url`: user が `rvpm add` で渡した URL (config 書き込み時の同定用)
 ///   - `plugin_root`: clone 済みプラグインの実パス (README/doc 抽出元)
 ///   - `config_root`: per-plugin hook を書く先のルート

@@ -204,7 +204,7 @@ concurrency = 16
 # auto_lazy = "ask"
 # Backend used to delegate `rvpm add` to an AI CLI (#93).
 #   "off" (default) — use the static scan + auto_lazy flow
-#   "claude" / "gemini" / "codex" — spawn the corresponding CLI as a subprocess
+#   "claude" / "gemini" / "codex" / "opencode" — spawn the corresponding CLI as a subprocess
 # Errors out if the CLI is not installed. `auto_lazy` is ignored.
 # CLI flags `--ai claude` / `--no-ai` allow per-call overrides.
 # ai = "claude"
