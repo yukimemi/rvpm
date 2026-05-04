@@ -45,7 +45,14 @@ which = "8"
 # default-features = false で `reqwest` を rustls 経由に固定する (rvpm 全体の
 # TLS pin と整合)。 `archive-zip` / `archive-tar` / `compression-flate2` で
 # GitHub release artifact (linux .tar.gz / windows .zip) を解凍可能にする。
-self_update = { version = "0.42", default-features = false, features = [
+#
+# 0.44 から HTTP backend (`reqwest` / `ureq`) は明示 opt-in に変わった (旧バージョン
+# は default で reqwest 必須だった)。 default-features = false のままだと backend
+# 未選択で `http_client::get` が定義されず compile エラーになるので、 ここで
+# `reqwest` feature を明示的に有効化する。 続く `rustls` は `reqwest?/rustls`
+# を経由して TLS backend だけを差し替える。
+self_update = { version = "0.44", default-features = false, features = [
+    "reqwest",
     "rustls",
     "compression-flate2",
     "archive-tar",
