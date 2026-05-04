@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="rvpm — Rust-based Vim Plugin Manager" width="560">
+</p>
+
 # rvpm
 
 > **R**ust-based **V**im **P**lugin **M**anager — a fast, pre-compiled plugin manager for Neovim
