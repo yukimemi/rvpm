@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="rvpm">
+  <title>rvpm</title>
+  <defs>
+    <linearGradient id="rvpm-streak" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#A02214" stop-opacity="0"/>
+      <stop offset="50%"  stop-color="#CE422B" stop-opacity="0.7"/>
+      <stop offset="100%" stop-color="#FFAE4D" stop-opacity="1"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="256" height="256" rx="44" fill="#0F0F12"/>
+
+  <!-- Streaks of varying length, right edges trace a soft chevron / comet-head profile -->
+  <g fill="url(#rvpm-streak)">
+    <rect x="40" y="56"  width="138" height="8" rx="4"/>
+    <rect x="32" y="72"  width="152" height="8" rx="4"/>
+    <rect x="24" y="88"  width="166" height="8" rx="4"/>
+    <rect x="20" y="104" width="176" height="8" rx="4"/>
+    <rect x="16" y="120" width="184" height="8" rx="4"/>
+    <rect x="12" y="136" width="188" height="8" rx="4"/>
+    <rect x="16" y="152" width="184" height="8" rx="4"/>
+    <rect x="20" y="168" width="176" height="8" rx="4"/>
+    <rect x="24" y="184" width="166" height="8" rx="4"/>
+    <rect x="32" y="200" width="152" height="8" rx="4"/>
+    <rect x="40" y="216" width="138" height="8" rx="4"/>
+  </g>
+</svg>
