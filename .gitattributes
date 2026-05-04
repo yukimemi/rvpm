@@ -1,0 +1,4 @@
+# APM lockfile is generated/normalized in CI; pin LF so Windows checkouts
+# don't rewrite it to CRLF and create spurious diffs.
+*.yml text eol=lf
+*.yaml text eol=lf

@@ -1,3 +1,6 @@
 .claude/settings.local.json
 /target
-.claude/
+
+
+# APM dependencies
+apm_modules/
