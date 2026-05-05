@@ -2668,6 +2668,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kaishin"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "836bddb8626482751e73399b0cee771afde04775dd55be551af8ac4b38582582"
+dependencies = [
+ "anyhow",
+ "console",
+ "dirs",
+ "humantime",
+ "reqwest",
+ "self_update",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "kasuari"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3806,14 +3825,13 @@ dependencies = [
  "dialoguer",
  "dirs",
  "gix",
- "humantime",
  "indicatif",
  "junction",
+ "kaishin",
  "open",
  "ratatui",
  "regex",
  "reqwest",
- "self_update",
  "semver",
  "serde",
  "serde_json",
@@ -4492,9 +4510,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.52.1"
+version = "1.52.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
+checksum = "110a78583f19d5cdb2c5ccf321d1290344e71313c6c37d43520d386027d18386"
 dependencies = [
  "bytes",
  "libc",

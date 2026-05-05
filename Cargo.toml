@@ -42,29 +42,9 @@ toml_edit = "0.25"
 which = "8"
 
 # Self-update (`rvpm self-update`, daily auto-check banner) — #125
-# default-features = false で `reqwest` を rustls 経由に固定する (rvpm 全体の
-# TLS pin と整合)。 `archive-zip` / `archive-tar` / `compression-flate2` で
-# GitHub release artifact (linux .tar.gz / windows .zip) を解凍可能にする。
-#
-# 0.44 から HTTP backend (`reqwest` / `ureq`) は明示 opt-in に変わった (旧バージョン
-# は default で reqwest 必須だった)。 default-features = false のままだと backend
-# 未選択で `http_client::get` が定義されず compile エラーになるので、 ここで
-# `reqwest` feature を明示的に有効化する。 続く `rustls` は `reqwest?/rustls`
-# を経由して TLS backend だけを差し替える。
-self_update = { version = "0.44", default-features = false, features = [
-    "reqwest",
-    "rustls",
-    "compression-flate2",
-    "archive-tar",
-    "archive-zip",
-    # Windows の GitHub release `.zip` artifact は deflate 圧縮されているので、
-    # `archive-zip` だけだと展開時にエラーになる (CodeRabbit PR #126 指摘)。
-    "compression-zip-deflate",
-] }
+kaishin = "0.2"
 # Version 比較 (current `Cargo.toml` の version vs. 取得した `tag_name`)。
 semver = "1"
-# `[options] update_check_interval = "24h"` 等のパース。
-humantime = "2"
 
 # Markdown rendering (for store TUI README preview).
 # `highlight-code` brings in syntect + ansi-to-tui (~4 MB of syntax / theme
