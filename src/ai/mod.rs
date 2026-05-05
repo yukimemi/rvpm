@@ -305,7 +305,20 @@ pub async fn invoke_oneshot(backend: Backend, prompt_text: &str) -> Result<Strin
         ));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    // RVPM_AI_DUMP_RESPONSE=<path> があれば生の応答を保存 (#141)
+    if let Ok(dump_path) = std::env::var("RVPM_AI_DUMP_RESPONSE")
+        && !dump_path.trim().is_empty()
+    {
+        if let Err(e) = std::fs::write(&dump_path, &stdout) {
+            eprintln!("\u{26a0}\u{fe0f}  Failed to dump AI response to {dump_path}: {e}");
+        } else {
+            eprintln!("\u{1f4dd} AI response dumped to {dump_path}");
+        }
+    }
+
+    Ok(stdout)
 }
 
 /// AI 応答から `<rvpm:plugin_entry>` 等の XML tag を抜き取る。
