@@ -33,6 +33,7 @@ pub enum Backend {
     Claude,
     Gemini,
     Codex,
+    Opencode,
 }
 
 /// `crate::config::AiBackend` (Off を含む TOML 設定型) → 実行時 `Backend` 変換。
@@ -47,6 +48,7 @@ impl TryFrom<crate::config::AiBackend> for Backend {
             crate::config::AiBackend::Claude => Ok(Backend::Claude),
             crate::config::AiBackend::Gemini => Ok(Backend::Gemini),
             crate::config::AiBackend::Codex => Ok(Backend::Codex),
+            crate::config::AiBackend::Opencode => Ok(Backend::Opencode),
             crate::config::AiBackend::Off => Err(()),
         }
     }
@@ -59,6 +61,7 @@ impl Backend {
             Backend::Claude => "claude",
             Backend::Gemini => "gemini",
             Backend::Codex => "codex",
+            Backend::Opencode => "opencode",
         }
     }
 
@@ -75,6 +78,7 @@ impl Backend {
             Backend::Claude => "Claude",
             Backend::Gemini => "Gemini",
             Backend::Codex => "Codex",
+            Backend::Opencode => "OpenCode",
         }
     }
 }
@@ -201,6 +205,7 @@ pub fn ensure_cli_installed(backend: Backend) -> Result<()> {
         Backend::Claude => "https://docs.claude.com/claude-code",
         Backend::Gemini => "https://ai.google.dev/gemini-api/docs/cli",
         Backend::Codex => "https://github.com/openai/codex",
+        Backend::Opencode => "https://opencode.ai",
     };
     Err(anyhow!(
         "AI backend `{cli}` is not on PATH. Install it first ({hint}) or pass a different `--ai` flag."
@@ -236,12 +241,15 @@ pub async fn invoke_oneshot(backend: Backend, prompt_text: &str) -> Result<Strin
     //   - claude: `claude -p` で one-shot non-interactive、stdin で prompt
     //   - gemini: `gemini -p` 同様
     //   - codex:  `codex exec`  (or `codex -p`、ver 依存)
-    // どれも stdin 受け付けるはず。安全側に prompt を stdin で渡す。
+    //   - opencode: `opencode run` で stdin から読み取り
     let mut cmd = Command::new(&resolved.program);
     cmd.args(&resolved.prefix_args);
     match backend {
         Backend::Claude | Backend::Gemini => {
             cmd.arg("-p").arg("-");
+        }
+        Backend::Opencode => {
+            cmd.arg("run");
         }
         Backend::Codex => {
             cmd.arg("exec").arg("-");
@@ -421,7 +429,7 @@ pub fn should_emit_merged_with(backend: Backend, get_env: impl Fn(&str) -> Optio
     }
     match backend {
         Backend::Gemini => false,
-        Backend::Claude | Backend::Codex => true,
+        Backend::Claude | Backend::Codex | Backend::Opencode => true,
     }
 }
 
@@ -430,14 +438,13 @@ pub fn should_emit_merged_with(backend: Backend, get_env: impl Fn(&str) -> Optio
 #[derive(Debug, Clone, Copy)]
 enum FirstMessageStrategy {
     /// `<cli> "<msg>"` — positional arg で interactive を継続したまま最初の
-    /// user message を送る。claude / codex 両方この方式。
+    /// user message を送る。claude / codex / opencode 等。
     Positional,
     /// `gemini -i "<msg>"` — `--prompt-interactive` 相当の short flag。
     /// `-p` (non-interactive) と区別して対話継続する。
     InteractiveFlag,
     /// Auto-send が安全に出来ない backend 用フォールバック。argless で
-    /// interactive 起動 + stderr に「コピペしてください」案内を出す。現状
-    /// 未使用だが将来 backend を増やした際の保険として残す。
+    /// interactive 起動 + stderr に「コピペしてください」案内を出す。
     #[allow(dead_code)]
     Manual,
 }
@@ -446,7 +453,8 @@ fn first_message_strategy(backend: Backend) -> FirstMessageStrategy {
     match backend {
         // claude: `claude "<msg>"`
         // codex:  `codex  "<msg>"` (claude と同様 positional 仕様)
-        Backend::Claude | Backend::Codex => FirstMessageStrategy::Positional,
+        // opencode: `opencode "<msg>"`
+        Backend::Claude | Backend::Codex | Backend::Opencode => FirstMessageStrategy::Positional,
         // gemini: `gemini -i "<msg>"` (`-p` だと one-shot non-interactive)
         Backend::Gemini => FirstMessageStrategy::InteractiveFlag,
     }
@@ -691,6 +699,7 @@ mod tests {
         assert_eq!(Backend::try_from(Cfg::Claude), Ok(Backend::Claude));
         assert_eq!(Backend::try_from(Cfg::Gemini), Ok(Backend::Gemini));
         assert_eq!(Backend::try_from(Cfg::Codex), Ok(Backend::Codex));
+        assert_eq!(Backend::try_from(Cfg::Opencode), Ok(Backend::Opencode));
         assert_eq!(Backend::try_from(Cfg::Off), Err(()));
     }
 
@@ -701,6 +710,7 @@ mod tests {
         let no_env = |_: &str| None;
         assert!(should_emit_merged_with(Backend::Claude, no_env));
         assert!(should_emit_merged_with(Backend::Codex, no_env));
+        assert!(should_emit_merged_with(Backend::Opencode, no_env));
         assert!(!should_emit_merged_with(Backend::Gemini, no_env));
     }
 
