@@ -671,6 +671,8 @@ enum AutoUpdateHandle {
     Pending {
         checker: kaishin::Checker,
         handle: tokio::task::JoinHandle<Result<kaishin::LatestRelease, anyhow::Error>>,
+        /// タイムアウト時のフォールバック用。
+        cached_latest: Option<kaishin::LatestRelease>,
     },
 }
 
@@ -697,11 +699,11 @@ async fn maybe_spawn_auto_update_check() -> Option<AutoUpdateHandle> {
     let cache_root = resolve_cache_root(cfg.options.cache_root.as_deref());
     let opts = kaishin::KaishinOptions::new(
         "yukimemi",
-        "rvpm",
-        "rvpm",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
     );
-    let checker = kaishin::Checker::new("rvpm", opts)
+    let checker = kaishin::Checker::new(env!("CARGO_PKG_NAME"), opts)
         .interval(interval)
         .state_path(cache_root.join("last_update_check.json"));
 
@@ -714,9 +716,14 @@ async fn maybe_spawn_auto_update_check() -> Option<AutoUpdateHandle> {
     }
 
     // fetch を spawn
+    let cached_latest = checker.cached_update();
     let checker_clone = checker.clone();
     let handle = tokio::spawn(async move { checker_clone.check_and_save().await });
-    Some(AutoUpdateHandle::Pending { checker, handle })
+    Some(AutoUpdateHandle::Pending {
+        checker,
+        handle,
+        cached_latest,
+    })
 }
 
 /// `rvpm` の config file の path を解決する (auto-check 用)。
@@ -734,14 +741,20 @@ async fn finalize_auto_update_check(handle: AutoUpdateHandle) {
         AutoUpdateHandle::CachedAvailable { checker, latest } => {
             eprintln!("\n{}", checker.format_banner(&latest));
         }
-        AutoUpdateHandle::Pending { checker, handle } => {
+        AutoUpdateHandle::Pending {
+            checker,
+            handle,
+            cached_latest,
+        } => {
             // 1 秒 timeout で結果を待つ。 タイムアウトは silent skip。
             let res = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
-            let Ok(Ok(Ok(latest))) = res else {
-                return;
-            };
-            // banner 出力
-            eprintln!("\n{}", checker.format_banner(&latest));
+            if let Ok(Ok(Ok(latest))) = res {
+                // banner 出力
+                eprintln!("\n{}", checker.format_banner(&latest));
+            } else if let Some(latest) = cached_latest {
+                // タイムアウトやエラー時はキャッシュがあれば表示
+                eprintln!("\n{}", checker.format_banner(&latest));
+            }
         }
     }
 }
@@ -750,11 +763,16 @@ async fn finalize_auto_update_check(handle: AutoUpdateHandle) {
 async fn run_self_update(yes: bool, check_only: bool) -> Result<()> {
     let opts = kaishin::KaishinOptions::new(
         "yukimemi",
-        "rvpm",
-        "rvpm",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_NAME"),
         env!("CARGO_PKG_VERSION"),
     );
-    kaishin::run_self_update(&opts, yes, check_only).await
+    let upd_opts = kaishin::UpdateOptions::new()
+        .yes(yes)
+        .check_only(check_only);
+    // non_interactive フラグは rvpm ではまだ CmdCtx に持っていないため、デフォルト false。
+    // (必要になれば CmdCtx に追加して伝搬させる)
+    kaishin::run_self_update(&opts, upd_opts).await
 }
 
 use crate::tui::{PluginStatus, TuiState};
