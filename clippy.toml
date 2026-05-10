@@ -1,0 +1,9 @@
+# yukimemi/* Rust clippy policy. Centralised in
+# `yukimemi/pj-rust`; every Rust project picks this up via
+# `kata apply` (overwrite always). Local edits don't survive
+# `kata apply` — push the change here.
+
+# MSRV — keeps `cargo clippy` from suggesting features that are
+# stable on `stable` but not yet on the project's pinned MSRV.
+# Bumped together with `package.rust-version` in Cargo.toml.
+msrv = "1.85"

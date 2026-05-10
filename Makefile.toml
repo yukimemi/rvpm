@@ -2,8 +2,8 @@
 alias = "check"
 
 [tasks.check]
-description = "Run fmt + clippy + test (same as CI)"
-dependencies = ["fmt-check", "clippy", "test"]
+description = "Run fmt + clippy + test + lock-check (same as CI)"
+dependencies = ["fmt-check", "clippy", "test", "lock-check"]
 
 [tasks.fmt-check]
 description = "Check formatting"
@@ -18,17 +18,22 @@ args = ["fmt", "--all"]
 [tasks.clippy]
 description = "Run clippy with warnings as errors"
 command = "cargo"
-args = ["clippy", "--all-targets", "--", "-D", "warnings"]
+args = ["clippy", "--locked", "--all-targets", "--", "-D", "warnings"]
 
 [tasks.test]
 description = "Run all tests"
 command = "cargo"
-args = ["test"]
+args = ["test", "--locked"]
 
 [tasks.install]
 description = "Install rvpm from local source (respects Cargo.lock via --locked)"
 command = "cargo"
 args = ["install", "--path", ".", "--locked"]
+
+[tasks.lock-check]
+description = "Verify Cargo.lock is in sync with Cargo.toml"
+command = "cargo"
+args = ["check", "--locked", "--all-targets"]
 
 [tasks.publish-dry]
 description = "Dry-run crates.io publish"
@@ -44,22 +49,93 @@ hook_file = set "${hook_dir}/pre-push"
 mkdir ${hook_dir}
 hook_content = set "#!/bin/sh\n# Installed by: cargo make hook-install\ncargo make check"
 writefile ${hook_file} ${hook_content}
+# chmod +x is needed on Unix; on Windows the exec bit is a no-op
+# AND `chmod` may not be on PATH (it's only present when Git for
+# Windows / busybox is wired into the shell). Skip silently if
+# `chmod` isn't reachable so plain Windows shells don't fail this
+# task with `program not found`.
+chmod_path = which chmod
+if not is_empty ${chmod_path}
+    exec chmod +x ${hook_file}
+else
+    echo "chmod not on PATH; skipping exec-bit (no-op on Windows; on Unix this means the hook may not be executable)"
+end
 echo "Installed pre-push hook -> ${hook_file}"
 '''
 
 [tasks.apm-install]
-description = "Compile the renri skill into .claude/skills/ + .gemini/skills/ + .github/skills/ via APM"
-command = "apm"
-args = ["install", "-t", "copilot,claude,gemini"]
+description = "Install agent skills declared in apm.yml (Copilot / Claude / Gemini targets). Skipped silently when apm.yml or the apm CLI is absent."
+script_runner = "@duckscript"
+script = '''
+exists = is_path_exists "apm.yml"
+if not ${exists}
+    echo "no apm.yml; skipping apm-install"
+    exit 0
+end
+apm_path = which apm
+if is_empty ${apm_path}
+    echo "apm CLI not on PATH; skipping apm-install (install via aka.ms/apm-unix or your platform's package manager)"
+    exit 0
+end
+exec apm install -t copilot,claude,gemini
+'''
 
 [tasks.apm-install-update]
-description = "Refresh APM dependencies to upstream latest (used by on-add hook)"
-command = "apm"
-args = ["install", "--update", "-t", "copilot,claude,gemini"]
+description = "Refresh APM dependencies to upstream latest. Skipped when apm.yml/apm absent, or when apm.lock.yaml already records the current upstream renri HEAD (kicks in on every cargo make on-add after the first to keep worktree creation fast)."
+script_runner = "@duckscript"
+script = '''
+exists = is_path_exists "apm.yml"
+if not ${exists}
+    echo "no apm.yml; skipping apm-install-update"
+    exit 0
+end
+apm_path = which apm
+if is_empty ${apm_path}
+    echo "apm CLI not on PATH; skipping apm-install-update (install via aka.ms/apm-unix or your platform's package manager)"
+    exit 0
+end
+
+# Fast-path: if apm.lock.yaml already records the current
+# upstream HEAD of yukimemi/renri (the only APM dependency for
+# yukimemi/* projects), don't re-run `apm install --update` —
+# git ls-remote is ~100ms, an actual reinstall is several
+# seconds. This makes `cargo make on-add` cheap on every
+# `renri add` after the first.
+lock_exists = is_path_exists "apm.lock.yaml"
+if ${lock_exists}
+    ls_result = exec git ls-remote https://github.com/yukimemi/renri.git refs/heads/main
+    ls_ok = eq ${ls_result.code} 0
+    if ${ls_ok}
+        upstream_line = trim ${ls_result.stdout}
+        upstream_sha = substring ${upstream_line} 0 40
+        # Guard against empty / short upstream_sha. duckscript's
+        # `contains "haystack" ""` returns true (empty needle is
+        # always a substring), so without this check a successful-
+        # but-empty `git ls-remote` (deleted main ref, weird CI
+        # mirror, etc.) would incorrectly skip the install.
+        sha_len = length ${upstream_sha}
+        sha_valid = eq ${sha_len} 40
+        if ${sha_valid}
+            lock_body = readfile apm.lock.yaml
+            already_synced = contains ${lock_body} ${upstream_sha}
+            if ${already_synced}
+                echo "apm.lock.yaml already at upstream renri ${upstream_sha}; skipping apm install --update"
+                exit 0
+            end
+        end
+    end
+end
+
+exec apm install --update -t copilot,claude,gemini
+'''
+
+[tasks.setup]
+description = "One-time setup for new contributors: pre-push hook + APM install"
+dependencies = ["hook-install", "apm-install"]
 
 [tasks.vcs-fetch]
 description = "Fetch latest refs (jj when in a jj workspace, otherwise git)"
-# Best-effort: a missing `jj`/`git` binary, an unreachable remote, etc.
+# Best-effort: a missing `jj` / `git` binary, an unreachable remote, etc.
 # should log but not fail `cargo make on-add` and break `renri add`.
 ignore_errors = true
 script_runner = "@duckscript"
@@ -68,11 +144,8 @@ script = '''
 # fails there with "not a git repository". Prefer `jj git fetch`, which
 # works in pure-jj and colocated repos. Fall back to `git fetch` for
 # pure-git (no `.jj/`) worktrees.
-#
-# Best-effort: don't `--fail-on-error` because a transient network
-# failure during `renri add` shouldn't break the worktree; the user
-# can always `cargo make vcs-fetch` later.
-if is_path_exists .jj
+jj_present = is_path_exists ".jj"
+if ${jj_present}
     exec jj git fetch
 else
     exec git fetch
@@ -82,10 +155,6 @@ end
 [tasks.on-add]
 description = "Wired to renri's [[hooks.post_create]] — runs in a freshly created worktree"
 dependencies = ["apm-install-update", "vcs-fetch"]
-
-[tasks.setup]
-description = "One-time setup for new contributors: pre-push hook + APM install (requires `apm` CLI on PATH — see https://github.com/microsoft/apm)"
-dependencies = ["hook-install", "apm-install"]
 
 # ─── vhs / demo GIF regeneration ───────────────────────────────────────
 # Native vhs on Windows hangs on `Set Theme`, so we ship a Docker image
