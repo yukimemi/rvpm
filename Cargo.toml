@@ -22,7 +22,7 @@ dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 # するためのターミナル style ヘルパ。dialoguer からも transitive に入っている
 # が、直接依存として明示しておく。
 console = "0.16"
-anyhow = "1.0"
+anyhow = "1.0.102"
 
 # Async & Process
 tokio = { version = "1.51", features = ["full"] }
