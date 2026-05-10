@@ -1105,6 +1105,52 @@ mod tests {
         cmd
     }
 
+    // Ensures the test process itself has a committer identity gix can find,
+    // for code paths (Repo::sync / Repo::update / Repo::checkout_locally) that
+    // create or mutate dst repos via gix-in-process — those don't go through
+    // `git_cmd`'s per-Command env, so they need either repo-local config or
+    // process-level env vars. We use env vars because dst repos are created
+    // *by* gix (sync) and we don't have a hook to write their .git/config.
+    //
+    // `Once` keeps this safe under the parallel test runner: env mutation
+    // happens exactly once, before any test reads the env.
+    fn ensure_committer_env() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            // SAFETY: called on first git_init_with_user, before any test
+            // gix-call. No other test code mutates these vars, so racing
+            // reads from gix are stable after this single write.
+            unsafe {
+                std::env::set_var("GIT_AUTHOR_NAME", "test");
+                std::env::set_var("GIT_AUTHOR_EMAIL", "test@test.com");
+                std::env::set_var("GIT_COMMITTER_NAME", "test");
+                std::env::set_var("GIT_COMMITTER_EMAIL", "test@test.com");
+            }
+        });
+    }
+
+    // `git init` + write `[user]` into the repo's local `.git/config` so that
+    // gix-based code paths (Repo::checkout_locally, sync_impl, …) running
+    // inside the test process can find a committer for reflog updates. The
+    // env vars set on `git_cmd` only reach the spawned `git` CLI; they do
+    // NOT propagate to the parent test process where gix actually executes —
+    // hence both the per-repo write and the process-level env var below.
+    async fn git_init_with_user(dir: &Path) {
+        ensure_committer_env();
+        git_cmd(dir).args(["init"]).output().await.unwrap();
+        git_cmd(dir)
+            .args(["config", "user.name", "test"])
+            .output()
+            .await
+            .unwrap();
+        git_cmd(dir)
+            .args(["config", "user.email", "test@test.com"])
+            .output()
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn test_get_status_not_installed() {
         let root = tempdir().unwrap();
@@ -1118,7 +1164,7 @@ mod tests {
         let root = tempdir().unwrap();
         let src = root.path().join("src");
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("hello.txt"), "hello").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -1136,7 +1182,7 @@ mod tests {
         let root = tempdir().unwrap();
         let src = root.path().join("src");
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("hello.txt"), "hello").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -1155,7 +1201,7 @@ mod tests {
         let root = tempdir().unwrap();
         let src = root.path().join("src");
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("hello.txt"), "hello").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -1196,7 +1242,7 @@ mod tests {
 
         // ローカル bare repo を作成
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("hello.txt"), "hello").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -1226,7 +1272,7 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("hello.txt"), "hello").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -1273,7 +1319,7 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("hello.txt"), "v1").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -1318,7 +1364,7 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("a.txt"), "v1").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -1378,7 +1424,7 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("a.txt"), "seed").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -1445,7 +1491,7 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("a.txt"), "seed").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -1482,7 +1528,7 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&dst).unwrap();
-        git_cmd(&dst).args(["init"]).output().await.unwrap();
+        git_init_with_user(&dst).await;
         fs::write(dst.join("a.txt"), "v1").unwrap();
         git_cmd(&dst).args(["add", "."]).output().await.unwrap();
         git_cmd(&dst)
@@ -1626,7 +1672,7 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         // **最重要**: `git init` 直後の default branch を確定させる (CodeRabbit
         // PR #99 review 指摘)。後で v1 を作って checkout するので、この段階で
         // default を控えておかないと、setup 末尾で「現在の HEAD = v1」を
@@ -1701,7 +1747,7 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("a.txt"), "only").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -1729,7 +1775,7 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("a.txt"), "a").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -1784,7 +1830,7 @@ mod tests {
         let src = root.path().join("repo");
         fs::create_dir_all(&src).unwrap();
         fs::create_dir_all(src.join("doc")).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("README.md"), "v1\n").unwrap();
         fs::write(src.join("doc/intro.txt"), "hello\n").unwrap();
         fs::write(src.join("src.txt"), "code v1\n").unwrap();
@@ -1850,7 +1896,7 @@ mod tests {
         let root = tempdir().unwrap();
         let src = root.path().join("repo");
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("README.md"), "alpha\nbeta\ngamma\n").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -1904,7 +1950,7 @@ mod tests {
         let root = tempdir().unwrap();
         let src = root.path().join("repo");
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("README.md"), "v1\n").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -1954,7 +2000,7 @@ mod tests {
         let root = tempdir().unwrap();
         let src = root.path().join("repo");
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         // null-byte を含む binary 風 blob (現実的には PNG / dat 等の `doc/` 内画像)。
         fs::create_dir_all(src.join("doc")).unwrap();
         fs::write(
@@ -2013,7 +2059,7 @@ mod tests {
         let root = tempdir().unwrap();
         let src = root.path().join("repo");
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("README.md"), "v1\n").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -2065,7 +2111,7 @@ mod tests {
         let root = tempdir().unwrap();
         let src = root.path().join("repo");
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("README.md"), "alpha\nbeta\n").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -2118,7 +2164,7 @@ mod tests {
         let root = tempdir().unwrap();
         let src = root.path().join("repo");
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("README.md"), "v1\n").unwrap();
         fs::write(src.join("other.txt"), "stable\n").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
@@ -2253,7 +2299,7 @@ mod tests {
         let root = tempdir().unwrap();
         let src = root.path().join("src");
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("a.txt"), "seed").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -2275,7 +2321,7 @@ mod tests {
         let root = tempdir().unwrap();
         let src = root.path().join("src");
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("a.txt"), "seed").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -2304,7 +2350,7 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("a.txt"), "seed").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -2373,7 +2419,7 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("a.txt"), "seed").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)
@@ -2405,7 +2451,7 @@ mod tests {
         let dst = root.path().join("dst");
 
         fs::create_dir_all(&src).unwrap();
-        git_cmd(&src).args(["init"]).output().await.unwrap();
+        git_init_with_user(&src).await;
         fs::write(src.join("a.txt"), "seed").unwrap();
         git_cmd(&src).args(["add", "."]).output().await.unwrap();
         git_cmd(&src)

@@ -1,4 +1,19 @@
-# renri.toml
+# renri.toml — language-agnostic worktree config for yukimemi/* projects.
+# pj-base ships the minimum hook chain that any PJ benefits from
+# (refresh installed agent skills); language-specific layers
+# (pj-rust, pj-go, pj-bun) overwrite this file with a richer hook
+# that delegates to the project's build-system on-add task.
+
+[ui]
+# Surface the GitHub PR # next to each worktree in `renri list`.
+# renri batches `gh pr list` lookups (one call per `list` run
+# regardless of worktree count) and caches the result; pass
+# `renri list --refresh` to bypass the cache when a new PR has
+# just been opened or merged.
+show_pr = true
+# renri.toml — fresh worktrees run `cargo make on-add`, which
+# refreshes apm skills *and* fetches the upstream remote so the
+# new worktree is rebase-ready without a second command.
 # Schema and examples: https://github.com/yukimemi/renri
 
 [[hooks.post_create]]
