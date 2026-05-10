@@ -5115,28 +5115,24 @@ where
     let _ = std::fs::remove_dir_all(&old_dir);
     // Step 1: tmp に新規 build。
     build(&tmp_dir)?;
-    // Step 2 (POSIX): 直接 rename で existing dir を atomic 置換。
-    #[cfg(unix)]
-    {
-        if let Err(e) = std::fs::rename(&tmp_dir, view_dir) {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(e.into());
-        }
+    // Step 2: 既存 view を .old に退避 → tmp を view に rename → .old 削除。
+    //
+    // 旧実装は POSIX なら `rename(tmp, view)` で直接置換できると想定していたが、
+    // Linux の rename(2) は dst が非空ディレクトリの場合 ENOTEMPTY を返すため
+    // 2 回目以降の sync で必ず失敗していた (#158)。
+    // Windows 同様に「退避 → rename → 削除」の 3-step に統一する。
+    // view_dir が空になる瞬間は退避 rename と tmp rename の間に微小窓として残るが、
+    // いずれも rename (メタデータ更新のみ) なので旧実装の delete→build より十分短い。
+    if view_dir.exists() {
+        std::fs::rename(view_dir, &old_dir)?;
     }
-    // Step 2 (Windows): 既存 view を .old に退避 → tmp を view に rename。
-    #[cfg(not(unix))]
-    {
-        if view_dir.exists() {
-            std::fs::rename(view_dir, &old_dir)?;
-        }
-        if let Err(e) = std::fs::rename(&tmp_dir, view_dir) {
-            // Step 3 失敗時は .old を view に戻して整合保つ (best-effort)。
-            let _ = std::fs::rename(&old_dir, view_dir);
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            return Err(e.into());
-        }
-        let _ = std::fs::remove_dir_all(&old_dir);
+    if let Err(e) = std::fs::rename(&tmp_dir, view_dir) {
+        // Step 3 失敗時は .old を view に戻して整合保つ (best-effort)。
+        let _ = std::fs::rename(&old_dir, view_dir);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(e.into());
     }
+    let _ = std::fs::remove_dir_all(&old_dir);
     Ok(())
 }
 
