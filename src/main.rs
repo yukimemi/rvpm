@@ -749,8 +749,11 @@ async fn finalize_auto_update_check(handle: AutoUpdateHandle) {
             // 1 秒 timeout で結果を待つ。 タイムアウトは silent skip。
             let res = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
             if let Ok(Ok(Ok(latest))) = res {
-                // banner 出力
-                eprintln!("\n{}", checker.format_banner(&latest));
+                if kaishin::is_update_available(env!("CARGO_PKG_VERSION"), &latest.tag_name)
+                    .unwrap_or(false)
+                {
+                    eprintln!("\n{}", checker.format_banner(&latest));
+                }
             } else if let Some(latest) = cached_latest {
                 // タイムアウトやエラー時はキャッシュがあれば表示
                 eprintln!("\n{}", checker.format_banner(&latest));
