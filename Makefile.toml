@@ -38,15 +38,16 @@ description = "cargo test --all-targets (lib / bins / tests / benches / examples
 command = "cargo"
 args = ["test", "--locked", "--all-targets"]
 
+[tasks.test-doc]
+description = "cargo test --doc (doc tests only — excluded from --all-targets). Skipped on bin-only packages, since `cargo test --doc` errors with `no library targets found` when there is no library to extract doc tests from."
+command = "cargo"
+args = ["test", "--locked", "--doc"]
+condition = { files_exist = ["${CARGO_MAKE_WORKING_DIRECTORY}/src/lib.rs"] }
+
 [tasks.lock-check]
 description = "Verify Cargo.lock is in sync with Cargo.toml"
 command = "cargo"
 args = ["check", "--locked", "--all-targets"]
-
-[tasks.test-doc]
-description = "cargo test --doc (doc tests only — excluded from --all-targets)"
-command = "cargo"
-args = ["test", "--locked", "--doc"]
 
 [tasks.publish-dry]
 description = "Dry-run crates.io publish"
