@@ -39,7 +39,7 @@ toml = "1.1.2"
 toml_edit = "0.25.11"
 
 # CLI subprocess discovery (`claude` / `gemini` / `codex` on PATH for AI add #93).
-which = "8"
+which = "8.0.2"
 
 # Self-update (`rvpm self-update`, daily auto-check banner) — #125
 kaishin = "0.2.4"
