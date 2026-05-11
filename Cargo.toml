@@ -58,7 +58,7 @@ unicode-width = "0.2.2"
 # 明示しておくと将来 tui-markdown を差し替えても壊れない。
 ansi-to-tui = "8.0.1"
 # `[options.store.readme_command]` で spawn する外部プロセスのタイムアウト。
-wait-timeout = "0.2"
+wait-timeout = "0.2.1"
 # 外部 renderer に `{file_path}` を渡す場合の一時ファイル作成。
 tempfile = "3.27.0"
 
