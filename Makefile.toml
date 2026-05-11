@@ -21,19 +21,32 @@ command = "cargo"
 args = ["clippy", "--locked", "--all-targets", "--", "-D", "warnings"]
 
 [tasks.test]
-description = "Run all tests"
-command = "cargo"
-args = ["test", "--locked"]
+description = "Run all tests (targets + doc)"
+# `cargo test --all-targets` covers lib / bins / tests / benches /
+# examples but EXCLUDES doc tests. Run --doc separately so the
+# task name still matches its description ("all tests"). CI runs
+# both jobs in parallel; locally we sequence them via dependencies.
+dependencies = ["test-targets", "test-doc"]
 
 [tasks.install]
 description = "Install rvpm from local source (respects Cargo.lock via --locked)"
 command = "cargo"
 args = ["install", "--path", ".", "--locked"]
 
+[tasks.test-targets]
+description = "cargo test --all-targets (lib / bins / tests / benches / examples — no doc)"
+command = "cargo"
+args = ["test", "--locked", "--all-targets"]
+
 [tasks.lock-check]
 description = "Verify Cargo.lock is in sync with Cargo.toml"
 command = "cargo"
 args = ["check", "--locked", "--all-targets"]
+
+[tasks.test-doc]
+description = "cargo test --doc (doc tests only — excluded from --all-targets)"
+command = "cargo"
+args = ["test", "--locked", "--doc"]
 
 [tasks.publish-dry]
 description = "Dry-run crates.io publish"
@@ -107,14 +120,26 @@ if ${lock_exists}
     ls_ok = eq ${ls_result.code} 0
     if ${ls_ok}
         upstream_line = trim ${ls_result.stdout}
-        upstream_sha = substring ${upstream_line} 0 40
-        # Guard against empty / short upstream_sha. duckscript's
-        # `contains "haystack" ""` returns true (empty needle is
-        # always a substring), so without this check a successful-
-        # but-empty `git ls-remote` (deleted main ref, weird CI
-        # mirror, etc.) would incorrectly skip the install.
-        sha_len = length ${upstream_sha}
-        sha_valid = eq ${sha_len} 40
+        # `substring` errors out (failing the whole task) if the
+        # input is shorter than the requested range, so length-check
+        # *before* the call. Empty / short `upstream_line` happens
+        # when `git ls-remote` succeeds-with-empty (deleted main ref,
+        # weird CI mirror, etc.) — in that case we skip the fast-
+        # path and fall through to a real `apm install --update`.
+        line_len = length ${upstream_line}
+        line_long_enough = greater_than ${line_len} 39
+        if ${line_long_enough}
+            upstream_sha = substring ${upstream_line} 0 40
+            # Defense-in-depth: still re-check sha_len in case
+            # duckscript's substring semantics ever change.
+            # `contains "haystack" ""` returns true (empty needle is
+            # always a substring), so a stray empty sha would also
+            # incorrectly skip the install without this guard.
+            sha_len = length ${upstream_sha}
+            sha_valid = eq ${sha_len} 40
+        else
+            sha_valid = set false
+        end
         if ${sha_valid}
             lock_body = readfile apm.lock.yaml
             already_synced = contains ${lock_body} ${upstream_sha}

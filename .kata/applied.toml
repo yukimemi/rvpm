@@ -1,20 +1,26 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-05-10T01:47:19.7370279Z"
+applied_at = "2026-05-11T23:33:15.8926428Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "280ca2337400c0fe4cd2da17dc16185581f3a2dd"
-version = "0.3.0"
+rev = "c9d03e3bc2a50c526276c1902f8146140af90c71"
+version = "0.7.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "8c3842eb0e073b506f6bc293423a2d20273accae"
-version = "0.2.0"
+rev = "53e800e32456697fee3a3a28c028bc5fbab62e15"
+version = "0.4.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust-cli"
-rev = "048e9fecbe348a9f0507b4fe61d259810d6c704a"
+rev = "9263751c3f94f3415147e546db33170157fb1503"
 version = "0.2.0"
+
+[files.".agents/skills/renri/SKILL.md"]
+once_applied = true
+
+[files.".claude/skills/renri/SKILL.md"]
+once_applied = true
 
 [files.".editorconfig"]
 once_applied = true
@@ -22,14 +28,20 @@ once_applied = true
 [files.".gemini/settings.json"]
 content_hash = "486c974de88903113ed99b4e643432b7050e88f1031276f5263e8da7b43fe11e"
 
+[files.".gitattributes"]
+content_hash = "1a4b579b1b643a41dbf97d8834ff1f3f1fe532ff863d0f861431cf3ca47d31e2"
+
 [files.".github/workflows/ci.yml"]
-content_hash = "a7a9e10867d5b2ec06fecb9f3248b0f2ad940584cc583bd2b9dd48cccff624b8"
+content_hash = "3a3da2a8ca5ea9b4a2e88163ad4b6de7fb58fa3762b52431aec06294ac4646fc"
 
 [files.".github/workflows/release.yml"]
 once_applied = true
 
 [files.".gitignore"]
-content_hash = "733fc58cfdd43e5c91b522e71932bbd22c83b51700937fed382564bbe7262193"
+content_hash = "4bebd1c3417c33f9d1c51f011694f6d82b098bbb1a5a102ba56e97ab01a866ef"
+
+[files.".kata/vars.toml"]
+once_applied = true
 
 [files."AGENTS.md"]
 content_hash = "e4f146a1c66d11e6b6c707f52507b3e37da2fe52d8d7cf13f75edcf9ad5d3a7f"
@@ -44,10 +56,13 @@ content_hash = "3670f70a2f0be4013926bab6e878b90a42ad64c17899080aef4d193b246fa390
 once_applied = true
 
 [files."Makefile.toml"]
-content_hash = "656e02f02146079b1d966219eb395000462fe9121719621dc2d9696f80b13e25"
+content_hash = "6fc09bdba9c464e8f924f0c54091a9cd29abdecc65d12b7e903d53758e62989f"
 
 [files."OPENCODE.md"]
 content_hash = "11993dc7feec5fca8e83934f135de33879b88f100c48aeba0729de2f57a11a48"
+
+[files."apm.lock.yaml"]
+once_applied = true
 
 [files."apm.yml"]
 once_applied = true
@@ -59,7 +74,7 @@ content_hash = "89dbb3b4fd63c479f61f077d2383ab5c0998ea838f271ed57fd09281975deda0
 content_hash = "2ada1cf4347db9e98fadd67ca72cd9e29042c5bf6ab719d666b5d71f97663e81"
 
 [files."renovate.json"]
-content_hash = "32569a8b8904be51b03feff5955357333e191a4e95d93bc2b38bf067f56a6bbb"
+once_applied = true
 
 [files."renri.toml"]
 content_hash = "f4751570494ba62997cfb47e3abee2e707d3e01d924d1e8b940905a4e7c974f3"

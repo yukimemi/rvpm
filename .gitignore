@@ -13,4 +13,10 @@ apm_modules/
 *~
 .DS_Store
 Thumbs.db
+
+# APM dependencies — install output of apm.yml's deps.
+# Skill files under .agents/, .claude/, .gemini/ etc. are
+# committed (kata seeds them; renri post_create refreshes via
+# `apm install --update`); the apm_modules/ source cache is not.
+apm_modules/
 # kata:gitignore:base:end

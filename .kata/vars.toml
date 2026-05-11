@@ -1,0 +1,19 @@
+# Action version pins for kata-managed GHA workflow templates.
+#
+# Each `# renovate:` annotation tells Renovate which datasource and
+# upstream repo the value tracks; Renovate bumps these in-place via
+# the customManager declared in `renovate.json`. Edits here flow
+# into the next `kata apply` (which re-renders the `.tera` workflow
+# files using these values) without being reverted.
+#
+# Two-level layering: this file is shipped via kata as a `when =
+# "once"` seed into each consumer's `.kata/vars.toml`. After the
+# initial seed, the consumer owns their copy — bumps happen there
+# (or stay pinned by hand). The seed in this template repo is what
+# new `kata init` consumers start with.
+
+[actions]
+# renovate: datasource=github-tags depName=actions/checkout
+checkout = "v6"
+# renovate: datasource=github-tags depName=Swatinem/rust-cache
+swatinem_rust_cache = "v2"
