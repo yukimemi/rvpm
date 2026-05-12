@@ -41,8 +41,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # `cargo test --all-targets` covers lib / bins / tests / benches
       # / examples but EXCLUDES doc tests, so run --doc separately.
+      # Doc-test step is gated on `src/lib.rs` presence: `cargo test
+      # --doc` errors with `no library targets found` on bin-only
+      # crates (yukimemi/todoke#50, yukimemi/rvpm#176 track the
+      # consumer-side refactor). Drop this `if:` once both land.
       - run: cargo test --all-targets
-      - run: cargo test --doc
+      - if: ${{ hashFiles('src/lib.rs') != '' }}
+        run: cargo test --doc
 
   fmt:
     name: rustfmt

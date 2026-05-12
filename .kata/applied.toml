@@ -1,5 +1,5 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-05-11T23:53:23.0647521Z"
+applied_at = "2026-05-12T00:00:46.0377426Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
@@ -8,8 +8,8 @@ version = "0.7.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "b740611e032cad7a3167d0dc36d6b1e6570f46c6"
-version = "0.4.1"
+rev = "99af835c61fbc9da55b886ba3b3f22f23b8ee8b5"
+version = "0.4.2"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust-cli"
@@ -32,7 +32,7 @@ content_hash = "486c974de88903113ed99b4e643432b7050e88f1031276f5263e8da7b43fe11e
 content_hash = "1a4b579b1b643a41dbf97d8834ff1f3f1fe532ff863d0f861431cf3ca47d31e2"
 
 [files.".github/workflows/ci.yml"]
-content_hash = "3a3da2a8ca5ea9b4a2e88163ad4b6de7fb58fa3762b52431aec06294ac4646fc"
+content_hash = "ec163f67d4b75e3a3499ac45998472dac7cb24a3594a685559a250dc4f48d3d0"
 
 [files.".github/workflows/release.yml"]
 once_applied = true
@@ -56,7 +56,7 @@ content_hash = "3670f70a2f0be4013926bab6e878b90a42ad64c17899080aef4d193b246fa390
 once_applied = true
 
 [files."Makefile.toml"]
-content_hash = "68b1381f22649befbe83029aab176ca244251de580d0b7f8a84894fbaca25a6b"
+content_hash = "27e3f57b9efd6c177843d9b0d248f40af5843739bcde6ceaf985f2ce518ecfcf"
 
 [files."OPENCODE.md"]
 content_hash = "11993dc7feec5fca8e83934f135de33879b88f100c48aeba0729de2f57a11a48"
