@@ -19,10 +19,12 @@ name: kata-apply
 # rendered-file diff. Auto-merged when CI passes — if CI fails,
 # the PR stays open for human review.
 #
-# Source: yukimemi/pj-base. Filename carries `.template` so kata
-# strips the suffix on apply (pj-base itself has no `.kata` state,
-# so the workflow never fires there; consumer receives
-# `.github/workflows/kata-apply.yml`).
+# Source: yukimemi/pj-base. Filename carries `.tera` so kata
+# Tera-renders the file at apply time (substituting
+# `{{ vars.actions.* }}`) and strips the
+# suffix — consumer receives `.github/workflows/kata-apply.yml`.
+# pj-base itself has no `.kata` state, so the .tera source never
+# executes in GHA in this repo (GHA only invokes `.yml`/`.yaml`).
 
 on:
   schedule:
