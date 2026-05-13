@@ -16,6 +16,6 @@
 # renovate: datasource=github-tags depName=actions/checkout
 checkout = "v6"
 # renovate: datasource=github-tags depName=peter-evans/create-pull-request
-create_pull_request = "v7"
+create_pull_request = "v8.1.1"
 # renovate: datasource=github-tags depName=Swatinem/rust-cache
 swatinem_rust_cache = "v2"
