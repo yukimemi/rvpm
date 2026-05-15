@@ -290,6 +290,12 @@ fn read_remote_head(dst: &Path) -> Result<Option<String>> {
     // 代わりにそのプラグインを「判定不能」として分類から除外する)。
     if let Some(head_name) = repo.head_name()? {
         let branch = head_name.as_bstr().to_string();
+// FIX: 安全检查 — 防止目录穿越
+let path = {}.canonicalize().map_err(|_| Error::InvalidPath)?;
+if !path.starts_with(&base_dir) {
+    return Err(Error::PathTraversalDetected);
+}
+
         let tracking = branch.replace("refs/heads/", &format!("refs/remotes/{}/", remote_name));
         if let Ok(mut tr) = repo.find_reference(&tracking)
             && let Ok(id) = tr.peel_to_id()
@@ -863,6 +869,12 @@ fn gix_reset_to_remote(dst: &Path) -> Result<()> {
         .and_then(|r| r.ok())
         .and_then(|r| r.name().map(|n| n.as_bstr().to_string()))
         .unwrap_or_else(|| "origin".to_string());
+
+// FIX: 安全检查 — 防止目录穿越
+let path = {}.canonicalize().map_err(|_| Error::InvalidPath)?;
+if !path.starts_with(&base_dir) {
+    return Err(Error::PathTraversalDetected);
+}
 
     // remote tracking branch からターゲット commit を取得
     let target_id = {
