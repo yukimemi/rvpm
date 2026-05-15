@@ -1,0 +1,86 @@
+# Auto-tag on version bump.
+#
+# Watches `main` and, whenever a commit lands that changes
+# `[package] version` in Cargo.toml, creates a matching
+# `vX.Y.Z` tag and pushes it. The tag push then triggers the
+# tag-driven release workflow (cross-compile + GitHub Release +
+# cargo publish for CLIs, lib publish for libs).
+#
+# This file is kata-managed via `pj-rust`'s template.toml
+# (rendered out of `auto-tag.yml.tera`, the suffix stripped on
+# the consumer side). The `.tera` suffix keeps GitHub Actions
+# from running the source inside `pj-rust` itself, the same
+# protection `ci.yml.tera` and `release.yml.template` use.
+
+name: Auto-tag on version bump
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  auto-tag:
+    runs-on: ubuntu-latest
+    steps:
+      # `fetch-depth: 2` so HEAD~1 (the parent commit) is in scope
+      # for the Cargo.toml diff. fetch-depth: 0 would also work but
+      # is wasteful when we only need one parent.
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 2
+
+      # Extract `version = "..."` from Cargo.toml under [package].
+      # Plain grep is enough because yukimemi/* crates are
+      # single-package (no [workspace] virtual manifest), so the
+      # first `^version =` line is always the package version.
+      - name: Detect version bump
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          extract() {
+            grep -E '^version = "' "$1" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
+          }
+          NEW=$(extract Cargo.toml)
+          # HEAD~1 might not have Cargo.toml (very first commit on a
+          # new repo) — fall back to empty string so the diff below
+          # still classifies it as a bump.
+          OLD=$(git show HEAD~1:Cargo.toml 2>/dev/null | grep -E '^version = "' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          OLD="${OLD:-}"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          echo "old=$OLD" >> "$GITHUB_OUTPUT"
+          if [ -n "$NEW" ] && [ "$NEW" != "$OLD" ]; then
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Detected version bump: ${OLD:-<none>} -> $NEW"
+          else
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No version change ($NEW); nothing to tag."
+          fi
+
+      - name: Create and push tag
+        if: steps.ver.outputs.bumped == 'true'
+        shell: bash
+        env:
+          # `gh` reads this; `git push` uses the default token from
+          # actions/checkout's persisted credentials.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="v${{ steps.ver.outputs.new }}"
+          # Be idempotent: if the tag already exists (e.g. someone
+          # ran `git tag` by hand before this workflow caught up),
+          # don't overwrite it — just exit successfully.
+          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null \
+            || gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/$TAG" --silent 2>/dev/null; then
+            echo "::notice::Tag $TAG already exists; skipping."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
+          echo "::notice::Pushed tag $TAG"

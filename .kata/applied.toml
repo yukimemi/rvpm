@@ -1,5 +1,5 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-05-14T04:33:37.7511795Z"
+applied_at = "2026-05-15T04:38:23.012504836Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
@@ -8,7 +8,7 @@ version = "0.10.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "20f3042ca5f4ffba2b26fb1fadd19154077e6477"
+rev = "8f059bb3dc6e14792915db70fff4b16f9af92080"
 version = "0.5.0"
 
 [[templates]]
@@ -30,6 +30,9 @@ content_hash = "486c974de88903113ed99b4e643432b7050e88f1031276f5263e8da7b43fe11e
 
 [files.".gitattributes"]
 content_hash = "1a4b579b1b643a41dbf97d8834ff1f3f1fe532ff863d0f861431cf3ca47d31e2"
+
+[files.".github/workflows/auto-tag.yml"]
+content_hash = "31ba3d93dfa16bfa95d81618f613a02d3975b60ecd4eda36abc0d6e18ea69972"
 
 [files.".github/workflows/ci.yml"]
 content_hash = "3a35eeef0bd68f37a34f7168d82133305954283d9bc724208aeafce55da20d91"
