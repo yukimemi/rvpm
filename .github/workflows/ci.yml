@@ -60,8 +60,17 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
-    name: clippy
-    runs-on: ubuntu-latest
+    # Matrix across all three OSes so OS-specific dead code (e.g. helpers
+    # gated under `cfg(target_os = "windows")`) is caught everywhere, not
+    # just on the maintainer's machine. Without this, a Windows-only
+    # helper looks fine on a Windows pre-push hook but blows up the Linux
+    # clippy run.
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@stable
@@ -81,3 +90,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.1
       - run: cargo check --locked --all-targets
+
+  coverage:
+    # llvm-cov on Linux + Codecov upload. taiki-e/install-action grabs the
+    # cargo-llvm-cov binary. codecov-action@v5 nominally accepts tokenless
+    # uploads from public repos, but in practice Codecov rejects them with
+    # 'Token required - not valid tokenless upload', so plumb CODECOV_TOKEN
+    # through as a repo secret. `fail_ci_if_error: false` still keeps a
+    # flaky upload from gating merges.
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
