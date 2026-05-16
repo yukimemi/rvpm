@@ -1,16 +1,29 @@
 # Auto-tag on version bump.
 #
-# Watches `main` and, whenever a commit lands that changes
-# `[package] version` in Cargo.toml, creates a matching
-# `vX.Y.Z` tag and pushes it. The tag push then triggers the
-# tag-driven release workflow (cross-compile + GitHub Release +
-# cargo publish for CLIs, lib publish for libs).
+# Watches `main` and, whenever a commit lands that changes the
+# top-level `version = "..."` in Cargo.toml (`[package]` for
+# single-crate repos or `[workspace.package]` for workspace roots),
+# creates a matching `vX.Y.Z` tag and pushes it. The tag push then
+# triggers the tag-driven release workflow (cross-compile + GitHub
+# Release + cargo publish for CLIs, lib publish for libs).
 #
 # This file is kata-managed via `pj-rust`'s template.toml
 # (rendered out of `auto-tag.yml.tera`, the suffix stripped on
 # the consumer side). The `.tera` suffix keeps GitHub Actions
 # from running the source inside `pj-rust` itself, the same
 # protection `ci.yml.tera` and `release.yml.template` use.
+#
+# Token: this workflow pushes the tag with `KATA_APPLY_TOKEN`
+# (a PAT) rather than the default `GITHUB_TOKEN`. The default
+# token would create the tag fine, but GitHub deliberately
+# refuses to fire downstream workflows (release.yml) from refs
+# pushed by `GITHUB_TOKEN` to prevent recursive workflow runs.
+# Using the PAT — the same one `kata-apply.yml` already relies
+# on for the exact same downstream-trigger reason — restores
+# the tag → release.yml chain. Each consumer repo needs a
+# `KATA_APPLY_TOKEN` secret set; this is documented in
+# pj-base's apply-workflow notes alongside the kata-apply
+# bootstrap step.
 
 name: Auto-tag on version bump
 
@@ -28,28 +41,43 @@ jobs:
       # `fetch-depth: 2` so HEAD~1 (the parent commit) is in scope
       # for the Cargo.toml diff. fetch-depth: 0 would also work but
       # is wasteful when we only need one parent.
+      #
+      # `token: KATA_APPLY_TOKEN` makes actions/checkout persist
+      # the PAT as the credential the later `git push` call will
+      # use. Without this the tag push goes out under the default
+      # `GITHUB_TOKEN` and downstream workflows stay silent.
       - name: Checkout
         uses: actions/checkout@v6.0.2
         with:
           fetch-depth: 2
+          token: ${{ secrets.KATA_APPLY_TOKEN }}
 
-      # Extract `version = "..."` from Cargo.toml under [package].
-      # Plain grep is enough because yukimemi/* crates are
-      # single-package (no [workspace] virtual manifest), so the
-      # first `^version =` line is always the package version.
+      # Extract the top-level `version = "..."` from Cargo.toml.
+      # Plain grep is enough: the first line matching `^version
+      # <optional space> = "` is the package version for both
+      # `[package]` (single crate) and `[workspace.package]`
+      # (workspace root). The whitespace tolerance is what lets
+      # alignment-style formatting (`version      = "x"`) work
+      # alongside the more common `version = "x"`.
+      #
+      # `|| true` on the OLD extraction is what keeps the pipeline
+      # alive when HEAD~1 has no Cargo.toml (first-ever commit) OR
+      # the grep finds no match — without it, pipefail + set -e would
+      # kill the step before we get a chance to classify "no match"
+      # as "no previous version".
       - name: Detect version bump
         id: ver
         shell: bash
         run: |
           set -euo pipefail
           extract() {
-            grep -E '^version = "' "$1" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/'
+            grep -E '^version[[:space:]]*=[[:space:]]*"' "$1" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true
           }
           NEW=$(extract Cargo.toml)
           # HEAD~1 might not have Cargo.toml (very first commit on a
           # new repo) — fall back to empty string so the diff below
           # still classifies it as a bump.
-          OLD=$(git show HEAD~1:Cargo.toml 2>/dev/null | grep -E '^version = "' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
+          OLD=$(git show HEAD~1:Cargo.toml 2>/dev/null | grep -E '^version[[:space:]]*=[[:space:]]*"' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
           OLD="${OLD:-}"
           echo "new=$NEW" >> "$GITHUB_OUTPUT"
           echo "old=$OLD" >> "$GITHUB_OUTPUT"
@@ -65,9 +93,13 @@ jobs:
         if: steps.ver.outputs.bumped == 'true'
         shell: bash
         env:
-          # `gh` reads this; `git push` uses the default token from
-          # actions/checkout's persisted credentials.
-          GH_TOKEN: ${{ github.token }}
+          # `gh` reads this; the matching `git push` uses the PAT
+          # that actions/checkout persisted above. Using
+          # `KATA_APPLY_TOKEN` for both keeps "the tag was pushed
+          # by a user, not a workflow" — which is the bit GitHub
+          # checks before firing downstream workflows like
+          # release.yml.
+          GH_TOKEN: ${{ secrets.KATA_APPLY_TOKEN }}
         run: |
           set -euo pipefail
           TAG="v${{ steps.ver.outputs.new }}"
