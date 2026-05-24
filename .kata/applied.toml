@@ -1,19 +1,19 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-05-17T04:40:39.922928074Z"
+applied_at = "2026-05-24T04:45:13.739886651Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "f04151faf4f0678be9621bb724c8f3120a5e4d8b"
-version = "0.10.0"
+rev = "3e3c7ee971897ae6cc71e78d597c838412974f19"
+version = "0.12.1"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "9f103ca5aaf39e1dcf1a4d84b11685821aabc62f"
-version = "0.5.0"
+rev = "f78e190bac618fc3870b3c4a6e4187eb01c3cc42"
+version = "0.7.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust-cli"
-rev = "9263751c3f94f3415147e546db33170157fb1503"
+rev = "58fae0574cbf118e61312c7599c412bfd7d3d3ac"
 version = "0.2.0"
 
 [files.".agents/skills/renri/SKILL.md"]
@@ -29,13 +29,16 @@ once_applied = true
 content_hash = "486c974de88903113ed99b4e643432b7050e88f1031276f5263e8da7b43fe11e"
 
 [files.".gitattributes"]
-content_hash = "1a4b579b1b643a41dbf97d8834ff1f3f1fe532ff863d0f861431cf3ca47d31e2"
+content_hash = "6d380d1ecc2f882c2011429d548a6f3c774b74f0c757d884453e4667172acc2a"
+
+[files.".github/workflows/apm-bump.yml"]
+content_hash = "79b12afa028841f8bce3c0caffd60dfe491642dba685142e33ed22a8cfcb9f9d"
 
 [files.".github/workflows/auto-tag.yml"]
 content_hash = "0796dfb281c7447610035360622ddada137a8e2d89efa574aea89374676d768b"
 
 [files.".github/workflows/ci.yml"]
-content_hash = "741862d937397ea8fa0c02529cb4e7bc81266a8e628d317e590fa4687c2a3ec5"
+content_hash = "594c14cf24dd2aa17d8c50d0db6d56321cb729ad4fc660888d7e6fbe36ca9211"
 
 [files.".github/workflows/kata-apply.yml"]
 content_hash = "bc0e3def04b634949297d60322999a27f53bffc71b6cb662ae58ac8087e78bed"
@@ -50,7 +53,7 @@ content_hash = "4bebd1c3417c33f9d1c51f011694f6d82b098bbb1a5a102ba56e97ab01a866ef
 once_applied = true
 
 [files."AGENTS.md"]
-content_hash = "e4f146a1c66d11e6b6c707f52507b3e37da2fe52d8d7cf13f75edcf9ad5d3a7f"
+content_hash = "2a38543fca1f22128c41fe51c40159e8ea7f3331ae221fb99cddfca0194ece32"
 
 [files."CLAUDE.md"]
 content_hash = "a76b3af252969b8120128d7ce44f2b6cfdcf88c7420ee00675732f542d047529"
@@ -62,7 +65,7 @@ content_hash = "3670f70a2f0be4013926bab6e878b90a42ad64c17899080aef4d193b246fa390
 once_applied = true
 
 [files."Makefile.toml"]
-content_hash = "27e3f57b9efd6c177843d9b0d248f40af5843739bcde6ceaf985f2ce518ecfcf"
+content_hash = "930554e54d2c4090b4e0ba6014dd0692a05884ff6af803897f9d1c1647818b94"
 
 [files."OPENCODE.md"]
 content_hash = "11993dc7feec5fca8e83934f135de33879b88f100c48aeba0729de2f57a11a48"
@@ -74,7 +77,7 @@ once_applied = true
 once_applied = true
 
 [files."clippy.toml"]
-content_hash = "89dbb3b4fd63c479f61f077d2383ab5c0998ea838f271ed57fd09281975deda0"
+content_hash = "c750cb285075d0cb0c5c9ea77cd67baf7b0c4af864603cbe6c0c6692e75ed6fb"
 
 [files."opencode.json"]
 content_hash = "2ada1cf4347db9e98fadd67ca72cd9e29042c5bf6ab719d666b5d71f97663e81"
@@ -89,4 +92,4 @@ content_hash = "f4751570494ba62997cfb47e3abee2e707d3e01d924d1e8b940905a4e7c974f3
 content_hash = "9eac3c057320afbad00022718e0c14731122b4c3f28abd2dc702846244c39f66"
 
 [files."rustfmt.toml"]
-content_hash = "8a0bd07a7aaaf3e9fed5dd297b04a5f96c4a969d895375aa4e00247a95aa616c"
+content_hash = "0d4916b2ce83f5270265e2fcc01b308e34e255d37fde92946382f8dbeb4427bb"

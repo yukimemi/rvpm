@@ -111,7 +111,7 @@ end
 
 # Fast-path: if apm.lock.yaml already records the current
 # upstream HEAD of yukimemi/renri (the only APM dependency for
-# yukimemi/* projects), don't re-run `apm install --update` —
+# projects using these templates), don't re-run `apm install --update` —
 # git ls-remote is ~100ms, an actual reinstall is several
 # seconds. This makes `cargo make on-add` cheap on every
 # `renri add` after the first.
@@ -180,7 +180,16 @@ end
 
 [tasks.on-add]
 description = "Wired to renri's [[hooks.post_create]] — runs in a freshly created worktree"
-dependencies = ["apm-install-update", "vcs-fetch"]
+# `apm-install` (no `--update`) is idempotent against the existing
+# `apm.lock.yaml` — fresh worktrees install the recorded skills
+# without rewriting the lock. Upstream-refresh is delegated to
+# pj-base's `.github/workflows/apm-bump.yml` (weekly cron + manual
+# dispatch); same Renovate-equivalent pattern as `kata-apply.yml`.
+# Avoids the per-`renri add` lock churn that `apm install --update`
+# produced whenever upstream renri (or any other apm dep) had
+# moved — see yukimemi/pj-base#8 for the companion change in
+# `renri.toml.base`.
+dependencies = ["apm-install", "vcs-fetch"]
 
 # ─── vhs / demo GIF regeneration ───────────────────────────────────────
 # Native vhs on Windows hangs on `Set Theme`, so we ship a Docker image
