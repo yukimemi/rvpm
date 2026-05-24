@@ -1,4 +1,4 @@
-# yukimemi/* Rust formatting policy. Centralised in
+# Shared Rust formatting policy. Centralised in
 # `yukimemi/pj-rust`; every Rust project picks this up via
 # `kata apply` (overwrite always). Local edits don't survive
 # `kata apply` — push the change here.
