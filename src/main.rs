@@ -2731,6 +2731,48 @@ async fn run_list(no_tui: bool) -> Result<bool> {
     Ok(goto_browse)
 }
 
+pub(crate) async fn update_single_plugin(
+    plugin: &crate::config::Plugin,
+    cache_root: &Path,
+    tx: mpsc::Sender<(String, PluginStatus)>,
+) -> Result<(
+    crate::config::Plugin,
+    Option<crate::git::GitChange>,
+    Option<String>,
+)> {
+    let dst_path = resolve_plugin_dst(plugin, cache_root);
+    let is_missing = !dst_path.exists();
+    let _ = tx
+        .send((
+            plugin.url.clone(),
+            PluginStatus::Syncing(if is_missing {
+                "Syncing...".to_string()
+            } else {
+                "Updating...".to_string()
+            }),
+        ))
+        .await;
+    let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
+    let res = if is_missing {
+        repo.sync().await
+    } else {
+        repo.update().await
+    };
+    match res {
+        Ok(change) => {
+            let head_commit = repo.head_commit().await.ok();
+            let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
+            Ok((plugin.clone(), change, head_commit))
+        }
+        Err(e) => {
+            let _ = tx
+                .send((plugin.url.clone(), PluginStatus::Failed(e.to_string())))
+                .await;
+            Err(e)
+        }
+    }
+}
+
 async fn run_update(query: Option<String>) -> Result<()> {
     let config_path = rvpm_config_path();
     let toml_content = std::fs::read_to_string(&config_path)
@@ -2796,28 +2838,7 @@ async fn run_update(query: Option<String>) -> Result<()> {
 
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
-            let dst_path = resolve_plugin_dst(&plugin, &cache_root);
-            let _ = tx
-                .send((
-                    plugin.url.clone(),
-                    PluginStatus::Syncing("Updating...".to_string()),
-                ))
-                .await;
-            let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
-            let res = repo.update().await;
-            match res {
-                Ok(change) => {
-                    let head_commit = repo.head_commit().await.ok();
-                    let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
-                    Ok((plugin, change, head_commit))
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send((plugin.url.clone(), PluginStatus::Failed(e.to_string())))
-                        .await;
-                    Err(e)
-                }
-            }
+            update_single_plugin(&plugin, &cache_root, tx).await
         });
     }
 

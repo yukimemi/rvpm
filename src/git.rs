@@ -2484,4 +2484,50 @@ mod tests {
             "pattern が解決→commit SHA",
         );
     }
+
+    #[tokio::test]
+    async fn test_update_single_plugin_syncs_missing() {
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_init_with_user(&src).await;
+        fs::write(src.join("hello.txt"), "hello").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+
+        let plugin = crate::config::Plugin {
+            url: src.to_str().unwrap().to_string(),
+            dst: Some(dst.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let cache_root = root.path().join("cache");
+
+        let res = crate::update_single_plugin(&plugin, &cache_root, tx).await;
+
+        // TDD: This will fail on the current codebase because the plugin is missing and not synced yet.
+        assert!(
+            res.is_ok(),
+            "Expected update_single_plugin to succeed by syncing the missing plugin, but got: {:?}",
+            res
+        );
+
+        assert!(dst.join("hello.txt").exists());
+        assert_eq!(fs::read_to_string(dst.join("hello.txt")).unwrap(), "hello");
+
+        let mut statuses = Vec::new();
+        while let Ok((_, status)) = rx.try_recv() {
+            statuses.push(status);
+        }
+        assert_eq!(statuses.len(), 2);
+        assert!(matches!(statuses[0], crate::PluginStatus::Syncing(ref m) if m == "Syncing..."));
+        assert!(matches!(statuses[1], crate::PluginStatus::Finished));
+    }
 }
