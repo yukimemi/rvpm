@@ -501,4 +501,28 @@ The binary name is derived from the GitHub repo name at runtime
 identical across CLIs using these templates unless your `[[bin]] name` in
 `Cargo.toml` deliberately differs from the repo name — in that
 case override `BIN_NAME` in the workflow's `env:` block.
+
+### Release smoke target (`examples/smoke.rs`)
+
+After `cargo build --release`, `release.yml` runs
+`cargo run --release --target <T> --example smoke` on every build
+matrix entry. `cargo test` runs only library code, so the produced
+binary's startup path goes unverified — that's how shoka v0.10.0
+shipped a rustls `CryptoProvider` panic to crates.io even though
+all 13 CI checks were green.
+
+The template's default `examples/smoke.rs` body is intentionally
+no-op so kata can drop it into every consumer crate without
+breaking releases. **Override it per crate** with the smallest
+operation that exercises the regression-prone surface:
+
+- HTTPS-using CLIs: build the API client (octocrab, reqwest, etc.)
+  and issue a tiny no-auth GET — that forces the rustls handshake
+  to run inside the same binary the release publishes.
+- File-handling CLIs: write+read a temp file via the real I/O
+  helpers (catches missing crate features, permission regressions).
+- Pure library crates: leave as no-op.
+
+A failing smoke blocks the release before publishing to GitHub
+Releases / crates.io.
 <!-- kata:agents:rust-cli:end -->

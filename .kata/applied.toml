@@ -1,5 +1,5 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-05-24T04:45:13.739886651Z"
+applied_at = "2026-05-28T04:46:16.633075427Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
@@ -13,8 +13,8 @@ version = "0.7.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust-cli"
-rev = "58fae0574cbf118e61312c7599c412bfd7d3d3ac"
-version = "0.2.0"
+rev = "3cc89e5f11c2a83dc4cd3c10a56c49306b444975"
+version = "0.3.0"
 
 [files.".agents/skills/renri/SKILL.md"]
 once_applied = true
@@ -53,7 +53,7 @@ content_hash = "4bebd1c3417c33f9d1c51f011694f6d82b098bbb1a5a102ba56e97ab01a866ef
 once_applied = true
 
 [files."AGENTS.md"]
-content_hash = "2a38543fca1f22128c41fe51c40159e8ea7f3331ae221fb99cddfca0194ece32"
+content_hash = "38c105d7b01a7034665facbb6840017db92b0d460e91a89edc5d2c86b6b7acad"
 
 [files."CLAUDE.md"]
 content_hash = "a76b3af252969b8120128d7ce44f2b6cfdcf88c7420ee00675732f542d047529"
@@ -78,6 +78,9 @@ once_applied = true
 
 [files."clippy.toml"]
 content_hash = "c750cb285075d0cb0c5c9ea77cd67baf7b0c4af864603cbe6c0c6692e75ed6fb"
+
+[files."examples/smoke.rs"]
+once_applied = true
 
 [files."opencode.json"]
 content_hash = "2ada1cf4347db9e98fadd67ca72cd9e29042c5bf6ab719d666b5d71f97663e81"
