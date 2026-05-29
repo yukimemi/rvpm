@@ -670,7 +670,7 @@ enum AutoUpdateHandle {
     /// バックグラウンドで GitHub API を叩いてる。 join 結果に応じて状態保存 + banner。
     Pending {
         checker: kaishin::Checker,
-        handle: tokio::task::JoinHandle<Result<kaishin::LatestRelease, anyhow::Error>>,
+        handle: tokio::task::JoinHandle<Result<Option<kaishin::LatestRelease>, anyhow::Error>>,
         /// タイムアウト時のフォールバック用。
         cached_latest: Option<kaishin::LatestRelease>,
     },
@@ -747,16 +747,23 @@ async fn finalize_auto_update_check(handle: AutoUpdateHandle) {
             cached_latest,
         } => {
             // 1 秒 timeout で結果を待つ。 タイムアウトは silent skip。
+            // kaishin 0.4 で check_and_save が Option を返すようになったので、
+            // ここでの is_update_available 重複チェックは不要 (Ok(None) = 更新無し)。
             let res = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
-            if let Ok(Ok(Ok(latest))) = res {
-                if kaishin::is_update_available(env!("CARGO_PKG_VERSION"), &latest.tag_name)
-                    .unwrap_or(false)
-                {
+            match res {
+                Ok(Ok(Ok(Some(latest)))) => {
                     eprintln!("\n{}", checker.format_banner(&latest));
                 }
-            } else if let Some(latest) = cached_latest {
-                // タイムアウトやエラー時はキャッシュがあれば表示
-                eprintln!("\n{}", checker.format_banner(&latest));
+                Ok(Ok(Ok(None))) => {
+                    // fetch 成功 + 更新無し: cache へのフォールバックは不要
+                    // (最新が現在版に追いついた直後など、 cache は古いだけ)。
+                }
+                _ => {
+                    // タイムアウトや fetch エラー時のみ cache を試す。
+                    if let Some(latest) = cached_latest {
+                        eprintln!("\n{}", checker.format_banner(&latest));
+                    }
+                }
             }
         }
     }
