@@ -750,13 +750,19 @@ async fn finalize_auto_update_check(handle: AutoUpdateHandle) {
             // kaishin 0.4 で check_and_save が Option を返すようになったので、
             // ここでの is_update_available 重複チェックは不要 (Ok(None) = 更新無し)。
             let res = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
-            if let Ok(Ok(Ok(Some(latest)))) = res {
-                eprintln!("\n{}", checker.format_banner(&latest));
-            } else if !matches!(res, Ok(Ok(Ok(None)))) {
-                // タイムアウトやエラー時はキャッシュがあれば表示。
-                // Ok(None) は「fetch 成功で更新無し」なので fallback しない。
-                if let Some(latest) = cached_latest {
+            match res {
+                Ok(Ok(Ok(Some(latest)))) => {
                     eprintln!("\n{}", checker.format_banner(&latest));
+                }
+                Ok(Ok(Ok(None))) => {
+                    // fetch 成功 + 更新無し: cache へのフォールバックは不要
+                    // (最新が現在版に追いついた直後など、 cache は古いだけ)。
+                }
+                _ => {
+                    // タイムアウトや fetch エラー時のみ cache を試す。
+                    if let Some(latest) = cached_latest {
+                        eprintln!("\n{}", checker.format_banner(&latest));
+                    }
                 }
             }
         }
