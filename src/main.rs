@@ -5139,8 +5139,17 @@ where
     let tmp_dir = sibling_with_suffix(view_dir, "rvpm-tmp");
     let old_dir = sibling_with_suffix(view_dir, "rvpm-old");
     // 前回の sync が中途で死んでて残骸が残ってるケースに備えて事前 cleanup。
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-    let _ = std::fs::remove_dir_all(&old_dir);
+    //
+    // ここを silent fail (`let _ = remove_dir_all`) にすると致命的な汚染が起きる:
+    // Windows で Neovim が走ってて hard-link を掴んでいる等で remove が失敗すると、
+    // 前回 run の `*.rvpm-tmp` 残骸が残ったまま build が走り、merge は「この run で
+    // 誰も置いていないファイル」の上に first-wins で重なる。結果として merge 衝突
+    // レポートが winner=<unknown> で大量に出る (実際にユーザー環境で観測)。
+    // remove を verify して、消し切れなければ build に進まず Err を返す
+    // — 呼び出し側 (run_generate / build_view_atomically) は既存 view/merged を
+    // 温存したままこの run の更新を諦め、次 run (ロック解放後) で自己修復する。
+    ensure_absent(&tmp_dir)?;
+    ensure_absent(&old_dir)?;
     // Step 1: tmp に新規 build。
     build(&tmp_dir)?;
     // Step 2: 既存 view を .old に退避 → tmp を view に rename → .old 削除。
@@ -5161,6 +5170,33 @@ where
         return Err(e.into());
     }
     let _ = std::fs::remove_dir_all(&old_dir);
+    Ok(())
+}
+
+/// `path` を再帰削除し、削除後も残っていれば Err を返す。
+///
+/// `remove_dir_all` は Windows でファイルがロックされている等のとき、配下を
+/// 一部だけ消した状態で中断して Err を返すことがある (atomic ではない)。さらに
+/// 「既に存在しない」場合は Ok を返すので、戻り値だけでは「消し切れたか」を判定
+/// できない。そこで remove のあと存在を再確認し、残っていれば残骸混入を防ぐため
+/// 明示的に fail させる。呼び出し側はこの Err を「この run の更新を諦めて既存状態を
+/// 温存する」シグナルとして扱う (次 run で自己修復)。
+fn ensure_absent(path: &Path) -> anyhow::Result<()> {
+    // `Path::exists()` は **broken symlink で false を返す** (target の metadata を
+    // 引くため)。残骸が dangling symlink だと exists() が false → 削除も検証もすり抜け、
+    // 後段の rename/create が "already exists" で落ちる。link.rs でも既出の罠。
+    // `symlink_metadata()` は symlink 自体を stat するので、壊れた symlink も含めて
+    // 「path に何かあるか」を正しく判定できる。
+    if path.symlink_metadata().is_ok() {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("remove stale dir {}", path.display()))?;
+    }
+    if path.symlink_metadata().is_ok() {
+        anyhow::bail!(
+            "{} still exists after remove_dir_all (locked by another process?)",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -5294,6 +5330,16 @@ fn print_merge_conflicts(conflicts: &[crate::merge_conflicts::MergeConflictRepor
             let winner = r.winner.as_deref().unwrap_or("<unknown>");
             eprintln!("    {}  (kept: {})", r.relative, winner);
         }
+    }
+    // winner=<unknown> は「この run で誰も置いていないファイルと衝突した」状態で、
+    // 通常は前回 run の merged 残骸が混入したときに出る。`ensure_absent` でこの
+    // 混入は構造的に防いでいるが、何らかの理由で残骸が残った場合に再 sync で
+    // 直ることをユーザーに案内する (本物の cross-plugin 衝突なら winner は実名が出る)。
+    if conflicts.iter().any(|r| r.winner.is_none()) {
+        eprintln!(
+            "  note: \"<unknown>\" winners usually mean stale merged residue — \
+             re-run `rvpm sync` to rebuild from scratch; if it persists, please report it."
+        );
     }
 }
 
@@ -6782,6 +6828,27 @@ mod tests {
     use crate::loader::PluginScripts;
     use tempfile::tempdir;
     use toml_edit::DocumentMut;
+
+    // ── ensure_absent: 残骸混入を防ぐ事前 cleanup ────────────────────
+
+    #[test]
+    fn ensure_absent_removes_existing_dir() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("stale");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/file.txt"), b"residue").unwrap();
+        ensure_absent(&dir).unwrap();
+        assert!(!dir.exists(), "dir should be gone after ensure_absent");
+    }
+
+    #[test]
+    fn ensure_absent_is_ok_when_missing() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("never-existed");
+        // 存在しない path でも Ok を返す (べき等)。
+        ensure_absent(&dir).unwrap();
+        assert!(!dir.exists());
+    }
 
     // ── patch_plugin_entry_triggers regression: respect existing user fields ──
 
