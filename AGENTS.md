@@ -437,11 +437,11 @@ either way; using a PR also gives CI a chance to gate the
 release. Enable automerge so CI green = release start:
 
 ```sh
-git switch -c chore/bump-X.Y.Z
+git switch -c chore/release-vX.Y.Z
 # Edit `package.version` in Cargo.toml, then:
 cargo build                     # let Cargo.lock follow
-git commit -am "chore: bump version to X.Y.Z"
-git push -u origin chore/bump-X.Y.Z
+git commit -am "chore: release vX.Y.Z"
+git push -u origin chore/release-vX.Y.Z
 gh pr create --fill
 gh pr merge --auto --squash --delete-branch
 ```

@@ -71,6 +71,7 @@ jobs:
       - uses: actions/checkout@v6.0.2
         with:
           token: ${{ secrets.KATA_APPLY_TOKEN }}
+          persist-credentials: false
 
       - name: Install apm
         # aka.ms/apm-unix is the Unix one-liner installer published
