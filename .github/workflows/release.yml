@@ -2,119 +2,100 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*.*.*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  # Cargo binary name derived from the GitHub repo so this template
+  # works unchanged for any CLI using these templates without per-PJ patching.
+  # If your `[[bin]] name` in Cargo.toml differs from the repo name,
+  # override this on the spot.
+  BIN_NAME: ${{ github.event.repository.name }}
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: rvpm
-            archive_name: rvpm-x86_64-unknown-linux-gnu.tar.gz
-            archive_cmd: tar
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: rvpm
-            archive_name: rvpm-x86_64-apple-darwin.tar.gz
-            archive_cmd: tar
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: rvpm
-            archive_name: rvpm-aarch64-apple-darwin.tar.gz
-            archive_cmd: tar
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: rvpm.exe
-            archive_name: rvpm-x86_64-pc-windows-msvc.zip
-            archive_cmd: zip
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
     steps:
       - uses: actions/checkout@v6
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
       - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Package (tar)
-        if: matrix.archive_cmd == 'tar'
-        shell: bash
+      - name: install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install -y musl-tools
+      - run: cargo build --release --target ${{ matrix.target }}
+      # Run the `smoke` example on the same runner that produced the
+      # binary. The example's default body is a no-op (see
+      # `examples/smoke.rs` in the consumer crate); each crate is
+      # expected to override it with a real-world startup check
+      # (HTTPS handshake, I/O probe, etc.) so this step blocks a
+      # release before bad binaries reach users — `cargo test` runs
+      # only library code and missed shoka v0.10.0's rustls panic.
+      - name: smoke
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo run --release --target ${{ matrix.target }} --example smoke
+      - name: package (unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} dist/
-          cp README.md LICENSE dist/
-          tar -C dist -czf ${{ matrix.archive_name }} ${{ matrix.artifact_name }} README.md LICENSE
-
-      - name: Package (zip)
-        if: matrix.archive_cmd == 'zip'
+          pkg=target/${{ matrix.target }}/release
+          tar czf "dist/${BIN_NAME}-${{ matrix.target }}.tar.gz" -C "$pkg" "${BIN_NAME}"
+      - name: package (windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" "dist/"
-          Copy-Item "README.md" "dist/"
-          Copy-Item "LICENSE" "dist/"
-          Compress-Archive -Path "dist/*" -DestinationPath "${{ matrix.archive_name }}"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+          New-Item -ItemType Directory -Force dist
+          $pkg = "target/${{ matrix.target }}/release"
+          Compress-Archive -Path "$pkg/$env:BIN_NAME.exe" `
+            -DestinationPath "dist/$env:BIN_NAME-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.archive_name }}
-          path: ${{ matrix.archive_name }}
-          if-no-files-found: error
-          retention-days: 1
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          path: dist/*
 
-  publish:
-    name: Publish to crates.io
+  release:
+    name: github release
     needs: build
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  publish:
+    name: publish to crates.io
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - name: Publish
-        run: cargo publish --allow-dirty
-        continue-on-error: true
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-  release:
-    name: Create Release
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-
-      - name: Flatten artifact directory
-        run: |
-          mkdir -p release
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release/ \;
-          ls -la release/
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: release/*
-          generate_release_notes: true
-          draft: false
-          prerelease: false
+      # --locked keeps the committed Cargo.lock so the publish
+      # verification step cannot fail the dirty-git-state check by
+      # rewriting the lock.
+      - run: cargo publish --locked --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
