@@ -2,6 +2,8 @@
 // 静的スキャンして、user-facing な hook 情報を集める:
 //
 //   - `commands`     : `nvim_create_user_command("Foo", ...)` / `command! Foo`
+//                       に加え、`doc/**/*.txt` の help タグ `*:Foo*` からも補完
+//                       (ラッパー越し定義など literal で拾えないコマンドの救済)
 //   - `user_maps`    : `nnoremap gc ...` / `vim.keymap.set("n", "gc", ...)` 等、
 //                       **`<Plug>(...)` LHS は除外**した「user が直接押すキー」
 //   - `plug_maps`    : `<Plug>(Foo)` 形式 LHS のみ。プラグインが exposing する
@@ -16,8 +18,10 @@
 //   - `rvpm add` 自動 lazy 提案 (#87 UI) — `commands` + `user_maps` を消費
 //
 // 制約:
-//   - 動的定義 (computed name, setup() 内定義で setup 未呼出) は拾えない。
-//     これらは user が exact 名を手書きする想定。
+//   - 動的定義 (computed name, setup() 内定義で setup 未呼出) は source からは
+//     拾えない。ただし `doc/` に `*:Cmd*` タグがあればそこから補完する
+//     (例: `local cmd = function(name, …) nvim_create_user_command(name, …) end`
+//     のようなラッパー定義)。doc タグも無いものは user が exact 名を手書きする想定。
 //   - `<Plug>(...)` LHS は user-entry ではないので user_maps から弾き、専用
 //     フィールド `plug_maps` に集める。
 //   - On-event suggestion は deadlock 的制約があり、プラグインが **発火する側** の
@@ -253,7 +257,66 @@ pub fn scan_plugin(plugin_root: &Path) -> ScanResult {
         }
         collect_scan_targets(&dir, &mut files);
     }
-    scan_files(&files)
+    let mut result = scan_files(&files);
+    augment_commands_from_doc(plugin_root, &mut result);
+    result
+}
+
+/// `doc/**/*.txt` の help タグ (`*:Cmd*`) からコマンド名を拾い、source スキャンで
+/// 拾えなかったものを `result.commands` に**追記**する (既存の順序は保持、重複は除外)。
+///
+/// 動機: plugin が `local function cmd(name, …) nvim_create_user_command(name, …) end`
+/// のようなラッパー越しにコマンドを登録すると、第1引数がリテラルでないため
+/// `scan_lua_commands` では拾えず、`on_cmd = ["/^Foo/"]` の regex 展開がゼロマッチで
+/// drop される。だが help doc には慣習的に `*:Foo*` タグが振られているので、そこから
+/// 補完すれば literal を手書きしなくても regex 展開が効く。
+fn augment_commands_from_doc(plugin_root: &Path, result: &mut ScanResult) {
+    let doc_dir = plugin_root.join("doc");
+    if !doc_dir.is_dir() {
+        return;
+    }
+    let mut txt_files: Vec<PathBuf> = Vec::new();
+    collect_doc_targets(&doc_dir, &mut txt_files);
+    if txt_files.is_empty() {
+        return;
+    }
+    let mut seen: HashSet<String> = result.commands.iter().cloned().collect();
+    for path in txt_files {
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut found = Vec::new();
+        scan_doc_command_tags(&src, &mut found);
+        for c in found {
+            if seen.insert(c.clone()) {
+                result.commands.push(c);
+            }
+        }
+    }
+}
+
+/// `doc/` 配下を再帰して `.txt` (Vim help) ファイルを集める。
+fn collect_doc_targets(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        // `entry.file_type()` は Unix では追加の stat 無しで型を取れ、symlink を
+        // **追わない**。doc/ 内に循環 symlink があっても dir として再帰せず、
+        // 無限再帰 (stack overflow) を避けられる。symlink 先の .txt は依然
+        // 拡張子経由で拾う (file_type が symlink → dir 分岐に入らない)。
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if ft.is_dir() {
+            collect_doc_targets(&path, out);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) == Some("txt") {
+            out.push(path);
+        }
+    }
 }
 
 fn collect_scan_targets(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -286,6 +349,25 @@ fn lua_cmd_re() -> &'static Regex {
 
 fn scan_lua_commands(code: &str, out: &mut Vec<String>) {
     for caps in lua_cmd_re().captures_iter(code) {
+        out.push(caps[1].to_string());
+    }
+}
+
+// ── doc help-tag scanning (`*:Cmd*`) ────────────────────────────────────
+
+/// Vim help タグ `*:Foo*` 形式からコマンド名を拾う regex。
+///
+/// コマンド名は Vim の E183 に従い大文字始まり (`[A-Z][A-Za-z0-9_]*`) なので、
+/// builtin の小文字タグ (`*:command*` / `*:map*` 等) や option タグ (`*'opt'*`)、
+/// 概念タグ (`*foo-introduction*`) と衝突しない。`*...*` で囲まれた tag 形式のみを
+/// 対象にし、地の文中の `:Foo` (asterisk 無し) は拾わない (誤検出回避)。
+fn doc_cmd_tag_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\*:([A-Z][A-Za-z0-9_]*)\*").unwrap())
+}
+
+fn scan_doc_command_tags(src: &str, out: &mut Vec<String>) {
+    for caps in doc_cmd_tag_re().captures_iter(src) {
         out.push(caps[1].to_string());
     }
 }
@@ -721,6 +803,86 @@ vim.api.nvim_create_user_command("Real", function() end, {})
         std::fs::write(&b, "command! Foo echo 'same name'").unwrap();
         // scan_files dedups by command name, so it reports Foo once.
         assert_eq!(scan_files(&[a, b]).commands, vec!["Foo"]);
+    }
+
+    // ── doc help-tag command scanning ──────────────────────────────
+
+    #[test]
+    fn scan_doc_command_tags_picks_uppercase_colon_tags() {
+        // 単独行 / 同一行に複数並ぶ tag の両方を拾う。
+        let src = "\
+                                                              *:LumirisChange*\n\
+:LumirisChange      Switch now.\n\
+                          *:LumirisEnable* *:LumirisDisable* *:LumirisToggle*\n";
+        let mut out = Vec::new();
+        scan_doc_command_tags(src, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                "LumirisChange",
+                "LumirisEnable",
+                "LumirisDisable",
+                "LumirisToggle"
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_doc_command_tags_ignores_non_command_tags() {
+        // 小文字 builtin タグ / option タグ / 概念タグ / 地の文の `:Foo` は拾わない。
+        let src = "\
+*lumiris.txt*  *lumiris-introduction*  *:command*  *'background'*\n\
+Use :LumirisChange to switch (this is prose, not a tag).\n";
+        let mut out = Vec::new();
+        scan_doc_command_tags(src, &mut out);
+        assert!(out.is_empty(), "unexpected tags picked up: {out:?}");
+    }
+
+    #[test]
+    fn scan_plugin_augments_commands_from_doc_for_wrapper_definitions() {
+        // ラッパー越し定義 (`cmd(name, …)`) は source からは拾えないが、
+        // doc/*.txt の `*:Cmd*` タグから補完されることを担保する。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("lua/lumiris")).unwrap();
+        std::fs::create_dir_all(root.join("doc")).unwrap();
+        std::fs::write(
+            root.join("lua/lumiris/command.lua"),
+            r#"
+local function cmd(name, fn, desc)
+  vim.api.nvim_create_user_command(name, fn, { desc = desc })
+end
+cmd("LumirisChange", function() end)
+cmd("LumirisToggle", function() end)
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("doc/lumiris.txt"),
+            "*:LumirisChange*  *:LumirisToggle*\n",
+        )
+        .unwrap();
+        let mut out = scan_plugin(root).commands;
+        out.sort();
+        assert_eq!(out, vec!["LumirisChange", "LumirisToggle"]);
+    }
+
+    #[test]
+    fn scan_plugin_doc_augment_dedups_against_source_commands() {
+        // source で拾えた literal コマンドと doc タグが重複しても二重計上しない。
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("plugin")).unwrap();
+        std::fs::create_dir_all(root.join("doc")).unwrap();
+        std::fs::write(root.join("plugin/foo.vim"), "command! FooRun echo 'run'\n").unwrap();
+        std::fs::write(
+            root.join("doc/foo.txt"),
+            "*:FooRun*  *:FooExtra*\n", // FooRun は重複、FooExtra は doc のみ
+        )
+        .unwrap();
+        let out = scan_plugin(root).commands;
+        // 既存 (source) を先頭に保ち、doc 由来の新規だけ追記される。
+        assert_eq!(out, vec!["FooRun", "FooExtra"]);
     }
 
     // ── user-facing keymap scanning ────────────────────────────────
