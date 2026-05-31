@@ -2599,9 +2599,9 @@ dependencies = [
 
 [[package]]
 name = "kaishin"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c6d2c686f0d695242e962273ab427bea81654c3742cc7a89d595a23b59115fb"
+checksum = "0a8224aa54b879cdd99560aa38b70c333b455a4c15b6367bf4d1d8ba4fc70cc2"
 dependencies = [
  "anyhow",
  "console",
@@ -2614,6 +2614,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
