@@ -345,11 +345,20 @@ commit-bound change. From the main checkout:
 ```sh
 renri add <branch-name>            # create a worktree (jj-first)
 renri --vcs git add <branch-name>  # force a git worktree
-renri remove <branch-name>         # cleanup after merge
+renri remove <branch-name> -y --non-interactive  # cleanup after merge (agent-safe; see note)
 renri prune                        # GC stale worktrees
 ```
 
 Read-only inspection can stay on the main checkout.
+
+**Agents / non-interactive shells:** `renri remove` prints a details
+panel and waits for a confirmation prompt — without `-y` it **hangs**,
+and `--non-interactive` *alone* errors asking for `-y`. Always pass
+`-y`, and add `--non-interactive` so a mistyped/omitted name fails
+instead of opening a fuzzy picker (the same picker-fallback applies to
+`remove` / `cd` / `exec` with no name). Use `-f`/`--force` to remove a
+worktree that still has uncommitted changes or conflicts. To sweep
+every merged-PR worktree in one shot: `renri remove --merged -y`.
 
 ### kata-managed sections
 
