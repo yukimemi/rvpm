@@ -2179,9 +2179,18 @@ async fn run_doctor() -> Result<i32> {
     let toml_content = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
         Err(e) => {
+            // io エラーの種類で hint を出し分ける。NotFound 以外 (権限など) で
+            // 「create the file」を案内すると誤誘導になるため。
+            let hint = match e.kind() {
+                std::io::ErrorKind::NotFound => "run `rvpm init --write` or create the file",
+                std::io::ErrorKind::PermissionDenied => {
+                    "check the file permissions on the config path"
+                }
+                _ => "check the config path and that the file is readable",
+            };
             let diag = crate::doctor::Diagnostic::config_error(
-                format!("failed to read: {}", e),
-                Some("run `rvpm init --write` or create the file"),
+                format!("failed to read {}: {}", config_path.display(), e),
+                Some(hint),
             );
             print!("{}", crate::doctor::render(&[diag], &fallback_icons));
             return Ok(1);
@@ -2190,9 +2199,11 @@ async fn run_doctor() -> Result<i32> {
     let mut config = match parse_config(&toml_content) {
         Ok(c) => c,
         Err(e) => {
+            // parse_config は TOML 構文エラーだけでなく Tera 展開や型検証の失敗も
+            // 返すので「syntax error」と決めつけない。原因は message に含める。
             let diag = crate::doctor::Diagnostic::config_error(
-                format!("parse error: {}", e),
-                Some("fix the syntax error in config.toml"),
+                format!("failed to load {}: {}", config_path.display(), e),
+                Some("fix the reported error in config.toml and rerun `rvpm doctor`"),
             );
             print!("{}", crate::doctor::render(&[diag], &fallback_icons));
             return Ok(1);

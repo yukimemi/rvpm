@@ -1172,6 +1172,9 @@ impl Summary {
 /// 左端のラベル (title) の固定幅。出力例の縦位置を揃える。
 const TITLE_WIDTH: usize = 25;
 
+/// ヘッダー / フッターの水平罫線の幅 (バナーの枠を揃えるため一箇所に集約)。
+const RULE_WIDTH: usize = 46;
+
 /// 診断アイコンを Icons スタイルに合わせて返す (先頭プレフィクス)。
 /// Ascii モードではタイトル列を揃えるため全 prefix を 4 文字に統一する
 /// ("ok  " / "WARN" / "ERR ")。
@@ -1290,7 +1293,7 @@ pub fn render(diagnostics: &[Diagnostic], icons: &Icons) -> String {
     // ── ヘッダー ────────────────────────────────────────────────
     // 上下を罫線で挟んだタイトルバナー。色 (cyan) は console が NO_COLOR /
     // 非 TTY を尊重して自動でフォールバックする。
-    let rule = g.rule.repeat(46);
+    let rule = g.rule.repeat(RULE_WIDTH);
     let hicon = header_icon(icons);
     let title_label = if hicon.is_empty() {
         "rvpm doctor".to_string()
@@ -1379,7 +1382,10 @@ pub fn render(diagnostics: &[Diagnostic], icons: &Icons) -> String {
 
     let summary = Summary::from(diagnostics);
     out.push('\n');
-    out.push_str(&format!("{}\n", style(g.rule.repeat(46)).cyan().dim()));
+    out.push_str(&format!(
+        "{}\n",
+        style(g.rule.repeat(RULE_WIDTH)).cyan().dim()
+    ));
     out.push_str(&format!(
         "Summary: {} ok  {}  {} warn  {}  {} error   (exit {})\n",
         style(summary.ok).green().bold(),
