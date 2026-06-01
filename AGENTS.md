@@ -121,8 +121,13 @@ on_map = [
   { lhs = "<leader>g",  mode = ["n", "x"], desc = "Grep" },
   { lhs = "/^<Plug>\\(Chezmoi/", mode = ["n"] },           # bulk-lazy <Plug> family
 ]
-# Conditional loading (Lua expression)
+# Conditional loading (Lua expression, runtime)
 cond = "vim.fn.has('win32') == 1"
+# Compile-time exclusion (#140). Tera-rendered at generate/sync; a truthy
+# result ("true"/"1"/"yes"/"on", case-insensitive) keeps the plugin, anything
+# else drops it ENTIRELY — no clone, no merge, no loader.lua, no dep resolution.
+# `when` (compile-time) and `cond` (runtime) compose: when is checked first.
+# when = "{{ is_windows }}"            # or {{ env.RVPM_ENABLE_DEV }} / {{ vars.enable_custom }}
 # Per-plugin override of `options.merge_doc` (#119).
 # - Some(true)  → for this plugin, merge `doc/` into `merged/doc/` and route rtp through `views/<plug>/`
 # - Some(false) → opt out of doc-merge even when global default is true
