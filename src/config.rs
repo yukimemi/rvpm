@@ -418,10 +418,13 @@ where
 /// を truthy とみなす。env var フラグ (`RVPM_ENABLE_DEV=1` 等) を素直に扱える
 /// よう `"1"` 系も許容する。それ以外 (`"false"` / `"0"` / 空文字列など) は falsy。
 fn when_passes(rendered: &str) -> bool {
-    matches!(
-        rendered.trim().to_ascii_lowercase().as_str(),
-        "true" | "1" | "yes" | "on"
-    )
+    // 軽量性のため `to_ascii_lowercase()` のヒープ確保を避け、trim 済み slice に
+    // 直接 `eq_ignore_ascii_case` をかける (plugin ごとに呼ばれる)。
+    let trimmed = rendered.trim();
+    trimmed.eq_ignore_ascii_case("true")
+        || trimmed == "1"
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("on")
 }
 
 fn default_merge() -> bool {
