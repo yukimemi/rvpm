@@ -2172,31 +2172,40 @@ async fn run_generate() -> Result<()> {
 /// 診断レポートを stdout に出し、exit code を返す。
 async fn run_doctor() -> Result<i32> {
     let config_path = rvpm_config_path();
+    // config 読み込み / parse の失敗は通常チェックに入れず、専用の Config カテゴリ
+    // で 1 件だけ報告する。icons は config が無い (= まだ読めていない) ので
+    // デフォルトスタイルで描画する。
+    let fallback_icons = crate::tui::Icons::from_style(crate::config::IconStyle::default());
     let toml_content = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
         Err(e) => {
-            println!("rvpm doctor — diagnostic report");
-            println!();
-            println!("Config");
-            println!(
-                "  \u{2717} config.toml              — failed to read: {}",
-                e
+            // io エラーの種類で hint を出し分ける。NotFound 以外 (権限など) で
+            // 「create the file」を案内すると誤誘導になるため。
+            let hint = match e.kind() {
+                std::io::ErrorKind::NotFound => "run `rvpm init --write` or create the file",
+                std::io::ErrorKind::PermissionDenied => {
+                    "check the file permissions on the config path"
+                }
+                _ => "check the config path and that the file is readable",
+            };
+            let diag = crate::doctor::Diagnostic::config_error(
+                format!("failed to read {}: {}", config_path.display(), e),
+                Some(hint),
             );
-            println!("      hint: run `rvpm init --write` or create the file");
-            println!();
-            println!("Summary: 0 ok  ·  0 warn  ·  1 error   (exit 1)");
+            print!("{}", crate::doctor::render(&[diag], &fallback_icons));
             return Ok(1);
         }
     };
     let mut config = match parse_config(&toml_content) {
         Ok(c) => c,
         Err(e) => {
-            println!("rvpm doctor — diagnostic report");
-            println!();
-            println!("Config");
-            println!("  \u{2717} config.toml              — parse error: {}", e);
-            println!();
-            println!("Summary: 0 ok  ·  0 warn  ·  1 error   (exit 1)");
+            // parse_config は TOML 構文エラーだけでなく Tera 展開や型検証の失敗も
+            // 返すので「syntax error」と決めつけない。原因は message に含める。
+            let diag = crate::doctor::Diagnostic::config_error(
+                format!("failed to load {}: {}", config_path.display(), e),
+                Some("fix the reported error in config.toml and rerun `rvpm doctor`"),
+            );
+            print!("{}", crate::doctor::render(&[diag], &fallback_icons));
             return Ok(1);
         }
     };
