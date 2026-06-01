@@ -1331,10 +1331,11 @@ pub fn render(diagnostics: &[Diagnostic], icons: &Icons) -> String {
                 Severity::Ok => style(&padded_title).dim().to_string(),
                 _ => paint_severity(d.severity, &padded_title),
             };
-            // summary も同様に severity 色 (Ok は色なしの通常表示)。
+            // summary も同様に severity 色 + bold で強調 (Ok は色なしの通常表示)。
             let summary_disp = match d.severity {
                 Severity::Ok => d.summary.clone(),
-                _ => style(&d.summary).bold().to_string(),
+                Severity::Warn => style(&d.summary).yellow().bold().to_string(),
+                Severity::Error => style(&d.summary).red().bold().to_string(),
             };
             out.push_str(&format!(
                 "  {} {} {} {}\n",
