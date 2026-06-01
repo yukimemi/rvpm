@@ -60,18 +60,33 @@ impl Diagnostic {
         self.hint = Some(hint.into());
         self
     }
+
+    /// config.toml の読み込み / parse 失敗を表す Error 診断を作る。
+    /// `run_doctor` の early-return でだけ使われる (通常チェックは経由しない)。
+    pub fn config_error(summary: impl Into<String>, hint: Option<&str>) -> Self {
+        let d = Diagnostic::new(Severity::Error, CAT_CONFIG, "config.toml", summary);
+        match hint {
+            Some(h) => d.with_hint(h),
+            None => d,
+        }
+    }
 }
 
 // ============================================================
 // Categories (固定の並び順 + セクション見出し文字列)
 // ============================================================
 
+/// config.toml の読み込み / parse 自体に失敗したときだけ使う特殊カテゴリ。
+/// 通常の `run_checks` はここに診断を積まないので、正常系のレポートでは
+/// (空カテゴリ扱いで) スキップされる。
+pub const CAT_CONFIG: &str = "Config";
 pub const CAT_PLUGIN_CONFIG: &str = "Plugin config";
 pub const CAT_STATE_INTEGRITY: &str = "State integrity";
 pub const CAT_NEOVIM: &str = "Neovim integration";
 pub const CAT_TOOLS: &str = "External tools";
 
 const CATEGORY_ORDER: &[&str] = &[
+    CAT_CONFIG,
     CAT_PLUGIN_CONFIG,
     CAT_STATE_INTEGRITY,
     CAT_NEOVIM,
@@ -1186,6 +1201,8 @@ struct Glyphs {
     last_bullet: &'static str,
     /// details の中間要素 bullet
     mid_bullet: &'static str,
+    /// セクション区切りに使う水平罫線 1 文字 (繰り返して使う)
+    rule: &'static str,
 }
 
 fn glyphs_for(icons: &Icons) -> Glyphs {
@@ -1195,6 +1212,7 @@ fn glyphs_for(icons: &Icons) -> Glyphs {
             middot: ".",
             last_bullet: "`",
             mid_bullet: "|",
+            rule: "-",
         }
     } else {
         Glyphs {
@@ -1202,36 +1220,132 @@ fn glyphs_for(icons: &Icons) -> Glyphs {
             middot: "\u{00b7}",      // ·
             last_bullet: "\u{2514}", // └
             mid_bullet: "\u{251c}",  // ├
+            rule: "\u{2500}",        // ─
         }
     }
 }
 
+/// 診断アイコンの「ヘッダー用」装飾アイコン。聴診器 (doctor) を表す。
+/// Ascii モードでは空文字 (純 ASCII 出力を守るため)。
+fn header_icon(icons: &Icons) -> &'static str {
+    match icons.style {
+        IconStyle::Ascii => "",
+        IconStyle::Nerd => "\u{f0f1}", // nf-fa-stethoscope
+        _ => "\u{1fa7a}",              // 🩺
+    }
+}
+
+/// カテゴリ見出しの先頭に付けるアイコン。スタイルに応じて Nerd / emoji /
+/// なし (Ascii) を返す。`render` 側で末尾スペースを足すので、ここでは
+/// アイコン文字そのものだけを返す。
+fn category_icon(category: &str, icons: &Icons) -> &'static str {
+    match icons.style {
+        IconStyle::Ascii => "",
+        IconStyle::Nerd => match category {
+            CAT_CONFIG => "\u{f013}",          // nf-fa-cog
+            CAT_PLUGIN_CONFIG => "\u{f12e}",   // nf-fa-puzzle_piece
+            CAT_STATE_INTEGRITY => "\u{f1c0}", // nf-fa-database
+            CAT_NEOVIM => "\u{e62b}",          // nf-custom-vim
+            CAT_TOOLS => "\u{f0ad}",           // nf-fa-wrench
+            _ => "",
+        },
+        _ => match category {
+            CAT_CONFIG => "\u{2699}",           // ⚙
+            CAT_PLUGIN_CONFIG => "\u{1f4e6}",   // 📦
+            CAT_STATE_INTEGRITY => "\u{1f4be}", // 💾
+            CAT_NEOVIM => "\u{1f4dd}",          // 📝
+            CAT_TOOLS => "\u{1f527}",           // 🔧
+            _ => "",
+        },
+    }
+}
+
+/// hint 行の先頭に付けるアイコン (電球)。Ascii では空。
+fn hint_icon(icons: &Icons) -> &'static str {
+    match icons.style {
+        IconStyle::Ascii => "",
+        IconStyle::Nerd => "\u{f0335}", // nf-md-lightbulb_on
+        _ => "\u{1f4a1}",               // 💡
+    }
+}
+
+/// severity に応じて console の色を当てて文字列化する小ヘルパ。
+/// `console::style` は NO_COLOR / 非 TTY を尊重するので、redirect 時や CI では
+/// 自動的にプレーン表示にフォールバックする (= テストはプレーンで通る)。
+fn paint_severity(sev: Severity, text: &str) -> String {
+    use console::style;
+    match sev {
+        Severity::Ok => style(text).green().to_string(),
+        Severity::Warn => style(text).yellow().to_string(),
+        Severity::Error => style(text).red().to_string(),
+    }
+}
+
 pub fn render(diagnostics: &[Diagnostic], icons: &Icons) -> String {
+    use console::style;
+
     let g = glyphs_for(icons);
     let mut out = String::new();
-    out.push_str(&format!("rvpm doctor {} diagnostic report\n\n", g.dash));
 
-    for (ci, cat) in CATEGORY_ORDER.iter().enumerate() {
+    // ── ヘッダー ────────────────────────────────────────────────
+    // 上下を罫線で挟んだタイトルバナー。色 (cyan) は console が NO_COLOR /
+    // 非 TTY を尊重して自動でフォールバックする。
+    let rule = g.rule.repeat(46);
+    let hicon = header_icon(icons);
+    let title_label = if hicon.is_empty() {
+        "rvpm doctor".to_string()
+    } else {
+        format!("{} rvpm doctor", hicon)
+    };
+    out.push_str(&format!("{}\n", style(&rule).cyan().dim()));
+    out.push_str(&format!(
+        "  {} {} diagnostic report\n",
+        style(&title_label).cyan().bold(),
+        style(g.dash).dim(),
+    ));
+    out.push_str(&format!("{}\n", style(&rule).cyan().dim()));
+
+    for cat in CATEGORY_ORDER.iter() {
         let diags_in_cat: Vec<&Diagnostic> =
             diagnostics.iter().filter(|d| d.category == *cat).collect();
         if diags_in_cat.is_empty() {
             continue;
         }
-        if ci > 0 {
-            out.push('\n');
-        }
-        out.push_str(cat);
+        // 各カテゴリの前に空行を入れて区切る (ヘッダー直後も含め視認性を上げる)。
         out.push('\n');
 
+        let cicon = category_icon(cat, icons);
+        let heading = if cicon.is_empty() {
+            (*cat).to_string()
+        } else {
+            format!("{} {}", cicon, cat)
+        };
+        out.push_str(&format!("{}\n", style(&heading).cyan().bold().underlined()));
+
         for d in diags_in_cat {
-            let prefix = severity_prefix(d.severity, icons);
+            let prefix = paint_severity(d.severity, &severity_prefix(d.severity, icons));
             let padded_title = pad_right(&d.title, TITLE_WIDTH);
+            // タイトルは severity に応じて強調。Ok は控えめ (dim)、Warn/Error は
+            // 色付きで目立たせ、流し読みでも問題箇所が拾えるようにする。
+            let title_disp = match d.severity {
+                Severity::Ok => style(&padded_title).dim().to_string(),
+                _ => paint_severity(d.severity, &padded_title),
+            };
+            // summary も同様に severity 色 (Ok は色なしの通常表示)。
+            let summary_disp = match d.severity {
+                Severity::Ok => d.summary.clone(),
+                _ => style(&d.summary).bold().to_string(),
+            };
             out.push_str(&format!(
                 "  {} {} {} {}\n",
-                prefix, padded_title, g.dash, d.summary
+                prefix,
+                title_disp,
+                style(g.dash).dim(),
+                summary_disp,
             ));
 
-            // details: 最後の行は最終 bullet、それ以外は中間 bullet
+            // details: 最後の行は最終 bullet、それ以外は中間 bullet。
+            // ツリー文字は severity 色、本文は dim で控えめに。
             let n = d.details.len();
             for (i, line) in d.details.iter().enumerate() {
                 let bullet = if i == n - 1 {
@@ -1239,25 +1353,79 @@ pub fn render(diagnostics: &[Diagnostic], icons: &Icons) -> String {
                 } else {
                     g.mid_bullet
                 };
-                out.push_str(&format!("      {} {}\n", bullet, line));
+                out.push_str(&format!(
+                    "      {} {}\n",
+                    paint_severity(d.severity, bullet),
+                    style(line).dim(),
+                ));
             }
             if let Some(h) = &d.hint {
-                out.push_str(&format!("      hint: {}\n", h));
+                let hi = hint_icon(icons);
+                let lead = if hi.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} ", style(hi).yellow())
+                };
+                out.push_str(&format!(
+                    "      {}{} {}\n",
+                    lead,
+                    style("hint:").yellow().dim(),
+                    style(h).italic().dim(),
+                ));
             }
         }
     }
 
     let summary = Summary::from(diagnostics);
     out.push('\n');
+    out.push_str(&format!("{}\n", style(g.rule.repeat(46)).cyan().dim()));
     out.push_str(&format!(
         "Summary: {} ok  {}  {} warn  {}  {} error   (exit {})\n",
-        summary.ok,
-        g.middot,
-        summary.warn,
-        g.middot,
-        summary.error,
+        style(summary.ok).green().bold(),
+        style(g.middot).dim(),
+        style(summary.warn).yellow().bold(),
+        style(g.middot).dim(),
+        style(summary.error).red().bold(),
         summary.exit_code()
     ));
+
+    // 総合判定の一言。一目で健康状態が分かるようにする。
+    let verdict_icon = severity_prefix(
+        if summary.error > 0 {
+            Severity::Error
+        } else if summary.warn > 0 {
+            Severity::Warn
+        } else {
+            Severity::Ok
+        },
+        icons,
+    );
+    let verdict = if summary.error > 0 {
+        paint_severity(
+            Severity::Error,
+            &format!(
+                "{} errors found {} fix the items above",
+                verdict_icon, g.dash
+            ),
+        )
+    } else if summary.warn > 0 {
+        paint_severity(
+            Severity::Warn,
+            &format!(
+                "{} warnings present {} review the items above",
+                verdict_icon, g.dash
+            ),
+        )
+    } else {
+        paint_severity(
+            Severity::Ok,
+            &format!(
+                "{} all checks passed {} everything looks healthy!",
+                verdict_icon, g.dash
+            ),
+        )
+    };
+    out.push_str(&format!("{}\n", verdict));
 
     out
 }
@@ -2204,6 +2372,102 @@ mod tests {
             out.contains(" . "),
             "expected ' . ' (middot replacement) in ASCII summary"
         );
+    }
+
+    #[test]
+    fn test_render_unicode_has_category_icons() {
+        // Unicode モードではカテゴリ見出しに emoji アイコンが付く。
+        let diags = vec![
+            Diagnostic::new(Severity::Ok, CAT_PLUGIN_CONFIG, "x", "ok"),
+            Diagnostic::new(Severity::Ok, CAT_TOOLS, "nvim", "v1"),
+        ];
+        let icons = Icons::from_style(IconStyle::Unicode);
+        let out = render(&diags, &icons);
+        assert!(
+            out.contains("\u{1f4e6}"),
+            "expected 📦 before Plugin config"
+        );
+        assert!(
+            out.contains("\u{1f527}"),
+            "expected 🔧 before External tools"
+        );
+    }
+
+    #[test]
+    fn test_render_nerd_has_category_icons() {
+        let diags = vec![Diagnostic::new(Severity::Ok, CAT_NEOVIM, "x", "ok")];
+        let icons = Icons::from_style(IconStyle::Nerd);
+        let out = render(&diags, &icons);
+        assert!(
+            out.contains("\u{e62b}"),
+            "expected nerd vim icon before heading"
+        );
+    }
+
+    #[test]
+    fn test_render_verdict_all_ok() {
+        let diags = vec![Diagnostic::new(Severity::Ok, CAT_PLUGIN_CONFIG, "x", "ok")];
+        let icons = Icons::from_style(IconStyle::Unicode);
+        let out = render(&diags, &icons);
+        assert!(out.contains("all checks passed"));
+        assert!(out.contains("exit 0"));
+    }
+
+    #[test]
+    fn test_render_verdict_warn() {
+        let diags = vec![Diagnostic::new(
+            Severity::Warn,
+            CAT_PLUGIN_CONFIG,
+            "x",
+            "1 found",
+        )];
+        let icons = Icons::from_style(IconStyle::Unicode);
+        let out = render(&diags, &icons);
+        assert!(out.contains("warnings present"));
+    }
+
+    #[test]
+    fn test_render_verdict_error() {
+        let diags = vec![Diagnostic::new(
+            Severity::Error,
+            CAT_PLUGIN_CONFIG,
+            "x",
+            "bad",
+        )];
+        let icons = Icons::from_style(IconStyle::Unicode);
+        let out = render(&diags, &icons);
+        assert!(out.contains("errors found"));
+        assert!(out.contains("exit 1"));
+    }
+
+    #[test]
+    fn test_config_error_renders_under_config_category() {
+        let diag = Diagnostic::config_error("failed to read: nope", Some("run `rvpm init`"));
+        assert_eq!(diag.severity, Severity::Error);
+        assert_eq!(diag.category, CAT_CONFIG);
+        let icons = Icons::from_style(IconStyle::Unicode);
+        let out = render(&[diag], &icons);
+        assert!(out.contains("Config"));
+        assert!(out.contains("config.toml"));
+        assert!(out.contains("failed to read: nope"));
+        assert!(out.contains("hint: run `rvpm init`"));
+        assert!(out.contains("exit 1"));
+    }
+
+    #[test]
+    fn test_render_ascii_verdict_is_pure_ascii() {
+        // Ascii モードでは verdict 行も含め完全に ASCII (絵文字・em-dash 混入なし)。
+        let diags = vec![Diagnostic::new(Severity::Ok, CAT_PLUGIN_CONFIG, "x", "ok")];
+        let icons = Icons::from_style(IconStyle::Ascii);
+        let out = render(&diags, &icons);
+        for ch in out.chars() {
+            assert!(
+                ch.is_ascii(),
+                "non-ASCII char {:?} in ASCII verdict output",
+                ch
+            );
+        }
+        assert!(out.contains("all checks passed"));
     }
 
     #[test]
