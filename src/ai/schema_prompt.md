@@ -28,7 +28,8 @@ on_map = [
   { lhs = "/^<Plug>\\(Chezmoi/", mode = ["n"] },
 ]
 
-cond = "vim.fn.has('win32') == 1"   # optional Lua expression; load only when truthy
+cond = "vim.fn.has('win32') == 1"   # optional Lua expression; load only when truthy (runtime)
+when = "{{ is_windows }}"           # optional compile-time gate; Tera-rendered, falsy => plugin excluded entirely (no clone/loader)
 ```
 
 ## Hook file conventions
@@ -98,7 +99,7 @@ Rules for the merged variant:
 1. **Don't drop user-added content silently.** Keymaps, autocmds, custom helper functions, comments — preserve them unless they're clearly broken.
 2. **Don't duplicate.** If you'd add the same line that's already there, just keep it once.
 3. **Order matters for Lua hooks.** `vim.g.<plugin>_xxx = ...` must run before `require('plugin').setup({})` — keep the user's ordering or fix it if broken.
-4. **For `[[plugins]]` entry merged**: keep `name`, `url`, `rev`, `dev`, `dst`, `cond`, `build`, `build_lua`, `depends` intact unless you have a strong reason to change them. `on_*` triggers are where you'd typically refine.
+4. **For `[[plugins]]` entry merged**: keep `name`, `url`, `rev`, `dev`, `dst`, `cond`, `when`, `build`, `build_lua`, `depends` intact unless you have a strong reason to change them. `on_*` triggers are where you'd typically refine.
 5. **If there's nothing meaningful to merge** (existing is empty or unrelated), output `(none)` in the `_merged` tag and keep the fresh variant alone.
 
 When **no existing content is provided** for a section, omit the `_merged` tag entirely (or output `(none)` — both are accepted).

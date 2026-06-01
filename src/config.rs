@@ -311,6 +311,19 @@ pub struct Plugin {
     pub build_lua: Option<String>,
     pub rev: Option<String>,
     pub cond: Option<String>,
+    /// コンパイル時 (`rvpm generate` / `rvpm sync`) に評価される除外条件 (#140)。
+    /// Tera でレンダリングされた後の文字列が truthy (`"true"` / `"1"` / `"yes"` /
+    /// `"on"`、いずれも大小文字無視・前後空白許容) なら plugin を残し、それ以外
+    /// (`"false"` / `"0"` / 空文字列など) なら **config から完全に除外**する。
+    ///
+    /// `cond` (runtime に loader.lua へ埋め込む Lua 式) との違いは評価タイミング:
+    /// `when=false` の plugin は clone も link も loader.lua 生成も依存解決も
+    /// 一切行われない。両方指定した場合、`when` が先 (compile-time) に評価され、
+    /// 通過したら `cond` が従来どおり runtime guard として残る。
+    ///
+    /// 例: `when = "{{ is_windows }}"` / `when = "{{ env.RVPM_ENABLE_DEV }}"` /
+    /// `when = "{{ vars.enable_custom }}"`。
+    pub when: Option<String>,
     /// dev = true のプラグインは sync/update をスキップする。
     /// ローカル開発中のプラグインに使う。
     #[serde(default)]
@@ -398,6 +411,20 @@ where
             })
             .collect()
     }))
+}
+
+/// `when` フィールドの Tera レンダリング結果を真偽値として解釈する (#140)。
+/// 前後空白を除き大小文字を無視したうえで `"true"` / `"1"` / `"yes"` / `"on"`
+/// を truthy とみなす。env var フラグ (`RVPM_ENABLE_DEV=1` 等) を素直に扱える
+/// よう `"1"` 系も許容する。それ以外 (`"false"` / `"0"` / 空文字列など) は falsy。
+fn when_passes(rendered: &str) -> bool {
+    // 軽量性のため `to_ascii_lowercase()` のヒープ確保を避け、trim 済み slice に
+    // 直接 `eq_ignore_ascii_case` をかける (plugin ごとに呼ばれる)。
+    let trimmed = rendered.trim();
+    trimmed.eq_ignore_ascii_case("true")
+        || trimmed == "1"
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("on")
 }
 
 fn default_merge() -> bool {
@@ -602,7 +629,16 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     // 9. TOML パース
     let mut config: Config = toml::from_str(&rendered)?;
 
-    // 9. lazy 自動解決: on_* トリガーがあれば lazy = true にする (明示 false は尊重)
+    // 10. `when` (compile-time exclusion) フィルタ (#140)。
+    //    Tera レンダリング後 (手順 7) の `when` 文字列が falsy な plugin を
+    //    config から完全に除外する。これより後段の lazy 解決・sort_plugins・
+    //    sync・loader.lua 生成は一切この plugin に触れない。`cond` (runtime
+    //    guard) と違い clone も link も発生しない。
+    config
+        .plugins
+        .retain(|p| p.when.as_deref().map(when_passes).unwrap_or(true));
+
+    // 11. lazy 自動解決: on_* トリガーがあれば lazy = true にする (明示 false は尊重)
     for plugin in config.plugins.iter_mut() {
         let has_trigger = plugin.on_cmd.is_some()
             || plugin.on_ft.is_some()
@@ -1508,6 +1544,181 @@ url = "owner/win-only"
         } else {
             assert_eq!(config.plugins.len(), 1);
         }
+    }
+
+    // ========================================================
+    // `when` (compile-time exclusion) テスト (#140)
+    // ========================================================
+
+    #[test]
+    fn test_when_passes_truthy_values() {
+        for v in ["true", "True", "TRUE", " true ", "1", "yes", "on", "ON"] {
+            assert!(when_passes(v), "{v:?} should be truthy");
+        }
+    }
+
+    #[test]
+    fn test_when_passes_falsy_values() {
+        for v in ["false", "False", "0", "no", "off", "", "  ", "maybe"] {
+            assert!(!when_passes(v), "{v:?} should be falsy");
+        }
+    }
+
+    #[test]
+    fn test_when_false_excludes_plugin() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/always"
+
+[[plugins]]
+url = "owner/gated"
+when = "false"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins.len(), 1);
+        assert_eq!(config.plugins[0].url, "owner/always");
+    }
+
+    #[test]
+    fn test_when_true_includes_plugin() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/always"
+
+[[plugins]]
+url = "owner/gated"
+when = "true"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins.len(), 2);
+        assert_eq!(config.plugins[1].url, "owner/gated");
+    }
+
+    #[test]
+    fn test_when_omitted_includes_plugin() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins.len(), 1);
+        assert_eq!(config.plugins[0].when, None);
+    }
+
+    #[test]
+    fn test_when_renders_is_windows() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/always"
+
+[[plugins]]
+url = "owner/win-only"
+when = "{{ is_windows }}"
+"#;
+        let config = parse_config(toml).unwrap();
+        if cfg!(windows) {
+            assert_eq!(config.plugins.len(), 2);
+        } else {
+            assert_eq!(config.plugins.len(), 1);
+            assert_eq!(config.plugins[0].url, "owner/always");
+        }
+    }
+
+    #[test]
+    fn test_when_renders_vars() {
+        let toml = r#"
+[vars]
+enable_custom = true
+
+[options]
+
+[[plugins]]
+url = "owner/custom"
+when = "{{ vars.enable_custom }}"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins.len(), 1);
+        assert_eq!(config.plugins[0].url, "owner/custom");
+    }
+
+    #[test]
+    fn test_when_renders_vars_false() {
+        let toml = r#"
+[vars]
+enable_custom = false
+
+[options]
+
+[[plugins]]
+url = "owner/custom"
+when = "{{ vars.enable_custom }}"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins.len(), 0);
+    }
+
+    #[test]
+    fn test_when_renders_env() {
+        unsafe {
+            std::env::set_var("RVPM_TEST_WHEN_FLAG", "1");
+        }
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/dev-tool"
+when = "{{ env.RVPM_TEST_WHEN_FLAG }}"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins.len(), 1);
+        assert_eq!(config.plugins[0].url, "owner/dev-tool");
+    }
+
+    #[test]
+    fn test_when_false_plugin_excluded_from_deps() {
+        // when=false の plugin は依存解決にも参加しない
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/main"
+depends = ["gated"]
+
+[[plugins]]
+name = "gated"
+url = "owner/gated"
+when = "false"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins.len(), 1);
+        assert_eq!(config.plugins[0].url, "owner/main");
+    }
+
+    #[test]
+    fn test_when_coexists_with_cond() {
+        // when が通れば cond は runtime 用にそのまま残る
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/maybe-win"
+when = "true"
+cond = "vim.g.maybe_win == 1"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.plugins.len(), 1);
+        assert_eq!(
+            config.plugins[0].cond.as_deref(),
+            Some("vim.g.maybe_win == 1")
+        );
     }
 
     #[test]

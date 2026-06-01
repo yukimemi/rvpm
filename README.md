@@ -291,6 +291,7 @@ separate, hand-maintained list and is not affected by this command.
 | `merge_doc` | `bool` | inherits `options.merge_doc` | Per-plugin override of the global `merge_doc`. `true` aggregates this plugin's `doc/` into `merged/doc/` and routes its rtp through a doc-stripped view (so `:help` works pre-trigger and `:tselect` doesn't dupe). `false` opts out even when the global default is `true`. Ignored for `Full` merge plugins (eager + `merge = true`) — those already include `doc/` in `merged/`. With `cond` set, an unset value is auto-forced `false` (only sweeps `cond` plugins out of the global default — explicit `true` is honored) |
 | `rev` | `string` | HEAD | Branch, tag, or commit hash to check out after clone/pull |
 | `depends` | `string[]` | none | Plugins that must be loaded before this one. Accepts `display_name` (e.g. `"snacks.nvim"`) or `url` (e.g. `"folke/snacks.nvim"`). Eager → lazy dep auto-promotes the dep to eager (with a warning); lazy → lazy dep loads dep first inside the trigger callback |
+| `when` | `string` | none | **Compile-time** exclusion condition, evaluated at `generate` / `sync` after Tera rendering. If the rendered string is truthy (`"true"` / `"1"` / `"yes"` / `"on"`, case-insensitive) the plugin is kept; anything else (`"false"` / `"0"` / empty) removes it **entirely** — no clone, no merge, no `loader.lua`, not in dependency resolution. Use Tera to gate on OS / env / vars: `when = "{{ is_windows }}"`, `when = "{{ env.RVPM_ENABLE_DEV }}"`, `when = "{{ vars.enable_custom }}"`. Contrast with `cond` (runtime). Both may be set: `when` is checked first, and if it passes, `cond` still wraps the generated Lua |
 | `cond` | `string` | none | Lua expression. When set, the plugin's loader code is wrapped in `if <cond> then ... end` |
 | `build` | `string` | none | Shell command to run after clone / update. Vim-style `:Cmd` is invoked via `nvim --headless` with the plugin and its transitive depends on `runtimepath`. 5-minute timeout. Failures are reported in the sync summary but don't stop other plugins (resilience) |
 | `build_lua` | `string` | none | Lua snippet to run after clone / update, **after** the shell `build` if both are set. Invoked via `nvim --headless -u NONE -l <tmp.lua>` with the plugin and its transitive depends appended to `runtimepath`. `vim.fn.stdpath("data")` etc. resolve to the user's real data dir (no `--clean`), so plugins like `blink.cmp` that install native libs into `{stdpath('data')}/site/lib/` work as expected. Both `build_lua = "require('blink.cmp').build():wait(60000)"` (statement form) and `build_lua = "function() require('blink.cmp').build():wait(60000) end"` (lazy.nvim function form, auto-unwrapped) are accepted |
@@ -586,12 +587,20 @@ url = "thinca/vim-winenv"
 [[plugins]]
 url = "folke/snacks.nvim"
 cond = "{{ is_windows }}"  # runtime cond: kept in loader but guarded
+
+[[plugins]]
+url = "owner/win-only.nvim"
+when = "{{ is_windows }}"  # compile-time: excluded entirely off Windows
 ```
 
-> **`{% if %}` vs `cond`**: `{% if %}` removes the plugin entirely at
-> generate time — no clone, no merge, not in `loader.lua`. `cond` keeps
-> the plugin in `loader.lua` but wraps it in `if <expr> then ... end`
-> for runtime evaluation.
+> **`{% if %}` vs `when` vs `cond`**: `{% if %}` and `when` both remove
+> the plugin entirely at generate time — no clone, no merge, not in
+> `loader.lua`. `when` is the per-`[[plugins]]` field form (no need to
+> wrap the whole block in template tags); it renders via Tera, then a
+> truthy result (`"true"` / `"1"` / `"yes"` / `"on"`) keeps the plugin.
+> `cond` instead keeps the plugin in `loader.lua` but wraps it in
+> `if <expr> then ... end` for runtime evaluation. `when` and `cond` can
+> be combined: `when` gates compile-time, `cond` gates runtime.
 
 </details>
 
