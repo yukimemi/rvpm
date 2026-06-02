@@ -659,36 +659,69 @@ fn run_completion(shell: clap_complete::Shell) {
     clap_complete::generate(shell, &mut cmd, bin, &mut std::io::stdout());
 }
 
-/// 自動 update check の handle。 結果は `finalize_auto_update_check` で消費する。
+/// 自動 update の handle。 結果は `finalize_auto_update_check` で消費する。
 enum AutoUpdateHandle {
-    /// throttle window 内で fetch skip、 過去の cache が新版を示しているので
-    /// banner だけ出す。
+    /// notify mode: throttle window 内で fetch skip、 過去の cache が新版を示して
+    /// いるので banner だけ出す。
     CachedAvailable {
         checker: kaishin::Checker,
         latest: kaishin::LatestRelease,
     },
-    /// バックグラウンドで GitHub API を叩いてる。 join 結果に応じて状態保存 + banner。
+    /// notify mode: バックグラウンドで GitHub API を叩いてる。 join 結果に応じて
+    /// 状態保存 + banner。
     Pending {
         checker: kaishin::Checker,
         handle: tokio::task::JoinHandle<Result<Option<kaishin::LatestRelease>, anyhow::Error>>,
         /// タイムアウト時のフォールバック用。
         cached_latest: Option<kaishin::LatestRelease>,
     },
+    /// install mode: バックグラウンドで check + download + 差し替えを silent 実行。
+    /// 完了して新版を入れたら 1 行だけ通知する (走行中プロセスは旧バイナリのまま、
+    /// 反映は次回起動)。
+    Installing {
+        handle: tokio::task::JoinHandle<Result<Option<kaishin::LatestRelease>, anyhow::Error>>,
+    },
 }
 
-/// `auto_update_check` 設定が ON で、 throttle window を超えてれば background fetch を
-/// 起動する。 throttle 内でも cached `last_known_latest` が現バイナリより新しければ
-/// banner 用の handle (CachedAvailable) を返す。
+/// `RVPM_NO_AUTOUPDATE` が「有効」な値で設定されているか。 `0` / `false` / 空白は
+/// 無効扱い (= 自動更新を止めない)。 config の `auto_update` より優先する kill-switch。
+fn auto_update_disabled_by_env() -> bool {
+    match std::env::var("RVPM_NO_AUTOUPDATE") {
+        Ok(v) => {
+            let v = v.trim();
+            !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    }
+}
+
+/// config の `auto_update` (旧 `auto_update_check`) に応じて background 処理を起動する。
 ///
-/// 失敗時 (config 読めない / network preflight 失敗) は `None` を返して silent skip。
+/// - `off` (または env `RVPM_NO_AUTOUPDATE`): 何もせず `None`。
+/// - `notify`: GitHub API を叩いて新版があれば banner で案内する (install しない)。
+///   throttle 内でも cache が新版を示していれば banner 用 handle を返す。
+/// - `install`: `Checker::auto_update` を spawn し、 silent に download + 差し替え。
+///   完了したら finalize で 1 行通知する。
+///
+/// 失敗時 (config 読めない等) は `None` を返して silent skip (resilience)。
 async fn maybe_spawn_auto_update_check() -> Option<AutoUpdateHandle> {
+    use crate::config::AutoUpdateMode;
+
     // config が読めない / 失敗するケースもあるので resilience。 panic は絶対にしない。
     let config_path = config_path_for_auto_check()?;
     let toml_str = std::fs::read_to_string(&config_path).ok()?;
     let cfg = parse_config(&toml_str).ok()?;
-    if !cfg.options.auto_update_check {
+
+    // env kill-switch は config より優先。
+    let mode = if auto_update_disabled_by_env() {
+        AutoUpdateMode::Off
+    } else {
+        cfg.options.update_mode()
+    };
+    if mode == AutoUpdateMode::Off {
         return None;
     }
+
     let interval = cfg
         .options
         .update_check_interval
@@ -707,23 +740,34 @@ async fn maybe_spawn_auto_update_check() -> Option<AutoUpdateHandle> {
         .interval(interval)
         .state_path(cache_root.join("last_update_check.json"));
 
-    if !checker.should_check() {
-        // throttle 内 — cache から判定
-        if let Some(latest) = checker.cached_update() {
-            return Some(AutoUpdateHandle::CachedAvailable { checker, latest });
+    match mode {
+        // 上で early-return 済みだが、 網羅性のため。
+        AutoUpdateMode::Off => None,
+        AutoUpdateMode::Notify => {
+            if !checker.should_check() {
+                // throttle 内 — cache から判定
+                if let Some(latest) = checker.cached_update() {
+                    return Some(AutoUpdateHandle::CachedAvailable { checker, latest });
+                }
+                return None;
+            }
+            // fetch を spawn
+            let cached_latest = checker.cached_update();
+            let checker_clone = checker.clone();
+            let handle = tokio::spawn(async move { checker_clone.check_and_save().await });
+            Some(AutoUpdateHandle::Pending {
+                checker,
+                handle,
+                cached_latest,
+            })
         }
-        return None;
+        AutoUpdateMode::Install => {
+            // `auto_update` は self-throttle + cross-process lock + silent install
+            // まで面倒を見る。 due でなければ即 Ok(None)。 dev build は no-op。
+            let handle = tokio::spawn(async move { checker.auto_update().await });
+            Some(AutoUpdateHandle::Installing { handle })
+        }
     }
-
-    // fetch を spawn
-    let cached_latest = checker.cached_update();
-    let checker_clone = checker.clone();
-    let handle = tokio::spawn(async move { checker_clone.check_and_save().await });
-    Some(AutoUpdateHandle::Pending {
-        checker,
-        handle,
-        cached_latest,
-    })
 }
 
 /// `rvpm` の config file の path を解決する (auto-check 用)。
@@ -764,6 +808,20 @@ async fn finalize_auto_update_check(handle: AutoUpdateHandle) {
                         eprintln!("\n{}", checker.format_banner(&latest));
                     }
                 }
+            }
+        }
+        AutoUpdateHandle::Installing { handle } => {
+            // 実際に download が走るのは新版がある時 (= throttle ごとに高々 1 回)
+            // だけで、 大半の起動では `auto_update` が即 Ok(None) を返すのでこの待ちは
+            // 一瞬で抜ける。 download 中の稀な起動でも `rvpm list` 等を長時間ブロック
+            // しないよう、 待ちは短い上限 (5 秒) に留める。 download は起動時から
+            // コマンド本体と並行で走っているので、 大抵はこの時点で完了済み。
+            // タイムアウト時は黙って次回に回す — 中断しても self_replace は atomic
+            // なのでバイナリは壊れない (遅い回線では次の機会か手動 self-update に委ねる)。
+            let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+            if let Ok(Ok(Ok(Some(latest)))) = res {
+                let v = latest.tag_name.trim_start_matches('v');
+                eprintln!("\n\u{2713} rvpm {v} installed in the background — restart to apply.");
             }
         }
     }

@@ -133,15 +133,56 @@ pub struct Options {
     /// (AI が自然言語名で受け付けてくれるので)。
     #[serde(default = "default_ai_language")]
     pub ai_language: String,
-    /// `true` (default) なら `rvpm <subcommand>` 完了時に GitHub releases を
-    /// バックグラウンドで叩いて新版があれば banner で案内する (#125)。
-    /// 自動 install はしない — banner を見た user が `rvpm self-update` を能動的に
-    /// 叩く設計。 ネットワーク失敗 / rate limit は silent skip。
-    #[serde(default = "default_auto_update_check")]
-    pub auto_update_check: bool,
+    /// バックグラウンド self-update の挙動 (`off` / `notify` / `install`)。
+    /// 既定は `install` (opt-out): `rvpm <subcommand>` 実行時にバックグラウンドで
+    /// GitHub releases を確認し、新版があれば**静かにダウンロードして差し替える**。
+    /// 走行中プロセスは旧バイナリのまま動き、新版は次回起動で反映される。
+    /// `notify` は旧来の「banner で案内するだけ・install しない」挙動。
+    /// `off` で完全無効。 ネットワーク失敗 / rate limit は silent skip。
+    /// 環境変数 `RVPM_NO_AUTOUPDATE=1` でも (config より優先して) 無効化できる。
+    ///
+    /// 未指定時は下の deprecated な `auto_update_check` を見て解決する
+    /// ([`Options::update_mode`])。
+    #[serde(default)]
+    pub auto_update: Option<AutoUpdateMode>,
+    /// **Deprecated**: `auto_update` の旧名 (bool)。`true` → `notify`、
+    /// `false` → `off` に写像される。`auto_update` が明示されていれば無視される。
+    /// 残してあるのは、 更新を切っていた既存 config (`auto_update_check = false`)
+    /// が新既定の `install` に化けて勝手に更新されてしまう事故を防ぐため。
+    #[serde(default)]
+    pub auto_update_check: Option<bool>,
     /// 自動 update check の throttle 間隔 (humantime 書式: `"24h"` / `"1d"` 等)。
     /// 未指定なら `"24h"`、 不正値は warn 後 default に fallback。
     pub update_check_interval: Option<String>,
+}
+
+/// `options.auto_update` が取る 3 値。 既定は `install` (opt-out)。
+#[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoUpdateMode {
+    /// 自動更新チェックを一切しない。
+    Off,
+    /// 新版があれば banner で案内するだけ (install はしない)。
+    Notify,
+    /// 新版を静かにダウンロード + 差し替え、 次回起動で反映する (既定)。
+    #[default]
+    Install,
+}
+
+impl Options {
+    /// 実効的な [`AutoUpdateMode`] を解決する。 `auto_update` が明示されていれば
+    /// それを、 無ければ deprecated な `auto_update_check` (`true`→`notify` /
+    /// `false`→`off`) を、 どちらも無ければ既定 (`install`) を返す。
+    pub fn update_mode(&self) -> AutoUpdateMode {
+        if let Some(mode) = self.auto_update {
+            return mode;
+        }
+        match self.auto_update_check {
+            Some(true) => AutoUpdateMode::Notify,
+            Some(false) => AutoUpdateMode::Off,
+            None => AutoUpdateMode::default(),
+        }
+    }
 }
 
 fn default_ai_language() -> String {
@@ -199,7 +240,8 @@ impl Default for Options {
             auto_lazy: AutoLazyPolicy::default(),
             ai: AiBackend::default(),
             ai_language: default_ai_language(),
-            auto_update_check: default_auto_update_check(),
+            auto_update: None,
+            auto_update_check: None,
             update_check_interval: None,
         }
     }
@@ -435,10 +477,6 @@ fn default_auto_helptags() -> bool {
     true
 }
 
-fn default_auto_update_check() -> bool {
-    true
-}
-
 impl Plugin {
     pub fn canonical_path(&self) -> String {
         let url = self.url.trim_end_matches(".git");
@@ -628,6 +666,21 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
 
     // 9. TOML パース
     let mut config: Config = toml::from_str(&rendered)?;
+
+    // 9b. 旧 `auto_update_check` (bool) は `auto_update` (enum) に置き換えられた。
+    //     既存 config を黙って壊さないよう alias として解釈は続けるが、 移行を
+    //     促す warning を出す。`auto_update` が明示されている場合は alias 無視。
+    if config.options.auto_update_check.is_some() {
+        if config.options.auto_update.is_some() {
+            eprintln!(
+                "\u{26a0} `auto_update_check` is deprecated and ignored because `auto_update` is set; remove `auto_update_check`."
+            );
+        } else {
+            eprintln!(
+                "\u{26a0} `auto_update_check` is deprecated; use `auto_update = \"off\" | \"notify\" | \"install\"` instead."
+            );
+        }
+    }
 
     // 10. `when` (compile-time exclusion) フィルタ (#140)。
     //    Tera レンダリング後 (手順 7) の `when` 文字列が falsy な plugin を
@@ -828,7 +881,8 @@ url = "owner/repo"
     }
 
     #[test]
-    fn test_parse_config_auto_update_check_defaults_to_true() {
+    fn test_parse_config_auto_update_defaults_to_install() {
+        // opt-out: with nothing set, rvpm silently self-updates in the background.
         let toml = r#"
 [options]
 
@@ -836,21 +890,75 @@ url = "owner/repo"
 url = "owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
-        assert!(config.options.auto_update_check);
+        assert_eq!(config.options.update_mode(), AutoUpdateMode::Install);
         assert_eq!(config.options.update_check_interval, None);
     }
 
     #[test]
-    fn test_parse_config_accepts_auto_update_check_false() {
-        let toml = r#"
+    fn test_parse_config_auto_update_explicit_modes() {
+        for (value, expected) in [
+            ("off", AutoUpdateMode::Off),
+            ("notify", AutoUpdateMode::Notify),
+            ("install", AutoUpdateMode::Install),
+        ] {
+            let toml = format!(
+                r#"
+[options]
+auto_update = "{value}"
+
+[[plugins]]
+url = "owner/repo"
+"#
+            );
+            let config = parse_config(&toml).unwrap();
+            assert_eq!(config.options.update_mode(), expected, "value = {value}");
+        }
+    }
+
+    #[test]
+    fn test_parse_config_legacy_auto_update_check_maps_to_mode() {
+        // Deprecated alias: false → off (must keep disabling for users who
+        // turned updates off), true → notify (the old banner-only behaviour).
+        let off = parse_config(
+            r#"
 [options]
 auto_update_check = false
 
 [[plugins]]
 url = "owner/repo"
-"#;
-        let config = parse_config(toml).unwrap();
-        assert!(!config.options.auto_update_check);
+"#,
+        )
+        .unwrap();
+        assert_eq!(off.options.update_mode(), AutoUpdateMode::Off);
+
+        let notify = parse_config(
+            r#"
+[options]
+auto_update_check = true
+
+[[plugins]]
+url = "owner/repo"
+"#,
+        )
+        .unwrap();
+        assert_eq!(notify.options.update_mode(), AutoUpdateMode::Notify);
+    }
+
+    #[test]
+    fn test_parse_config_auto_update_overrides_legacy_alias() {
+        // When both are present, the new key wins.
+        let config = parse_config(
+            r#"
+[options]
+auto_update = "off"
+auto_update_check = true
+
+[[plugins]]
+url = "owner/repo"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.options.update_mode(), AutoUpdateMode::Off);
     }
 
     #[test]
