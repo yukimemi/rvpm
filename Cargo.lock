@@ -996,6 +996,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2599,13 +2609,14 @@ dependencies = [
 
 [[package]]
 name = "kaishin"
-version = "0.4.5"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a8224aa54b879cdd99560aa38b70c333b455a4c15b6367bf4d1d8ba4fc70cc2"
+checksum = "12c212110a07db0a36f7ea753027513769b3227fc270200eb7d1fb659757e30d"
 dependencies = [
  "anyhow",
  "console",
  "dirs",
+ "fs2",
  "humantime",
  "reqwest",
  "self_update",
