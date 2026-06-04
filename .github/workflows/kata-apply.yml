@@ -64,7 +64,7 @@ jobs:
           set -euo pipefail
           KATA_VERSION="$(curl -fsSL https://api.github.com/repos/yukimemi/kata/releases/latest | jq -r .tag_name)"
           echo "Installing kata ${KATA_VERSION}"
-          curl -fsSL "https://github.com/yukimemi/kata/releases/download/${KATA_VERSION}/kata-x86_64-unknown-linux-gnu.tar.gz" \
+          curl -fsSL "https://github.com/yukimemi/kata/releases/download/${KATA_VERSION}/kata-x86_64-unknown-linux-musl.tar.gz" \
             | tar xz -C /tmp
           sudo mv /tmp/kata /usr/local/bin/kata
           kata --version
