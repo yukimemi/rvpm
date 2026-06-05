@@ -28,8 +28,7 @@ jobs:
             os: ubuntu-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
+          # Intel Mac (x86_64-apple-darwin) dropped — Apple Silicon only.
           - target: aarch64-apple-darwin
             os: macos-latest
     steps:
