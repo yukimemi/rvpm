@@ -163,11 +163,12 @@ At generate time rvpm checks each file's existence and embeds `dofile(...)` in l
 
 ## Architecture overview
 
-`src/main.rs` is the entry point and command handler. Each command is implemented as a `run_*()` function and runs on the Tokio async runtime.
+The crate is **library + bin**: `src/main.rs` is a thin shell whose `main()` just calls `rvpm::run()`, and `src/lib.rs` hosts the CLI definitions, the command handler, and every helper. `run()` builds the Tokio runtime and dispatches the parsed CLI; each command is implemented as a `run_*()` function that runs on that async runtime. Keeping the logic in the library crate is what lets `cargo test --doc` and unit tests reach it (#176).
 
 ```text
 src/
-  main.rs       — CLI definitions (clap), run_*() implementations for every command, helper functions
+  main.rs       — thin binary entry point: `fn main() { rvpm::run() }`
+  lib.rs        — CLI definitions (clap), `run()` entry point, run_*() implementations for every command, helper functions
   config.rs     — TOML config parsing (with Tera template expansion), MapSpec type, sort_plugins
   doctor.rs     — `rvpm doctor` — 17 diagnostics × 4 categories + render (nerd/unicode/ascii)
   git.rs        — async wrappers for git clone/pull/fetch/checkout (Repo struct) + GitChange recording
@@ -232,7 +233,7 @@ Config / cache are **fixed at `~/.config/rvpm/` and `~/.cache/rvpm/` across all 
 - `config_root` (override: `options.config_root`) → default `~/.config/rvpm/<appname>/plugins` — per-plugin init/before/after.lua.
 - `<appname>` resolves as `$RVPM_APPNAME` → `$NVIM_APPNAME` → `"nvim"`.
 
-Always go through the `resolve_*` helpers in `src/main.rs` — never hardcode `.config/rvpm/...` or `.cache/rvpm/...` string literals. Full table of helpers and the directory layout in [`docs/architecture.md`](docs/architecture.md).
+Always go through the `resolve_*` helpers in `src/lib.rs` — never hardcode `.config/rvpm/...` or `.cache/rvpm/...` string literals. Full table of helpers and the directory layout in [`docs/architecture.md`](docs/architecture.md).
 
 ### Windows support
 

@@ -173,7 +173,7 @@ Why not embed it in loader.lua: rvpm's concept is to **prioritize Neovim startup
 
 Rules used by `collect_helptag_targets` to enumerate target `doc/`:
 - If `merged_dir/doc/` exists, add it first — docs of merge=true & !lazy plugins are aggregated in one place, so a single `:helptags` call processes all of them.
-- **Lazy plugins must be added individually even when merge=true** — the condition at `main.rs:1407` keeps lazy plugins out of merged/, so each plugin's own `doc/` must be processed.
+- **Lazy plugins must be added individually even when merge=true** — `decide_merge_mode` (`src/lib.rs`) keeps lazy plugins out of merged/, so each plugin's own `doc/` must be processed.
 - Eager plugins with merge=false are also added individually.
 - `cond` is evaluated at Lua runtime and cannot be judged from Rust, so all plugins are candidates (= those visible in `rvpm list` = targets).
 
@@ -205,7 +205,7 @@ let _permit = sem.acquire_owned().await.unwrap();
 
 The write side (`set_plugin_list_field`) writes back as a string for one element and as an array for multiple (the minimal representation).
 
-## Merge strategy (`src/link.rs` + `src/main.rs::decide_merge_mode`)
+## Merge strategy (`src/link.rs` + `src/lib.rs::decide_merge_mode`)
 
 rvpm builds **at most two** rtp source directories (#119):
 
@@ -239,7 +239,7 @@ Resolution rule:
 
 - **Files are hard-linked** (no admin rights required on Windows; stable on Unix). Same volume is required, but since repos / merged / views are all under `<cache_root>` this is fine. If hard-link fails (e.g. cross-volume), fall back to `std::fs::copy`. Junctions are directory-only and cannot be used for files. Symbolic links require admin rights on Windows and are therefore not used.
 - **Directories are just created** (`create_dir_all`). The directory itself is a real directory; its contents are recursively linked file by file. The previous junction-per-directory scheme would, when multiple plugins place files under the same hierarchy (e.g. several cmp plugins sharing `lua/cmp/`), cause last-writer-wins overwrites and clobber earlier contents.
-- **First-wins + conflict summary** — on conflict, the new file is skipped and a `MergeConflict { relative }` is collected. `MergeResult.placed` returns the list of files newly placed in this run, and main.rs maintains a `HashMap<PathBuf, String>` to **look up the winner plugin name** (loser-only would not tell you "which plugin did it collide with?"). Self-conflicts (winner == loser, e.g. when a plugin promoted from `ViewWithoutDoc` to `Full` re-links its already-placed `doc/` files) are filtered out by `record_merge_result`. At the end of `run_sync` / `run_generate`, `print_merge_conflicts` groups results by plugin, displays each line on stderr with `(kept: <winner>)` appended, and overwrites `<cache_root>/merge_conflicts.json` each time. `rvpm doctor` reads the latter and surfaces it as a warning.
+- **First-wins + conflict summary** — on conflict, the new file is skipped and a `MergeConflict { relative }` is collected. `MergeResult.placed` returns the list of files newly placed in this run, and lib.rs maintains a `HashMap<PathBuf, String>` to **look up the winner plugin name** (loser-only would not tell you "which plugin did it collide with?"). Self-conflicts (winner == loser, e.g. when a plugin promoted from `ViewWithoutDoc` to `Full` re-links its already-placed `doc/` files) are filtered out by `record_merge_result`. At the end of `run_sync` / `run_generate`, `print_merge_conflicts` groups results by plugin, displays each line on stderr with `(kept: <winner>)` appended, and overwrites `<cache_root>/merge_conflicts.json` each time. `rvpm doctor` reads the latter and surfaces it as a warning.
 - **Files at the plugin root are ignored** — README.md / LICENSE / Makefile / package.json / *.toml and other meta files have no place on the rtp; they would only become noise that collides across plugins.
 - **Directories at the plugin root are allow-listed to rtp conventions + denops** — `plugin/`, `lua/`, `doc/`, `ftplugin/`, `ftdetect/`, `syntax/`, `indent/`, `colors/`, `compiler/`, `autoload/`, `after/`, `queries/`, `parser/`, `rplugin/`, `spell/`, `keymap/`, `lang/`, `pack/`, `tutor/` (for `:Tutor`), and `denops/` (for denops.vim TypeScript plugins). `tests/` `scripts/` `examples/` `src/` etc. are unrelated to the rtp and are excluded.
 - **Skip dotfiles at every level** (`.gitignore`, `.luarc.json`, `.editorconfig`, `.gitkeep`, etc.) — they are unrelated to Neovim startup, and at deep levels (e.g. `doc/.gitignore`) would just collide across plugins and add conflict-warning noise.
@@ -281,7 +281,7 @@ Config / cache are **fixed at `~/.config/rvpm/` and `~/.cache/rvpm/` across all 
 - Lets dotfiles share an identical path layout across WSL / Linux / Windows.
 - A single mental model is enough.
 
-### Path helpers (src/main.rs)
+### Path helpers (src/lib.rs)
 
 | Helper | Purpose | Override |
 |---|---|---|
