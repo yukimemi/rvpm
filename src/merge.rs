@@ -308,7 +308,7 @@ pub(crate) fn ensure_absent(path: &Path) -> anyhow::Result<()> {
     }
     if path.symlink_metadata().is_ok() {
         anyhow::bail!(
-            "{} still exists after remove_dir_all (locked by another process?)",
+            "{} still exists after removal (locked by another process?)",
             path.display()
         );
     }
