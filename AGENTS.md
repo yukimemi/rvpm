@@ -349,13 +349,23 @@ Use [`renri`](https://github.com/yukimemi/renri) for any
 commit-bound change. From the main checkout:
 
 ```sh
-renri add <branch-name>            # create a worktree (jj-first)
-renri --vcs git add <branch-name>  # force a git worktree
+renri add <branch-name> --from main@origin            # create a worktree (jj-first), off latest upstream main
+renri --vcs git add <branch-name> --from origin/main  # force a git worktree, off latest upstream main
 renri remove <branch-name> -y --non-interactive  # cleanup after merge (agent-safe; see note)
 renri prune                        # GC stale worktrees
 ```
 
 Read-only inspection can stay on the main checkout.
+
+**Always pass `--from <upstream main>`** (`main@origin` for jj,
+`origin/main` for git). Without it, `renri add` forks off the *cwd
+worktree's current HEAD* — in a long-lived main checkout that often
+lags upstream, so the PR later shows up CONFLICTING against a `main`
+that had already moved (e.g. a refactor merged upstream before the
+branch was cut), forcing a manual re-port of the whole change.
+`renri add` does fetch first, but fetching only updates `main@origin`
+— it never moves the checkout's HEAD, so an explicit `--from` is what
+guarantees a fresh base.
 
 **Agents / non-interactive shells:** `renri remove` prints a details
 panel and waits for a confirmation prompt — without `-y` it **hangs**,
