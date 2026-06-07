@@ -1,10 +1,10 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-06-07T04:52:54.114994463Z"
+applied_at = "2026-06-07T06:34:35.64841426Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "3e03ea70c4c70ea601e6ea5e1a273fe99122c0b8"
-version = "0.12.1"
+rev = "54360f67db62bc84413c451e4eb86a7d91cbe0cb"
+version = "0.13.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
@@ -40,6 +40,12 @@ content_hash = "5c5c9592fb47120e5278d77af38d38e0657e39841509f000a84561a0a62ea29f
 [files.".github/workflows/ci.yml"]
 content_hash = "7969eab018580d42ee36d5e1a295ef4ad3474604eaad6fb6190846fc6eed5e68"
 
+[files.".github/workflows/claude-review.yml"]
+content_hash = "e8e99a82d2ddb3e7a7e7daa4e26ad7a9a0627abdf99db6f79177d1a2fcfebbf4"
+
+[files.".github/workflows/claude.yml"]
+content_hash = "13b455ea1b225e23c9c36906b88df3ad8b9601102593f231b38f4cba5432ef59"
+
 [files.".github/workflows/kata-apply.yml"]
 content_hash = "a63f0e30f6c010e497ab3c3feb7061cfc59ca397ffef2c4ecec356ff99253641"
 
@@ -51,6 +57,7 @@ once_applied = true
 content_hash = "4bebd1c3417c33f9d1c51f011694f6d82b098bbb1a5a102ba56e97ab01a866ef"
 
 [files.".kata/vars.toml"]
+content_hash = "393b2b94540e792790ef9357e46e5bc259eb3064605794ca2373ae458999cb23"
 once_applied = true
 
 [files."AGENTS.md"]
