@@ -212,6 +212,14 @@ fn update_impl(_url: &str, dst: &Path, rev: Option<&str>) -> Result<Option<GitCh
     Ok(build_change(dst, before, after))
 }
 
+/// clone path の HEAD commit hash を同期 (in-process gix) で読む。
+/// view stamp の fingerprint 用 (#perf incremental generate)。 `.git` が無い
+/// dev plugin や壊れた clone では Err — caller は None 化して「stamp 無効 =
+/// 毎回 rebuild」へ安全側フォールバックする。
+pub fn head_commit_of(dst: &Path) -> Result<String> {
+    read_head(dst)
+}
+
 /// HEAD の commit hash を読み取る。failure は呼び出し側で None 化することもある。
 fn read_head(dst: &Path) -> Result<String> {
     let repo = gix::open(dst)?;

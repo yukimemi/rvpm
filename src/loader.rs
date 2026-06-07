@@ -74,6 +74,10 @@ pub struct PluginScripts {
     /// User イベントの pattern 一覧 (#88)。`on_event = ["/User Foo.*/"]` の展開ソース。
     pub defined_user_events: Vec<String>,
     pub cond: Option<String>,
+    /// `Plugin.dev` のコピー (#perf incremental generate)。
+    /// dev plugin は commit と無関係にローカル編集で中身が変わるため、
+    /// view stamp による rebuild skip の対象外にする判定に使う。
+    pub dev: bool,
 }
 
 impl PluginScripts {
@@ -107,6 +111,7 @@ impl PluginScripts {
             defined_plug_maps: Vec::new(),
             defined_user_events: Vec::new(),
             cond: None,
+            dev: false,
         }
     }
 }

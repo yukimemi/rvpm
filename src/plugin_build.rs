@@ -408,5 +408,6 @@ pub(crate) fn build_plugin_scripts(
         defined_plug_maps: scan.plug_maps,
         defined_user_events: scan.user_events,
         cond: plugin.cond.clone(),
+        dev: plugin.dev,
     }
 }

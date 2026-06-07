@@ -43,6 +43,41 @@ pub enum PluginMergeMode {
     ViewWithoutDoc,
 }
 
+/// stamp fingerprint に埋める merge mode の安定キー (#perf)。
+/// enum の Debug 表記に依存しない (rename リファクタで stamp が割れないように)。
+pub(crate) fn merge_mode_key(mode: PluginMergeMode) -> &'static str {
+    match mode {
+        PluginMergeMode::Full => "full",
+        PluginMergeMode::ViewWithDoc => "view_with_doc",
+        PluginMergeMode::ViewWithoutDoc => "view_without_doc",
+    }
+}
+
+/// view の rebuild 要否判定に使う期待 stamp を組み立てる (#perf)。
+///
+/// `None` を返すケースは全て「常に rebuild & stamp 無し」へ倒れる:
+/// - `dev` plugin (commit と無関係にローカル編集で中身が変わる)
+/// - `commit = None` (clone に .git が無い / 読めない)
+///
+/// 強制 rebuild (`generate --force` / `sync --rebuild`) はここでは扱わない —
+/// stamp は計算した上で `build_view_if_needed` に `force=true` を渡すと
+/// 「skip はしないが新 stamp は書く」挙動になる (次回から skip 可能)。
+pub(crate) fn expected_view_stamp(
+    mode: PluginMergeMode,
+    commit: Option<&str>,
+    dev: bool,
+) -> Option<crate::view_stamp::ViewStamp> {
+    if dev {
+        return None;
+    }
+    let commit = commit?;
+    Some(crate::view_stamp::ViewStamp::new(format!(
+        "{}:{}",
+        commit,
+        merge_mode_key(mode)
+    )))
+}
+
 pub(crate) fn decide_merge_mode(
     plugin_merge: bool,
     plugin_lazy: bool,
@@ -113,6 +148,67 @@ pub(crate) fn sibling_with_suffix(p: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// 置換済み旧 dir (`*.rvpm-old`) の `remove_dir_all` をバックグラウンド
+/// スレッドへ逃がす collector (#perf)。
+///
+/// rename (メタデータ更新のみ、一瞬) で view を swap した後の旧 tree 削除は
+/// 数千ファイルになり得るが、 削除の完了を後続処理が待つ必要は無い。
+/// spawn しておいて run の末尾に `join_all` で回収する — プロセス生存中に
+/// 必ず join するので、 削除中の path に次の run の `ensure_absent` が重なる
+/// in-process race も起きない。 異常終了で残骸が残っても、 次 run の
+/// `ensure_absent` / `prune_stale_views` が掃除する既存の自己修復に乗る。
+pub(crate) struct DirReaper {
+    handles: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl DirReaper {
+    /// `path` の再帰削除をバックグラウンドスレッドで開始する。
+    /// 失敗は無視 (次 run の自己修復に任せる)。
+    pub(crate) fn spawn_remove(&self, path: PathBuf) {
+        let handle = std::thread::spawn(move || {
+            let _ = std::fs::remove_dir_all(&path);
+        });
+        self.handles
+            .lock()
+            .expect("DirReaper mutex poisoned")
+            .push(handle);
+    }
+
+    /// spawn 済みの削除スレッドを全部回収する。 べき等。
+    pub(crate) fn join_all(&self) {
+        let handles: Vec<_> =
+            std::mem::take(&mut *self.handles.lock().expect("DirReaper mutex poisoned"));
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+}
+
+/// プロセス共通の `DirReaper` (run_generate は add / update / TUI 等からも
+/// 呼ばれるので、 引数で配るよりプロセス唯一の collector に積むのが単純)。
+pub(crate) fn dir_reaper() -> &'static DirReaper {
+    static REAPER: std::sync::OnceLock<DirReaper> = std::sync::OnceLock::new();
+    REAPER.get_or_init(|| DirReaper {
+        handles: std::sync::Mutex::new(Vec::new()),
+    })
+}
+
+/// Drop で `dir_reaper().join_all()` を呼ぶ RAII guard。
+///
+/// `run_generate` / `run_sync` は `?` / `bail!` で early return し得るので、
+/// 関数末尾の明示 join だと error 経路で削除スレッドが走りっぱなしになる。
+/// TUI のような長寿命プロセスで直後に再実行されると、 削除中の `.rvpm-old` に
+/// 次 run の `ensure_absent` が重なって Windows の sharing violation を踏む —
+/// guard にしておけば正常・異常どちらの経路でも必ず回収される
+/// (Gemini PR #229 high)。 ネストしても `join_all` がべき等なので安全。
+pub(crate) struct ReapGuard;
+
+impl Drop for ReapGuard {
+    fn drop(&mut self) {
+        dir_reaper().join_all();
+    }
+}
+
 /// View dir を atomic に置き換えるためのヘルパ。
 ///
 /// 旧実装は `remove_dir_all(view_dir)` → `merge_plugin_view*` で再 link、 という
@@ -166,7 +262,11 @@ where
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return Err(e.into());
     }
-    let _ = std::fs::remove_dir_all(&old_dir);
+    // 旧 tree の削除は swap 完了後の純粋な掃除で、 後続処理は何も依存しない。
+    // バックグラウンドに逃がして即 return する (#perf)。 run 側の `ReapGuard` が回収。
+    if old_dir.symlink_metadata().is_ok() {
+        dir_reaper().spawn_remove(old_dir);
+    }
     Ok(())
 }
 
@@ -206,15 +306,18 @@ pub(crate) fn ensure_absent(path: &Path) -> anyhow::Result<()> {
 ///
 /// 既存ファイルは別 view への上書きの心配が無い (view dir は per-plugin に新規) ので
 /// view 側の衝突は通常発生しない。 merged/ 側だけが ownership 共有の対象。
+#[allow(clippy::too_many_arguments)] // sync 経路専用の dispatch。 引数は呼び出し 3 箇所で形が揃っている
 pub(crate) fn dispatch_plugin_merge(
     mode: PluginMergeMode,
     src: &Path,
     merged_dir: &Path,
     view_dir: &Path,
     plugin_name: &str,
+    view_stamp: Option<&crate::view_stamp::ViewStamp>,
+    force_view: bool,
     ownership: &mut std::collections::HashMap<PathBuf, String>,
     conflicts: &mut Vec<crate::merge_conflicts::MergeConflictReport>,
-) {
+) -> bool {
     // View 系の rebuild では既存 view_dir を削除してから link し直す:
     // `merge_plugin*` は first-wins + hard-link only なので、 残骸が残ったままだと
     // (a) upstream で削除されたファイルが view にゴミとして残る、
@@ -226,33 +329,77 @@ pub(crate) fn dispatch_plugin_merge(
         PluginMergeMode::Full => {
             let r = crate::link::merge_plugin(src, merged_dir);
             record_merge_result(plugin_name, r, ownership, conflicts);
+            false
         }
         PluginMergeMode::ViewWithDoc => {
             // view 側は per-plugin 専用 dir なので、 別 plugin との衝突は発生しない。
             // atomic_replace_view_dir で tmp に build → atomic rename することで、
             // Neovim が走ってる状態で `rvpm generate` が動いても、 view dir が
             // 空になる窓を作らない (lazy plugin の require / autoload race を回避)。
-            build_view_atomically(
+            build_view_if_needed(
                 src,
                 view_dir,
                 plugin_name,
+                view_stamp,
+                force_view,
                 conflicts,
                 crate::link::merge_plugin_view,
-            );
+            )
         }
         PluginMergeMode::ViewWithoutDoc => {
-            build_view_atomically(
+            let built = build_view_if_needed(
                 src,
                 view_dir,
                 plugin_name,
+                view_stamp,
+                force_view,
                 conflicts,
                 crate::link::merge_plugin_view_no_doc,
             );
-            // 2) doc/ だけ merged/ に集約 (これが merge_doc=true の本命)
+            // 2) doc/ だけ merged/ に集約 (これが merge_doc=true の本命)。
+            // view が skip でも merged/ 側の構築要否は caller 管轄なのでここは常に行う。
             let r = crate::link::merge_plugin_doc_only(src, merged_dir);
             record_merge_result(plugin_name, r, ownership, conflicts);
+            built
         }
     }
+}
+
+/// stamp が現状と一致していれば view rebuild を丸ごと skip し、 そうでなければ
+/// `build_view_atomically` で再構築する (#perf incremental generate)。
+///
+/// - `expected_stamp = None` は「stamp 判定不能」 (dev plugin / commit が読めない
+///   clone) — 常に rebuild し、 stamp も書かない。
+/// - `force = true` は skip 判定だけ無効化する (`generate --force` /
+///   `sync --rebuild`)。 build 後に新 stamp は書くので次回から skip 可能。
+/// - 戻り値は「view を実際に build したか」。 caller (run_generate) は
+///   「1 件も build していない && merged も skip」のとき helptags まで省略する。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_view_if_needed(
+    src: &Path,
+    view_dir: &Path,
+    plugin_name: &str,
+    expected_stamp: Option<&crate::view_stamp::ViewStamp>,
+    force: bool,
+    conflicts: &mut Vec<crate::merge_conflicts::MergeConflictReport>,
+    merge_view_fn: fn(&Path, &Path) -> anyhow::Result<crate::link::MergeResult>,
+) -> bool {
+    if !force {
+        if let Some(expected) = expected_stamp {
+            if crate::view_stamp::is_current(view_dir, expected) {
+                return false;
+            }
+        }
+    }
+    build_view_atomically(
+        src,
+        view_dir,
+        plugin_name,
+        expected_stamp,
+        conflicts,
+        merge_view_fn,
+    );
+    true
 }
 
 /// `views/<plug>/` を tmp 経由で atomic rebuild するヘルパー。
@@ -268,6 +415,7 @@ pub(crate) fn build_view_atomically(
     src: &Path,
     view_dir: &Path,
     plugin_name: &str,
+    stamp: Option<&crate::view_stamp::ViewStamp>,
     conflicts: &mut Vec<crate::merge_conflicts::MergeConflictReport>,
     merge_view_fn: fn(&Path, &Path) -> anyhow::Result<crate::link::MergeResult>,
 ) {
@@ -283,6 +431,18 @@ pub(crate) fn build_view_atomically(
                 view_dir.display(),
                 e
             );
+        }
+        // stamp は build 完走後の tmp に書く → atomic rename で view と一緒に
+        // 公開される。 「stamp が在る ⟺ その fingerprint で build 完走済」を保つ。
+        if let Some(s) = stamp {
+            if let Err(e) = crate::view_stamp::write(tmp, s) {
+                // stamp が書けなくても view 自体は有効 — 次回 rebuild に倒れるだけ。
+                eprintln!(
+                    "\u{26a0} failed to write view stamp {}: {}",
+                    view_dir.display(),
+                    e
+                );
+            }
         }
         merge_result = Some(Ok(m));
         Ok(())
@@ -337,5 +497,239 @@ pub(crate) fn print_merge_conflicts(conflicts: &[crate::merge_conflicts::MergeCo
             "  note: \"<unknown>\" winners usually mean stale merged residue — \
              re-run `rvpm sync` to rebuild from scratch; if it persists, please report it."
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    // ── atomic_replace_view_dir: 旧 dir 削除のバックグラウンド化 (#perf) ──
+
+    #[test]
+    fn atomic_replace_swaps_immediately_and_reaps_old_in_background() {
+        let tmp = tempdir().unwrap();
+        let view = tmp.path().join("view");
+        std::fs::create_dir_all(view.join("sub")).unwrap();
+        std::fs::write(view.join("sub/old.txt"), b"old").unwrap();
+        atomic_replace_view_dir(&view, |t| {
+            std::fs::create_dir_all(t)?;
+            std::fs::write(t.join("new.txt"), b"new")?;
+            Ok(())
+        })
+        .unwrap();
+        // swap 直後: 新 view が見え、旧内容は view 配下に居ない。
+        assert!(view.join("new.txt").exists());
+        assert!(!view.join("sub").exists());
+        // 旧 dir (.rvpm-old) は背景スレッドが削除する。 join 後には消えている。
+        dir_reaper().join_all();
+        let old = sibling_with_suffix(&view, "rvpm-old");
+        assert!(
+            old.symlink_metadata().is_err(),
+            "old dir should be reaped after join_all"
+        );
+    }
+
+    #[test]
+    fn atomic_replace_first_build_has_no_old_dir() {
+        let tmp = tempdir().unwrap();
+        let view = tmp.path().join("view");
+        // 初回 build (view 不在) でも成功し、 .rvpm-old は生まれない。
+        atomic_replace_view_dir(&view, |t| {
+            std::fs::create_dir_all(t)?;
+            std::fs::write(t.join("a.txt"), b"a")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(view.join("a.txt").exists());
+        dir_reaper().join_all();
+        assert!(
+            sibling_with_suffix(&view, "rvpm-old")
+                .symlink_metadata()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reap_guard_joins_on_drop() {
+        // early return 経路の模擬: guard の Drop だけで背景削除が回収されること。
+        let tmp = tempdir().unwrap();
+        let doomed = tmp.path().join("doomed");
+        std::fs::create_dir_all(doomed.join("sub")).unwrap();
+        std::fs::write(doomed.join("sub/f.txt"), b"x").unwrap();
+        {
+            let _guard = ReapGuard;
+            dir_reaper().spawn_remove(doomed.clone());
+            // guard がここで drop → join_all
+        }
+        assert!(
+            doomed.symlink_metadata().is_err(),
+            "ReapGuard drop must join background removals"
+        );
+    }
+
+    // ── build_view_if_needed: stamp による incremental skip (#perf) ──
+
+    fn make_src_plugin(root: &Path) -> PathBuf {
+        let src = root.join("repos/github.com/o/p");
+        std::fs::create_dir_all(src.join("lua")).unwrap();
+        std::fs::write(src.join("lua/init.lua"), b"return {}").unwrap();
+        src
+    }
+
+    #[test]
+    fn view_build_skips_when_stamp_current() {
+        let tmp = tempdir().unwrap();
+        let src = make_src_plugin(tmp.path());
+        let view = tmp.path().join("views/github.com/o/p");
+        let stamp = crate::view_stamp::ViewStamp::new("commit-a:view_with_doc".into());
+        let mut conflicts = Vec::new();
+        let built = build_view_if_needed(
+            &src,
+            &view,
+            "p",
+            Some(&stamp),
+            false,
+            &mut conflicts,
+            crate::link::merge_plugin_view,
+        );
+        assert!(built, "first build must run");
+        assert!(view.join("lua/init.lua").exists());
+        // 外から sentinel を置く。 skip されれば生き残る (rebuild なら消える)。
+        std::fs::write(view.join("sentinel.txt"), b"s").unwrap();
+        let built = build_view_if_needed(
+            &src,
+            &view,
+            "p",
+            Some(&stamp),
+            false,
+            &mut conflicts,
+            crate::link::merge_plugin_view,
+        );
+        assert!(!built, "same stamp must skip rebuild");
+        assert!(
+            view.join("sentinel.txt").exists(),
+            "skip must not touch view"
+        );
+    }
+
+    #[test]
+    fn view_build_rebuilds_on_stamp_mismatch() {
+        let tmp = tempdir().unwrap();
+        let src = make_src_plugin(tmp.path());
+        let view = tmp.path().join("views/github.com/o/p");
+        let mut conflicts = Vec::new();
+        let stamp_a = crate::view_stamp::ViewStamp::new("commit-a:view_with_doc".into());
+        build_view_if_needed(
+            &src,
+            &view,
+            "p",
+            Some(&stamp_a),
+            false,
+            &mut conflicts,
+            crate::link::merge_plugin_view,
+        );
+        std::fs::write(view.join("sentinel.txt"), b"s").unwrap();
+        // commit が動いた想定 → rebuild され sentinel は消える。
+        let stamp_b = crate::view_stamp::ViewStamp::new("commit-b:view_with_doc".into());
+        let built = build_view_if_needed(
+            &src,
+            &view,
+            "p",
+            Some(&stamp_b),
+            false,
+            &mut conflicts,
+            crate::link::merge_plugin_view,
+        );
+        assert!(built, "stamp mismatch must rebuild");
+        assert!(!view.join("sentinel.txt").exists());
+        // 新 stamp が書かれている → 次回は skip 可能。
+        assert!(crate::view_stamp::is_current(&view, &stamp_b));
+    }
+
+    #[test]
+    fn view_build_force_rebuilds_but_writes_stamp() {
+        // `--force` は skip 判定だけ無効化し、 build 後の stamp は書き直す
+        // (次回の通常 run から skip 可能になる)。
+        let tmp = tempdir().unwrap();
+        let src = make_src_plugin(tmp.path());
+        let view = tmp.path().join("views/github.com/o/p");
+        let mut conflicts = Vec::new();
+        let stamp = crate::view_stamp::ViewStamp::new("commit-a:view_with_doc".into());
+        build_view_if_needed(
+            &src,
+            &view,
+            "p",
+            Some(&stamp),
+            false,
+            &mut conflicts,
+            crate::link::merge_plugin_view,
+        );
+        std::fs::write(view.join("sentinel.txt"), b"s").unwrap();
+        let built = build_view_if_needed(
+            &src,
+            &view,
+            "p",
+            Some(&stamp),
+            true,
+            &mut conflicts,
+            crate::link::merge_plugin_view,
+        );
+        assert!(built, "force must bypass the stamp skip");
+        assert!(!view.join("sentinel.txt").exists());
+        assert!(crate::view_stamp::is_current(&view, &stamp));
+    }
+
+    #[test]
+    fn view_build_always_builds_without_stamp() {
+        // dev plugin / commit 不明 → expected=None で毎回 rebuild。
+        let tmp = tempdir().unwrap();
+        let src = make_src_plugin(tmp.path());
+        let view = tmp.path().join("views/github.com/o/p");
+        let mut conflicts = Vec::new();
+        assert!(build_view_if_needed(
+            &src,
+            &view,
+            "p",
+            None,
+            false,
+            &mut conflicts,
+            crate::link::merge_plugin_view,
+        ));
+        std::fs::write(view.join("sentinel.txt"), b"s").unwrap();
+        assert!(build_view_if_needed(
+            &src,
+            &view,
+            "p",
+            None,
+            false,
+            &mut conflicts,
+            crate::link::merge_plugin_view,
+        ));
+        assert!(!view.join("sentinel.txt").exists());
+        // stamp 無しで build した view に stamp ファイルは残らない。
+        assert!(crate::view_stamp::read(&view).is_none());
+    }
+
+    #[test]
+    fn merge_mode_key_is_stable() {
+        assert_eq!(merge_mode_key(PluginMergeMode::Full), "full");
+        assert_eq!(
+            merge_mode_key(PluginMergeMode::ViewWithDoc),
+            "view_with_doc"
+        );
+        assert_eq!(
+            merge_mode_key(PluginMergeMode::ViewWithoutDoc),
+            "view_without_doc"
+        );
+    }
+
+    #[test]
+    fn expected_view_stamp_none_for_dev_or_unknown_commit() {
+        assert!(expected_view_stamp(PluginMergeMode::ViewWithDoc, Some("abc"), true).is_none());
+        assert!(expected_view_stamp(PluginMergeMode::ViewWithDoc, None, false).is_none());
+        let s = expected_view_stamp(PluginMergeMode::ViewWithDoc, Some("abc"), false).unwrap();
+        assert_eq!(s.fingerprint, "abc:view_with_doc");
     }
 }

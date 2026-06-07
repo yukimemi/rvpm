@@ -223,7 +223,7 @@ See [`docs/architecture.md`](docs/architecture.md) for design rationale, lazy tr
 - **ViewWithDoc** (everything else, `merge_doc=false`) → all rtp dirs (incl. `doc/`) hard-linked into `<cache_root>/plugins/views/<plug>/`; rtp gets that view path (eager: startup; lazy: at trigger).
 - **ViewWithoutDoc** (everything else, `merge_doc=true`) → view tree minus `doc/`, plus the plugin's `doc/` files aggregated into `merged/doc/`. rtp gets the doc-stripped view; `:help` works through `merged/` from startup, no `:tselect` duplicate after trigger.
 
-`repos/<plug>/` is **never on rtp** — only `merged/` and `views/<plug>/` are. Conflicts are first-wins, recorded in `merge_conflicts.json` (self-conflicts filtered), surfaced by `rvpm doctor`. `cond` plugins get `merge=false` forced by `disable_merge_if_cond`, and `merge_doc=None` is forced to `Some(false)` (explicit per-plugin `Some(true)` survives — Windows-only-but-help-findable use case). Full rules in [`docs/architecture.md`](docs/architecture.md).
+`repos/<plug>/` is **never on rtp** — only `merged/` and `views/<plug>/` are. Conflicts are first-wins, recorded in `merge_conflicts.json` (self-conflicts filtered), surfaced by `rvpm doctor`. `cond` plugins get `merge=false` forced by `disable_merge_if_cond`, and `merge_doc=None` is forced to `Some(false)` (explicit per-plugin `Some(true)` survives — Windows-only-but-help-findable use case). Rebuilds are **incremental**: `.rvpm-stamp.json` (clone HEAD + merge mode, `src/view_stamp.rs`) lets unchanged views / `merged/` / helptags be skipped; `generate --force` / `sync --rebuild` bypass the skip. Full rules in [`docs/architecture.md`](docs/architecture.md).
 
 ### Path conventions
 
