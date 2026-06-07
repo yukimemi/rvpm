@@ -233,6 +233,19 @@ Resolution rule:
 
 `disable_merge_if_cond` runs first as a pre-pass: when `cond` is set, `merge=true` is forced to `false`, and `merge_doc=None` is forced to `Some(false)` (explicit `Some(true)` survives — that's the "Windows-only plugin but help findable cross-platform" use case).
 
+### Incremental rebuild stamps (`src/view_stamp.rs`)
+
+Because views are hard-link trees, file *contents* track the clone automatically (shared inodes); only the file *set* can drift, and that only happens when the clone's HEAD moves. rvpm exploits this with on-disk stamps so repeat `generate` runs skip nearly all I/O:
+
+- **Per-view stamp** — `views/<plug>/.rvpm-stamp.json` records `{schema, rvpm_version, fingerprint}` where the fingerprint is `<HEAD commit>:<merge mode key>`. When the expected stamp matches, the whole walk + hard-link pass for that view is skipped. The stamp is written into the temp dir *before* the atomic rename, so "stamp exists ⟺ that fingerprint's build completed".
+- **Merged stamp** — `merged/.rvpm-stamp.json` fingerprints every contributing plugin `(name, commit, full|doc)` in config order (first-wins depends on order). On match, the `merged/` rebuild is skipped entirely. If any contributor's commit is unknown (dev plugin, non-git clone), skipping is disabled and `merged/` rebuilds every run (safe side).
+- **helptags skip** — when `merged/` was skipped, zero views were rebuilt, and every helptag target already has a `tags` file, the `nvim --headless` helptags pass is skipped too.
+- **Always rebuilt** — `dev = true` plugins (local edits don't move HEAD) and clones without a readable HEAD never get a stamp. `rvpm generate --force` and `rvpm sync --rebuild [QUERY]` bypass the skip check but still write fresh stamps (so the *next* normal run can skip). Stamps embed the rvpm version and a schema number; either changing invalidates all stamps.
+- **merge_conflicts.json on skipped runs** — a run that skipped the `merged/` rebuild never recomputed first-wins, so the previous snapshot is *preserved* instead of being overwritten with an empty list (`rvpm doctor` would otherwise misreport "no conflicts").
+- **Background reaping** — the replaced `*.rvpm-old` tree after an atomic view swap is deleted on a background thread (`DirReaper`); a `ReapGuard` instantiated at the top of `run_generate` / `run_sync` joins them on every exit path (including early `?` returns). Leftovers from an aborted process are cleaned by the existing `ensure_absent` / `prune_stale_views` self-healing.
+
+In `run_generate`, per-plugin view builds run in parallel (bounded by `options.concurrency`, same as sync's git phase) since views never collide; the `merged/` build stays sequential in config order to keep first-wins deterministic. `build_plugin_scripts` (pre-glob + `plugin_scan`) is parallelized the same way.
+
 ### File-level link mechanics
 
 `merge_plugin()` (and `merge_plugin_no_doc()` for the doc-stripped view, `merge_plugin_doc_only()` for the doc-only aggregation into `merged/doc/`) link into the destination directory **at file granularity**. Design highlights:
