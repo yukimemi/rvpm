@@ -57,7 +57,9 @@ pub(crate) async fn maybe_spawn_auto_update_check() -> Option<AutoUpdateHandle> 
 
     // config が読めない / 失敗するケースもあるので resilience。 panic は絶対にしない。
     let config_path = config_path_for_auto_check()?;
-    let toml_str = std::fs::read_to_string(&config_path).ok()?;
+    // async fn: use tokio::fs so the blocking read doesn't stall the executor
+    // thread while the background update check is being set up (#226).
+    let toml_str = tokio::fs::read_to_string(&config_path).await.ok()?;
     let cfg = crate::config::parse_config(&toml_str).ok()?;
 
     // env kill-switch は config より優先。

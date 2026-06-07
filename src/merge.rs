@@ -290,13 +290,25 @@ pub(crate) fn ensure_absent(path: &Path) -> anyhow::Result<()> {
     // 後段の rename/create が "already exists" で落ちる。link.rs でも既出の罠。
     // `symlink_metadata()` は symlink 自体を stat するので、壊れた symlink も含めて
     // 「path に何かあるか」を正しく判定できる。
-    if path.symlink_metadata().is_ok() {
-        std::fs::remove_dir_all(path)
-            .with_context(|| format!("remove stale dir {}", path.display()))?;
+    //
+    // 削除はファイル種別ごとに分岐する (#223、link.rs と同じ方針)。残骸が
+    // ディレクトリとは限らず、ファイル / file への symlink のこともある。Windows では
+    // `remove_dir_all` を非ディレクトリに対して呼ぶと PermissionDenied /
+    // NotADirectory で失敗し、毎 run bail して自己修復できなくなるため。
+    if let Ok(meta) = path.symlink_metadata() {
+        let res = if meta.file_type().is_symlink() {
+            // symlink 自体を消す (target は辿らない)。dir symlink の場合に備えて fallback。
+            std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path))
+        } else if meta.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        res.with_context(|| format!("remove stale path {}", path.display()))?;
     }
     if path.symlink_metadata().is_ok() {
         anyhow::bail!(
-            "{} still exists after remove_dir_all (locked by another process?)",
+            "{} still exists after removal (locked by another process?)",
             path.display()
         );
     }

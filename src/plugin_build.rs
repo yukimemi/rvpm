@@ -80,11 +80,18 @@ pub(crate) async fn run_build_shell(
     let build_cmd = plugin.build.as_ref()?;
     let (prog, args) = parse_build_command(build_cmd, rtp_dirs);
     let build_timeout = std::time::Duration::from_secs(300); // 5 minutes
-    let mut child = match tokio::process::Command::new(&prog)
+    let child = match tokio::process::Command::new(&prog)
         .args(&args)
         .current_dir(dst_path)
+        // Capture stdout/stderr and drain them via `wait_with_output()`: leaving
+        // piped output unread deadlocks the child once it writes past the OS
+        // pipe buffer (~64 KB), e.g. a chatty `cargo build` / `:TSUpdate` (#226).
+        // Draining also lets us surface the build's stderr on failure instead of
+        // a bare exit code. `kill_on_drop(true)` kills a timed-out build when the
+        // future is dropped (mirrors `run_build_lua`).
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
     {
         Ok(c) => c,
@@ -92,16 +99,18 @@ pub(crate) async fn run_build_shell(
             return Some(format!("build spawn failed: {}", e));
         }
     };
-    match tokio::time::timeout(build_timeout, child.wait()).await {
-        Ok(Ok(status)) if !status.success() => {
-            Some(format!("build failed (exit code: {:?})", status.code()))
+    match tokio::time::timeout(build_timeout, child.wait_with_output()).await {
+        Ok(Ok(out)) if !out.status.success() => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            Some(format!(
+                "build failed (exit code: {:?}): {}",
+                out.status.code(),
+                stderr.trim()
+            ))
         }
+        Ok(Ok(_)) => None,
         Ok(Err(e)) => Some(format!("build error: {}", e)),
-        Err(_) => {
-            let _ = child.kill().await;
-            Some(format!("build timed out ({}s)", build_timeout.as_secs()))
-        }
-        _ => None,
+        Err(_) => Some(format!("build timed out ({}s)", build_timeout.as_secs())),
     }
 }
 
