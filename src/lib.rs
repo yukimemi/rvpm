@@ -2089,6 +2089,33 @@ mod tests {
         assert!(!dir.exists());
     }
 
+    #[test]
+    fn ensure_absent_removes_plain_file() {
+        // 残骸がディレクトリではなくファイルのケース (#223)。Windows で
+        // remove_dir_all を file に対して呼ぶと失敗するので型分岐が要る。
+        let tmp = tempdir().unwrap();
+        let file = tmp.path().join("stale-file");
+        std::fs::write(&file, b"residue").unwrap();
+        ensure_absent(&file).unwrap();
+        assert!(!file.exists(), "file should be gone after ensure_absent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_absent_removes_dangling_symlink() {
+        // dangling symlink: target は存在しないが symlink 自体は残骸として残る (#223)。
+        let tmp = tempdir().unwrap();
+        let link = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("missing-target"), &link).unwrap();
+        // symlink 自体は存在する (target は無い)。
+        assert!(link.symlink_metadata().is_ok());
+        ensure_absent(&link).unwrap();
+        assert!(
+            link.symlink_metadata().is_err(),
+            "dangling symlink should be gone after ensure_absent"
+        );
+    }
+
     // ── patch_plugin_entry_triggers regression: respect existing user fields ──
 
     #[test]

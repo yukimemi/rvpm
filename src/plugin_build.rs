@@ -83,8 +83,13 @@ pub(crate) async fn run_build_shell(
     let mut child = match tokio::process::Command::new(&prog)
         .args(&args)
         .current_dir(dst_path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        // stdout/stderr are never read (we only `child.wait()` for the exit
+        // status), so they must be discarded rather than piped: an unread pipe
+        // deadlocks the child once it writes past the OS pipe buffer (~64 KB),
+        // e.g. a chatty `cargo build` / `:TSUpdate` (#226). `run_build_lua`
+        // differs — it drains the pipes via `wait_with_output()`.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
     {
         Ok(c) => c,
