@@ -175,10 +175,16 @@ impl DirReaper {
     }
 
     /// spawn 済みの削除スレッドを全部回収する。 べき等。
+    ///
+    /// lock を**保持したまま** join する点が重要: take してから lock 外で join
+    /// すると、 並行する別の `join_all` (nested ReapGuard / 並列テスト) が
+    /// 「自分の spawn した handle を他人が join 中」のとき空リストを見て即 return
+    /// してしまい、 削除完了前に戻るレースになる。 lock 越しに直列化すれば、
+    /// どの caller も「自分の呼び出し時点までの spawn が全部 join 済み」で帰れる。
+    /// join 中の spawn_remove は短時間ブロックするが、 削除は秒未満なので許容。
     pub(crate) fn join_all(&self) {
-        let handles: Vec<_> =
-            std::mem::take(&mut *self.handles.lock().expect("DirReaper mutex poisoned"));
-        for h in handles {
+        let mut handles = self.handles.lock().expect("DirReaper mutex poisoned");
+        for h in handles.drain(..) {
             let _ = h.join();
         }
     }
