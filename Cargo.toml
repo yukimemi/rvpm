@@ -42,7 +42,7 @@ toml_edit = "0.25.12"
 which = "8.0.3"
 
 # Self-update (`rvpm self-update`, background auto-update / check banner) — #125
-kaishin = "0.6.0"
+kaishin = "0.6.1"
 # Version 比較 (current `Cargo.toml` の version vs. 取得した `tag_name`)。
 semver = "1.0.28"
 
