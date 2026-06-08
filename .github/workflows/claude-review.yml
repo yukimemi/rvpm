@@ -1,12 +1,23 @@
 name: claude-review
 
-# Automatic Claude Code review on every human-authored PR.
+# Automatic Claude Code review — one full pass per human-authored
+# PR, at open time (plus ready_for_review / reopened).
 #
 # Replaces the Gemini Code Assist free-tier PR review (free tier
 # discontinued upstream). Runs anthropics/claude-code-action in
 # agent mode: the workflow supplies a review prompt, Claude reads
 # the diff (and the repo's AGENTS.md conventions) and posts inline
 # comments plus a top-level summary.
+#
+# Cost model: `synchronize` is deliberately NOT in the trigger
+# list. Re-reviewing the full diff on every fix push doubled up
+# with the @claude responder (claude.yml), which already verifies
+# each fix when the author replies on the review thread with an
+# @-mention (the AGENTS.md "reply to reviewers" convention) — so
+# every fix used to cost a full review AND a focused re-check.
+# Now the cycle is: one full review at open, then cheap
+# mention-driven re-checks per fix. Need a fresh full pass after
+# a large rework? Comment `@claude please re-review the full PR`.
 #
 # Review-skip policy — mirrors the AGENTS.md "PR review cycle"
 # rules so the workflow and the docs agree on which PRs skip the
@@ -40,7 +51,7 @@ name: claude-review
 
 on:
   pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
+    types: [opened, ready_for_review, reopened]
 
 permissions:
   contents: read
@@ -48,8 +59,9 @@ permissions:
   id-token: write
 
 concurrency:
-  # One review per PR at a time; a new push supersedes the
-  # in-flight review (reviewing a stale diff is wasted tokens).
+  # One review per PR at a time; a re-fire (reopen / ready)
+  # supersedes an in-flight run (reviewing a stale diff is wasted
+  # tokens).
   group: claude-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 

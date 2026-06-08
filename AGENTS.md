@@ -283,6 +283,16 @@ here so each tool's auto-load behaviour still finds something.
   `chore/release-*`, `kata-apply/auto`, `apm-bump/auto`, and
   Renovate / Dependabot authors) — a missing Claude review on
   those PRs is expected, not a failure.
+- **The Claude full review fires once, at PR open** (plus
+  `ready_for_review` / `reopened`) — fix pushes do **not** re-trigger
+  it (`synchronize` is deliberately off the trigger list; a full
+  re-review per push doubled up with the mention-driven re-check
+  below and burned tokens for no extra signal). Verification of
+  fixes rides the `@claude` thread replies. After a large rework
+  that changes the PR's shape, request a fresh full pass
+  explicitly: `@claude please re-review the full PR`. CodeRabbit
+  still reviews pushes on its own cadence (its app config, not
+  this workflow).
 - **After opening a PR, immediately enter the review-monitoring
   loop — do not ask the user whether to start it.** Drive the
   cadence with `/loop` — fixed-interval mode (e.g.
@@ -328,9 +338,11 @@ here so each tool's auto-load behaviour still finds something.
   reviewers and cost the audit trail. Note `@claude` also
   triggers the interactive responder
   (`.github/workflows/claude.yml`, kata-managed) — it will
-  re-check the fix and reply on the thread; that re-check is the
-  point, but don't @-mention it for pure FYI notes that need no
-  verification.
+  re-check the fix and reply on the thread. Since fix pushes no
+  longer re-trigger the full review, this mention-driven re-check
+  is the **only** Claude-side verification of a fix — don't skip
+  it for substantive fixes; do skip it for pure FYI notes that
+  need no verification.
 - A review thread is **settled** the moment the latest bot reply
   is ack-only ("Thank you" / "Understood" / a re-review summary
   with no new findings) or 30 minutes elapse with no actionable
