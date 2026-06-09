@@ -1,9 +1,10 @@
 //! CLI subcommand handlers (#217 stage 3, split per-subcommand in #228).
 //!
-//! Every `run_*` entry point invoked by the dispatcher in `lib.rs::run_cli`
-//! lives in a focused submodule here. Shared helpers and the clap `Cli` /
-//! `Commands` definitions stay in `lib.rs` and are reached via `crate::`
-//! (glob-imported below; each submodule pulls these in with `use super::*`).
+//! Every `run_*` entry point invoked by the dispatcher in `cli.rs::run_cli`
+//! lives in a focused submodule here. Shared helpers stay in `lib.rs` and the
+//! clap `Cli` / `Commands` definitions live in `cli.rs` (#233); both are
+//! reached via `crate::` (glob-imported below; each submodule pulls these in
+//! with `use super::*`).
 
 use crate::config::parse_config;
 use crate::git::Repo;
