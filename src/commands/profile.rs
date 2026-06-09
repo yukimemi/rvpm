@@ -203,3 +203,40 @@ pub(crate) async fn run_profile(
     crate::profile_tui::run(report)?;
     Ok(())
 }
+
+/// 起動時に前回 crash 由来の `loader.lua.bak` があれば検出して復元する。
+///
+/// ただし現在の loader.lua が `rvpm-profile-markers-` を含まない (= 既にクリーン
+/// な generate で上書き済み) ケースでは、戻すべきでない古い bak を捨てる。
+/// これをしないと「crash 後にユーザが `rvpm generate` で loader を更新 → 次の
+/// profile 起動で古い bak が上書きしてロールバックしてしまう」事故が起きる。
+fn recover_stale_loader_backup(loader_path: &Path) {
+    let backup_path = loader_path.with_extension("lua.bak");
+    if !backup_path.exists() {
+        return;
+    }
+    // 現状の loader.lua が instrumented なら bak は生きた退避、そうでなければ
+    // generate/sync で再生成済み → bak は不要。
+    let current_is_instrumented = std::fs::read_to_string(loader_path)
+        .map(|s| s.contains("rvpm-profile-markers-"))
+        .unwrap_or(false);
+    if !current_is_instrumented {
+        eprintln!(
+            "\u{26a0} rvpm: removing stale loader.lua.bak (current loader.lua is already clean)"
+        );
+        let _ = std::fs::remove_file(&backup_path);
+        return;
+    }
+    eprintln!(
+        "\u{26a0} rvpm: detected stale loader.lua.bak from a previous crashed profile run — restoring",
+    );
+    if loader_path.exists() {
+        let _ = std::fs::remove_file(loader_path);
+    }
+    if let Err(e) = std::fs::rename(&backup_path, loader_path) {
+        eprintln!(
+            "\u{26a0} rvpm: could not auto-restore ({}). Run `rvpm generate` to rebuild.",
+            e
+        );
+    }
+}

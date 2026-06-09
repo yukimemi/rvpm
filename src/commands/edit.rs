@@ -186,3 +186,56 @@ pub(crate) async fn run_edit(
     chezmoi::apply(&edit_target, &target_file).await;
     Ok(true)
 }
+
+/// init/before/after.lua の存在チェックしてサークルアイコンの文字列を返す
+/// 例: "● ○ ●" (init あり、before なし、after あり)
+fn hook_indicators(dir: &Path) -> String {
+    let i = if dir.join("init.lua").exists() {
+        "\u{25cf}"
+    } else {
+        "\u{25cb}"
+    };
+    let b = if dir.join("before.lua").exists() {
+        "\u{25cf}"
+    } else {
+        "\u{25cb}"
+    };
+    let a = if dir.join("after.lua").exists() {
+        "\u{25cf}"
+    } else {
+        "\u{25cb}"
+    };
+    format!("{} {} {}", i, b, a)
+}
+
+/// global hooks 用のサークルアイコン。`init.lua` だけ Neovim 本体の場所
+/// (`nvim_init_lua_path()`) を見て、`before.lua` / `after.lua` は `<config_root>`
+/// 配下を見る — `rvpm edit --global` の対応と同じ。
+fn global_hook_indicators(config_root: &Path, init_lua_path: &Path) -> String {
+    let i = if init_lua_path.exists() {
+        "\u{25cf}"
+    } else {
+        "\u{25cb}"
+    };
+    let b = if config_root.join("before.lua").exists() {
+        "\u{25cf}"
+    } else {
+        "\u{25cb}"
+    };
+    let a = if config_root.join("after.lua").exists() {
+        "\u{25cf}"
+    } else {
+        "\u{25cb}"
+    };
+    format!("{} {} {}", i, b, a)
+}
+
+/// ファイル名に存在アイコンを付ける
+fn file_with_icon(dir: &Path, name: &str) -> String {
+    let icon = if dir.join(name).exists() {
+        "\u{25cf}"
+    } else {
+        "\u{25cb}"
+    };
+    format!("{} {}", icon, name)
+}
