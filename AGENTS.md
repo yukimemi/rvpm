@@ -332,10 +332,20 @@ here so each tool's auto-load behaviour still finds something.
   to 1200–1800s instead and let it ride. Stopping is only correct
   when the owner has explicitly chosen to skip the bot pass per
   the rate-limit exception below.)
-- **Reply to reviewers after pushing a fix.** Reply on the
-  corresponding review thread with an **@-mention**
-  (`@claude` / `@coderabbitai`). Silent fixes are invisible to
-  reviewers and cost the audit trail. Note `@claude` also
+- **Reply to reviewers after pushing a fix — in each thread, not
+  at the top level.** Every finding lives in its own inline review
+  thread; answer *each* one as an in-thread reply, carrying an
+  **@-mention** (`@claude` / `@coderabbitai`). Use the review-
+  comment *replies* endpoint — `gh api repos/<owner>/<repo>/pulls/<N>/comments/<comment_id>/replies -f body=…`
+  (or `-F in_reply_to=<comment_id> -f body=…` on the comments
+  endpoint — `body` is required there too) — and
+  get each comment's `<comment_id>` from
+  `gh api repos/<owner>/<repo>/pulls/<N>/comments`. A single
+  top-level `gh pr comment` does **not** count: it leaves every
+  inline thread unresolved, the bot can't tie your response to the
+  finding it raised, and the per-finding audit trail is lost.
+  Reply in-thread even when you're **declining** a suggestion —
+  say why; a silent skip reads as overlooked. Note `@claude` also
   triggers the interactive responder
   (`.github/workflows/claude.yml`, kata-managed) — it will
   re-check the fix and reply on the thread. Since fix pushes no
@@ -366,6 +376,21 @@ here so each tool's auto-load behaviour still finds something.
   time-sensitive PRs, merge on owner approval without waiting.
 
 ### Worktree workflow
+
+> **Before your FIRST edit to any file, run `renri add` — NEVER edit the
+> main checkout.** Read-only inspection (Read / Grep / Glob) stays on the
+> main checkout; the instant you intend to *change* a file, you must
+> already be in a worktree. The trap that keeps catching agents: diving
+> into a fix the moment the diagnosis lands and editing in place. A
+> concurrent agent shares the main checkout — your in-place edits will
+> clobber theirs or be clobbered, and in a jj-colocated repo a stray
+> working-copy commit entangles unrelated WIP into your branch. If you
+> slip and edit in the main checkout, capture the diff first (jj already
+> snapshotted it into the working-copy commit, so `jj diff > patch`; for
+> git, `git stash` or save a patch — if you got as far as committing on a
+> branch, just push it). Then reset the main checkout to pristine main
+> (`jj new main@origin`, or `git switch -`), `renri add` a worktree, and
+> re-apply the captured diff there.
 
 Use [`renri`](https://github.com/yukimemi/renri) for any
 commit-bound change. From the main checkout:
