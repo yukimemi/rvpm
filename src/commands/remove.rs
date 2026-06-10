@@ -44,3 +44,38 @@ pub(crate) async fn run_remove(query: Option<String>) -> Result<()> {
     run_generate(false).await?;
     Ok(())
 }
+
+fn remove_plugin_from_toml(doc: &mut DocumentMut, url: &str) -> Result<()> {
+    let plugins = doc["plugins"]
+        .as_array_of_tables_mut()
+        .context("plugins is not an array of tables")?;
+    let idx = plugins
+        .iter()
+        .position(|p| p.get("url").and_then(|v| v.as_str()) == Some(url))
+        .context("Plugin not found in config")?;
+    plugins.remove(idx);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use toml_edit::DocumentMut;
+
+    #[test]
+    fn test_remove_from_toml() {
+        let toml = "[[plugins]]\nurl = \"owner/a\"\n\n[[plugins]]\nurl = \"owner/b\"\n";
+        let mut doc = toml.parse::<DocumentMut>().unwrap();
+        remove_plugin_from_toml(&mut doc, "owner/a").unwrap();
+        let result = doc.to_string();
+        assert!(!result.contains("owner/a"));
+        assert!(result.contains("owner/b"));
+    }
+
+    #[test]
+    fn test_remove_from_toml_not_found_returns_error() {
+        let toml = "[[plugins]]\nurl = \"owner/a\"\n";
+        let mut doc = toml.parse::<DocumentMut>().unwrap();
+        assert!(remove_plugin_from_toml(&mut doc, "owner/nonexistent").is_err());
+    }
+}

@@ -772,3 +772,196 @@ pub(crate) async fn run_sync(
     print_init_lua_hint_if_missing(&config);
     Ok(())
 }
+
+/// A plugin that sync left at a lockfile-pinned commit while its remote
+/// has advanced. Reported in the sync summary so users know `rvpm update`
+/// would actually change something.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeldBackPin {
+    name: String,
+    pinned: String,
+    remote: String,
+}
+
+/// Decide whether a just-synced plugin is being "held back" by a lockfile
+/// pin. Returns `Some((pinned_commit, remote_tip))` when:
+///
+/// - the plugin has **no explicit `rev`** (not the user's choice),
+/// - the **lockfile contributed** an effective rev (pin came from the lockfile),
+/// - and the pinned HEAD is **behind the remote tracking tip**.
+///
+/// Returns `None` otherwise — explicit `rev`, no lockfile contribution,
+/// already at remote tip, or either commit unknown (treat unknowns as
+/// "not held back" to avoid false positives).
+///
+/// This is the pure classification step; the caller is responsible for
+/// composing the plugin display name and emitting the summary line.
+fn classify_held_back(
+    plugin_rev: Option<&str>,
+    effective_rev: Option<&str>,
+    head_commit: Option<&str>,
+    remote_head: Option<&str>,
+) -> Option<(String, String)> {
+    if plugin_rev.is_some() {
+        return None;
+    }
+    effective_rev?;
+    let head = head_commit?;
+    let remote = remote_head?;
+    if head != remote {
+        Some((head.to_string(), remote.to_string()))
+    } else {
+        None
+    }
+}
+
+/// 現在の plugin が `--rebuild [QUERY]` のスコープに入るか判定する。
+///
+/// `rebuild_filter_lc` は **呼び出し側で小文字化済み** の前提。`run_sync` は N
+/// プラグインを回すので、N 回同じ query を lowercase するコストを避けるため
+/// 事前正規化を外側に持たせている。
+///
+/// - `None` (フラグ未指定) → 常に false (build 強制しない)
+/// - `Some("")` (フラグのみ、値無し) → 常に true (全 plugin)
+/// - `Some(q)` (フラグ + query) → plugin の url / name の
+///   いずれかに q が含まれれば true。url 側で決着すれば name の lowercase
+///   allocation は走らない (短絡評価)。
+fn matches_rebuild_filter(plugin: &crate::config::Plugin, rebuild_filter_lc: Option<&str>) -> bool {
+    match rebuild_filter_lc {
+        None => false,
+        Some("") => true,
+        Some(qlc) => {
+            plugin.url.to_ascii_lowercase().contains(qlc)
+                || plugin
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| n.to_ascii_lowercase().contains(qlc))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Plugin;
+
+    // ─── classify_held_back ──────────────────────────────────────────────
+    // Pure classification of "this plugin is being held back by a lockfile
+    // pin". The integration path is covered by the git::remote_head test
+    // on the git.rs side; these tests nail down the decision table only.
+
+    #[test]
+    fn test_classify_held_back_reports_pin_behind_remote() {
+        // No rev set, lockfile contributed a commit, and HEAD (= pin)
+        // lags behind remote → this is the case users hit.
+        let got = classify_held_back(
+            None,
+            Some("lockcommit"),
+            Some("lockcommit"),
+            Some("newcommit"),
+        );
+        assert_eq!(
+            got,
+            Some(("lockcommit".to_string(), "newcommit".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_classify_held_back_silent_when_explicit_rev_set() {
+        // If the user pinned via `rev`, the lag is intentional — not our
+        // call to flag.
+        let got = classify_held_back(Some("v1.0.0"), Some("v1.0.0"), Some("abc"), Some("def"));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_classify_held_back_silent_without_lockfile_contribution() {
+        // No lockfile entry → sync already reset to remote; there's no pin
+        // holding us back.
+        let got = classify_held_back(None, None, Some("abc"), Some("abc"));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_classify_held_back_silent_when_pin_matches_remote() {
+        // Lockfile pin and remote happen to line up — everyone's up to
+        // date, no reason to nag.
+        let got = classify_held_back(None, Some("abc"), Some("abc"), Some("abc"));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_classify_held_back_silent_when_remote_head_unknown() {
+        // Can't prove the pin is behind if we can't resolve the remote tip.
+        // Prefer silence over a false positive (resilience).
+        let got = classify_held_back(None, Some("abc"), Some("abc"), None);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn test_classify_held_back_silent_when_head_unknown() {
+        // Same resilience argument in the other direction.
+        let got = classify_held_back(None, Some("abc"), None, Some("def"));
+        assert_eq!(got, None);
+    }
+
+    // ─── matches_rebuild_filter ─────────────────────────────────────────
+    // `--rebuild [QUERY]` のスコープ判定を 3 分岐で押さえる:
+    //   None        → 常に false (フラグ未指定、従来デフォルト)
+    //   Some("")    → 常に true (フラグだけ、従来の `--rebuild` 挙動)
+    //   Some("q")   → url / name に q を含めば true
+
+    fn mk_plugin(url: &str, name: Option<&str>) -> Plugin {
+        Plugin {
+            url: url.to_string(),
+            name: name.map(|s| s.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_rebuild_filter_none_never_matches() {
+        let p = mk_plugin("nvim-treesitter/nvim-treesitter", None);
+        assert!(!matches_rebuild_filter(&p, None));
+    }
+
+    #[test]
+    fn test_rebuild_filter_empty_always_matches() {
+        let p = mk_plugin("folke/snacks.nvim", None);
+        assert!(matches_rebuild_filter(&p, Some("")));
+    }
+
+    #[test]
+    fn test_rebuild_filter_substring_matches_url() {
+        // 呼び出し側で lowercase 済みの query を渡す契約。
+        let p = mk_plugin("nvim-treesitter/nvim-treesitter", None);
+        assert!(matches_rebuild_filter(&p, Some("treesitter")));
+        assert!(!matches_rebuild_filter(&p, Some("telescope")));
+    }
+
+    #[test]
+    fn test_rebuild_filter_requires_caller_to_lowercase_query() {
+        // 契約: caller が lowercase してから渡す。大文字混じりは一致しない
+        // (run_sync 側で事前正規化する理由)。
+        let p = mk_plugin("nvim-treesitter/nvim-treesitter", None);
+        assert!(
+            !matches_rebuild_filter(&p, Some("TREESITTER")),
+            "case-insensitivity is the caller's responsibility"
+        );
+    }
+
+    #[test]
+    fn test_rebuild_filter_matches_explicit_name() {
+        // URL と name が独立: name 側で hit させたいケース
+        let p = mk_plugin("owner/repo", Some("my-alias"));
+        assert!(matches_rebuild_filter(&p, Some("alias")));
+    }
+
+    #[test]
+    fn test_rebuild_filter_no_false_match_without_name() {
+        // name = None のとき、url にだけマッチングが走る (name 側で空文字との
+        // 意図せぬ contains が起きないこと)
+        let p = mk_plugin("foo/bar", None);
+        assert!(!matches_rebuild_filter(&p, Some("baz")));
+    }
+}

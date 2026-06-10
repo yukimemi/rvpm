@@ -137,73 +137,6 @@ fn select_plugin_url(
     }
 }
 
-/// A plugin that sync left at a lockfile-pinned commit while its remote
-/// has advanced. Reported in the sync summary so users know `rvpm update`
-/// would actually change something.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HeldBackPin {
-    name: String,
-    pinned: String,
-    remote: String,
-}
-
-/// Decide whether a just-synced plugin is being "held back" by a lockfile
-/// pin. Returns `Some((pinned_commit, remote_tip))` when:
-///
-/// - the plugin has **no explicit `rev`** (not the user's choice),
-/// - the **lockfile contributed** an effective rev (pin came from the lockfile),
-/// - and the pinned HEAD is **behind the remote tracking tip**.
-///
-/// Returns `None` otherwise — explicit `rev`, no lockfile contribution,
-/// already at remote tip, or either commit unknown (treat unknowns as
-/// "not held back" to avoid false positives).
-///
-/// This is the pure classification step; the caller is responsible for
-/// composing the plugin display name and emitting the summary line.
-fn classify_held_back(
-    plugin_rev: Option<&str>,
-    effective_rev: Option<&str>,
-    head_commit: Option<&str>,
-    remote_head: Option<&str>,
-) -> Option<(String, String)> {
-    if plugin_rev.is_some() {
-        return None;
-    }
-    effective_rev?;
-    let head = head_commit?;
-    let remote = remote_head?;
-    if head != remote {
-        Some((head.to_string(), remote.to_string()))
-    } else {
-        None
-    }
-}
-
-/// 現在の plugin が `--rebuild [QUERY]` のスコープに入るか判定する。
-///
-/// `rebuild_filter_lc` は **呼び出し側で小文字化済み** の前提。`run_sync` は N
-/// プラグインを回すので、N 回同じ query を lowercase するコストを避けるため
-/// 事前正規化を外側に持たせている。
-///
-/// - `None` (フラグ未指定) → 常に false (build 強制しない)
-/// - `Some("")` (フラグのみ、値無し) → 常に true (全 plugin)
-/// - `Some(q)` (フラグ + query) → plugin の url / name の
-///   いずれかに q が含まれれば true。url 側で決着すれば name の lowercase
-///   allocation は走らない (短絡評価)。
-fn matches_rebuild_filter(plugin: &crate::config::Plugin, rebuild_filter_lc: Option<&str>) -> bool {
-    match rebuild_filter_lc {
-        None => false,
-        Some("") => true,
-        Some(qlc) => {
-            plugin.url.to_ascii_lowercase().contains(qlc)
-                || plugin
-                    .name
-                    .as_deref()
-                    .is_some_and(|n| n.to_ascii_lowercase().contains(qlc))
-        }
-    }
-}
-
 pub(crate) async fn update_single_plugin(
     plugin: &crate::config::Plugin,
     cache_root: &Path,
@@ -247,116 +180,6 @@ pub(crate) async fn update_single_plugin(
 }
 
 use toml_edit::{DocumentMut, value};
-
-/// `rvpm add` の scan 後に決まる、config.toml に書き込むべき trigger 候補。
-struct AddTriggerSuggestion {
-    /// on_cmd に入れる文字列 (exact 名 + `/regex/` の mixed list、ソート済)。
-    on_cmd: Vec<String>,
-    /// on_map に入れる候補 (lhs の enumerate のみ、regex 提案なし: 記号混じりで LCP 無意味)。
-    on_map: Vec<crate::config::MapSpec>,
-}
-
-impl AddTriggerSuggestion {
-    fn is_empty(&self) -> bool {
-        self.on_cmd.is_empty() && self.on_map.is_empty()
-    }
-}
-
-/// 非 TTY script でも `rvpm add --auto-lazy` が安定動作するよう、TTY 判定は
-/// `stdin` / `stdout` の両方を見る。どちらかでも非 TTY なら prompt を出さない。
-fn is_interactive_tty() -> bool {
-    use std::io::IsTerminal;
-    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
-}
-
-/// scan 結果から suggestion を組み立てる。0 件なら `None` — 提案する中身が無い。
-fn build_add_suggestion(scan: &crate::plugin_scan::ScanResult) -> Option<AddTriggerSuggestion> {
-    let on_cmd = crate::plugin_scan::suggest_cmd_triggers_smart(&scan.commands, 3);
-    // on_map は regex 化せず enumerate のみ (lhs に記号混じりで LCP 無意味)。
-    let on_map: Vec<crate::config::MapSpec> = scan
-        .user_maps
-        .iter()
-        .map(|m| crate::config::MapSpec {
-            lhs: m.lhs.clone(),
-            mode: m.modes.clone(),
-            desc: None,
-        })
-        .collect();
-    let s = AddTriggerSuggestion { on_cmd, on_map };
-    if s.is_empty() { None } else { Some(s) }
-}
-
-/// 対話プロンプトで user に選ばせて、適用する trigger を返す。
-///   - `Some(suggestion)` → 適用
-///   - `None`             → eager のまま
-fn prompt_lazy_decision(
-    display_name: &str,
-    suggestion: &AddTriggerSuggestion,
-) -> Option<AddTriggerSuggestion> {
-    use dialoguer::{Select, theme::ColorfulTheme};
-
-    println!();
-    println!("[{}] detected lazy triggers:", display_name);
-    if !suggestion.on_cmd.is_empty() {
-        println!("  on_cmd = {}", toml_array_preview(&suggestion.on_cmd));
-    }
-    if !suggestion.on_map.is_empty() {
-        let lhs: Vec<String> = suggestion.on_map.iter().map(|m| m.lhs.clone()).collect();
-        println!("  on_map = {}", toml_array_preview(&lhs));
-    }
-
-    let choices = ["accept (lazy-load)", "skip (eager install)"];
-    let sel = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("How should rvpm install this plugin?")
-        .items(choices.as_slice())
-        .default(0)
-        .interact()
-        .ok()?;
-
-    match sel {
-        0 => Some(AddTriggerSuggestion {
-            on_cmd: suggestion.on_cmd.clone(),
-            on_map: suggestion.on_map.clone(),
-        }),
-        _ => None,
-    }
-}
-
-fn toml_array_preview(items: &[String]) -> String {
-    let quoted: Vec<String> = items.iter().map(|s| format!("\"{}\"", s)).collect();
-    format!("[{}]", quoted.join(", "))
-}
-
-/// `rvpm add` 時の effective policy を決定:
-///   - CLI `--lazy` / `--no-lazy` (policy_override) が最優先
-///   - なければ `config.options.auto_lazy`
-fn resolve_add_lazy_policy(
-    policy_override: Option<crate::config::AutoLazyPolicy>,
-    config: &crate::config::Config,
-) -> crate::config::AutoLazyPolicy {
-    policy_override.unwrap_or(config.options.auto_lazy)
-}
-
-/// scan 結果 + policy に基づいて suggestion を適用するか決める。
-/// Never → None、Always → そのまま採用、Ask → TTY なら prompt / 非 TTY なら skip。
-fn decide_add_lazy_apply(
-    suggestion: AddTriggerSuggestion,
-    policy: crate::config::AutoLazyPolicy,
-    display_name: &str,
-) -> Option<AddTriggerSuggestion> {
-    use crate::config::AutoLazyPolicy;
-    match policy {
-        AutoLazyPolicy::Never => None,
-        AutoLazyPolicy::Always => Some(suggestion),
-        AutoLazyPolicy::Ask => {
-            if is_interactive_tty() {
-                prompt_lazy_decision(display_name, &suggestion)
-            } else {
-                None
-            }
-        }
-    }
-}
 
 /// `replace_plugin_entry_with_ai_toml` の挙動切替。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,66 +287,6 @@ fn replace_plugin_entry_with_ai_toml(
     Err(anyhow!(
         "could not find stub [[plugins]] entry with url=`{stored_url}` in config.toml"
     ))
-}
-
-/// 既存 config.toml 内の `[[plugins]]` のうち url が一致するエントリに
-/// `on_cmd` / `on_map` を書き込む。toml_edit で in-place patch。
-fn patch_plugin_entry_triggers(
-    doc: &mut DocumentMut,
-    stored_url: &str,
-    applied: &AddTriggerSuggestion,
-) {
-    let Some(plugins) = doc
-        .get_mut("plugins")
-        .and_then(|p| p.as_array_of_tables_mut())
-    else {
-        return;
-    };
-    for t in plugins.iter_mut() {
-        let url = t.get("url").and_then(|v| v.as_str()).unwrap_or_default();
-        if url != stored_url {
-            continue;
-        }
-        // 既存 on_cmd / on_map がある場合は user が CLI フラグ (`--on-cmd …`) で
-        // 明示指定した or 過去の add / 手編集で既に書いていたもの。scan 結果で
-        // 上書きすると user 設定を破壊するので skip (PR #91 review 指摘)。
-        if !applied.on_cmd.is_empty() && t.get("on_cmd").is_none() {
-            let mut arr = toml_edit::Array::new();
-            for s in &applied.on_cmd {
-                arr.push(s.as_str());
-            }
-            t["on_cmd"] = value(arr);
-        }
-        if !applied.on_map.is_empty() && t.get("on_map").is_none() {
-            // 全 entry が default mode (n) なら string 配列、それ以外なら table 配列。
-            // MapSpec::mode の default は ["n"]。modes が `["n"]` ジャストなら string で十分。
-            let all_default = applied
-                .on_map
-                .iter()
-                .all(|m| m.mode == vec!["n".to_string()]);
-            if all_default {
-                let mut arr = toml_edit::Array::new();
-                for m in &applied.on_map {
-                    arr.push(m.lhs.as_str());
-                }
-                t["on_map"] = value(arr);
-            } else {
-                let mut arr = toml_edit::Array::new();
-                for m in &applied.on_map {
-                    let mut tb = toml_edit::InlineTable::new();
-                    tb.insert("lhs", m.lhs.as_str().into());
-                    let mut modes_arr = toml_edit::Array::new();
-                    for md in &m.mode {
-                        modes_arr.push(md.as_str());
-                    }
-                    tb.insert("mode", toml_edit::Value::from(modes_arr));
-                    arr.push(toml_edit::Value::InlineTable(tb));
-                }
-                t["on_map"] = value(arr);
-            }
-        }
-        break;
-    }
 }
 
 use dialoguer::FuzzySelect;
@@ -697,37 +460,6 @@ fn find_unused_repos(
     Ok(unused)
 }
 
-fn remove_plugin_from_toml(doc: &mut DocumentMut, url: &str) -> Result<()> {
-    let plugins = doc["plugins"]
-        .as_array_of_tables_mut()
-        .context("plugins is not an array of tables")?;
-    let idx = plugins
-        .iter()
-        .position(|p| p.get("url").and_then(|v| v.as_str()) == Some(url))
-        .context("Plugin not found in config")?;
-    plugins.remove(idx);
-    Ok(())
-}
-
-/// 既存 config.toml の DocumentMut から、指定 url の `[[plugins]]` entry を
-/// **TOML テキストとして** 抜き出す (AI tune の prompt に貼るため)。
-///
-/// 単純に `existing.to_string()` だと `[[plugins]]` ヘッダが付かないので、
-/// `[[plugins]]\n` を頭に明示的に貼って、その後に table の各 key/value を
-/// 通常レンダリングで連結する。toml_edit が table 内の元 formatting (空白 /
-/// 改行 / コメント) をできる限り保つので、user が手で書いた config の見た目を
-/// AI に正しく見せられる。
-fn extract_plugin_entry_toml(doc: &DocumentMut, url: &str) -> Option<String> {
-    let plugins = doc.get("plugins").and_then(|p| p.as_array_of_tables())?;
-    let entry = plugins
-        .iter()
-        .find(|t| t.get("url").and_then(|v| v.as_str()) == Some(url))?;
-    // `[[plugins]]` header を含めて build。
-    let mut out = String::from("[[plugins]]\n");
-    out.push_str(&entry.to_string());
-    Some(out)
-}
-
 /// 指定プラグインの任意のリスト型フィールド (on_cmd / on_ft / on_map / on_event / on_path / on_source 等) を設定する。
 /// 要素が1つの場合は文字列として、2つ以上の場合は配列として書き込む (TOML の string | string[] を活用)。
 fn set_plugin_list_field(
@@ -893,54 +625,6 @@ fn set_plugin_map_field(
     Ok(())
 }
 
-fn update_plugin_config(
-    doc: &mut DocumentMut,
-    url: &str,
-    lazy: Option<bool>,
-    merge: Option<bool>,
-    on_cmd: Option<Vec<String>>,
-    on_ft: Option<Vec<String>>,
-    rev: Option<String>,
-) -> Result<()> {
-    if let Some(l) = lazy {
-        let plugins = doc["plugins"]
-            .as_array_of_tables_mut()
-            .context("plugins is not an array of tables")?;
-        let plugin_table = plugins
-            .iter_mut()
-            .find(|p| p.get("url").and_then(|v| v.as_str()) == Some(url))
-            .context("Could not find plugin in toml_edit document")?;
-        plugin_table["lazy"] = value(l);
-    }
-    if let Some(m) = merge {
-        let plugins = doc["plugins"]
-            .as_array_of_tables_mut()
-            .context("plugins is not an array of tables")?;
-        let plugin_table = plugins
-            .iter_mut()
-            .find(|p| p.get("url").and_then(|v| v.as_str()) == Some(url))
-            .context("Could not find plugin in toml_edit document")?;
-        plugin_table["merge"] = value(m);
-    }
-    if let Some(cmds) = on_cmd {
-        set_plugin_list_field(doc, url, "on_cmd", cmds)?;
-    }
-    if let Some(fts) = on_ft {
-        set_plugin_list_field(doc, url, "on_ft", fts)?;
-    }
-    if let Some(r) = rev {
-        let plugins = doc["plugins"]
-            .as_array_of_tables_mut()
-            .context("plugins is not an array of tables")?;
-        let plugin_table = plugins
-            .iter_mut()
-            .find(|p| p.get("url").and_then(|v| v.as_str()) == Some(url))
-            .context("Could not find plugin in toml_edit document")?;
-        plugin_table["rev"] = value(r);
-    }
-    Ok(())
-}
-
 /// `<config_root>/before.lua` / `after.lua` を検出して LoaderOptions を構築する。
 fn build_loader_options(config_root: &Path) -> crate::loader::LoaderOptions {
     crate::loader::LoaderOptions {
@@ -992,20 +676,6 @@ fn nvim_init_lua_path() -> PathBuf {
     nvim_init_lua_path_for_appname(appname.as_deref())
 }
 
-/// loader.lua を参照する `dofile(...)` 行を config から生成する。
-/// 優先順位: `options.cache_root`/plugins/loader.lua > `~/.cache/rvpm/<appname>/plugins/loader.lua`
-/// tilde 形式を保持することで dotfiles のマシン間共有を妨げない。
-fn loader_init_snippet(config: &config::Config) -> String {
-    let raw_path = if let Some(base) = &config.options.cache_root {
-        format!("{}/plugins/loader.lua", base.trim_end_matches(['/', '\\']))
-    } else {
-        format!("~/.cache/rvpm/{}/plugins/loader.lua", appname())
-    };
-    // Windows のバックスラッシュを Lua 文字列リテラルで安全な '/' に正規化。
-    let raw_path = raw_path.replace('\\', "/");
-    format!("dofile(vim.fn.expand(\"{}\"))", raw_path)
-}
-
 /// init.lua が rvpm の loader を参照しているかを緩く検出する。
 /// 同じ行内に `rvpm` と `loader.lua` が両方出ていれば真。
 pub(crate) fn init_lua_references_rvpm_loader(init_lua_path: &Path) -> bool {
@@ -1015,44 +685,6 @@ pub(crate) fn init_lua_references_rvpm_loader(init_lua_path: &Path) -> bool {
     content
         .lines()
         .any(|line| line.contains("rvpm") && line.contains("loader.lua"))
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum WriteInitResult {
-    /// init.lua が存在しなかったので新規作成した
-    Created,
-    /// 既存 init.lua に末尾追記した
-    Appended,
-    /// 既に loader を参照していて変更不要だった
-    AlreadyConfigured,
-}
-
-/// init.lua に loader snippet を書き込む (冪等)。
-fn write_init_lua_snippet(init_lua_path: &Path, snippet: &str) -> Result<WriteInitResult> {
-    if init_lua_path.exists() {
-        if init_lua_references_rvpm_loader(init_lua_path) {
-            return Ok(WriteInitResult::AlreadyConfigured);
-        }
-        let mut content = std::fs::read_to_string(init_lua_path)?;
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push_str("\n-- rvpm loader (auto-added by `rvpm init --write`)\n");
-        content.push_str(snippet);
-        content.push('\n');
-        std::fs::write(init_lua_path, content)?;
-        Ok(WriteInitResult::Appended)
-    } else {
-        if let Some(parent) = init_lua_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let content = format!(
-            "-- Neovim config (auto-created by `rvpm init --write`)\n\n-- rvpm loader\n{}\n",
-            snippet
-        );
-        std::fs::write(init_lua_path, content)?;
-        Ok(WriteInitResult::Created)
-    }
 }
 
 /// `rvpm sync` / `rvpm generate` / `rvpm add` 等の末尾で呼ぶ hint 表示。
@@ -1069,7 +701,7 @@ fn print_init_lua_hint_if_missing(config: &config::Config) {
         return;
     }
     if !init_lua_references_rvpm_loader(&init_lua_path) {
-        let snippet = loader_init_snippet(config);
+        let snippet = crate::commands::loader_init_snippet(config);
         println!();
         println!(
             "\u{26a0} {} doesn't reference rvpm loader yet.",
@@ -1079,28 +711,6 @@ fn print_init_lua_hint_if_missing(config: &config::Config) {
         println!("    {}", snippet);
         println!("  Or run `rvpm init --write` to do it automatically.");
     }
-}
-
-/// config.toml 上で指定プラグイン (url 一致) の `url = "..."` 行の行番号 (1-indexed) を返す。
-/// 見つからなければ 1 を返す (ファイル先頭)。
-/// whitespace の入り方に寛容: `url="..."`, `url = "..."`, `url  =   "..."` など全部拾う。
-fn find_plugin_line_in_toml(toml_content: &str, url: &str) -> usize {
-    let needle = format!("\"{}\"", url);
-    for (i, line) in toml_content.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with("url") {
-            continue;
-        }
-        // "url" の後は空白 or "=" しか来ないはず (他のフィールド名は "url..." で始まらない)
-        let rest = trimmed["url".len()..].trim_start();
-        if !rest.starts_with('=') {
-            continue;
-        }
-        if line.contains(&needle) {
-            return i + 1;
-        }
-    }
-    1
 }
 
 /// `$EDITOR` が `+<line>` 形式の行ジャンプをサポートするか簡易判定。
@@ -1215,73 +825,6 @@ mod tests {
     use crate::url::*;
     use tempfile::tempdir;
     use toml_edit::DocumentMut;
-
-    // ── ensure_absent: 残骸混入を防ぐ事前 cleanup ────────────────────
-
-    #[test]
-    fn patch_plugin_entry_triggers_does_not_overwrite_existing_on_cmd() {
-        // user が `--on-cmd MyCmd` で明示指定した / 手編集で既に書いた entry は
-        // scan 結果で上書きしてはいけない (PR #91 review 指摘)。
-        let initial = r#"[[plugins]]
-url = "owner/repo"
-on_cmd = ["MyCmd"]
-"#;
-        let mut doc = initial.parse::<DocumentMut>().unwrap();
-        let applied = AddTriggerSuggestion {
-            on_cmd: vec!["ScannedFoo".into(), "ScannedBar".into()],
-            on_map: vec![],
-        };
-        patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
-        let out = doc.to_string();
-        assert!(
-            out.contains(r#"on_cmd = ["MyCmd"]"#),
-            "existing on_cmd must be preserved, got:\n{out}"
-        );
-        assert!(
-            !out.contains("ScannedFoo"),
-            "scan result must not be written"
-        );
-    }
-
-    #[test]
-    fn patch_plugin_entry_triggers_does_not_overwrite_existing_on_map() {
-        let initial = r#"[[plugins]]
-url = "owner/repo"
-on_map = [{lhs = "<leader>x", mode = ["n", "x"], desc = "custom"}]
-"#;
-        let mut doc = initial.parse::<DocumentMut>().unwrap();
-        let applied = AddTriggerSuggestion {
-            on_cmd: vec![],
-            on_map: vec![MapSpec {
-                lhs: "gc".into(),
-                mode: vec!["n".into()],
-                desc: None,
-            }],
-        };
-        patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
-        let out = doc.to_string();
-        assert!(
-            out.contains("<leader>x"),
-            "existing on_map must be preserved:\n{out}"
-        );
-        assert!(!out.contains("gc"), "scan result must not be written");
-    }
-
-    #[test]
-    fn patch_plugin_entry_triggers_writes_when_field_absent() {
-        // 既存 entry に on_cmd が無ければ scan 結果を書く (通常パス)。
-        let initial = r#"[[plugins]]
-url = "owner/repo"
-"#;
-        let mut doc = initial.parse::<DocumentMut>().unwrap();
-        let applied = AddTriggerSuggestion {
-            on_cmd: vec!["ScannedFoo".into()],
-            on_map: vec![],
-        };
-        patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
-        let out = doc.to_string();
-        assert!(out.contains("ScannedFoo"));
-    }
 
     // ─── replace_plugin_entry_with_ai_toml (#95) ─────────────────────────
 
@@ -1480,54 +1023,6 @@ on_event = ["BufRead"]
         assert!(out.contains(r#"on_event = ["BufRead"]"#));
     }
 
-    // ─── extract_plugin_entry_toml (rvpm tune) ──────────────────────────
-
-    #[test]
-    fn extract_plugin_entry_toml_returns_full_block_with_header() {
-        let toml = r#"[options]
-ai = "claude"
-
-[[plugins]]
-url = "owner/first"
-on_cmd = ["First"]
-
-[[plugins]]
-url = "owner/target"
-on_cmd = ["Target"]
-on_ft = "rust"
-
-[[plugins]]
-url = "owner/last"
-"#;
-        let doc = toml.parse::<DocumentMut>().unwrap();
-        let entry = extract_plugin_entry_toml(&doc, "owner/target").unwrap();
-        // header が付く
-        assert!(entry.starts_with("[[plugins]]"));
-        // 中身を含む
-        assert!(entry.contains(r#"url = "owner/target""#));
-        assert!(entry.contains(r#"on_cmd = ["Target"]"#));
-        assert!(entry.contains(r#"on_ft = "rust""#));
-        // 他 entry は含まれない
-        assert!(!entry.contains("owner/first"));
-        assert!(!entry.contains("owner/last"));
-    }
-
-    #[test]
-    fn extract_plugin_entry_toml_returns_none_for_missing_url() {
-        let toml = r#"[[plugins]]
-url = "only/one"
-"#;
-        let doc = toml.parse::<DocumentMut>().unwrap();
-        assert!(extract_plugin_entry_toml(&doc, "missing/repo").is_none());
-    }
-
-    #[test]
-    fn extract_plugin_entry_toml_returns_none_when_plugins_missing() {
-        let toml = "[options]\nai = \"claude\"\n";
-        let doc = toml.parse::<DocumentMut>().unwrap();
-        assert!(extract_plugin_entry_toml(&doc, "any/url").is_none());
-    }
-
     // ─── select_plugin_url (rvpm tune / set / remove 共通) ───────────────
 
     #[test]
@@ -1633,66 +1128,6 @@ url = "only/one"
         assert!(!msg.contains("snacks"));
     }
 
-    // ─── classify_held_back ──────────────────────────────────────────────
-    // Pure classification of "this plugin is being held back by a lockfile
-    // pin". The integration path is covered by the git::remote_head test
-    // on the git.rs side; these tests nail down the decision table only.
-
-    #[test]
-    fn test_classify_held_back_reports_pin_behind_remote() {
-        // No rev set, lockfile contributed a commit, and HEAD (= pin)
-        // lags behind remote → this is the case users hit.
-        let got = classify_held_back(
-            None,
-            Some("lockcommit"),
-            Some("lockcommit"),
-            Some("newcommit"),
-        );
-        assert_eq!(
-            got,
-            Some(("lockcommit".to_string(), "newcommit".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_classify_held_back_silent_when_explicit_rev_set() {
-        // If the user pinned via `rev`, the lag is intentional — not our
-        // call to flag.
-        let got = classify_held_back(Some("v1.0.0"), Some("v1.0.0"), Some("abc"), Some("def"));
-        assert_eq!(got, None);
-    }
-
-    #[test]
-    fn test_classify_held_back_silent_without_lockfile_contribution() {
-        // No lockfile entry → sync already reset to remote; there's no pin
-        // holding us back.
-        let got = classify_held_back(None, None, Some("abc"), Some("abc"));
-        assert_eq!(got, None);
-    }
-
-    #[test]
-    fn test_classify_held_back_silent_when_pin_matches_remote() {
-        // Lockfile pin and remote happen to line up — everyone's up to
-        // date, no reason to nag.
-        let got = classify_held_back(None, Some("abc"), Some("abc"), Some("abc"));
-        assert_eq!(got, None);
-    }
-
-    #[test]
-    fn test_classify_held_back_silent_when_remote_head_unknown() {
-        // Can't prove the pin is behind if we can't resolve the remote tip.
-        // Prefer silence over a false positive (resilience).
-        let got = classify_held_back(None, Some("abc"), Some("abc"), None);
-        assert_eq!(got, None);
-    }
-
-    #[test]
-    fn test_classify_held_back_silent_when_head_unknown() {
-        // Same resilience argument in the other direction.
-        let got = classify_held_back(None, Some("abc"), None, Some("def"));
-        assert_eq!(got, None);
-    }
-
     #[test]
     fn test_resolve_plugin_dst_expands_tilde_in_custom_dst() {
         // `dst = "~/src/foo"` のような tilde 付きパスは home dir に展開される。
@@ -1722,66 +1157,6 @@ url = "only/one"
         let got = resolve_plugin_dst(&plugin, &cache_root);
         // repos_dir は `{cache_root}/plugins/repos`
         assert!(got.starts_with(cache_root.join("plugins/repos")));
-    }
-
-    // ─── matches_rebuild_filter ─────────────────────────────────────────
-    // `--rebuild [QUERY]` のスコープ判定を 3 分岐で押さえる:
-    //   None        → 常に false (フラグ未指定、従来デフォルト)
-    //   Some("")    → 常に true (フラグだけ、従来の `--rebuild` 挙動)
-    //   Some("q")   → url / name に q を含めば true
-
-    fn mk_plugin(url: &str, name: Option<&str>) -> Plugin {
-        Plugin {
-            url: url.to_string(),
-            name: name.map(|s| s.to_string()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn test_rebuild_filter_none_never_matches() {
-        let p = mk_plugin("nvim-treesitter/nvim-treesitter", None);
-        assert!(!matches_rebuild_filter(&p, None));
-    }
-
-    #[test]
-    fn test_rebuild_filter_empty_always_matches() {
-        let p = mk_plugin("folke/snacks.nvim", None);
-        assert!(matches_rebuild_filter(&p, Some("")));
-    }
-
-    #[test]
-    fn test_rebuild_filter_substring_matches_url() {
-        // 呼び出し側で lowercase 済みの query を渡す契約。
-        let p = mk_plugin("nvim-treesitter/nvim-treesitter", None);
-        assert!(matches_rebuild_filter(&p, Some("treesitter")));
-        assert!(!matches_rebuild_filter(&p, Some("telescope")));
-    }
-
-    #[test]
-    fn test_rebuild_filter_requires_caller_to_lowercase_query() {
-        // 契約: caller が lowercase してから渡す。大文字混じりは一致しない
-        // (run_sync 側で事前正規化する理由)。
-        let p = mk_plugin("nvim-treesitter/nvim-treesitter", None);
-        assert!(
-            !matches_rebuild_filter(&p, Some("TREESITTER")),
-            "case-insensitivity is the caller's responsibility"
-        );
-    }
-
-    #[test]
-    fn test_rebuild_filter_matches_explicit_name() {
-        // URL と name が独立: name 側で hit させたいケース
-        let p = mk_plugin("owner/repo", Some("my-alias"));
-        assert!(matches_rebuild_filter(&p, Some("alias")));
-    }
-
-    #[test]
-    fn test_rebuild_filter_no_false_match_without_name() {
-        // name = None のとき、url にだけマッチングが走る (name 側で空文字との
-        // 意図せぬ contains が起きないこと)
-        let p = mk_plugin("foo/bar", None);
-        assert!(!matches_rebuild_filter(&p, Some("baz")));
     }
 
     #[test]
@@ -1885,72 +1260,6 @@ url = "owner/repo"
     }
 
     #[test]
-    fn test_loader_init_snippet_uses_default_when_no_options() {
-        let cfg = config::Config {
-            vars: None,
-            options: config::Options::default(),
-            plugins: vec![],
-        };
-        let snippet = loader_init_snippet(&cfg);
-        // appname は env 依存なので partial match
-        assert!(snippet.starts_with("dofile(vim.fn.expand(\"~/.cache/rvpm/"));
-        assert!(snippet.ends_with("/plugins/loader.lua\"))"));
-    }
-
-    #[test]
-    fn test_loader_init_snippet_uses_cache_root_when_set() {
-        let cfg = config::Config {
-            vars: None,
-            options: config::Options {
-                cache_root: Some("~/dotfiles/rvpm".to_string()),
-                ..Default::default()
-            },
-            plugins: vec![],
-        };
-        assert_eq!(
-            loader_init_snippet(&cfg),
-            "dofile(vim.fn.expand(\"~/dotfiles/rvpm/plugins/loader.lua\"))"
-        );
-    }
-
-    #[test]
-    fn test_loader_init_snippet_normalizes_windows_path_separators() {
-        let cfg = config::Config {
-            vars: None,
-            options: config::Options {
-                cache_root: Some(r"C:\Users\test\.cache\rvpm\nvim".to_string()),
-                ..Default::default()
-            },
-            plugins: vec![],
-        };
-        let snippet = loader_init_snippet(&cfg);
-        assert!(
-            !snippet.contains('\\'),
-            "snippet contains backslash: {snippet}"
-        );
-        assert_eq!(
-            snippet,
-            "dofile(vim.fn.expand(\"C:/Users/test/.cache/rvpm/nvim/plugins/loader.lua\"))"
-        );
-    }
-
-    #[test]
-    fn test_loader_init_snippet_trims_trailing_backslash() {
-        let cfg = config::Config {
-            vars: None,
-            options: config::Options {
-                cache_root: Some(r"C:\cache\rvpm\".to_string()),
-                ..Default::default()
-            },
-            plugins: vec![],
-        };
-        assert_eq!(
-            loader_init_snippet(&cfg),
-            "dofile(vim.fn.expand(\"C:/cache/rvpm/plugins/loader.lua\"))"
-        );
-    }
-
-    #[test]
     fn test_init_lua_references_rvpm_loader_detects_line() {
         let root = tempdir().unwrap();
         let path = root.path().join("init.lua");
@@ -1984,52 +1293,6 @@ url = "owner/repo"
         // "loader.lua" だけでは rvpm の loader 参照と判定しない
         std::fs::write(&path, "dofile(\"~/other/loader.lua\")\n").unwrap();
         assert!(!init_lua_references_rvpm_loader(&path));
-    }
-
-    #[test]
-    fn test_write_init_lua_snippet_creates_when_missing() {
-        let root = tempdir().unwrap();
-        let init_path = root.path().join("nvim").join("init.lua");
-        let snippet = "dofile(vim.fn.expand(\"~/.cache/rvpm/loader.lua\"))";
-        let result = write_init_lua_snippet(&init_path, snippet).unwrap();
-        assert!(matches!(result, WriteInitResult::Created));
-        assert!(init_path.exists());
-        let content = std::fs::read_to_string(&init_path).unwrap();
-        assert!(content.contains(snippet));
-        assert!(content.contains("rvpm"));
-    }
-
-    #[test]
-    fn test_write_init_lua_snippet_appends_when_exists_without_loader() {
-        let root = tempdir().unwrap();
-        let init_path = root.path().join("init.lua");
-        std::fs::write(&init_path, "-- existing\nvim.g.mapleader = ' '\n").unwrap();
-        let snippet = "dofile(vim.fn.expand(\"~/.cache/rvpm/loader.lua\"))";
-        let result = write_init_lua_snippet(&init_path, snippet).unwrap();
-        assert!(matches!(result, WriteInitResult::Appended));
-        let content = std::fs::read_to_string(&init_path).unwrap();
-        assert!(content.contains("mapleader"));
-        assert!(content.contains(snippet));
-    }
-
-    #[test]
-    fn test_write_init_lua_snippet_noop_when_already_configured() {
-        let root = tempdir().unwrap();
-        let init_path = root.path().join("init.lua");
-        std::fs::write(
-            &init_path,
-            "dofile(vim.fn.expand(\"~/.cache/rvpm/loader.lua\"))\n",
-        )
-        .unwrap();
-        let result = write_init_lua_snippet(
-            &init_path,
-            "dofile(vim.fn.expand(\"~/.cache/rvpm/loader.lua\"))",
-        )
-        .unwrap();
-        assert!(matches!(result, WriteInitResult::AlreadyConfigured));
-        let content = std::fs::read_to_string(&init_path).unwrap();
-        // 行数が増えていないこと
-        assert_eq!(content.lines().count(), 1);
     }
 
     #[test]
@@ -2120,44 +1383,6 @@ url = "owner/repo"
     }
 
     #[test]
-    fn test_remove_from_toml() {
-        let toml = "[[plugins]]\nurl = \"owner/a\"\n\n[[plugins]]\nurl = \"owner/b\"\n";
-        let mut doc = toml.parse::<DocumentMut>().unwrap();
-        remove_plugin_from_toml(&mut doc, "owner/a").unwrap();
-        let result = doc.to_string();
-        assert!(!result.contains("owner/a"));
-        assert!(result.contains("owner/b"));
-    }
-
-    #[test]
-    fn test_find_plugin_line_in_toml_basic() {
-        let toml = "[options]\n\n[[plugins]]\nurl = \"owner/a\"\nlazy = true\n\n[[plugins]]\nurl = \"owner/b\"\n";
-        //            1         2  3             4             5           6  7             8
-        assert_eq!(find_plugin_line_in_toml(toml, "owner/a"), 4);
-        assert_eq!(find_plugin_line_in_toml(toml, "owner/b"), 8);
-    }
-
-    #[test]
-    fn test_find_plugin_line_in_toml_handles_whitespace_variants() {
-        let toml = "[[plugins]]\nurl=\"owner/a\"\n\n[[plugins]]\nurl  =   \"owner/b\"\n";
-        assert_eq!(find_plugin_line_in_toml(toml, "owner/a"), 2);
-        assert_eq!(find_plugin_line_in_toml(toml, "owner/b"), 5);
-    }
-
-    #[test]
-    fn test_find_plugin_line_in_toml_missing_falls_back_to_one() {
-        let toml = "[[plugins]]\nurl = \"owner/a\"\n";
-        assert_eq!(find_plugin_line_in_toml(toml, "owner/nonexistent"), 1);
-    }
-
-    #[test]
-    fn test_find_plugin_line_in_toml_ignores_substring_matches() {
-        // "owner/ab" should not be matched when searching for "owner/a"
-        let toml = "[[plugins]]\nurl = \"owner/ab\"\n\n[[plugins]]\nurl = \"owner/a\"\n";
-        assert_eq!(find_plugin_line_in_toml(toml, "owner/a"), 5);
-    }
-
-    #[test]
     fn test_editor_supports_line_jump() {
         assert!(editor_supports_line_jump("nvim"));
         assert!(editor_supports_line_jump("vim"));
@@ -2170,13 +1395,6 @@ url = "owner/repo"
         ));
         assert!(!editor_supports_line_jump("code"));
         assert!(!editor_supports_line_jump("hx"));
-    }
-
-    #[test]
-    fn test_remove_from_toml_not_found_returns_error() {
-        let toml = "[[plugins]]\nurl = \"owner/a\"\n";
-        let mut doc = toml.parse::<DocumentMut>().unwrap();
-        assert!(remove_plugin_from_toml(&mut doc, "owner/nonexistent").is_err());
     }
 
     #[test]
@@ -2462,28 +1680,6 @@ url = "owner/repo"
         );
         assert!(result.contains("\"BufRead\""));
         assert!(result.contains("\"BufNewFile\""));
-    }
-
-    #[test]
-    fn test_update_plugin_config() {
-        let toml = r#"[[plugins]]
-url = "test/plugin"
-lazy = false"#;
-        let mut doc = toml.parse::<DocumentMut>().unwrap();
-        update_plugin_config(
-            &mut doc,
-            "test/plugin",
-            Some(true),
-            Some(true),
-            None,
-            None,
-            Some("v1.0".to_string()),
-        )
-        .unwrap();
-        let result = doc.to_string();
-        assert!(result.contains("lazy = true"));
-        assert!(result.contains("merge = true"));
-        assert!(result.contains("rev = \"v1.0\""));
     }
 
     // -----------------------------------------------------------------

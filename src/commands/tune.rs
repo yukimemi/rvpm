@@ -141,3 +141,76 @@ pub(crate) async fn run_tune(
     run_generate(false).await?;
     Ok(())
 }
+
+/// 既存 config.toml の DocumentMut から、指定 url の `[[plugins]]` entry を
+/// **TOML テキストとして** 抜き出す (AI tune の prompt に貼るため)。
+///
+/// 単純に `existing.to_string()` だと `[[plugins]]` ヘッダが付かないので、
+/// `[[plugins]]\n` を頭に明示的に貼って、その後に table の各 key/value を
+/// 通常レンダリングで連結する。toml_edit が table 内の元 formatting (空白 /
+/// 改行 / コメント) をできる限り保つので、user が手で書いた config の見た目を
+/// AI に正しく見せられる。
+fn extract_plugin_entry_toml(doc: &DocumentMut, url: &str) -> Option<String> {
+    let plugins = doc.get("plugins").and_then(|p| p.as_array_of_tables())?;
+    let entry = plugins
+        .iter()
+        .find(|t| t.get("url").and_then(|v| v.as_str()) == Some(url))?;
+    // `[[plugins]]` header を含めて build。
+    let mut out = String::from("[[plugins]]\n");
+    out.push_str(&entry.to_string());
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use toml_edit::DocumentMut;
+
+    // ─── extract_plugin_entry_toml (rvpm tune) ──────────────────────────
+
+    #[test]
+    fn extract_plugin_entry_toml_returns_full_block_with_header() {
+        let toml = r#"[options]
+ai = "claude"
+
+[[plugins]]
+url = "owner/first"
+on_cmd = ["First"]
+
+[[plugins]]
+url = "owner/target"
+on_cmd = ["Target"]
+on_ft = "rust"
+
+[[plugins]]
+url = "owner/last"
+"#;
+        let doc = toml.parse::<DocumentMut>().unwrap();
+        let entry = extract_plugin_entry_toml(&doc, "owner/target").unwrap();
+        // header が付く
+        assert!(entry.starts_with("[[plugins]]"));
+        // 中身を含む
+        assert!(entry.contains(r#"url = "owner/target""#));
+        assert!(entry.contains(r#"on_cmd = ["Target"]"#));
+        assert!(entry.contains(r#"on_ft = "rust""#));
+        // 他 entry は含まれない
+        assert!(!entry.contains("owner/first"));
+        assert!(!entry.contains("owner/last"));
+    }
+
+    #[test]
+    fn extract_plugin_entry_toml_returns_none_for_missing_url() {
+        let toml = r#"[[plugins]]
+url = "only/one"
+"#;
+        let doc = toml.parse::<DocumentMut>().unwrap();
+        assert!(extract_plugin_entry_toml(&doc, "missing/repo").is_none());
+    }
+
+    #[test]
+    fn extract_plugin_entry_toml_returns_none_when_plugins_missing() {
+        let toml = "[options]\nai = \"claude\"\n";
+        let doc = toml.parse::<DocumentMut>().unwrap();
+        assert!(extract_plugin_entry_toml(&doc, "any/url").is_none());
+    }
+}
