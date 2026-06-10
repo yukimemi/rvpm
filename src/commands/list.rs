@@ -390,3 +390,47 @@ pub(crate) async fn run_list(no_tui: bool) -> Result<bool> {
     terminal.show_cursor()?;
     Ok(goto_browse)
 }
+
+/// 全プラグインの git 状態を並列で調べ、url -> PluginStatus のマップを返す。
+/// 全プラグインのステータスチェックを並列で spawn し、受信用 channel と
+/// JoinSet を返す。呼び出し側は progressive に受信して描画するか、一括で
+/// await して完了を待つか選べる。
+fn spawn_status_check(
+    config: &crate::config::Config,
+    cache_root: &Path,
+) -> (mpsc::Receiver<(String, PluginStatus)>, JoinSet<()>) {
+    let (tx, rx) = mpsc::channel::<(String, PluginStatus)>(100);
+    let mut set = JoinSet::new();
+    for plugin in config.plugins.iter() {
+        let plugin = plugin.clone();
+        let cache_root = cache_root.to_path_buf();
+        let tx = tx.clone();
+        set.spawn(async move {
+            let dst_path = resolve_plugin_dst(&plugin, &cache_root);
+            let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
+            let git_status = repo.get_status().await;
+            let plugin_status = match git_status {
+                crate::git::RepoStatus::Clean => PluginStatus::Finished,
+                crate::git::RepoStatus::NotInstalled => PluginStatus::Failed("Missing".to_string()),
+                crate::git::RepoStatus::Modified => PluginStatus::Syncing("Modified".to_string()),
+                crate::git::RepoStatus::Error(e) => PluginStatus::Failed(e),
+            };
+            let _ = tx.send((plugin.url.clone(), plugin_status)).await;
+        });
+    }
+    drop(tx);
+    (rx, set)
+}
+
+async fn fetch_plugin_statuses(
+    config: &crate::config::Config,
+    cache_root: &Path,
+) -> std::collections::HashMap<String, PluginStatus> {
+    let (mut rx, mut set) = spawn_status_check(config, cache_root);
+    while set.join_next().await.is_some() {}
+    let mut result = std::collections::HashMap::new();
+    while let Ok((url, status)) = rx.try_recv() {
+        result.insert(url, status);
+    }
+    result
+}

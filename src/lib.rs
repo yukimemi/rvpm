@@ -47,7 +47,6 @@ pub(crate) use crate::cli::Cli;
 pub use crate::cli::run;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use tokio::task::JoinSet;
 
 use crate::tui::PluginStatus;
 use tokio::sync::mpsc;
@@ -203,50 +202,6 @@ fn matches_rebuild_filter(plugin: &crate::config::Plugin, rebuild_filter_lc: Opt
                     .is_some_and(|n| n.to_ascii_lowercase().contains(qlc))
         }
     }
-}
-
-/// 全プラグインの git 状態を並列で調べ、url -> PluginStatus のマップを返す。
-/// 全プラグインのステータスチェックを並列で spawn し、受信用 channel と
-/// JoinSet を返す。呼び出し側は progressive に受信して描画するか、一括で
-/// await して完了を待つか選べる。
-fn spawn_status_check(
-    config: &config::Config,
-    cache_root: &Path,
-) -> (mpsc::Receiver<(String, PluginStatus)>, JoinSet<()>) {
-    let (tx, rx) = mpsc::channel::<(String, PluginStatus)>(100);
-    let mut set = JoinSet::new();
-    for plugin in config.plugins.iter() {
-        let plugin = plugin.clone();
-        let cache_root = cache_root.to_path_buf();
-        let tx = tx.clone();
-        set.spawn(async move {
-            let dst_path = resolve_plugin_dst(&plugin, &cache_root);
-            let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
-            let git_status = repo.get_status().await;
-            let plugin_status = match git_status {
-                crate::git::RepoStatus::Clean => PluginStatus::Finished,
-                crate::git::RepoStatus::NotInstalled => PluginStatus::Failed("Missing".to_string()),
-                crate::git::RepoStatus::Modified => PluginStatus::Syncing("Modified".to_string()),
-                crate::git::RepoStatus::Error(e) => PluginStatus::Failed(e),
-            };
-            let _ = tx.send((plugin.url.clone(), plugin_status)).await;
-        });
-    }
-    drop(tx);
-    (rx, set)
-}
-
-async fn fetch_plugin_statuses(
-    config: &config::Config,
-    cache_root: &Path,
-) -> std::collections::HashMap<String, PluginStatus> {
-    let (mut rx, mut set) = spawn_status_check(config, cache_root);
-    while set.join_next().await.is_some() {}
-    let mut result = std::collections::HashMap::new();
-    while let Ok((url, status)) = rx.try_recv() {
-        result.insert(url, status);
-    }
-    result
 }
 
 pub(crate) async fn update_single_plugin(
@@ -773,37 +728,6 @@ fn extract_plugin_entry_toml(doc: &DocumentMut, url: &str) -> Option<String> {
     Some(out)
 }
 
-/// 現在 disk 上の `config.toml` から `stored_url` 一致の entry を引いて、
-/// `name` フィールド があればそれを、なければ URL 由来のデフォルト名を返す。
-///
-/// 用途: `run_add` の末尾で `fetch_state` に名前を記録するとき、AI / auto-lazy
-/// branch が config.toml の `name` を後から書き換えている可能性があるため、
-/// 初回 `parse_config` のスナップショット (`plugin.display_name()`) ではなく
-/// **最新 disk 状態** から名前を引く必要がある。失敗時は URL 由来 fallback
-/// (`Plugin::default_name` と同じロジック) で resilience を保つ。
-fn read_persisted_plugin_name(config_path: &Path, stored_url: &str, fallback_url: &str) -> String {
-    // `Plugin::default_name` (src/config.rs) と同じ規則で URL から repo 名を切り出す。
-    let derive_default = || {
-        let url = fallback_url.trim_end_matches(".git");
-        let normalized = url.replace(':', "/");
-        normalized.rsplit('/').next().unwrap_or(url).to_string()
-    };
-    std::fs::read_to_string(config_path)
-        .ok()
-        .and_then(|s| s.parse::<DocumentMut>().ok())
-        .and_then(|doc| {
-            let plugins = doc.get("plugins")?.as_array_of_tables()?;
-            let entry = plugins
-                .iter()
-                .find(|t| t.get("url").and_then(|v| v.as_str()) == Some(stored_url))?;
-            entry
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(derive_default)
-}
-
 /// 指定プラグインの任意のリスト型フィールド (on_cmd / on_ft / on_map / on_event / on_path / on_source 等) を設定する。
 /// 要素が1つの場合は文字列として、2つ以上の場合は配列として書き込む (TOML の string | string[] を活用)。
 fn set_plugin_list_field(
@@ -1204,105 +1128,6 @@ fn open_editor_at_line(path: &Path, line: usize) -> Result<()> {
     Ok(())
 }
 
-/// ESC キーで None を返し、Enter キーで入力文字列を Some で返すテキスト入力。
-/// crossterm の raw mode を一時的に有効化して使用する。
-/// `initial` を渡すと、その値を初期入力として表示・編集できる。
-fn read_input_with_esc(prompt: &str, initial: &str) -> Result<Option<String>> {
-    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-    use std::io::Write;
-
-    let mut input = String::from(initial);
-    print!("{}: {}", prompt, input);
-    std::io::stdout().flush()?;
-
-    crossterm::terminal::enable_raw_mode()?;
-
-    let result = loop {
-        match crossterm::event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Esc => {
-                    break Ok(None);
-                }
-                KeyCode::Enter => {
-                    break Ok(Some(input.clone()));
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    break Err(anyhow::anyhow!("Interrupted"));
-                }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    print!("{}", c);
-                    std::io::stdout().flush()?;
-                }
-                KeyCode::Backspace if !input.is_empty() => {
-                    input.pop();
-                    print!("\x08 \x08");
-                    std::io::stdout().flush()?;
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-    };
-
-    crossterm::terminal::disable_raw_mode()?;
-    println!();
-    result
-}
-
-/// init/before/after.lua の存在チェックしてサークルアイコンの文字列を返す
-/// 例: "● ○ ●" (init あり、before なし、after あり)
-fn hook_indicators(dir: &Path) -> String {
-    let i = if dir.join("init.lua").exists() {
-        "\u{25cf}"
-    } else {
-        "\u{25cb}"
-    };
-    let b = if dir.join("before.lua").exists() {
-        "\u{25cf}"
-    } else {
-        "\u{25cb}"
-    };
-    let a = if dir.join("after.lua").exists() {
-        "\u{25cf}"
-    } else {
-        "\u{25cb}"
-    };
-    format!("{} {} {}", i, b, a)
-}
-
-/// global hooks 用のサークルアイコン。`init.lua` だけ Neovim 本体の場所
-/// (`nvim_init_lua_path()`) を見て、`before.lua` / `after.lua` は `<config_root>`
-/// 配下を見る — `rvpm edit --global` の対応と同じ。
-fn global_hook_indicators(config_root: &Path, init_lua_path: &Path) -> String {
-    let i = if init_lua_path.exists() {
-        "\u{25cf}"
-    } else {
-        "\u{25cb}"
-    };
-    let b = if config_root.join("before.lua").exists() {
-        "\u{25cf}"
-    } else {
-        "\u{25cb}"
-    };
-    let a = if config_root.join("after.lua").exists() {
-        "\u{25cf}"
-    } else {
-        "\u{25cb}"
-    };
-    format!("{} {} {}", i, b, a)
-}
-
-/// ファイル名に存在アイコンを付ける
-fn file_with_icon(dir: &Path, name: &str) -> String {
-    let icon = if dir.join(name).exists() {
-        "\u{25cf}"
-    } else {
-        "\u{25cb}"
-    };
-    format!("{} {}", icon, name)
-}
-
 pub(crate) fn find_lua(dir: &Path, name: &str) -> Option<String> {
     let path = dir.join(name);
     if path.exists() {
@@ -1375,43 +1200,6 @@ impl Drop for LoaderSwapGuard {
                 e
             );
         }
-    }
-}
-
-/// 起動時に前回 crash 由来の `loader.lua.bak` があれば検出して復元する。
-///
-/// ただし現在の loader.lua が `rvpm-profile-markers-` を含まない (= 既にクリーン
-/// な generate で上書き済み) ケースでは、戻すべきでない古い bak を捨てる。
-/// これをしないと「crash 後にユーザが `rvpm generate` で loader を更新 → 次の
-/// profile 起動で古い bak が上書きしてロールバックしてしまう」事故が起きる。
-fn recover_stale_loader_backup(loader_path: &Path) {
-    let backup_path = loader_path.with_extension("lua.bak");
-    if !backup_path.exists() {
-        return;
-    }
-    // 現状の loader.lua が instrumented なら bak は生きた退避、そうでなければ
-    // generate/sync で再生成済み → bak は不要。
-    let current_is_instrumented = std::fs::read_to_string(loader_path)
-        .map(|s| s.contains("rvpm-profile-markers-"))
-        .unwrap_or(false);
-    if !current_is_instrumented {
-        eprintln!(
-            "\u{26a0} rvpm: removing stale loader.lua.bak (current loader.lua is already clean)"
-        );
-        let _ = std::fs::remove_file(&backup_path);
-        return;
-    }
-    eprintln!(
-        "\u{26a0} rvpm: detected stale loader.lua.bak from a previous crashed profile run — restoring",
-    );
-    if loader_path.exists() {
-        let _ = std::fs::remove_file(loader_path);
-    }
-    if let Err(e) = std::fs::rename(&backup_path, loader_path) {
-        eprintln!(
-            "\u{26a0} rvpm: could not auto-restore ({}). Run `rvpm generate` to rebuild.",
-            e
-        );
     }
 }
 

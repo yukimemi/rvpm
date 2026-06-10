@@ -277,3 +277,49 @@ pub(crate) async fn run_set(
     }
     Ok(false)
 }
+
+/// ESC キーで None を返し、Enter キーで入力文字列を Some で返すテキスト入力。
+/// crossterm の raw mode を一時的に有効化して使用する。
+/// `initial` を渡すと、その値を初期入力として表示・編集できる。
+fn read_input_with_esc(prompt: &str, initial: &str) -> Result<Option<String>> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+    use std::io::Write;
+
+    let mut input = String::from(initial);
+    print!("{}: {}", prompt, input);
+    std::io::stdout().flush()?;
+
+    crossterm::terminal::enable_raw_mode()?;
+
+    let result = loop {
+        match crossterm::event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Esc => {
+                    break Ok(None);
+                }
+                KeyCode::Enter => {
+                    break Ok(Some(input.clone()));
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    break Err(anyhow::anyhow!("Interrupted"));
+                }
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    print!("{}", c);
+                    std::io::stdout().flush()?;
+                }
+                KeyCode::Backspace if !input.is_empty() => {
+                    input.pop();
+                    print!("\x08 \x08");
+                    std::io::stdout().flush()?;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    };
+
+    crossterm::terminal::disable_raw_mode()?;
+    println!();
+    result
+}

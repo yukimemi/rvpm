@@ -382,3 +382,34 @@ pub(crate) async fn run_add(
     run_generate(false).await?;
     Ok(())
 }
+
+/// 現在 disk 上の `config.toml` から `stored_url` 一致の entry を引いて、
+/// `name` フィールド があればそれを、なければ URL 由来のデフォルト名を返す。
+///
+/// 用途: `run_add` の末尾で `fetch_state` に名前を記録するとき、AI / auto-lazy
+/// branch が config.toml の `name` を後から書き換えている可能性があるため、
+/// 初回 `parse_config` のスナップショット (`plugin.display_name()`) ではなく
+/// **最新 disk 状態** から名前を引く必要がある。失敗時は URL 由来 fallback
+/// (`Plugin::default_name` と同じロジック) で resilience を保つ。
+fn read_persisted_plugin_name(config_path: &Path, stored_url: &str, fallback_url: &str) -> String {
+    // `Plugin::default_name` (src/config.rs) と同じ規則で URL から repo 名を切り出す。
+    let derive_default = || {
+        let url = fallback_url.trim_end_matches(".git");
+        let normalized = url.replace(':', "/");
+        normalized.rsplit('/').next().unwrap_or(url).to_string()
+    };
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|s| s.parse::<DocumentMut>().ok())
+        .and_then(|doc| {
+            let plugins = doc.get("plugins")?.as_array_of_tables()?;
+            let entry = plugins
+                .iter()
+                .find(|t| t.get("url").and_then(|v| v.as_str()) == Some(stored_url))?;
+            entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(derive_default)
+}
