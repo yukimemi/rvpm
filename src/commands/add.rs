@@ -413,3 +413,245 @@ fn read_persisted_plugin_name(config_path: &Path, stored_url: &str, fallback_url
         })
         .unwrap_or_else(derive_default)
 }
+
+/// `rvpm add` の scan 後に決まる、config.toml に書き込むべき trigger 候補。
+struct AddTriggerSuggestion {
+    /// on_cmd に入れる文字列 (exact 名 + `/regex/` の mixed list、ソート済)。
+    on_cmd: Vec<String>,
+    /// on_map に入れる候補 (lhs の enumerate のみ、regex 提案なし: 記号混じりで LCP 無意味)。
+    on_map: Vec<crate::config::MapSpec>,
+}
+
+impl AddTriggerSuggestion {
+    fn is_empty(&self) -> bool {
+        self.on_cmd.is_empty() && self.on_map.is_empty()
+    }
+}
+
+/// 非 TTY script でも `rvpm add --auto-lazy` が安定動作するよう、TTY 判定は
+/// `stdin` / `stdout` の両方を見る。どちらかでも非 TTY なら prompt を出さない。
+fn is_interactive_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// scan 結果から suggestion を組み立てる。0 件なら `None` — 提案する中身が無い。
+fn build_add_suggestion(scan: &crate::plugin_scan::ScanResult) -> Option<AddTriggerSuggestion> {
+    let on_cmd = crate::plugin_scan::suggest_cmd_triggers_smart(&scan.commands, 3);
+    // on_map は regex 化せず enumerate のみ (lhs に記号混じりで LCP 無意味)。
+    let on_map: Vec<crate::config::MapSpec> = scan
+        .user_maps
+        .iter()
+        .map(|m| crate::config::MapSpec {
+            lhs: m.lhs.clone(),
+            mode: m.modes.clone(),
+            desc: None,
+        })
+        .collect();
+    let s = AddTriggerSuggestion { on_cmd, on_map };
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// 対話プロンプトで user に選ばせて、適用する trigger を返す。
+///   - `Some(suggestion)` → 適用
+///   - `None`             → eager のまま
+fn prompt_lazy_decision(
+    display_name: &str,
+    suggestion: &AddTriggerSuggestion,
+) -> Option<AddTriggerSuggestion> {
+    use dialoguer::{Select, theme::ColorfulTheme};
+
+    println!();
+    println!("[{}] detected lazy triggers:", display_name);
+    if !suggestion.on_cmd.is_empty() {
+        println!("  on_cmd = {}", toml_array_preview(&suggestion.on_cmd));
+    }
+    if !suggestion.on_map.is_empty() {
+        let lhs: Vec<String> = suggestion.on_map.iter().map(|m| m.lhs.clone()).collect();
+        println!("  on_map = {}", toml_array_preview(&lhs));
+    }
+
+    let choices = ["accept (lazy-load)", "skip (eager install)"];
+    let sel = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("How should rvpm install this plugin?")
+        .items(choices.as_slice())
+        .default(0)
+        .interact()
+        .ok()?;
+
+    match sel {
+        0 => Some(AddTriggerSuggestion {
+            on_cmd: suggestion.on_cmd.clone(),
+            on_map: suggestion.on_map.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn toml_array_preview(items: &[String]) -> String {
+    let quoted: Vec<String> = items.iter().map(|s| format!("\"{}\"", s)).collect();
+    format!("[{}]", quoted.join(", "))
+}
+
+/// `rvpm add` 時の effective policy を決定:
+///   - CLI `--lazy` / `--no-lazy` (policy_override) が最優先
+///   - なければ `config.options.auto_lazy`
+fn resolve_add_lazy_policy(
+    policy_override: Option<crate::config::AutoLazyPolicy>,
+    config: &crate::config::Config,
+) -> crate::config::AutoLazyPolicy {
+    policy_override.unwrap_or(config.options.auto_lazy)
+}
+
+/// scan 結果 + policy に基づいて suggestion を適用するか決める。
+/// Never → None、Always → そのまま採用、Ask → TTY なら prompt / 非 TTY なら skip。
+fn decide_add_lazy_apply(
+    suggestion: AddTriggerSuggestion,
+    policy: crate::config::AutoLazyPolicy,
+    display_name: &str,
+) -> Option<AddTriggerSuggestion> {
+    use crate::config::AutoLazyPolicy;
+    match policy {
+        AutoLazyPolicy::Never => None,
+        AutoLazyPolicy::Always => Some(suggestion),
+        AutoLazyPolicy::Ask => {
+            if is_interactive_tty() {
+                prompt_lazy_decision(display_name, &suggestion)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// 既存 config.toml 内の `[[plugins]]` のうち url が一致するエントリに
+/// `on_cmd` / `on_map` を書き込む。toml_edit で in-place patch。
+fn patch_plugin_entry_triggers(
+    doc: &mut DocumentMut,
+    stored_url: &str,
+    applied: &AddTriggerSuggestion,
+) {
+    let Some(plugins) = doc
+        .get_mut("plugins")
+        .and_then(|p| p.as_array_of_tables_mut())
+    else {
+        return;
+    };
+    for t in plugins.iter_mut() {
+        let url = t.get("url").and_then(|v| v.as_str()).unwrap_or_default();
+        if url != stored_url {
+            continue;
+        }
+        // 既存 on_cmd / on_map がある場合は user が CLI フラグ (`--on-cmd …`) で
+        // 明示指定した or 過去の add / 手編集で既に書いていたもの。scan 結果で
+        // 上書きすると user 設定を破壊するので skip (PR #91 review 指摘)。
+        if !applied.on_cmd.is_empty() && t.get("on_cmd").is_none() {
+            let mut arr = toml_edit::Array::new();
+            for s in &applied.on_cmd {
+                arr.push(s.as_str());
+            }
+            t["on_cmd"] = value(arr);
+        }
+        if !applied.on_map.is_empty() && t.get("on_map").is_none() {
+            // 全 entry が default mode (n) なら string 配列、それ以外なら table 配列。
+            // MapSpec::mode の default は ["n"]。modes が `["n"]` ジャストなら string で十分。
+            let all_default = applied
+                .on_map
+                .iter()
+                .all(|m| m.mode == vec!["n".to_string()]);
+            if all_default {
+                let mut arr = toml_edit::Array::new();
+                for m in &applied.on_map {
+                    arr.push(m.lhs.as_str());
+                }
+                t["on_map"] = value(arr);
+            } else {
+                let mut arr = toml_edit::Array::new();
+                for m in &applied.on_map {
+                    let mut tb = toml_edit::InlineTable::new();
+                    tb.insert("lhs", m.lhs.as_str().into());
+                    let mut modes_arr = toml_edit::Array::new();
+                    for md in &m.mode {
+                        modes_arr.push(md.as_str());
+                    }
+                    tb.insert("mode", toml_edit::Value::from(modes_arr));
+                    arr.push(toml_edit::Value::InlineTable(tb));
+                }
+                t["on_map"] = value(arr);
+            }
+        }
+        break;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::MapSpec;
+    use toml_edit::DocumentMut;
+
+    #[test]
+    fn patch_plugin_entry_triggers_does_not_overwrite_existing_on_cmd() {
+        // user が `--on-cmd MyCmd` で明示指定した / 手編集で既に書いた entry は
+        // scan 結果で上書きしてはいけない (PR #91 review 指摘)。
+        let initial = r#"[[plugins]]
+url = "owner/repo"
+on_cmd = ["MyCmd"]
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let applied = AddTriggerSuggestion {
+            on_cmd: vec!["ScannedFoo".into(), "ScannedBar".into()],
+            on_map: vec![],
+        };
+        patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
+        let out = doc.to_string();
+        assert!(
+            out.contains(r#"on_cmd = ["MyCmd"]"#),
+            "existing on_cmd must be preserved, got:\n{out}"
+        );
+        assert!(
+            !out.contains("ScannedFoo"),
+            "scan result must not be written"
+        );
+    }
+
+    #[test]
+    fn patch_plugin_entry_triggers_does_not_overwrite_existing_on_map() {
+        let initial = r#"[[plugins]]
+url = "owner/repo"
+on_map = [{lhs = "<leader>x", mode = ["n", "x"], desc = "custom"}]
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let applied = AddTriggerSuggestion {
+            on_cmd: vec![],
+            on_map: vec![MapSpec {
+                lhs: "gc".into(),
+                mode: vec!["n".into()],
+                desc: None,
+            }],
+        };
+        patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
+        let out = doc.to_string();
+        assert!(
+            out.contains("<leader>x"),
+            "existing on_map must be preserved:\n{out}"
+        );
+        assert!(!out.contains("gc"), "scan result must not be written");
+    }
+
+    #[test]
+    fn patch_plugin_entry_triggers_writes_when_field_absent() {
+        // 既存 entry に on_cmd が無ければ scan 結果を書く (通常パス)。
+        let initial = r#"[[plugins]]
+url = "owner/repo"
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let applied = AddTriggerSuggestion {
+            on_cmd: vec!["ScannedFoo".into()],
+            on_map: vec![],
+        };
+        patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
+        let out = doc.to_string();
+        assert!(out.contains("ScannedFoo"));
+    }
+}

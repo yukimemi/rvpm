@@ -323,3 +323,129 @@ fn read_input_with_esc(prompt: &str, initial: &str) -> Result<Option<String>> {
     println!();
     result
 }
+
+/// config.toml 上で指定プラグイン (url 一致) の `url = "..."` 行の行番号 (1-indexed) を返す。
+/// 見つからなければ 1 を返す (ファイル先頭)。
+/// whitespace の入り方に寛容: `url="..."`, `url = "..."`, `url  =   "..."` など全部拾う。
+fn find_plugin_line_in_toml(toml_content: &str, url: &str) -> usize {
+    let needle = format!("\"{}\"", url);
+    for (i, line) in toml_content.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("url") {
+            continue;
+        }
+        // "url" の後は空白 or "=" しか来ないはず (他のフィールド名は "url..." で始まらない)
+        let rest = trimmed["url".len()..].trim_start();
+        if !rest.starts_with('=') {
+            continue;
+        }
+        if line.contains(&needle) {
+            return i + 1;
+        }
+    }
+    1
+}
+
+fn update_plugin_config(
+    doc: &mut DocumentMut,
+    url: &str,
+    lazy: Option<bool>,
+    merge: Option<bool>,
+    on_cmd: Option<Vec<String>>,
+    on_ft: Option<Vec<String>>,
+    rev: Option<String>,
+) -> Result<()> {
+    if let Some(l) = lazy {
+        let plugins = doc["plugins"]
+            .as_array_of_tables_mut()
+            .context("plugins is not an array of tables")?;
+        let plugin_table = plugins
+            .iter_mut()
+            .find(|p| p.get("url").and_then(|v| v.as_str()) == Some(url))
+            .context("Could not find plugin in toml_edit document")?;
+        plugin_table["lazy"] = value(l);
+    }
+    if let Some(m) = merge {
+        let plugins = doc["plugins"]
+            .as_array_of_tables_mut()
+            .context("plugins is not an array of tables")?;
+        let plugin_table = plugins
+            .iter_mut()
+            .find(|p| p.get("url").and_then(|v| v.as_str()) == Some(url))
+            .context("Could not find plugin in toml_edit document")?;
+        plugin_table["merge"] = value(m);
+    }
+    if let Some(cmds) = on_cmd {
+        set_plugin_list_field(doc, url, "on_cmd", cmds)?;
+    }
+    if let Some(fts) = on_ft {
+        set_plugin_list_field(doc, url, "on_ft", fts)?;
+    }
+    if let Some(r) = rev {
+        let plugins = doc["plugins"]
+            .as_array_of_tables_mut()
+            .context("plugins is not an array of tables")?;
+        let plugin_table = plugins
+            .iter_mut()
+            .find(|p| p.get("url").and_then(|v| v.as_str()) == Some(url))
+            .context("Could not find plugin in toml_edit document")?;
+        plugin_table["rev"] = value(r);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use toml_edit::DocumentMut;
+
+    #[test]
+    fn test_find_plugin_line_in_toml_basic() {
+        let toml = "[options]\n\n[[plugins]]\nurl = \"owner/a\"\nlazy = true\n\n[[plugins]]\nurl = \"owner/b\"\n";
+        //            1         2  3             4             5           6  7             8
+        assert_eq!(find_plugin_line_in_toml(toml, "owner/a"), 4);
+        assert_eq!(find_plugin_line_in_toml(toml, "owner/b"), 8);
+    }
+
+    #[test]
+    fn test_find_plugin_line_in_toml_handles_whitespace_variants() {
+        let toml = "[[plugins]]\nurl=\"owner/a\"\n\n[[plugins]]\nurl  =   \"owner/b\"\n";
+        assert_eq!(find_plugin_line_in_toml(toml, "owner/a"), 2);
+        assert_eq!(find_plugin_line_in_toml(toml, "owner/b"), 5);
+    }
+
+    #[test]
+    fn test_find_plugin_line_in_toml_missing_falls_back_to_one() {
+        let toml = "[[plugins]]\nurl = \"owner/a\"\n";
+        assert_eq!(find_plugin_line_in_toml(toml, "owner/nonexistent"), 1);
+    }
+
+    #[test]
+    fn test_find_plugin_line_in_toml_ignores_substring_matches() {
+        // "owner/ab" should not be matched when searching for "owner/a"
+        let toml = "[[plugins]]\nurl = \"owner/ab\"\n\n[[plugins]]\nurl = \"owner/a\"\n";
+        assert_eq!(find_plugin_line_in_toml(toml, "owner/a"), 5);
+    }
+
+    #[test]
+    fn test_update_plugin_config() {
+        let toml = r#"[[plugins]]
+url = "test/plugin"
+lazy = false"#;
+        let mut doc = toml.parse::<DocumentMut>().unwrap();
+        update_plugin_config(
+            &mut doc,
+            "test/plugin",
+            Some(true),
+            Some(true),
+            None,
+            None,
+            Some("v1.0".to_string()),
+        )
+        .unwrap();
+        let result = doc.to_string();
+        assert!(result.contains("lazy = true"));
+        assert!(result.contains("merge = true"));
+        assert!(result.contains("rev = \"v1.0\""));
+    }
+}
