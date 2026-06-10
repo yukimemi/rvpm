@@ -420,3 +420,375 @@ pub(crate) fn build_plugin_scripts(
         dev: plugin.dev,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, Options, Plugin};
+    use tempfile::tempdir;
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn test_collect_denops_plugins_finds_main_ts() {
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        write_file(
+            &plugin.join("denops/foo/main.ts"),
+            "export async function main() {}",
+        );
+        write_file(&plugin.join("denops/foo/util.ts"), "export const x = 1;");
+
+        let got = collect_denops_plugins(&plugin);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "foo");
+        assert!(
+            got[0].main_script.ends_with("denops/foo/main.ts"),
+            "main_script should be absolute path ending with denops/foo/main.ts, got: {}",
+            got[0].main_script
+        );
+        // forward slash に正規化されている
+        assert!(
+            !got[0].main_script.contains('\\'),
+            "main_script must use forward slashes"
+        );
+    }
+
+    #[test]
+    fn test_collect_denops_plugins_returns_empty_without_denops_dir() {
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        write_file(&plugin.join("plugin/foo.vim"), "echo 'foo'");
+        // denops/ が無い
+        let got = collect_denops_plugins(&plugin);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn test_collect_denops_plugins_falls_back_to_main_js() {
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        // main.ts なし、main.js のみ
+        write_file(
+            &plugin.join("denops/bar/main.js"),
+            "export async function main() {}",
+        );
+
+        let got = collect_denops_plugins(&plugin);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "bar");
+        assert!(got[0].main_script.ends_with("denops/bar/main.js"));
+    }
+
+    #[test]
+    fn test_collect_denops_plugins_prefers_main_ts_over_main_js() {
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        write_file(&plugin.join("denops/dual/main.ts"), "ts");
+        write_file(&plugin.join("denops/dual/main.js"), "js");
+        let got = collect_denops_plugins(&plugin);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].main_script.ends_with("main.ts"));
+    }
+
+    #[test]
+    fn test_collect_denops_plugins_skips_dirs_without_main() {
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        // main.ts も main.js も無いディレクトリは無視
+        write_file(&plugin.join("denops/incomplete/other.ts"), "");
+        write_file(&plugin.join("denops/ok/main.ts"), "");
+        let got = collect_denops_plugins(&plugin);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_denops_plugins_follows_symlinked_subdir() {
+        // dev plugin や mono-repo の構成で、denops/<name>/ が別ディレクトリへの
+        // symlink になっているケースを follow して検出する。
+        // Windows は symlink 作成に管理者権限が要るので Unix のみで実行。
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        let real = root.path().join("external").join("real-denops");
+        write_file(&real.join("main.ts"), "export async function main() {}");
+        std::fs::create_dir_all(plugin.join("denops")).unwrap();
+        std::os::unix::fs::symlink(&real, plugin.join("denops/sym-linked")).unwrap();
+
+        let got = collect_denops_plugins(&plugin);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "sym-linked");
+        assert!(got[0].main_script.ends_with("main.ts"));
+    }
+
+    #[test]
+    fn test_collect_denops_plugins_multiple_sorted_by_name() {
+        // 同一プラグイン repo が複数の denops サブモジュールを持つケース
+        // (例: 一部の mono-repo) も決定論的な順序を保証
+        let root = tempdir().unwrap();
+        let plugin = root.path().join("plugin-repo");
+        write_file(&plugin.join("denops/zeta/main.ts"), "");
+        write_file(&plugin.join("denops/alpha/main.ts"), "");
+        write_file(&plugin.join("denops/mid/main.ts"), "");
+        let got = collect_denops_plugins(&plugin);
+        let names: Vec<&str> = got.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    #[test]
+    fn test_parse_build_command_shell() {
+        let dirs = vec![PathBuf::from("/path/to/plugin")];
+        let (cmd, args) = parse_build_command("cargo build --release", &dirs);
+        if cfg!(windows) {
+            assert_eq!(cmd, "cmd");
+            assert_eq!(args, vec!["/C", "cargo build --release"]);
+        } else {
+            assert_eq!(cmd, "sh");
+            assert_eq!(args, vec!["-c", "cargo build --release"]);
+        }
+    }
+
+    #[test]
+    fn test_parse_build_command_vim_prefix() {
+        let dirs = vec![PathBuf::from("/path/to/plugin")];
+        let (cmd, args) = parse_build_command(":call mkdp#util#install()", &dirs);
+        assert_eq!(cmd, "nvim");
+        assert!(args.iter().any(|a| a == "--headless"));
+        assert!(args.iter().any(|a| a.contains("mkdp#util#install()")));
+    }
+
+    #[test]
+    fn test_parse_build_command_vim_simple() {
+        let dirs = vec![PathBuf::from("/path/to/plugin")];
+        let (cmd, args) = parse_build_command(":TSUpdate", &dirs);
+        assert_eq!(cmd, "nvim");
+        assert!(args.iter().any(|a| a == "--headless"));
+        assert!(args.iter().any(|a| a.contains("TSUpdate")));
+    }
+
+    #[test]
+    fn test_parse_build_command_vim_adds_rtp() {
+        let dirs = vec![PathBuf::from("/path/to/my-plugin")];
+        let (cmd, args) = parse_build_command(":MyBuild", &dirs);
+        assert_eq!(cmd, "nvim");
+        assert!(args.iter().any(|a| a == "--cmd"));
+        assert!(
+            args.iter()
+                .any(|a| a.contains("set rtp+=/path/to/my-plugin")),
+            "should add plugin dir to rtp: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn test_parse_build_command_vim_includes_deps_rtp() {
+        let dirs = vec![
+            PathBuf::from("/path/to/plugin"),
+            PathBuf::from("/path/to/dep1"),
+            PathBuf::from("/path/to/dep2"),
+        ];
+        let (cmd, args) = parse_build_command(":Build", &dirs);
+        assert_eq!(cmd, "nvim");
+        let rtp_arg = args
+            .iter()
+            .find(|a| a.contains("set rtp+="))
+            .expect("should have rtp cmd");
+        assert!(rtp_arg.contains("/path/to/plugin"), "self: {}", rtp_arg);
+        assert!(rtp_arg.contains("/path/to/dep1"), "dep1: {}", rtp_arg);
+        assert!(rtp_arg.contains("/path/to/dep2"), "dep2: {}", rtp_arg);
+    }
+
+    // ─── build_lua / collect_build_rtp (#97) ────────────────────────────
+
+    #[test]
+    fn collect_build_rtp_includes_self_first_then_transitive_deps() {
+        // A depends [B], B depends [C]. rtp should be [A, B, C]. (#97)
+        let plugin_a = Plugin {
+            url: "owner/a".to_string(),
+            depends: Some(vec!["b".to_string()]),
+            ..Default::default()
+        };
+        let plugin_b = Plugin {
+            name: Some("b".to_string()),
+            url: "owner/b".to_string(),
+            depends: Some(vec!["c".to_string()]),
+            ..Default::default()
+        };
+        let plugin_c = Plugin {
+            name: Some("c".to_string()),
+            url: "owner/c".to_string(),
+            ..Default::default()
+        };
+        let config = Config {
+            vars: None,
+            options: Options::default(),
+            plugins: vec![plugin_a.clone(), plugin_b, plugin_c],
+        };
+        let cache_root = PathBuf::from("/cache");
+        let rtp = collect_build_rtp(
+            &plugin_a,
+            &PathBuf::from("/cache/plugins/repos/owner/a"),
+            &config,
+            &cache_root,
+        );
+        // self が先頭
+        assert_eq!(rtp[0], PathBuf::from("/cache/plugins/repos/owner/a"));
+        // transitive deps が含まれる (順序は DFS なので厳密には保証しないが、
+        // 全部存在することを確認)
+        let rtp_strings: Vec<String> = rtp.iter().map(|p| p.display().to_string()).collect();
+        assert!(
+            rtp_strings.iter().any(|s| s.contains("owner/b")),
+            "B in rtp: {rtp_strings:?}"
+        );
+        assert!(
+            rtp_strings.iter().any(|s| s.contains("owner/c")),
+            "C in rtp: {rtp_strings:?}"
+        );
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_strips_lazy_nvim_style_wrapper() {
+        // lazy.nvim style — user が `build = function() ... end` から copy
+        let r = unwrap_anonymous_lua_function(
+            "function() require('blink.cmp').build():wait(60000) end",
+        );
+        assert_eq!(
+            r.as_deref(),
+            Some("require('blink.cmp').build():wait(60000)"),
+            "function() body end → body extraction"
+        );
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_handles_space_after_function_keyword() {
+        let r = unwrap_anonymous_lua_function("function ()  vim.cmd('TSUpdate')  end");
+        assert_eq!(r.as_deref(), Some("vim.cmd('TSUpdate')"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_returns_none_for_plain_statement() {
+        // 既に statement なら触らない (None で「unwrap 不要」と通知)。
+        let r = unwrap_anonymous_lua_function("require('x').build():wait(60000)");
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_returns_none_for_named_function_decl() {
+        // `function name() ... end` は valid な statement (function 宣言) なので
+        // 触る理由が無い。
+        let r = unwrap_anonymous_lua_function("function build_step() require('x') end");
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_does_not_split_identifier_ending_in_end() {
+        // `local end_var = 1 end` のように identifier が "end" で終わるケースで
+        // strip_suffix が誤動作しないこと。strip_suffix は exact suffix match
+        // なので、"end_var" の "end" 部分は拾わない (前後の文字を見るので)。
+        let r = unwrap_anonymous_lua_function("function() local end_var = 1 end");
+        assert_eq!(r.as_deref(), Some("local end_var = 1"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_preserves_inner_function_blocks() {
+        // 入れ子の `function() ... end` は inner 側を保持する (lazy `.*?` + 末尾
+        // anchor で「最後の一番外の end」だけを落とす)。
+        let r =
+            unwrap_anonymous_lua_function("function() local f = function() return 1 end; f() end");
+        assert_eq!(r.as_deref(), Some("local f = function() return 1 end; f()"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_handles_multiline_body() {
+        // 改行を含む typical な複数行 build_lua。
+        let code = "function()\n  local cmp = require('blink.cmp')\n  cmp.build():wait(60000)\n  vim.print('done')\nend";
+        let r = unwrap_anonymous_lua_function(code);
+        let body = r.expect("multiline function() should unwrap");
+        assert!(body.contains("local cmp = require('blink.cmp')"));
+        assert!(body.contains("cmp.build():wait(60000)"));
+        assert!(body.contains("vim.print('done')"));
+        assert!(!body.contains("function()"));
+        // 末尾に余分な end が残ってないこと
+        assert!(!body.ends_with("end"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_handles_complex_multiline_with_nested_function() {
+        // 複雑な複数行: ローカル関数定義入り。inner の function() ... end は保持。
+        let code = "function()\n  local helper = function(x)\n    return x * 2\n  end\n  print(helper(21))\nend";
+        let r = unwrap_anonymous_lua_function(code);
+        let body = r.expect("complex multiline should unwrap outer only");
+        assert!(body.contains("local helper = function(x)"));
+        assert!(body.contains("return x * 2"));
+        assert!(body.contains("print(helper(21))"));
+        // inner の helper 定義 end が残ってる
+        assert!(
+            body.matches("end").count() >= 1,
+            "inner helper end should remain, body: {body}"
+        );
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_tolerates_trailing_line_comment() {
+        // `end` の後に行コメントが付くケース (regex で末尾 `(?:--[^\n]*)?` 許容)。
+        let r = unwrap_anonymous_lua_function("function() vim.print('hi') end -- post-build hook");
+        assert_eq!(r.as_deref(), Some("vim.print('hi')"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_tolerates_whitespace_inside_parens() {
+        // `function ( )` のような余分な空白も許容。
+        let r = unwrap_anonymous_lua_function("function(  )  print('x')  end");
+        assert_eq!(r.as_deref(), Some("print('x')"));
+    }
+
+    #[test]
+    fn unwrap_anonymous_lua_function_returns_none_when_function_takes_args() {
+        // `function(a, b)` のように引数があるものは触らない (匿名 zero-arity 専用)。
+        let r = unwrap_anonymous_lua_function("function(a, b) return a + b end");
+        assert!(r.is_none(), "function with args should not be unwrapped");
+    }
+
+    #[tokio::test]
+    async fn run_build_lua_returns_none_when_field_unset() {
+        let plugin = Plugin {
+            url: "x/y".to_string(),
+            ..Default::default()
+        };
+        let result = run_build_lua(&plugin, &PathBuf::from("/tmp"), &[]).await;
+        assert!(
+            result.is_none(),
+            "no build_lua field → no-op, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_build_lua_reports_error_when_nvim_missing() {
+        // nvim が PATH に無くても rvpm はクラッシュさせず、明示的なエラー文字列を返す。
+        // この test は nvim がインストールされてる環境ではスキップされる
+        // (nvim コマンドが本当に成功してしまうため)。CI / 開発機の typical 構成では
+        // nvim あり、ローカル run_build_lua の no-build-lua path を検証する別 test
+        // (run_build_lua_returns_none_when_field_unset) で十分。
+        if which::which("nvim").is_ok() {
+            return;
+        }
+        let tmp = tempdir().unwrap();
+        let plugin = Plugin {
+            url: "x/y".to_string(),
+            build_lua: Some("vim.print('hi')".to_string()),
+            ..Default::default()
+        };
+        let result = run_build_lua(&plugin, tmp.path(), &[tmp.path().to_path_buf()]).await;
+        let err = result.expect("missing nvim should yield an error");
+        assert!(
+            err.contains("failed to spawn") || err.contains("nvim"),
+            "error should mention nvim: {err}"
+        );
+    }
+}

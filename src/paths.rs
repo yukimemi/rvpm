@@ -249,3 +249,241 @@ pub(crate) fn resolve_views_dir(cache_root: &Path) -> PathBuf {
 pub(crate) fn resolve_plugin_view_dir(views_dir: &Path, plugin: &crate::config::Plugin) -> PathBuf {
     views_dir.join(plugin.canonical_path())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Plugin;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_expand_tilde_bare_tilde_returns_home() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_tilde("~"), home);
+    }
+
+    #[test]
+    fn test_expand_tilde_with_forward_slash_subpath() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_tilde("~/foo/bar"), home.join("foo").join("bar"));
+    }
+
+    #[test]
+    fn test_expand_tilde_with_backslash_subpath() {
+        let home = dirs::home_dir().unwrap();
+        // Windows 入力形式にも対応
+        let got = expand_tilde("~\\foo\\bar");
+        // 実際のパス区切りは OS 依存だが、home 配下に foo と bar を含むかで判定
+        let s = got.to_string_lossy().replace('\\', "/");
+        let expected = home
+            .join("foo")
+            .join("bar")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn test_expand_tilde_absolute_path_untouched() {
+        assert_eq!(
+            expand_tilde("/absolute/path"),
+            PathBuf::from("/absolute/path")
+        );
+    }
+
+    #[test]
+    fn test_expand_tilde_relative_path_untouched() {
+        assert_eq!(
+            expand_tilde("relative/path"),
+            PathBuf::from("relative/path")
+        );
+    }
+
+    #[test]
+    fn test_is_valid_appname_rejects_unsafe_values() {
+        assert!(is_valid_appname("nvim"));
+        assert!(is_valid_appname("nvim-test"));
+        assert!(!is_valid_appname(""));
+        assert!(!is_valid_appname("."));
+        assert!(!is_valid_appname(".."));
+        assert!(!is_valid_appname("foo/bar"));
+        assert!(!is_valid_appname("foo\\bar"));
+        assert!(!is_valid_appname("foo\0bar"));
+    }
+
+    #[test]
+    fn test_resolve_cache_root_uses_appname_default() {
+        let home = dirs::home_dir().unwrap();
+        let result = resolve_cache_root(None);
+        // appname は env に依存するので親ディレクトリだけ確認
+        assert!(result.starts_with(home.join(".cache").join("rvpm")));
+    }
+
+    #[test]
+    fn test_resolve_cache_root_expands_tilde() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            resolve_cache_root(Some("~/dotfiles/rvpm")),
+            home.join("dotfiles").join("rvpm")
+        );
+    }
+
+    #[test]
+    fn test_resolve_cache_root_accepts_absolute_path() {
+        assert_eq!(
+            resolve_cache_root(Some("/opt/rvpm")),
+            PathBuf::from("/opt/rvpm")
+        );
+    }
+
+    #[test]
+    fn test_resolve_config_root_uses_default_when_none() {
+        let home = dirs::home_dir().unwrap();
+        let result = resolve_config_root(None);
+        // デフォルトは `~/.config/rvpm/<appname>` (plugins は含まない)
+        assert!(result.starts_with(home.join(".config").join("rvpm")));
+        assert!(!result.ends_with("plugins"));
+        // 末尾は appname (env 依存)
+        assert_eq!(
+            result.parent(),
+            Some(home.join(".config").join("rvpm").as_path())
+        );
+    }
+
+    #[test]
+    fn test_resolve_config_root_expands_tilde() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            resolve_config_root(Some("~/dotfiles/nvim")),
+            home.join("dotfiles").join("nvim")
+        );
+    }
+
+    #[test]
+    fn test_resolve_config_root_accepts_absolute_path() {
+        assert_eq!(
+            resolve_config_root(Some("/etc/rvpm")),
+            PathBuf::from("/etc/rvpm")
+        );
+    }
+
+    #[test]
+    fn test_resolve_plugin_config_dir_joins_plugins_subdir() {
+        let plugin = config::Plugin {
+            url: "folke/snacks.nvim".to_string(),
+            ..Default::default()
+        };
+        let root = PathBuf::from("/tmp/rvpm");
+        let got = resolve_plugin_config_dir(&root, &plugin);
+        assert_eq!(
+            got,
+            PathBuf::from("/tmp/rvpm")
+                .join("plugins")
+                .join(plugin.canonical_path())
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // rvpm init ヘルパーのテスト
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_loader_path_is_under_plugins() {
+        let base = PathBuf::from("/cache/rvpm/nvim");
+        let result = resolve_loader_path(&base);
+        assert_eq!(result, PathBuf::from("/cache/rvpm/nvim/plugins/loader.lua"));
+    }
+
+    #[test]
+    fn test_resolve_update_log_path_is_cache_root_sibling() {
+        let cache = std::path::PathBuf::from("/tmp/cache_root");
+        let p = resolve_update_log_path(&cache);
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/tmp/cache_root/update_log.json")
+        );
+        // loader.lua の親 (= /tmp/cache_root/plugins/) には居ない
+        let loader = resolve_loader_path(&cache);
+        assert_ne!(p.parent(), loader.parent());
+    }
+
+    #[test]
+    fn test_change_record_from_preserves_fields() {
+        let plugin = Plugin {
+            url: "folke/snacks.nvim".to_string(),
+            name: Some("snacks".to_string()),
+            ..Default::default()
+        };
+        let change = crate::git::GitChange {
+            from: Some("aaaaaaa".to_string()),
+            to: "bbbbbbb".to_string(),
+            subjects: vec!["fix: x".to_string()],
+            breaking_subjects: vec![],
+            doc_files_changed: vec!["README.md".to_string()],
+        };
+        let rec = change_record_from(&plugin, change);
+        assert_eq!(rec.name, "snacks");
+        assert_eq!(rec.url, "folke/snacks.nvim");
+        assert_eq!(rec.from.as_deref(), Some("aaaaaaa"));
+        assert_eq!(rec.to, "bbbbbbb");
+        assert_eq!(rec.subjects, vec!["fix: x".to_string()]);
+        assert_eq!(rec.doc_files_changed, vec!["README.md".to_string()]);
+    }
+
+    #[test]
+    fn test_change_record_from_uses_default_name_when_no_name() {
+        let plugin = Plugin {
+            url: "https://github.com/owner/Repo.git".to_string(),
+            ..Default::default()
+        };
+        let change = crate::git::GitChange {
+            from: None,
+            to: "deadbee".to_string(),
+            subjects: vec![],
+            breaking_subjects: vec![],
+            doc_files_changed: vec![],
+        };
+        let rec = change_record_from(&plugin, change);
+        // default_name は `.git` を剥がして最終セグメントを返す
+        assert_eq!(rec.name, "Repo");
+        assert!(rec.from.is_none());
+    }
+
+    #[test]
+    fn test_record_changes_or_warn_writes_file() {
+        // 空 changes は file 自体を作らない方針 (有用履歴を押し出さないため)。
+        // 非空 changes 1 件渡したらきちんと書かれることを確認。
+        let dir = tempdir().unwrap();
+        let cache_root = dir.path().to_path_buf();
+        record_changes_or_warn(
+            &cache_root,
+            "sync",
+            vec![crate::update_log::ChangeRecord {
+                name: "x".into(),
+                url: "owner/x".into(),
+                from: Some("a".into()),
+                to: "b".into(),
+                subjects: vec!["fix: x".into()],
+                breaking_subjects: vec![],
+                doc_files_changed: vec![],
+            }],
+        );
+        let path = resolve_update_log_path(&cache_root);
+        assert!(path.exists(), "expected log file for non-empty changes");
+        let log = crate::update_log::load_log(&path);
+        assert_eq!(log.runs.len(), 1);
+        assert_eq!(log.runs[0].command, "sync");
+    }
+
+    #[test]
+    fn test_record_changes_or_warn_skips_empty() {
+        let dir = tempdir().unwrap();
+        let cache_root = dir.path().to_path_buf();
+        record_changes_or_warn(&cache_root, "sync", vec![]);
+        let path = resolve_update_log_path(&cache_root);
+        assert!(
+            !path.exists(),
+            "empty changes should not create the log file"
+        );
+    }
+}

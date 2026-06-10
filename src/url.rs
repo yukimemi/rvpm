@@ -122,3 +122,217 @@ pub(crate) fn format_plugin_url(input: &str, style: crate::config::UrlStyle) -> 
         None => input.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_installed_full_name_owner_repo() {
+        assert_eq!(
+            installed_full_name("folke/snacks.nvim"),
+            Some("folke/snacks.nvim".to_string())
+        );
+    }
+
+    #[test]
+    fn test_installed_full_name_https_url_with_git_suffix() {
+        assert_eq!(
+            installed_full_name("https://github.com/Owner/Repo.git"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_installed_full_name_https_url_without_git_suffix() {
+        assert_eq!(
+            installed_full_name("https://github.com/nvim-lua/plenary.nvim"),
+            Some("nvim-lua/plenary.nvim".to_string())
+        );
+    }
+
+    #[test]
+    fn test_installed_full_name_ssh_url() {
+        assert_eq!(
+            installed_full_name("git@github.com:Owner/Repo.git"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_installed_full_name_non_github_returns_none() {
+        assert_eq!(installed_full_name("https://gitlab.com/owner/repo"), None);
+    }
+
+    #[test]
+    fn test_installed_full_name_case_normalized() {
+        assert_eq!(
+            installed_full_name("Folke/Snacks.NVIM"),
+            Some("folke/snacks.nvim".to_string())
+        );
+    }
+
+    // -------- urls_match --------
+
+    #[test]
+    fn test_urls_match_treats_github_short_and_full_as_equal() {
+        // `owner/repo` 形式と `https://github.com/owner/repo` 形式は同一リポジトリ扱い。
+        assert!(urls_match(
+            "folke/snacks.nvim",
+            "https://github.com/folke/snacks.nvim",
+        ));
+        assert!(urls_match(
+            "https://github.com/Folke/Snacks.NVIM.git",
+            "folke/snacks.nvim",
+        ));
+        assert!(urls_match(
+            "git@github.com:folke/snacks.nvim.git",
+            "folke/snacks.nvim",
+        ));
+    }
+
+    #[test]
+    fn test_urls_match_rejects_different_owner_or_repo() {
+        // 同じ repo 名でも owner が違うのは別プラグイン。
+        assert!(!urls_match("foo/snacks.nvim", "bar/snacks.nvim"));
+        assert!(!urls_match("folke/snacks.nvim", "folke/other.nvim"));
+    }
+
+    #[test]
+    fn test_urls_match_non_github_falls_back_to_string_eq() {
+        // GitHub と認識できない URL は生文字列比較。
+        assert!(urls_match(
+            "https://gitlab.com/x/y",
+            "https://gitlab.com/x/y",
+        ));
+        assert!(!urls_match(
+            "https://gitlab.com/x/y",
+            "https://gitlab.com/x/z",
+        ));
+    }
+
+    #[test]
+    fn test_installed_full_name_trailing_slash() {
+        // `owner/repo/`, `.../repo.git/`, `.../repo/` をすべて許容する
+        assert_eq!(
+            installed_full_name("folke/snacks.nvim/"),
+            Some("folke/snacks.nvim".to_string())
+        );
+        assert_eq!(
+            installed_full_name("https://github.com/Owner/Repo/"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            installed_full_name("https://github.com/Owner/Repo.git/"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_github_owner_repo_preserves_case() {
+        // installed_full_name と違い case は保持する (config.toml 書き込み用途)
+        assert_eq!(
+            github_owner_repo("Folke/Snacks.NVIM"),
+            Some("Folke/Snacks.NVIM".to_string())
+        );
+        assert_eq!(
+            github_owner_repo("https://github.com/Owner/Repo.git"),
+            Some("Owner/Repo".to_string())
+        );
+        assert_eq!(
+            github_owner_repo("git@github.com:Owner/Repo.git"),
+            Some("Owner/Repo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_github_owner_repo_non_github_returns_none() {
+        assert_eq!(github_owner_repo("https://gitlab.com/a/b"), None);
+        assert_eq!(github_owner_repo("https://git.example/a/b"), None);
+    }
+
+    #[test]
+    fn test_format_plugin_url_short_form() {
+        use crate::config::UrlStyle;
+        // 入力がどの形式でも owner/repo に統一
+        assert_eq!(
+            format_plugin_url("folke/snacks.nvim", UrlStyle::Short),
+            "folke/snacks.nvim"
+        );
+        assert_eq!(
+            format_plugin_url("https://github.com/folke/snacks.nvim", UrlStyle::Short),
+            "folke/snacks.nvim"
+        );
+        assert_eq!(
+            format_plugin_url("https://github.com/folke/snacks.nvim.git", UrlStyle::Short),
+            "folke/snacks.nvim"
+        );
+    }
+
+    #[test]
+    fn test_format_plugin_url_full_form() {
+        use crate::config::UrlStyle;
+        // 入力がどの形式でも https://github.com/owner/repo に統一
+        assert_eq!(
+            format_plugin_url("folke/snacks.nvim", UrlStyle::Full),
+            "https://github.com/folke/snacks.nvim"
+        );
+        assert_eq!(
+            format_plugin_url("https://github.com/folke/snacks.nvim.git", UrlStyle::Full),
+            "https://github.com/folke/snacks.nvim"
+        );
+        assert_eq!(
+            format_plugin_url("git@github.com:folke/snacks.nvim.git", UrlStyle::Full),
+            "https://github.com/folke/snacks.nvim"
+        );
+    }
+
+    #[test]
+    fn test_format_plugin_url_non_github_passthrough() {
+        use crate::config::UrlStyle;
+        // GitHub 以外は入力そのまま保存 (style 無視)
+        assert_eq!(
+            format_plugin_url("https://gitlab.com/g/h", UrlStyle::Short),
+            "https://gitlab.com/g/h"
+        );
+        assert_eq!(
+            format_plugin_url("https://gitlab.com/g/h", UrlStyle::Full),
+            "https://gitlab.com/g/h"
+        );
+    }
+
+    #[test]
+    fn test_github_owner_repo_rejects_local_paths() {
+        // `./foo`, `../foo`, `~/foo`, `/foo`, `\foo`, `C:/foo` を GitHub shorthand
+        // と誤認しないこと (CodeRabbit major fix)。
+        assert_eq!(github_owner_repo("./foo"), None);
+        assert_eq!(github_owner_repo("../foo"), None);
+        assert_eq!(github_owner_repo("~/foo"), None);
+        assert_eq!(github_owner_repo("/tmp/foo"), None);
+        assert_eq!(github_owner_repo("\\foo\\bar"), None);
+        assert_eq!(github_owner_repo("C:/foo"), None);
+        assert_eq!(github_owner_repo("d:/bar/baz"), None);
+    }
+
+    #[test]
+    fn test_github_owner_repo_rejects_invalid_chars() {
+        // owner / repo の文字集合を超えるものは GitHub shorthand と認めない。
+        // owner は alphanumeric + `-`、repo は + `. _` まで許容。
+        assert_eq!(github_owner_repo("foo bar/baz"), None);
+        assert_eq!(github_owner_repo("-foo/bar"), None); // owner 先頭 `-`
+        assert_eq!(github_owner_repo("foo!/bar"), None); // owner に `!`
+    }
+
+    #[test]
+    fn test_github_owner_repo_accepts_normal_shorthand() {
+        // 正常な owner/repo は従来どおり受理される
+        assert_eq!(
+            github_owner_repo("folke/snacks.nvim"),
+            Some("folke/snacks.nvim".to_string())
+        );
+        assert_eq!(
+            github_owner_repo("nvim-lua/plenary.nvim"),
+            Some("nvim-lua/plenary.nvim".to_string())
+        );
+    }
+}
