@@ -399,7 +399,11 @@ fn spawn_status_check(
     config: &crate::config::Config,
     cache_root: &Path,
 ) -> (mpsc::Receiver<(String, PluginStatus)>, JoinSet<()>) {
-    let (tx, rx) = mpsc::channel::<(String, PluginStatus)>(100);
+    // Size the channel to the plugin count so a producer never blocks on a full
+    // buffer while `fetch_plugin_statuses` is still joining every task before it
+    // drains `rx` — that combination deadlocked once a config had >100 plugins
+    // (#247). The TUI path drains progressively, so it was never affected.
+    let (tx, rx) = mpsc::channel::<(String, PluginStatus)>(config.plugins.len().max(1));
     let mut set = JoinSet::new();
     for plugin in config.plugins.iter() {
         let plugin = plugin.clone();
@@ -433,4 +437,33 @@ async fn fetch_plugin_statuses(
         result.insert(url, status);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fetch_plugin_statuses_does_not_deadlock_above_channel_capacity() {
+        // Regression for #247: with the old fixed channel capacity of 100, a
+        // config with >100 plugins deadlocked — every producer blocked on
+        // `tx.send().await` once the buffer filled, but `fetch_plugin_statuses`
+        // only drains `rx` after `join_next()` has joined them all.
+        let mut toml = String::from("[options]\n\n");
+        for i in 0..150 {
+            toml.push_str(&format!("[[plugins]]\nurl = \"owner/plugin-{i}\"\n\n"));
+        }
+        let config = crate::config::parse_config(&toml).unwrap();
+        let cache_root = tempfile::tempdir().unwrap();
+        // No plugin dir exists under cache_root, so every status resolves quickly
+        // to "Missing". Guard with a timeout so a future deadlock regression fails
+        // loudly here instead of hanging CI indefinitely.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            fetch_plugin_statuses(&config, cache_root.path()),
+        )
+        .await
+        .expect("fetch_plugin_statuses timed out — possible deadlock regression");
+        assert_eq!(result.len(), 150);
+    }
 }
