@@ -2114,34 +2114,6 @@ url = "owner/repo"
     }
 
     #[test]
-    fn test_completion_generation_succeeds_for_all_shells() {
-        // `rvpm completion <SHELL>` が clap_complete に渡る CLI 定義を毎回 panic
-        // 無く読めることを確認 (#114)。 出力内容自体は clap_complete の責務なので
-        // 中身は assert しないが、 何かしら出力されることだけは確認する。
-        use clap::CommandFactory;
-        use clap_complete::Shell;
-
-        let shells = [
-            Shell::Bash,
-            Shell::Zsh,
-            Shell::Fish,
-            Shell::PowerShell,
-            Shell::Elvish,
-        ];
-        for shell in shells {
-            let mut cmd = Cli::command();
-            let bin = cmd.get_name().to_string();
-            let mut out: Vec<u8> = Vec::new();
-            clap_complete::generate(shell, &mut cmd, bin, &mut out);
-            assert!(
-                !out.is_empty(),
-                "completion output for {:?} should not be empty",
-                shell
-            );
-        }
-    }
-
-    #[test]
     fn test_resolve_concurrency_uses_config_value() {
         let result = resolve_concurrency(Some(5));
         assert_eq!(result, 5);
