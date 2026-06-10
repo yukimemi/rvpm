@@ -750,4 +750,127 @@ mod tests {
         let s = expected_view_stamp(PluginMergeMode::ViewWithDoc, Some("abc"), false).unwrap();
         assert_eq!(s.fingerprint, "abc:view_with_doc");
     }
+
+    #[test]
+    fn ensure_absent_removes_existing_dir() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("stale");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/file.txt"), b"residue").unwrap();
+        ensure_absent(&dir).unwrap();
+        assert!(!dir.exists(), "dir should be gone after ensure_absent");
+    }
+
+    #[test]
+    fn ensure_absent_is_ok_when_missing() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("never-existed");
+        // 存在しない path でも Ok を返す (べき等)。
+        ensure_absent(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn ensure_absent_removes_plain_file() {
+        // 残骸がディレクトリではなくファイルのケース (#223)。Windows で
+        // remove_dir_all を file に対して呼ぶと失敗するので型分岐が要る。
+        let tmp = tempdir().unwrap();
+        let file = tmp.path().join("stale-file");
+        std::fs::write(&file, b"residue").unwrap();
+        ensure_absent(&file).unwrap();
+        assert!(!file.exists(), "file should be gone after ensure_absent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_absent_removes_dangling_symlink() {
+        // dangling symlink: target は存在しないが symlink 自体は残骸として残る (#223)。
+        let tmp = tempdir().unwrap();
+        let link = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("missing-target"), &link).unwrap();
+        // symlink 自体は存在する (target は無い)。
+        assert!(link.symlink_metadata().is_ok());
+        ensure_absent(&link).unwrap();
+        assert!(
+            link.symlink_metadata().is_err(),
+            "dangling symlink should be gone after ensure_absent"
+        );
+    }
+
+    // ── decide_merge_mode ──
+
+    #[test]
+    fn test_decide_merge_mode_eager_merge_is_full() {
+        // eager + merge=true → 常に Full (per-plugin / global の merge_doc は影響しない)
+        assert_eq!(
+            decide_merge_mode(true, false, None, false),
+            PluginMergeMode::Full
+        );
+        assert_eq!(
+            decide_merge_mode(true, false, None, true),
+            PluginMergeMode::Full
+        );
+        assert_eq!(
+            decide_merge_mode(true, false, Some(false), true),
+            PluginMergeMode::Full
+        );
+        assert_eq!(
+            decide_merge_mode(true, false, Some(true), false),
+            PluginMergeMode::Full
+        );
+    }
+
+    #[test]
+    fn test_decide_merge_mode_global_default_lazy() {
+        // lazy + merge=true + per-plugin None → global で決まる
+        assert_eq!(
+            decide_merge_mode(true, true, None, false),
+            PluginMergeMode::ViewWithDoc
+        );
+        assert_eq!(
+            decide_merge_mode(true, true, None, true),
+            PluginMergeMode::ViewWithoutDoc
+        );
+    }
+
+    #[test]
+    fn test_decide_merge_mode_per_plugin_override_wins() {
+        // per-plugin Some(true) は global=false でも勝つ
+        assert_eq!(
+            decide_merge_mode(true, true, Some(true), false),
+            PluginMergeMode::ViewWithoutDoc
+        );
+        // per-plugin Some(false) は global=true でも勝つ
+        assert_eq!(
+            decide_merge_mode(true, true, Some(false), true),
+            PluginMergeMode::ViewWithDoc
+        );
+    }
+
+    #[test]
+    fn test_decide_merge_mode_eager_non_merge_uses_view() {
+        // eager + merge=false: view 経由で扱う (clone path 直 rtp:append しない統一案)
+        assert_eq!(
+            decide_merge_mode(false, false, None, false),
+            PluginMergeMode::ViewWithDoc
+        );
+        // merge_doc=true なら eager + merge=false でも doc を merged/ に集約
+        assert_eq!(
+            decide_merge_mode(false, false, Some(true), false),
+            PluginMergeMode::ViewWithoutDoc
+        );
+    }
+
+    #[test]
+    fn test_decide_merge_mode_lazy_non_merge_uses_view() {
+        // lazy + merge=false: view 経由で扱う
+        assert_eq!(
+            decide_merge_mode(false, true, None, false),
+            PluginMergeMode::ViewWithDoc
+        );
+        assert_eq!(
+            decide_merge_mode(false, true, Some(true), false),
+            PluginMergeMode::ViewWithoutDoc
+        );
+    }
 }
