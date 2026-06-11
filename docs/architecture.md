@@ -167,17 +167,20 @@ Implementation notes:
 
 ## Supply-chain cooldown (`src/cooldown.rs`)
 
-Opt-in "minimum release age" gate for `rvpm update`, mirroring what npm /
-pnpm shipped after the 2025 Shai-Hulud-class worm attacks (pnpm 11 defaults
-to 1 day) and what folke/lazy.nvim#2141 proposes for Neovim: a malicious
-commit is usually detected and reverted within hours-to-days, so refusing to
-apply anything *too new* skips most attack windows.
+"Minimum release age" gate for `rvpm update`, **on by default at 1 day**,
+mirroring what npm / pnpm shipped after the 2025 Shai-Hulud-class worm
+attacks (pnpm 11 also defaults to 1 day) and what folke/lazy.nvim#2141
+proposes for Neovim: a malicious commit is usually detected and reverted
+within hours-to-days, so refusing to apply anything *too new* skips most
+attack windows.
 
-Configuration: `options.cooldown = "1d"` (humantime-lite, shared parser with
-`fetch_interval`), per-plugin `[[plugins]] cooldown` override (`"0"` =
-opt-out). Unset = disabled. Parse failures **fail closed** to 1d (a typo in
-a safety knob must not silently disable it — note this is the opposite
-fallback direction from `fetch_interval`).
+Configuration: `options.cooldown` (humantime-lite, shared parser with
+`fetch_interval`), per-plugin `[[plugins]] cooldown` override. **Unset →
+`DEFAULT_COOLDOWN` (1d, default on)**; `"0"` disables (globally or
+per-plugin). Parse failures **fail closed** to 1d (a typo in a safety knob
+must not silently disable it — note this is the opposite fallback direction
+from `fetch_interval`, and `DEFAULT_COOLDOWN` serves as both the unset
+default and the parse-failure fallback since both want 1d).
 
 ### Why first-seen instead of committer dates
 

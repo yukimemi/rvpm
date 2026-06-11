@@ -56,10 +56,10 @@ pub const CURRENT_VERSION: u32 = 1;
 /// prune が eligible を 1 つに畳むので通常ここまで溜まらない (防波堤)。
 pub const MAX_OBSERVED: usize = 200;
 
-/// `options.cooldown` / `[[plugins]] cooldown` のパース失敗時フォールバック。
-/// cooldown は安全機構なので、設定ミスで黙って無効化 (fail-open) せず
-/// 1d (pnpm 11 の既定と同じ) に倒す (fail-closed)。
-pub const FALLBACK_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
+/// cooldown の既定値 (pnpm 11 と同じ 1d)。`options.cooldown` 未指定時の
+/// **デフォルト ON** 値であり、設定文字列のパース失敗時の fail-closed
+/// フォールバックも兼ねる (どちらも安全側に倒したいので同じ 1d)。
+pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// cooldown_state のルート構造。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,14 +394,14 @@ pub fn prune(
 
 /// `options.cooldown` / `[[plugins]] cooldown` の生文字列を Duration に解決する。
 ///
-/// - 未指定 (None) → `Duration::ZERO` (= cooldown 無効。既存ユーザーの挙動を
-///   変えない opt-in 設計)
+/// - 未指定 (None) → `DEFAULT_COOLDOWN` (1d。**デフォルト ON**: 明示的に
+///   `"0"` で無効化しない限り cooldown を効かせる。pnpm 11 と同じ方針)
 /// - `"0"` → 無効化の明示
 /// - パース失敗 → warn を出して **1d にフォールバック** (安全機構なので
 ///   fail-open にしない; fetch_interval とは逆方向の倒し方)
 pub fn resolve_cooldown(raw: Option<&str>) -> Duration {
     match raw {
-        None => Duration::ZERO,
+        None => DEFAULT_COOLDOWN,
         Some(s) => match crate::fetch_state::parse_duration(s) {
             Ok(d) => d,
             Err(e) => {
@@ -409,7 +409,7 @@ pub fn resolve_cooldown(raw: Option<&str>) -> Duration {
                     "\u{26a0} cooldown: {} — falling back to 1d (fail-closed)",
                     e
                 );
-                FALLBACK_COOLDOWN
+                DEFAULT_COOLDOWN
             }
         },
     }
@@ -688,8 +688,9 @@ mod tests {
     // ───── resolve / effective cooldown ─────
 
     #[test]
-    fn test_resolve_cooldown_unset_is_disabled() {
-        assert_eq!(resolve_cooldown(None), Duration::ZERO);
+    fn test_resolve_cooldown_unset_defaults_on() {
+        // デフォルト ON: 未指定なら 1d が効く (`"0"` で明示無効化しない限り)。
+        assert_eq!(resolve_cooldown(None), DEFAULT_COOLDOWN);
     }
 
     #[test]
@@ -705,7 +706,13 @@ mod tests {
     #[test]
     fn test_resolve_cooldown_bad_input_fails_closed() {
         // 安全機構なので設定ミスは「無効化」ではなく 1d に倒す。
-        assert_eq!(resolve_cooldown(Some("garbage")), FALLBACK_COOLDOWN);
+        assert_eq!(resolve_cooldown(Some("garbage")), DEFAULT_COOLDOWN);
+    }
+
+    #[test]
+    fn test_effective_cooldown_unset_everywhere_defaults_on() {
+        // global も per-plugin も未指定 → デフォルト ON の 1d。
+        assert_eq!(effective_cooldown(None, None), DEFAULT_COOLDOWN);
     }
 
     #[test]
@@ -719,6 +726,12 @@ mod tests {
     #[test]
     fn test_effective_cooldown_plugin_zero_opts_out() {
         assert_eq!(effective_cooldown(Some("1d"), Some("0")), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_effective_cooldown_plugin_zero_opts_out_of_default() {
+        // global 未指定 (= デフォルト ON) でも、plugin `"0"` で個別 opt-out できる。
+        assert_eq!(effective_cooldown(None, Some("0")), Duration::ZERO);
     }
 
     #[test]

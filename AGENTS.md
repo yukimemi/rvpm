@@ -60,9 +60,10 @@ concurrency = 16
 # Supply-chain cooldown (minimum release age, like npm/pnpm's
 # minimumReleaseAge): `rvpm update` won't advance to a commit until rvpm has
 # first observed it for this long (or the commit itself is older than the
-# window). Unset = disabled. Per-plugin override via `[[plugins]] cooldown`
-# ("0" opts out); bypass once with `rvpm update --no-cooldown`. Observations
-# live in `<cache_root>/cooldown_state.json`. See docs/architecture.md.
+# window). ON BY DEFAULT at "1d" (pnpm 11 parity); set "0" to disable.
+# Per-plugin override via `[[plugins]] cooldown` ("0" opts out); bypass once
+# with `rvpm update --no-cooldown`. Observations live in
+# `<cache_root>/cooldown_state.json`. See docs/architecture.md.
 # cooldown = "1d"
 # URL form written by `rvpm add`: "short" (owner/repo, default) or
 # "full" (https://github.com/owner/repo). Duplicate detection normalizes both forms before comparing.

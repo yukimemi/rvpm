@@ -164,7 +164,7 @@ for fully isolated test configs.
 | `merge_doc` | `boolean` | `false` | Aggregate every non-Full plugin's `doc/` into `merged/doc/` so `:help <topic>` resolves their tags before the plugin loads. The plugin's rtp entry routes through `views/<plug>/` (a doc-stripped hard-link tree of the clone) so `:tselect` shows no duplicate post-trigger. Eager + `merge = true` (Full merge) is unaffected. Per-plugin override: `[[plugins]] merge_doc = true` / `merge_doc = false`. Filename conflicts inside `doc/` are first-wins |
 | `url_style` | `"short"` \| `"full"` | `"short"` | How `rvpm add` writes GitHub plugin URLs. Duplicate detection normalizes between styles |
 | `fetch_interval` | duration string (`"6h"`, `"30m"`, `"45s"`, `"1d"`, `"0"`) | `"6h"` | Per-plugin fetch cache window. `sync` skips `git fetch` for plugins pulled within the last *fetch_interval*. Accepted units: `s` / `m` / `h` / `d`. Set to `"0"` to disable caching (pre-v3.19 behavior). Override per-run with `rvpm sync --refresh` / `--no-refresh` |
-| `cooldown` | duration string (`"1d"`, `"12h"`, `"0"`) | unset (disabled) | **Supply-chain cooldown** (minimum release age): `rvpm update` won't advance a plugin to a commit until rvpm has *first observed* it for at least this long (or the commit itself is older than the window). Malicious commits are typically detected and reverted within hours-to-days, so even `"1d"` skips most attack windows — same idea as npm/pnpm `minimumReleaseAge`. While the tip is too fresh, update advances to the newest already-matured observed commit instead, so active plugins still move forward (delayed by the cooldown). Explicit `rev` pins, `dev` plugins, and first installs are exempt. Per-plugin override: `[[plugins]] cooldown = "..."` (`"0"` opts a plugin out). Bypass once with `rvpm update --no-cooldown`. See [Advanced → Supply-chain cooldown](#advanced) |
+| `cooldown` | duration string (`"1d"`, `"12h"`, `"0"`) | `"1d"` (**on by default**) | **Supply-chain cooldown** (minimum release age): `rvpm update` won't advance a plugin to a commit until rvpm has *first observed* it for at least this long (or the commit itself is older than the window). Malicious commits are typically detected and reverted within hours-to-days, so even `"1d"` skips most attack windows — same idea as npm/pnpm `minimumReleaseAge` (pnpm 11 also defaults to 1 day). While the tip is too fresh, update advances to the newest already-matured observed commit instead, so active plugins still move forward (delayed by the cooldown). Set `"0"` to disable. Explicit `rev` pins, `dev` plugins, and first installs are exempt. Per-plugin override: `[[plugins]] cooldown = "..."` (`"0"` opts a plugin out). Bypass once with `rvpm update --no-cooldown`. See [Advanced → Supply-chain cooldown](#advanced) |
 | `auto_lazy` | `"ask"` \| `"always"` \| `"never"` | `"ask"` | How `rvpm add` (and `rvpm browse → Enter`) handles the post-clone scan that looks for `nvim_create_user_command` / keymaps in the plugin's `plugin/` + `ftplugin/` + `after/plugin/` + `lua/` dirs. `"ask"` (default) prompts interactively on TTY and skips silently on non-TTY. `"always"` accepts the suggestion unconditionally. `"never"` skips the scan entirely. Per-call override via `--auto-lazy` / `--no-lazy` on `rvpm add`. Accepted suggestions cluster commands by 3-char LCP (3+ char shared prefix becomes `/^Prefix/` regex so future commands in that family auto-load) and enumerate keymaps (maps don't LCP well). **Ignored when `ai != "off"`** — the AI handles the design end-to-end |
 | `ai` | `"off"` \| `"claude"` \| `"gemini"` \| `"codex"` \| `"opencode"` | `"off"` | Use an AI CLI to design the full `[[plugins]]` block (plus per-plugin hook files) on `rvpm add`. The chosen CLI must already be installed and authenticated (`claude login`, `gemini auth`, etc.) — rvpm doesn't manage API keys. When set, the static-scan + auto-lazy path is skipped entirely. After the AI proposes, you can apply, refine via chat, hand off to the native CLI for free-form follow-up, or skip. Per-call override via `--ai <backend>` / `--no-ai` on `rvpm add` |
 | `ai_language` | string | `"en"` | Natural language for the AI's `<rvpm:explanation>` body and chat replies. The XML tag structure itself is always English so parsing stays predictable. Accepts BCP-47-ish codes (`"en"`, `"ja"`, `"zh"`, `"de"`) or free-form names |
@@ -315,11 +315,14 @@ a short delay skips most attack windows (npm/pnpm call this
 `minimumReleaseAge`; pnpm 11 enables 1 day by default; the same idea is
 proposed for lazy.nvim in folke/lazy.nvim#2141).
 
-rvpm's version of this is opt-in:
+rvpm enables this **by default at `"1d"`** (matching pnpm 11). Tune or
+disable it in `[options]`, and override per plugin:
 
 ```toml
 [options]
-cooldown = "1d"          # don't trust commits rvpm has known for < 1 day
+# cooldown = "1d"        # the default — don't trust commits known for < 1 day
+# cooldown = "0"         # opt out globally
+cooldown = "3d"          # or go stricter
 
 [[plugins]]
 url = "owner/critical-thing"
