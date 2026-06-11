@@ -324,11 +324,14 @@ fn read_input_with_esc(prompt: &str, initial: &str) -> Result<Option<String>> {
     result
 }
 
-/// config.toml 上で指定プラグイン (url 一致) の `url = "..."` 行の行番号 (1-indexed) を返す。
-/// 見つからなければ 1 を返す (ファイル先頭)。
+/// config.toml 上で指定プラグイン (url 一致) の `url = "..."` / `url = '...'` 行の
+/// 行番号 (1-indexed) を返す。見つからなければ 1 を返す (ファイル先頭)。
 /// whitespace の入り方に寛容: `url="..."`, `url = "..."`, `url  =   "..."` など全部拾う。
+/// TOML の basic string (`"..."`) と literal string (`'...'`) の両方に対応 (#251)。
 fn find_plugin_line_in_toml(toml_content: &str, url: &str) -> usize {
-    let needle = format!("\"{}\"", url);
+    // basic string (`"url"`) と literal string (`'url'`) の両方を照合する。
+    let dq = format!("\"{}\"", url);
+    let sq = format!("'{}'", url);
     for (i, line) in toml_content.lines().enumerate() {
         let trimmed = line.trim_start();
         if !trimmed.starts_with("url") {
@@ -339,7 +342,7 @@ fn find_plugin_line_in_toml(toml_content: &str, url: &str) -> usize {
         if !rest.starts_with('=') {
             continue;
         }
-        if line.contains(&needle) {
+        if line.contains(&dq) || line.contains(&sq) {
             return i + 1;
         }
     }
@@ -355,7 +358,11 @@ fn update_plugin_config(
     on_ft: Option<Vec<String>>,
     rev: Option<String>,
 ) -> Result<()> {
-    if let Some(l) = lazy {
+    // Resolve the target plugin table once for all three scalar fields instead
+    // of re-scanning `doc["plugins"]` per field (#252). Callers (run_set) set a
+    // single field per call, so grouping the scalars ahead of the list fields is
+    // behaviour-equivalent.
+    if lazy.is_some() || merge.is_some() || rev.is_some() {
         let plugins = doc["plugins"]
             .as_array_of_tables_mut()
             .context("plugins is not an array of tables")?;
@@ -363,33 +370,21 @@ fn update_plugin_config(
             .iter_mut()
             .find(|p| p.get("url").and_then(|v| v.as_str()) == Some(url))
             .context("Could not find plugin in toml_edit document")?;
-        plugin_table["lazy"] = value(l);
-    }
-    if let Some(m) = merge {
-        let plugins = doc["plugins"]
-            .as_array_of_tables_mut()
-            .context("plugins is not an array of tables")?;
-        let plugin_table = plugins
-            .iter_mut()
-            .find(|p| p.get("url").and_then(|v| v.as_str()) == Some(url))
-            .context("Could not find plugin in toml_edit document")?;
-        plugin_table["merge"] = value(m);
+        if let Some(l) = lazy {
+            plugin_table["lazy"] = value(l);
+        }
+        if let Some(m) = merge {
+            plugin_table["merge"] = value(m);
+        }
+        if let Some(r) = rev {
+            plugin_table["rev"] = value(r);
+        }
     }
     if let Some(cmds) = on_cmd {
         set_plugin_list_field(doc, url, "on_cmd", cmds)?;
     }
     if let Some(fts) = on_ft {
         set_plugin_list_field(doc, url, "on_ft", fts)?;
-    }
-    if let Some(r) = rev {
-        let plugins = doc["plugins"]
-            .as_array_of_tables_mut()
-            .context("plugins is not an array of tables")?;
-        let plugin_table = plugins
-            .iter_mut()
-            .find(|p| p.get("url").and_then(|v| v.as_str()) == Some(url))
-            .context("Could not find plugin in toml_edit document")?;
-        plugin_table["rev"] = value(r);
     }
     Ok(())
 }
@@ -425,6 +420,14 @@ mod tests {
         // "owner/ab" should not be matched when searching for "owner/a"
         let toml = "[[plugins]]\nurl = \"owner/ab\"\n\n[[plugins]]\nurl = \"owner/a\"\n";
         assert_eq!(find_plugin_line_in_toml(toml, "owner/a"), 5);
+    }
+
+    #[test]
+    fn test_find_plugin_line_in_toml_matches_single_quoted_url() {
+        // TOML literal strings (single quotes) must be matched too (#251).
+        let toml = "[[plugins]]\nurl = 'owner/a'\n\n[[plugins]]\nurl = \"owner/b\"\n";
+        assert_eq!(find_plugin_line_in_toml(toml, "owner/a"), 2);
+        assert_eq!(find_plugin_line_in_toml(toml, "owner/b"), 5);
     }
 
     #[test]
