@@ -685,6 +685,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_prune_drops_malformed_entries_first_when_capped() {
+        // Malformed first_seen → parse_rfc3339_utc None, which sorts before
+        // any Some(_), so corrupted entries are drained first when the cap
+        // fires (safe direction: drop the untrustworthy ones). All pending
+        // here (huge cooldown) so only the MAX_OBSERVED cap is exercised.
+        let mut v: Vec<ObservedCommit> = Vec::new();
+        v.push(ObservedCommit {
+            commit: "malformed".into(),
+            first_seen: "not-a-timestamp".into(),
+            committed_at: None,
+        });
+        for i in 0..(MAX_OBSERVED + 10) {
+            v.push(obs(&format!("c{}", i), Duration::from_secs(i as u64)));
+        }
+        prune(&mut v, None, t0(), 365 * DAY);
+        assert_eq!(v.len(), MAX_OBSERVED);
+        assert!(
+            !v.iter().any(|o| o.commit == "malformed"),
+            "malformed entry must be dropped first when the cap fires"
+        );
+    }
+
     // ───── resolve / effective cooldown ─────
 
     #[test]

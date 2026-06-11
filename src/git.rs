@@ -377,9 +377,12 @@ fn commit_time_impl(dst: &Path, rev: &str) -> Result<Option<std::time::SystemTim
     if time.seconds < 0 {
         return Ok(None);
     }
-    Ok(Some(
-        std::time::UNIX_EPOCH + std::time::Duration::from_secs(time.seconds as u64),
-    ))
+    // `seconds as u64` is safe: guarded against negatives above. Use
+    // `checked_add` rather than `+` so a corrupted / far-future committer
+    // date can't panic — on Windows `SystemTime` is backed by `FILETIME`
+    // (max year 30828) and the `+` operator panics on overflow. Overflow
+    // degrades to `None`, matching this fn's "any problem → Ok(None)" contract.
+    Ok(std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(time.seconds as u64)))
 }
 
 /// fetch なしで remote tracking tip へ HEAD を進める (update_impl の checkout 部)。

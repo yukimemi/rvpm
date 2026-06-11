@@ -226,9 +226,20 @@ For an update with remote tip `T` and current HEAD `H`:
    entry, no fallback is taken (we cannot prove the candidate isn't a
    *downgrade*, so we stay put).
 
+The fallback's `*seen > head_seen` guard uses `first_seen` (wall-clock
+observation order) as a proxy for git ancestry. A second acknowledged
+trade-off: a remote force-push can make observations arrive in an order that
+doesn't match the rewritten git history, so a "newer by first_seen" fallback
+could in principle be a git-ancestor of the current HEAD. In practice the
+risk is tiny — force-pushes are rare, and a *malicious* force-push is exactly
+what the cooldown is defending against (the rewritten tip is still held until
+it matures) — but it's a real edge of the first-seen heuristic.
+
 `cooldown::prune` keeps all pending (not-yet-eligible) observations, the
 single newest eligible one, and the current HEAD's entry (the comparison
-baseline), capped at 200.
+baseline), capped at 200. Entries with malformed `first_seen` sort before
+valid ones (`Option<SystemTime>: None < Some`), so they are dropped first
+when the cap fires — the safe direction.
 
 ### Integration points
 

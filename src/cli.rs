@@ -288,7 +288,9 @@ enum Commands {
         query: Option<String>,
         /// Bypass the supply-chain cooldown for this run and update straight
         /// to the remote tip (see `options.cooldown`; use for e.g. a security
-        /// hotfix you want immediately)
+        /// hotfix you want immediately). Note: this run records no
+        /// observations, so habitually passing it keeps tips from maturing and
+        /// later non-bypassed updates will hold back again
         #[arg(long)]
         no_cooldown: bool,
     },

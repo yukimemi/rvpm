@@ -407,6 +407,9 @@ pub(crate) async fn run_sync(
                                 match tip {
                                     Some(tip) => {
                                         let now = std::time::SystemTime::now();
+                                        // Guard is an I/O optimization (elides
+                                        // commit_time() for already-seen tips);
+                                        // observe dedups on its own regardless.
                                         if !ctx.observed.iter().any(|o| o.commit == tip) {
                                             let committed =
                                                 repo.commit_time(&tip).await.ok().flatten();

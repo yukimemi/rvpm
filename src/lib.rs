@@ -238,6 +238,9 @@ async fn cooldown_gated_update(
     let Some(tip) = repo.remote_head().await? else {
         return Ok((None, None));
     };
+    // Guard is an I/O optimization, not correctness: `observe` dedups on its
+    // own (won't reset first_seen), but checking here elides the async
+    // `commit_time()` call when the tip was already observed in a prior fetch.
     if !ctx.observed.iter().any(|o| o.commit == tip) {
         let committed = repo.commit_time(&tip).await.ok().flatten();
         crate::cooldown::observe(&mut ctx.observed, &tip, committed, now);
