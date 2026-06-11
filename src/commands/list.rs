@@ -359,14 +359,14 @@ pub(crate) async fn run_list(no_tui: bool) -> Result<bool> {
                             continue;
                         }
                         leave_tui(&mut terminal)?;
-                        let _ = run_update(Some(url)).await;
+                        let _ = run_update(Some(url), false).await;
                         wait_for_keypress("\nPress any key to return to list...")?;
                         reload!();
                     }
                 }
                 crossterm::event::KeyCode::Char('U') => {
                     leave_tui(&mut terminal)?;
-                    let _ = run_update(None).await;
+                    let _ = run_update(None, false).await;
                     wait_for_keypress("\nPress any key to return to list...")?;
                     reload!();
                 }

@@ -125,6 +125,38 @@ impl<'a> Repo<'a> {
             .await
             .map_err(|e| anyhow::anyhow!("remote_head task panicked: {}", e))?
     }
+
+    /// 既存 clone に対して fetch だけ実行する (HEAD は動かさない)。
+    /// cooldown ゲート (#supply-chain) が「fetch → 判定 → checkout」を分割で
+    /// 実行するためのプリミティブ。未 clone はエラー (fetch_impl 経由)。
+    pub async fn fetch(&self) -> Result<()> {
+        let dst = self.dst.to_path_buf();
+        tokio::task::spawn_blocking(move || fetch_impl(&dst))
+            .await
+            .map_err(|e| anyhow::anyhow!("fetch task panicked: {}", e))?
+    }
+
+    /// `rev` の committer date を local DB から読む。未 clone / rev 解決不能 /
+    /// 時刻が読めない場合は `Ok(None)` (caller は「コミット時刻不明 = cooldown の
+    /// 熟成補助なし」として安全側に扱う)。network は打たない。
+    pub async fn commit_time(&self, rev: &str) -> Result<Option<std::time::SystemTime>> {
+        let dst = self.dst.to_path_buf();
+        let rev = rev.to_string();
+        tokio::task::spawn_blocking(move || commit_time_impl(&dst, &rev))
+            .await
+            .map_err(|e| anyhow::anyhow!("commit_time task panicked: {}", e))?
+    }
+
+    /// fetch 済みの remote tracking tip へ HEAD を進める (= `update()` から
+    /// fetch を抜いたもの)。cooldown ゲートが fetch 済みの clone に Advance
+    /// 判定を出した後の checkout に使う。`Option<GitChange>` の意味は
+    /// `update()` と同じ (HEAD が動かなければ `None`)。
+    pub async fn reset_to_remote_tip(&self) -> Result<Option<GitChange>> {
+        let dst = self.dst.to_path_buf();
+        tokio::task::spawn_blocking(move || reset_to_remote_tip_impl(&dst))
+            .await
+            .map_err(|e| anyhow::anyhow!("reset_to_remote_tip task panicked: {}", e))?
+    }
 }
 
 /// owner/repo 形式のショートハンドを GitHub URL に変換。
@@ -313,6 +345,52 @@ fn read_remote_head(dst: &Path) -> Result<Option<String>> {
         return Ok(Some(id.detach().to_string()));
     }
     Ok(None)
+}
+
+/// `rev` の committer date を読む。失敗系はすべて `Ok(None)` に丸める
+/// (resilience: cooldown 判定の補助情報が無いだけで処理は続行できる)。
+fn commit_time_impl(dst: &Path, rev: &str) -> Result<Option<std::time::SystemTime>> {
+    if !dst.exists() {
+        return Ok(None);
+    }
+    let repo = match gix::open(dst) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    // annotated tag を commit まで peel する (`resolve_revision_impl` と同じ理由)。
+    let peeled = format!("{}^{{commit}}", rev);
+    let id = match repo
+        .rev_parse_single(peeled.as_str())
+        .or_else(|_| repo.rev_parse_single(rev))
+    {
+        Ok(id) => id,
+        Err(_) => return Ok(None),
+    };
+    let commit = match repo.find_commit(id) {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    let time = match commit.time() {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    if time.seconds < 0 {
+        return Ok(None);
+    }
+    Ok(Some(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(time.seconds as u64),
+    ))
+}
+
+/// fetch なしで remote tracking tip へ HEAD を進める (update_impl の checkout 部)。
+fn reset_to_remote_tip_impl(dst: &Path) -> Result<Option<GitChange>> {
+    if !dst.exists() {
+        anyhow::bail!("Plugin not installed: {}", dst.display());
+    }
+    let before = read_head(dst).ok();
+    gix_reset_to_remote(dst)?;
+    let after = read_head(dst)?;
+    Ok(build_change(dst, before, after))
 }
 
 /// before/after の HEAD から `GitChange` を組み立てる。
@@ -1423,6 +1501,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fetch_only_updates_tracking_ref_without_moving_head() {
+        // cooldown gate primitive: `fetch()` must bring the new remote tip
+        // into the local DB (visible via remote_head) while HEAD stays put.
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_init_with_user(&src).await;
+        fs::write(src.join("a.txt"), "v1").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        let initial = git_head(&src).await;
+
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        repo.sync().await.unwrap();
+
+        fs::write(src.join("a.txt"), "v2").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "advance"])
+            .output()
+            .await
+            .unwrap();
+        let new_tip = git_head(&src).await;
+
+        repo.fetch().await.unwrap();
+
+        assert_eq!(
+            repo.head_commit().await.unwrap(),
+            initial,
+            "fetch must not move HEAD"
+        );
+        assert_eq!(
+            repo.remote_head().await.unwrap().as_deref(),
+            Some(new_tip.as_str()),
+            "fetch must update the remote tracking tip"
+        );
+        // Worktree untouched too.
+        assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "v1");
+    }
+
+    #[tokio::test]
+    async fn test_reset_to_remote_tip_advances_head_without_network() {
+        // After a separate fetch, reset_to_remote_tip must move HEAD (and the
+        // worktree) to the tracking tip and report the GitChange — the
+        // "Advance" half of the cooldown gate.
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_init_with_user(&src).await;
+        fs::write(src.join("a.txt"), "v1").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        let initial = git_head(&src).await;
+
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        repo.sync().await.unwrap();
+
+        fs::write(src.join("a.txt"), "v2").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "advance"])
+            .output()
+            .await
+            .unwrap();
+        let new_tip = git_head(&src).await;
+
+        repo.fetch().await.unwrap();
+        let change = repo
+            .reset_to_remote_tip()
+            .await
+            .unwrap()
+            .expect("HEAD moved");
+        assert_eq!(change.from.as_deref(), Some(initial.as_str()));
+        assert_eq!(change.to, new_tip);
+        assert_eq!(repo.head_commit().await.unwrap(), new_tip);
+        assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "v2");
+
+        // No-op second call → None.
+        assert!(repo.reset_to_remote_tip().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_commit_time_reads_committer_date() {
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_init_with_user(&src).await;
+        fs::write(src.join("a.txt"), "v1").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .env("GIT_COMMITTER_DATE", "2020-01-02T03:04:05Z")
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        repo.sync().await.unwrap();
+        let head = repo.head_commit().await.unwrap();
+
+        // 2020-01-02T03:04:05Z = 1577934245 unix
+        let expected = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_934_245);
+        assert_eq!(repo.commit_time(&head).await.unwrap(), Some(expected));
+
+        // Unresolvable rev / missing clone degrade to None, not Err.
+        assert_eq!(repo.commit_time("no-such-rev").await.unwrap(), None);
+        let never_cloned = root.path().join("nope");
+        let missing = Repo::new("dummy", &never_cloned, None);
+        assert_eq!(missing.commit_time("HEAD").await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn test_resolve_revision_locally_handles_sha_branch_tag_and_missing() {
         // Fast-path comparison depends on being able to resolve branch/tag
         // refs to SHAs locally without hitting the network. Exercise all
@@ -2518,7 +2722,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         let cache_root = root.path().join("cache");
 
-        let res = crate::update_single_plugin(&plugin, &cache_root, tx).await;
+        let res = crate::update_single_plugin(&plugin, &cache_root, tx, None).await;
 
         // TDD: This will fail on the current codebase because the plugin is missing and not synced yet.
         assert!(
@@ -2537,5 +2741,208 @@ mod tests {
         assert_eq!(statuses.len(), 2);
         assert!(matches!(statuses[0], crate::PluginStatus::Syncing(ref m) if m == "Syncing..."));
         assert!(matches!(statuses[1], crate::PluginStatus::Finished));
+    }
+
+    // ─── cooldown-gated update (#supply-chain) ─────────────────────────────
+    // End-to-end behavior of `update_single_plugin` with a `PluginCooldownCtx`:
+    // fresh tips are held, matured tips advance, old-by-commit-date tips
+    // advance, and a matured intermediate observation becomes the fallback.
+
+    use crate::cooldown::{ObservedCommit, PluginCooldownCtx};
+    use crate::update_log::format_rfc3339_utc;
+
+    const DAY_SECS: u64 = 24 * 60 * 60;
+
+    /// src repo (1 commit) + cloned dst + Plugin を作る共通セットアップ。
+    /// (plugin, src, dst, cache_root, initial_head) を返す。
+    async fn setup_cloned_plugin(
+        root: &Path,
+    ) -> (
+        crate::config::Plugin,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        String,
+    ) {
+        let src = root.join("src");
+        let dst = root.join("dst");
+        fs::create_dir_all(&src).unwrap();
+        git_init_with_user(&src).await;
+        fs::write(src.join("hello.txt"), "v1").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .args(["commit", "-m", "init"])
+            .output()
+            .await
+            .unwrap();
+        let initial = git_head(&src).await;
+
+        let plugin = crate::config::Plugin {
+            url: src.to_str().unwrap().to_string(),
+            dst: Some(dst.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        let cache_root = root.join("cache");
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        crate::update_single_plugin(&plugin, &cache_root, tx, None)
+            .await
+            .unwrap();
+        (plugin, src, dst, cache_root, initial)
+    }
+
+    async fn commit_to(src: &Path, content: &str, msg: &str) -> String {
+        fs::write(src.join("hello.txt"), content).unwrap();
+        git_cmd(src).args(["add", "."]).output().await.unwrap();
+        git_cmd(src)
+            .args(["commit", "-m", msg])
+            .output()
+            .await
+            .unwrap();
+        git_head(src).await
+    }
+
+    #[tokio::test]
+    async fn test_update_single_plugin_cooldown_holds_fresh_tip() {
+        let root = tempdir().unwrap();
+        let (plugin, src, dst, cache_root, initial) = setup_cloned_plugin(root.path()).await;
+        let new_tip = commit_to(&src, "v2", "advance").await;
+
+        // First-ever observation of the fresh tip → must hold at the old HEAD.
+        let ctx = PluginCooldownCtx {
+            cooldown: std::time::Duration::from_secs(DAY_SECS),
+            observed: Vec::new(),
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let (_p, change, head, outcome) =
+            crate::update_single_plugin(&plugin, &cache_root, tx, Some(ctx))
+                .await
+                .unwrap();
+
+        assert!(change.is_none(), "held update must not move HEAD");
+        assert_eq!(head.as_deref(), Some(initial.as_str()));
+        assert_eq!(fs::read_to_string(dst.join("hello.txt")).unwrap(), "v1");
+        let out = outcome.expect("cooldown outcome must be reported");
+        let held = out.held.expect("fresh tip must be flagged as held");
+        assert_eq!(held.tip, new_tip);
+        assert_eq!(held.fallback, None);
+        assert!(
+            out.observed.iter().any(|o| o.commit == new_tip),
+            "tip must be recorded as observed so it can mature"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_single_plugin_cooldown_advances_matured_tip() {
+        let root = tempdir().unwrap();
+        let (plugin, src, dst, cache_root, initial) = setup_cloned_plugin(root.path()).await;
+        let new_tip = commit_to(&src, "v2", "advance").await;
+
+        // Pretend we first saw this tip 2 days ago (cooldown = 1 day).
+        let two_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * DAY_SECS);
+        let ctx = PluginCooldownCtx {
+            cooldown: std::time::Duration::from_secs(DAY_SECS),
+            observed: vec![ObservedCommit {
+                commit: new_tip.clone(),
+                first_seen: format_rfc3339_utc(two_days_ago),
+                committed_at: None,
+            }],
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let (_p, change, head, outcome) =
+            crate::update_single_plugin(&plugin, &cache_root, tx, Some(ctx))
+                .await
+                .unwrap();
+
+        let change = change.expect("matured tip must be applied");
+        assert_eq!(change.from.as_deref(), Some(initial.as_str()));
+        assert_eq!(change.to, new_tip);
+        assert_eq!(head.as_deref(), Some(new_tip.as_str()));
+        assert_eq!(fs::read_to_string(dst.join("hello.txt")).unwrap(), "v2");
+        assert!(outcome.unwrap().held.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_single_plugin_cooldown_advances_old_commit_date() {
+        // Dormant repo: the new tip's committer date is ancient → applies
+        // immediately even on first observation.
+        let root = tempdir().unwrap();
+        let (plugin, src, dst, cache_root, _initial) = setup_cloned_plugin(root.path()).await;
+        fs::write(src.join("hello.txt"), "v2").unwrap();
+        git_cmd(&src).args(["add", "."]).output().await.unwrap();
+        git_cmd(&src)
+            .env("GIT_COMMITTER_DATE", "2020-01-02T03:04:05Z")
+            .args(["commit", "-m", "old advance"])
+            .output()
+            .await
+            .unwrap();
+        let new_tip = git_head(&src).await;
+
+        let ctx = PluginCooldownCtx {
+            cooldown: std::time::Duration::from_secs(DAY_SECS),
+            observed: Vec::new(),
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let (_p, change, head, outcome) =
+            crate::update_single_plugin(&plugin, &cache_root, tx, Some(ctx))
+                .await
+                .unwrap();
+
+        assert_eq!(change.expect("old commit must be applied").to, new_tip);
+        assert_eq!(head.as_deref(), Some(new_tip.as_str()));
+        assert_eq!(fs::read_to_string(dst.join("hello.txt")).unwrap(), "v2");
+        assert!(outcome.unwrap().held.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_single_plugin_cooldown_falls_back_to_matured_observed() {
+        // Active repo: tip is too fresh, but an intermediate commit observed
+        // long enough ago must be checked out instead (delayed following).
+        let root = tempdir().unwrap();
+        let (plugin, src, dst, cache_root, initial) = setup_cloned_plugin(root.path()).await;
+
+        // mid becomes tip, gets fetched (= how it entered the local DB in
+        // real usage when it was observed), then tip lands on top.
+        let mid = commit_to(&src, "v2", "mid").await;
+        {
+            let repo = Repo::new(&plugin.url, &dst, None);
+            repo.fetch().await.unwrap();
+        }
+        let new_tip = commit_to(&src, "v3", "tip").await;
+
+        let now = std::time::SystemTime::now();
+        let ctx = PluginCooldownCtx {
+            cooldown: std::time::Duration::from_secs(DAY_SECS),
+            observed: vec![
+                ObservedCommit {
+                    commit: initial.clone(),
+                    first_seen: format_rfc3339_utc(
+                        now - std::time::Duration::from_secs(10 * DAY_SECS),
+                    ),
+                    committed_at: None,
+                },
+                ObservedCommit {
+                    commit: mid.clone(),
+                    first_seen: format_rfc3339_utc(
+                        now - std::time::Duration::from_secs(2 * DAY_SECS),
+                    ),
+                    committed_at: None,
+                },
+            ],
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let (_p, change, head, outcome) =
+            crate::update_single_plugin(&plugin, &cache_root, tx, Some(ctx))
+                .await
+                .unwrap();
+
+        let change = change.expect("fallback checkout must move HEAD");
+        assert_eq!(change.from.as_deref(), Some(initial.as_str()));
+        assert_eq!(change.to, mid);
+        assert_eq!(head.as_deref(), Some(mid.as_str()));
+        assert_eq!(fs::read_to_string(dst.join("hello.txt")).unwrap(), "v2");
+        let held = outcome.unwrap().held.expect("tip itself is still held");
+        assert_eq!(held.tip, new_tip);
+        assert_eq!(held.fallback.as_deref(), Some(mid.as_str()));
     }
 }

@@ -165,6 +165,91 @@ Implementation notes:
   accumulate into something orders of magnitude larger). On timeout, a warning
   is emitted on stderr and the target-side path is returned (resilience).
 
+## Supply-chain cooldown (`src/cooldown.rs`)
+
+Opt-in "minimum release age" gate for `rvpm update`, mirroring what npm /
+pnpm shipped after the 2025 Shai-Hulud-class worm attacks (pnpm 11 defaults
+to 1 day) and what folke/lazy.nvim#2141 proposes for Neovim: a malicious
+commit is usually detected and reverted within hours-to-days, so refusing to
+apply anything *too new* skips most attack windows.
+
+Configuration: `options.cooldown = "1d"` (humantime-lite, shared parser with
+`fetch_interval`), per-plugin `[[plugins]] cooldown` override (`"0"` =
+opt-out). Unset = disabled. Parse failures **fail closed** to 1d (a typo in
+a safety knob must not silently disable it — note this is the opposite
+fallback direction from `fetch_interval`).
+
+### Why first-seen instead of committer dates
+
+Git has no registry-style trusted publish timestamp, and committer dates are
+trivially backdatable by an attacker — gating on them alone would neuter the
+whole mitigation. So the primary signal is **when rvpm itself first observed
+a commit as the remote tip** (`first_seen`), recorded locally in
+`<cache_root>/cooldown_state.json` on every fetch (both `sync` and `update`
+record; the file is ephemeral cache — losing it just means every tip looks
+freshly observed again, which fails safe). The committer date
+(`committed_at`) is kept as a *secondary* eligibility branch so that a
+dormant repo's months-old commit isn't pointlessly held on first contact;
+that branch is the one acknowledged trade-off (backdating slips through it,
+forging `first_seen` is impossible).
+
+State schema (JSON, versioned like fetch_state):
+
+```json
+{ "version": 1,
+  "entries": [
+    { "name": "snacks.nvim", "url": "folke/snacks.nvim",
+      "observed": [
+        { "commit": "abc...", "first_seen": "2026-06-01T12:34:56Z",
+          "committed_at": "2026-06-01T10:00:00Z" }
+      ] }
+  ] }
+```
+
+### Decision algorithm (`cooldown::decide`, pure)
+
+A commit is **eligible** when `now - first_seen >= cooldown` OR
+`now - committed_at >= cooldown` (unparseable / future timestamps count as
+not eligible — clock skew fails safe).
+
+For an update with remote tip `T` and current HEAD `H`:
+
+1. cooldown disabled or `T == H` → **Advance** (plain no-op/update).
+2. `T` eligible → **Advance** to `T`.
+3. otherwise **Hold**: pick as fallback the eligible observed commit with the
+   newest `first_seen` that is strictly newer than `H`'s own observation —
+   this is what keeps an active plugin moving forward (always ~cooldown
+   behind the tip) instead of freezing forever. If `H` has no observation
+   entry, no fallback is taken (we cannot prove the candidate isn't a
+   *downgrade*, so we stay put).
+
+`cooldown::prune` keeps all pending (not-yet-eligible) observations, the
+single newest eligible one, and the current HEAD's entry (the comparison
+baseline), capped at 200.
+
+### Integration points
+
+- `update_single_plugin` (`src/lib.rs`): when the caller passes a
+  `PluginCooldownCtx` (only for non-`rev`, non-dev plugins with an effective
+  cooldown > 0), the update runs as `Repo::fetch()` →
+  `Repo::remote_head()` → observe tip (+ `Repo::commit_time`) → `decide` →
+  `Repo::reset_to_remote_tip()` (Advance) / `Repo::checkout_locally(sha)`
+  (Hold-with-fallback; the sha is in the local DB because it was fetched
+  when it was itself the tip) / no-op (Hold). Held plugins are listed in the
+  update summary with tip age; `rvpm update --no-cooldown` skips the ctx
+  entirely for one run.
+- `run_sync` (`src/commands/sync.rs`): **not gated** — sync already honors
+  lockfile pins, which is precisely what blocks new upstream commits between
+  updates. But sync records tip observations on every real fetch (reusing
+  the `remote_head` it already reads for the held-back summary, or
+  `head_commit` on the fresh-clone/no-lock path where HEAD == tip), so tips
+  mature even if the user rarely runs `update`.
+- Exemptions: explicit `rev` (user's pin wins), `dev` plugins, first install
+  (clone takes the tip; you have to start somewhere — the clone's HEAD is
+  recorded as the first observation).
+- URL mismatch between state entry and config (same display name, different
+  repo) discards the observation history, same trust rule as the lockfile.
+
 ## Automatic helptags generation (`src/helptags.rs`)
 
 On `sync` / `generate` completion, launch `nvim --headless --clean -c "source <tmp.vim>" -c "qa!"` once and run `:helptags <path>` against every target `doc/`. Disable via `options.auto_helptags = false`.

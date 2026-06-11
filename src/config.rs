@@ -105,6 +105,25 @@ pub struct Options {
     /// `git fetch` をスキップする。CLI からは `rvpm sync --refresh` / `--no-refresh`
     /// で上書き可能。
     pub fetch_interval: Option<String>,
+    /// Supply-chain cooldown (minimum release age)。humantime-lite 書式
+    /// (`"1d" / "12h" / "0"`)。
+    ///
+    /// `rvpm update` は remote の新しい commit を**最初に観測してから**この期間が
+    /// 経過するまで、その commit へ進まない (npm / pnpm の `minimumReleaseAge`、
+    /// lazy.nvim#2141 と同じ発想)。悪性 commit は大抵数時間〜数日で検出・撤去
+    /// されるため、「新しすぎる commit を掴まない」だけで攻撃ウィンドウの大半を
+    /// 回避できる。tip が若い間は、観測済みで熟成済みの直近 commit へ代わりに
+    /// 前進する (アクティブな plugin でも cooldown ぶん遅れで追従し続ける)。
+    ///
+    /// - 未指定 → 無効 (従来挙動)。`"1d"` 程度からの opt-in を推奨
+    /// - `"0"` → 明示的に無効
+    /// - 不正な値 → warn を出して **1d にフォールバック** (安全機構なので
+    ///   fail-open にしない; fetch_interval と逆方向の倒し方)
+    ///
+    /// per-plugin override は `[[plugins]] cooldown = "..."` (`"0"` で個別
+    /// opt-out)。明示 `rev` ピン / dev plugin / 初回インストールは対象外。
+    /// CLI からは `rvpm update --no-cooldown` で 1 回だけバイパスできる。
+    pub cooldown: Option<String>,
     /// `rvpm add` のスキャン後 auto-lazy 提案ポリシー (#87)。
     ///
     /// - `"ask"` (default): TTY なら対話プロンプトを出す、非 TTY なら skip。
@@ -237,6 +256,7 @@ impl Default for Options {
             url_style: UrlStyle::default(),
             browse: BrowseOptions::default(),
             fetch_interval: None,
+            cooldown: None,
             auto_lazy: AutoLazyPolicy::default(),
             ai: AiBackend::default(),
             ai_language: default_ai_language(),
@@ -352,6 +372,10 @@ pub struct Plugin {
     /// 期待どおりの場所に届く。
     pub build_lua: Option<String>,
     pub rev: Option<String>,
+    /// per-plugin の supply-chain cooldown override (`options.cooldown` 参照)。
+    /// `"0"` でこの plugin だけ opt-out、長め (`"7d"` 等) で個別に厳しくも
+    /// できる。明示 `rev` ピンがあるときは無意味 (ピンが優先)。
+    pub cooldown: Option<String>,
     pub cond: Option<String>,
     /// コンパイル時 (`rvpm generate` / `rvpm sync`) に評価される除外条件 (#140)。
     /// Tera でレンダリングされた後の文字列が truthy (`"true"` / `"1"` / `"yes"` /
@@ -782,6 +806,38 @@ pub fn sort_plugins(plugins: &mut Vec<Plugin>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_config_accepts_cooldown_global_and_per_plugin() {
+        let toml = r#"
+[options]
+cooldown = "1d"
+
+[[plugins]]
+url = "owner/repo"
+cooldown = "7d"
+
+[[plugins]]
+url = "owner/other"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.options.cooldown.as_deref(), Some("1d"));
+        assert_eq!(config.plugins[0].cooldown.as_deref(), Some("7d"));
+        assert_eq!(config.plugins[1].cooldown, None);
+    }
+
+    #[test]
+    fn test_parse_config_cooldown_defaults_to_unset() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "owner/repo"
+"#;
+        let config = parse_config(toml).unwrap();
+        assert_eq!(config.options.cooldown, None);
+        assert_eq!(config.plugins[0].cooldown, None);
+    }
 
     #[test]
     fn test_parse_config_accepts_on_cmd_as_string() {

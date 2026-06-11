@@ -286,6 +286,11 @@ enum Commands {
     Update {
         /// Fuzzy match plugin url (omit to update all)
         query: Option<String>,
+        /// Bypass the supply-chain cooldown for this run and update straight
+        /// to the remote tip (see `options.cooldown`; use for e.g. a security
+        /// hotfix you want immediately)
+        #[arg(long)]
+        no_cooldown: bool,
     },
 
     /// Remove a plugin and delete its directory
@@ -573,8 +578,8 @@ async fn run_cli() -> Result<()> {
                 run_generate(false).await?;
             }
         }
-        Commands::Update { query } => {
-            run_update(query).await?;
+        Commands::Update { query, no_cooldown } => {
+            run_update(query, no_cooldown).await?;
         }
         Commands::Remove { query } => {
             run_remove(query).await?;

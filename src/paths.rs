@@ -193,6 +193,13 @@ pub(crate) fn resolve_fetch_state_path(cache_root: &Path) -> PathBuf {
     cache_root.join("fetch_state.json")
 }
 
+/// Supply-chain cooldown の commit 観測履歴 (#supply-chain)。
+/// `<cache_root>/cooldown_state.json` 固定 (fetch_state と同じ場所; ephemeral
+/// cache 側 — 消えても全 tip が「初観測」へ戻り held-back されるだけで安全側)。
+pub(crate) fn resolve_cooldown_state_path(cache_root: &Path) -> PathBuf {
+    cache_root.join("cooldown_state.json")
+}
+
 /// `Plugin` + `GitChange` から永続化向けの `ChangeRecord` を組み立てる小ヘルパー。
 /// run_sync / run_update / run_add で共通利用。
 pub(crate) fn change_record_from(

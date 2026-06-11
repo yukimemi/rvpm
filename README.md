@@ -164,6 +164,7 @@ for fully isolated test configs.
 | `merge_doc` | `boolean` | `false` | Aggregate every non-Full plugin's `doc/` into `merged/doc/` so `:help <topic>` resolves their tags before the plugin loads. The plugin's rtp entry routes through `views/<plug>/` (a doc-stripped hard-link tree of the clone) so `:tselect` shows no duplicate post-trigger. Eager + `merge = true` (Full merge) is unaffected. Per-plugin override: `[[plugins]] merge_doc = true` / `merge_doc = false`. Filename conflicts inside `doc/` are first-wins |
 | `url_style` | `"short"` \| `"full"` | `"short"` | How `rvpm add` writes GitHub plugin URLs. Duplicate detection normalizes between styles |
 | `fetch_interval` | duration string (`"6h"`, `"30m"`, `"45s"`, `"1d"`, `"0"`) | `"6h"` | Per-plugin fetch cache window. `sync` skips `git fetch` for plugins pulled within the last *fetch_interval*. Accepted units: `s` / `m` / `h` / `d`. Set to `"0"` to disable caching (pre-v3.19 behavior). Override per-run with `rvpm sync --refresh` / `--no-refresh` |
+| `cooldown` | duration string (`"1d"`, `"12h"`, `"0"`) | unset (disabled) | **Supply-chain cooldown** (minimum release age): `rvpm update` won't advance a plugin to a commit until rvpm has *first observed* it for at least this long (or the commit itself is older than the window). Malicious commits are typically detected and reverted within hours-to-days, so even `"1d"` skips most attack windows — same idea as npm/pnpm `minimumReleaseAge`. While the tip is too fresh, update advances to the newest already-matured observed commit instead, so active plugins still move forward (delayed by the cooldown). Explicit `rev` pins, `dev` plugins, and first installs are exempt. Per-plugin override: `[[plugins]] cooldown = "..."` (`"0"` opts a plugin out). Bypass once with `rvpm update --no-cooldown`. See [Advanced → Supply-chain cooldown](#advanced) |
 | `auto_lazy` | `"ask"` \| `"always"` \| `"never"` | `"ask"` | How `rvpm add` (and `rvpm browse → Enter`) handles the post-clone scan that looks for `nvim_create_user_command` / keymaps in the plugin's `plugin/` + `ftplugin/` + `after/plugin/` + `lua/` dirs. `"ask"` (default) prompts interactively on TTY and skips silently on non-TTY. `"always"` accepts the suggestion unconditionally. `"never"` skips the scan entirely. Per-call override via `--auto-lazy` / `--no-lazy` on `rvpm add`. Accepted suggestions cluster commands by 3-char LCP (3+ char shared prefix becomes `/^Prefix/` regex so future commands in that family auto-load) and enumerate keymaps (maps don't LCP well). **Ignored when `ai != "off"`** — the AI handles the design end-to-end |
 | `ai` | `"off"` \| `"claude"` \| `"gemini"` \| `"codex"` \| `"opencode"` | `"off"` | Use an AI CLI to design the full `[[plugins]]` block (plus per-plugin hook files) on `rvpm add`. The chosen CLI must already be installed and authenticated (`claude login`, `gemini auth`, etc.) — rvpm doesn't manage API keys. When set, the static-scan + auto-lazy path is skipped entirely. After the AI proposes, you can apply, refine via chat, hand off to the native CLI for free-form follow-up, or skip. Per-call override via `--ai <backend>` / `--no-ai` on `rvpm add` |
 | `ai_language` | string | `"en"` | Natural language for the AI's `<rvpm:explanation>` body and chat replies. The XML tag structure itself is always English so parsing stays predictable. Accepts BCP-47-ish codes (`"en"`, `"ja"`, `"zh"`, `"de"`) or free-form names |
@@ -191,7 +192,7 @@ integration, and the external README renderer — see
 | `rvpm clean` | Delete plugin directories no longer referenced by `config.toml` (no git, faster than `sync --prune` on 200+ plugins) |
 | `rvpm add <repo>` | Add a plugin and sync (records the new plugin's commit to `rvpm.lock`) |
 | `rvpm tune [query] [--ai <backend>]` | Re-run the AI chat loop against an **already-configured** plugin to refine its `[[plugins]]` block + hook files. AI-only |
-| `rvpm update [query]` | `git pull` installed plugins and write new HEADs back to `rvpm.lock` |
+| `rvpm update [query] [--no-cooldown]` | `git pull` installed plugins and write new HEADs back to `rvpm.lock`. With `options.cooldown` set, commits younger than the cooldown window are held back (the summary lists them); `--no-cooldown` bypasses the gate for this run (e.g. to grab a security hotfix immediately) |
 | `rvpm remove [query]` | Remove a plugin from `config.toml` and delete its directory |
 | `rvpm edit [query] [--init\|--before\|--after] [--global]` | Edit per-plugin Lua hooks in `$EDITOR`. With `--global`: `--init` opens Neovim's own `init.lua`, `--before` / `--after` open `<config_root>/before.lua` / `after.lua` |
 | `rvpm set [query] [flags]` | Tweak plugin options (`lazy`, `merge`, `on_*`, `rev`) interactively or via flags |
@@ -291,12 +292,68 @@ separate, hand-maintained list and is not affected by this command.
 | `merge` | `bool` | `true` | If `true` **and** the plugin loads eagerly, the plugin's runtime files are hard-linked into `{cache_root}/plugins/merged/` and share a single runtimepath entry. Otherwise the plugin gets a per-plugin view at `{cache_root}/plugins/views/<host>/<owner>/<repo>/` (also a hard-link tree of the clone) |
 | `merge_doc` | `bool` | inherits `options.merge_doc` | Per-plugin override of the global `merge_doc`. `true` aggregates this plugin's `doc/` into `merged/doc/` and routes its rtp through a doc-stripped view (so `:help` works pre-trigger and `:tselect` doesn't dupe). `false` opts out even when the global default is `true`. Ignored for `Full` merge plugins (eager + `merge = true`) — those already include `doc/` in `merged/`. With `cond` set, an unset value is auto-forced `false` (only sweeps `cond` plugins out of the global default — explicit `true` is honored) |
 | `rev` | `string` | HEAD | Branch, tag, or commit hash to check out after clone/pull |
+| `cooldown` | `string` | inherits `options.cooldown` | Per-plugin supply-chain cooldown override (`"7d"` for stricter, `"0"` to opt this plugin out). Meaningless when `rev` pins an exact commit/tag — the pin already wins |
 | `depends` | `string[]` | none | Plugins that must be loaded before this one. Accepts `display_name` (e.g. `"snacks.nvim"`) or `url` (e.g. `"folke/snacks.nvim"`). Eager → lazy dep auto-promotes the dep to eager (with a warning); lazy → lazy dep loads dep first inside the trigger callback |
 | `when` | `string` | none | **Compile-time** exclusion condition, evaluated at `generate` / `sync` after Tera rendering. If the rendered string is truthy (`"true"` / `"1"` / `"yes"` / `"on"`, case-insensitive) the plugin is kept; anything else (`"false"` / `"0"` / empty) removes it **entirely** — no clone, no merge, no `loader.lua`, not in dependency resolution. Use Tera to gate on OS / env / vars: `when = "{{ is_windows }}"`, `when = "{{ env.RVPM_ENABLE_DEV }}"`, `when = "{{ vars.enable_custom }}"`. Contrast with `cond` (runtime). Both may be set: `when` is checked first, and if it passes, `cond` still wraps the generated Lua |
 | `cond` | `string` | none | Lua expression. When set, the plugin's loader code is wrapped in `if <cond> then ... end` |
 | `build` | `string` | none | Shell command to run after clone / update. Vim-style `:Cmd` is invoked via `nvim --headless` with the plugin and its transitive depends on `runtimepath`. 5-minute timeout. Failures are reported in the sync summary but don't stop other plugins (resilience) |
 | `build_lua` | `string` | none | Lua snippet to run after clone / update, **after** the shell `build` if both are set. Invoked via `nvim --headless -u NONE -l <tmp.lua>` with the plugin and its transitive depends appended to `runtimepath`. `vim.fn.stdpath("data")` etc. resolve to the user's real data dir (no `--clean`), so plugins like `blink.cmp` that install native libs into `{stdpath('data')}/site/lib/` work as expected. Both `build_lua = "require('blink.cmp').build():wait(60000)"` (statement form) and `build_lua = "function() require('blink.cmp').build():wait(60000) end"` (lazy.nvim function form, auto-unwrapped) are accepted |
 | `dev` | `bool` | `false` | When `true`, `sync` and `update` skip this plugin entirely (no clone/fetch/reset). Use for local development |
+
+</details>
+
+<details>
+<summary><b>Supply-chain cooldown (<code>options.cooldown</code>)</b></summary>
+
+Neovim plugins run arbitrary code in your editor (and `build` hooks run it
+at install time), so a compromised upstream repo is an immediate code
+execution path. Package managers across ecosystems converged on the same
+practical mitigation after the 2025 npm worm attacks: **don't install
+anything that was published less than N hours ago**. Malicious commits and
+releases are typically detected and reverted within hours to a few days, so
+a short delay skips most attack windows (npm/pnpm call this
+`minimumReleaseAge`; pnpm 11 enables 1 day by default; the same idea is
+proposed for lazy.nvim in folke/lazy.nvim#2141).
+
+rvpm's version of this is opt-in:
+
+```toml
+[options]
+cooldown = "1d"          # don't trust commits rvpm has known for < 1 day
+
+[[plugins]]
+url = "owner/critical-thing"
+cooldown = "7d"           # stricter for this one
+
+[[plugins]]
+url = "you/your-own-plugin"
+cooldown = "0"            # opt out — you trust yourself
+```
+
+**How it decides.** Git has no trusted "publish time" (committer dates are
+trivially backdatable by an attacker), so rvpm records when *it first saw*
+each remote tip in `<cache_root>/cooldown_state.json` — both `sync` and
+`update` record observations whenever they fetch. `rvpm update` then only
+advances to a commit that has been **observed for longer than the
+cooldown**, or whose committer date is itself older than the window (so a
+dormant repo's months-old commit isn't pointlessly held; this committer-date
+shortcut is the one deliberate trade-off — a backdating attacker can slip
+through it, but `first_seen` cannot be forged). While the tip is too fresh,
+update advances to the newest already-matured observed commit instead, so
+active plugins keep moving forward, just delayed by the cooldown.
+
+**What it does *not* gate.** Explicit `rev` pins (your choice wins), `dev`
+plugins, and first installs (`rvpm add` / fresh clone — you have to start
+somewhere). `rvpm sync` is also not gated: it already respects `rvpm.lock`
+pins, which is exactly what blocks new upstream commits between updates.
+
+Held-back plugins are listed in the update summary with their tip age, and
+`rvpm update --no-cooldown` bypasses the gate for one run (e.g. when a
+held-back commit *is* the security fix you want right now).
+
+Defense in depth, not a silver bullet: pair it with `rvpm sync --frozen` in
+CI, commit `rvpm.lock` to your dotfiles, and prefer `rev` pins for plugins
+with `build` hooks.
 
 </details>
 
