@@ -1483,6 +1483,7 @@ mod tests {
                 url_style: UrlStyle::Short,
                 browse: BrowseOptions::default(),
                 fetch_interval: None,
+                cooldown: None,
                 auto_lazy: crate::config::AutoLazyPolicy::Ask,
                 ai: crate::config::AiBackend::Off,
                 ai_language: "en".to_string(),

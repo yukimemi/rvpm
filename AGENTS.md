@@ -57,6 +57,14 @@ concurrency = 16
 # is `[[plugins]] merge_doc = true|false`. Filename conflicts inside `doc/`
 # are first-wins (recorded in `merge_conflicts.json`). #119
 # merge_doc = true
+# Supply-chain cooldown (minimum release age, like npm/pnpm's
+# minimumReleaseAge): `rvpm update` won't advance to a commit until rvpm has
+# first observed it for this long (or the commit itself is older than the
+# window). ON BY DEFAULT at "1d" (pnpm 11 parity); set "0" to disable.
+# Per-plugin override via `[[plugins]] cooldown` ("0" opts out); bypass once
+# with `rvpm update --no-cooldown`. Observations live in
+# `<cache_root>/cooldown_state.json`. See docs/architecture.md.
+# cooldown = "1d"
 # URL form written by `rvpm add`: "short" (owner/repo, default) or
 # "full" (https://github.com/owner/repo). Duplicate detection normalizes both forms before comparing.
 # url_style = "full"
@@ -100,6 +108,8 @@ depends = ["snacks.nvim"]
 # rev: branch / tag / commit hash, or `/regex/` to pick the highest semver tag matching the pattern
 # rev = "v0.1.0"
 # rev = "/^v1\\..*/"   # picks max semver tag among /^v1\..*/ — re-resolves on every sync
+# cooldown: per-plugin supply-chain cooldown override (see options.cooldown)
+# cooldown = "7d"      # stricter for this plugin; "0" opts it out
 # build: shell command (run after sync / update completes, 5 min timeout)
 # build = "cargo build --release"
 # build_lua: Lua snippet executed via nvim --headless -u NONE -l (#97)
@@ -170,6 +180,7 @@ src/
   main.rs       — thin binary entry point: `fn main() { rvpm::run() }`
   lib.rs        — CLI definitions (clap), `run()` entry point, run_*() implementations for every command, helper functions
   config.rs     — TOML config parsing (with Tera template expansion), MapSpec type, sort_plugins
+  cooldown.rs   — supply-chain cooldown: `<cache_root>/cooldown_state.json` の read/write と「この commit へ進んでいいか」の pure 判定
   doctor.rs     — `rvpm doctor` — 17 diagnostics × 4 categories + render (nerd/unicode/ascii)
   git.rs        — async wrappers for git clone/pull/fetch/checkout (Repo struct) + GitChange recording
   helptags.rs   — runs :helptags via nvim --headless to generate tags

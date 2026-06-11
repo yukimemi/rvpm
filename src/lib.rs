@@ -5,6 +5,7 @@ mod chezmoi;
 mod cli;
 mod commands;
 mod config;
+mod cooldown;
 mod doctor;
 mod external_render;
 mod fetch_state;
@@ -141,10 +142,12 @@ pub(crate) async fn update_single_plugin(
     plugin: &crate::config::Plugin,
     cache_root: &Path,
     tx: mpsc::Sender<(String, PluginStatus)>,
+    cooldown_ctx: Option<crate::cooldown::PluginCooldownCtx>,
 ) -> Result<(
     crate::config::Plugin,
     Option<crate::git::GitChange>,
     Option<String>,
+    Option<crate::cooldown::CooldownOutcome>,
 )> {
     let dst_path = resolve_plugin_dst(plugin, cache_root);
     let is_missing = !dst_path.exists();
@@ -159,16 +162,51 @@ pub(crate) async fn update_single_plugin(
         ))
         .await;
     let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
-    let res = if is_missing {
-        repo.sync().await
+    let now = std::time::SystemTime::now();
+    // cooldown ゲート (#supply-chain) の適用範囲:
+    // - 初回インストール (clone) は対象外 — どこかから始めるしかない。clone した
+    //   HEAD を観測として記録だけする (以降の update から熟成判定が効く)。
+    // - 明示 `rev` ピン / cooldown 無効は caller が ctx = None で渡してくる。
+    let (res, outcome): (
+        Result<Option<crate::git::GitChange>>,
+        Option<crate::cooldown::CooldownOutcome>,
+    ) = if is_missing {
+        let res = repo.sync().await;
+        let outcome = match (&res, cooldown_ctx) {
+            (Ok(_), Some(mut ctx)) => match repo.head_commit().await {
+                Ok(head) => {
+                    let committed = repo.commit_time(&head).await.ok().flatten();
+                    crate::cooldown::observe(&mut ctx.observed, &head, committed, now);
+                    crate::cooldown::prune(&mut ctx.observed, Some(&head), now, ctx.cooldown);
+                    Some(crate::cooldown::CooldownOutcome {
+                        observed: ctx.observed,
+                        held: None,
+                    })
+                }
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        (res, outcome)
+    } else if let Some(mut ctx) = cooldown_ctx {
+        match cooldown_gated_update(&repo, &mut ctx, now).await {
+            Ok((change, held)) => (
+                Ok(change),
+                Some(crate::cooldown::CooldownOutcome {
+                    observed: ctx.observed,
+                    held,
+                }),
+            ),
+            Err(e) => (Err(e), None),
+        }
     } else {
-        repo.update().await
+        (repo.update().await, None)
     };
     match res {
         Ok(change) => {
             let head_commit = repo.head_commit().await.ok();
             let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
-            Ok((plugin.clone(), change, head_commit))
+            Ok((plugin.clone(), change, head_commit, outcome))
         }
         Err(e) => {
             let _ = tx
@@ -177,6 +215,65 @@ pub(crate) async fn update_single_plugin(
             Err(e)
         }
     }
+}
+
+/// cooldown ゲート付き update の本体: fetch → tip 観測 → 熟成判定 → checkout。
+///
+/// `repo.update()` (fetch + tip へ即 checkout) と違い、判定を挟むために fetch と
+/// checkout を分離する。返り値は (HEAD 差分, held-back 情報)。
+///
+/// fail-safe 方針:
+/// - tracking tip が読めない (origin/HEAD 不在等) → 現状維持で成功扱い
+///   (`gix_reset_to_remote` も同じ参照を読むので、どのみち前進できない)。
+/// - committer date が読めない → first_seen のみで熟成判定 (安全側)。
+async fn cooldown_gated_update(
+    repo: &Repo<'_>,
+    ctx: &mut crate::cooldown::PluginCooldownCtx,
+    now: std::time::SystemTime,
+) -> Result<(
+    Option<crate::git::GitChange>,
+    Option<crate::cooldown::HeldByCooldown>,
+)> {
+    repo.fetch().await?;
+    let Some(tip) = repo.remote_head().await? else {
+        return Ok((None, None));
+    };
+    // Guard is an I/O optimization, not correctness: `observe` dedups on its
+    // own (won't reset first_seen), but checking here elides the async
+    // `commit_time()` call when the tip was already observed in a prior fetch.
+    if !ctx.observed.iter().any(|o| o.commit == tip) {
+        let committed = repo.commit_time(&tip).await.ok().flatten();
+        crate::cooldown::observe(&mut ctx.observed, &tip, committed, now);
+    }
+    let current = repo.head_commit().await.ok();
+    let decision =
+        crate::cooldown::decide(&ctx.observed, &tip, current.as_deref(), now, ctx.cooldown);
+    let (change, held) = match decision {
+        crate::cooldown::CooldownDecision::Advance => (repo.reset_to_remote_tip().await?, None),
+        crate::cooldown::CooldownDecision::Hold { fallback } => {
+            let change = match fallback.as_deref() {
+                Some(sha) => repo.checkout_locally(sha).await?,
+                None => None,
+            };
+            let tip_first_seen = ctx
+                .observed
+                .iter()
+                .find(|o| o.commit == tip)
+                .map(|o| o.first_seen.clone());
+            (
+                change,
+                Some(crate::cooldown::HeldByCooldown {
+                    tip,
+                    tip_first_seen,
+                    fallback,
+                }),
+            )
+        }
+    };
+    // prune の基準点は checkout 後の HEAD (decide の前進/後退比較で使うので残す)。
+    let head_after = repo.head_commit().await.ok();
+    crate::cooldown::prune(&mut ctx.observed, head_after.as_deref(), now, ctx.cooldown);
+    Ok((change, held))
 }
 
 use toml_edit::{DocumentMut, value};

@@ -141,6 +141,14 @@ pub(crate) async fn run_sync(
         .collect();
     let is_hard_skip = refresh_mode == crate::fetch_state::RefreshMode::Skip;
 
+    // supply-chain cooldown (#supply-chain): sync は lockfile pin が新 commit を
+    // 既に遮断しているのでゲートはしない。ただし fetch のついでに remote tip の
+    // 観測を記録して cooldown の熟成を進める — update を走らせない期間も tip が
+    // 熟成していき、次の `rvpm update` がそこまで前進できる。
+    let cooldown_state_path = resolve_cooldown_state_path(&cache_root);
+    let mut cooldown_state = crate::cooldown::CooldownState::load(&cooldown_state_path);
+    let mut cooldown_tracking_any = false;
+
     if merged_dir.exists() {
         let _ = std::fs::remove_dir_all(&merged_dir);
     }
@@ -206,6 +214,32 @@ pub(crate) async fn run_sync(
         // `--no-refresh` (is_hard_skip) なら error、それ以外なら full flow にフォール。
         let want_fetch = *fetch_decisions.get(&plugin.display_name()).unwrap_or(&true);
         let hard_skip = is_hard_skip;
+
+        // cooldown 観測 ctx (#supply-chain): 実効 cooldown が有効な rev-none
+        // plugin だけ観測履歴を持ち込む。URL 不一致 (同名で別リポジトリへ
+        // 差し替え) は別 repo の履歴なので空からやり直す (lockfile と同じ思想)。
+        let cooldown_ctx: Option<crate::cooldown::PluginCooldownCtx> = if plugin.rev.is_some() {
+            None
+        } else {
+            let d = crate::cooldown::effective_cooldown(
+                config.options.cooldown.as_deref(),
+                plugin.cooldown.as_deref(),
+            );
+            if d.is_zero() {
+                None
+            } else {
+                cooldown_tracking_any = true;
+                let observed = cooldown_state
+                    .find(&plugin.display_name())
+                    .filter(|e| urls_match(&e.url, &plugin.url))
+                    .map(|e| e.observed.clone())
+                    .unwrap_or_default();
+                Some(crate::cooldown::PluginCooldownCtx {
+                    cooldown: d,
+                    observed,
+                })
+            }
+        };
 
         // --rebuild [QUERY] のスコープ判定は closure 外で済ませて bool を move する
         // (`rebuild_filter: &Option<String>` のライフタイムを async move に引き込まない)。
@@ -336,12 +370,13 @@ pub(crate) async fn run_sync(
                     //
                     // 分類が None 確定の前提条件 (explicit rev / lockfile 寄与なし) では
                     // gix open 自体をスキップして 200+ プラグイン構成の I/O を減らす。
+                    let remote_head = if fetched && plugin.rev.is_none() && effective_rev.is_some()
+                    {
+                        repo.remote_head().await.ok().flatten()
+                    } else {
+                        None
+                    };
                     let held_back = if fetched {
-                        let remote_head = if plugin.rev.is_none() && effective_rev.is_some() {
-                            repo.remote_head().await.ok().flatten()
-                        } else {
-                            None
-                        };
                         classify_held_back(
                             plugin.rev.as_deref(),
                             effective_rev.as_deref(),
@@ -356,8 +391,54 @@ pub(crate) async fn run_sync(
                     } else {
                         None
                     };
+                    // cooldown 観測 (#supply-chain): fetch を実行した plugin の remote
+                    // tip を記録する。lockfile pin 中 (effective_rev 有り) は上の
+                    // remote_head が tip。それ以外 (fresh clone / `--no-lock`) は sync
+                    // が HEAD を tip に揃えた後なので head_commit == tip (gix open の
+                    // 追加 I/O 無しで済む)。
+                    let cooldown_entry: Option<crate::cooldown::CooldownEntry> =
+                        match cooldown_ctx {
+                            Some(mut ctx) if fetched => {
+                                let tip = if effective_rev.is_some() {
+                                    remote_head.clone()
+                                } else {
+                                    head_commit.clone()
+                                };
+                                match tip {
+                                    Some(tip) => {
+                                        let now = std::time::SystemTime::now();
+                                        // Guard is an I/O optimization (elides
+                                        // commit_time() for already-seen tips);
+                                        // observe dedups on its own regardless.
+                                        if !ctx.observed.iter().any(|o| o.commit == tip) {
+                                            let committed =
+                                                repo.commit_time(&tip).await.ok().flatten();
+                                            crate::cooldown::observe(
+                                                &mut ctx.observed,
+                                                &tip,
+                                                committed,
+                                                now,
+                                            );
+                                        }
+                                        crate::cooldown::prune(
+                                            &mut ctx.observed,
+                                            head_commit.as_deref(),
+                                            now,
+                                            ctx.cooldown,
+                                        );
+                                        Some(crate::cooldown::CooldownEntry {
+                                            name: plugin.display_name(),
+                                            url: plugin.url.clone(),
+                                            observed: ctx.observed,
+                                        })
+                                    }
+                                    None => None,
+                                }
+                            }
+                            _ => None,
+                        };
                     let _ = tx.send((plugin.url.clone(), PluginStatus::Finished)).await;
-                    Ok((plugin, dst_path, build_warn, change, head_commit, held_back, fetched))
+                    Ok((plugin, dst_path, build_warn, change, head_commit, held_back, fetched, cooldown_entry))
                 }
                 Err(e) => {
                     let _ = tx
@@ -465,7 +546,7 @@ pub(crate) async fn run_sync(
             Some((url, status)) = rx.recv() => { tui_state.update_status(&url, status); }
             Some(res) = set.join_next() => {
                 finished_tasks += 1;
-                if let Ok(Ok((plugin, dst_path, build_warn, git_change, head_commit, pin, fetched))) = res {
+                if let Ok(Ok((plugin, dst_path, build_warn, git_change, head_commit, pin, fetched, cooldown_entry))) = res {
                     if let Some(warn) = build_warn {
                         build_warnings.push((plugin.url.clone(), warn));
                     }
@@ -474,6 +555,10 @@ pub(crate) async fn run_sync(
                     }
                     if let Some(p) = pin {
                         held_back.push(p);
+                    }
+                    // cooldown 観測履歴の反映 (#supply-chain)。永続化は sync 末尾。
+                    if let Some(entry) = cooldown_entry {
+                        cooldown_state.upsert(entry);
                     }
                     // fetch を実行したプラグインだけ last_fetched を更新する。
                     // fast-path で素通ししたプラグインは元のタイムスタンプを保つ
@@ -767,6 +852,19 @@ pub(crate) async fn run_sync(
             fetch_state_path.display(),
             e
         );
+    }
+
+    // cooldown 観測履歴の永続化 (#supply-chain)。cooldown を使っている config の
+    // ときだけディスクに触る。config.toml から外れた plugin の entry は drop。
+    if cooldown_tracking_any {
+        cooldown_state.retain_by_names(&active_names);
+        if let Err(e) = cooldown_state.save(&cooldown_state_path) {
+            eprintln!(
+                "\u{26a0} failed to save {}: {} (cooldown observations may be stale)",
+                cooldown_state_path.display(),
+                e
+            );
+        }
     }
 
     print_init_lua_hint_if_missing(&config);
