@@ -8,7 +8,7 @@ version = "0.13.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "6ac24c5f06b08962ad3f55e5142606824846ec7a"
+rev = "45af1969561402fc213d76ae51372a5853a33512"
 version = "0.8.0"
 
 [[templates]]
