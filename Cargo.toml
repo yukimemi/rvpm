@@ -21,7 +21,7 @@ dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 # AI preview の per-section ラベル ([EXISTING] / [FRESH] / [MERGED]) を色分け
 # するためのターミナル style ヘルパ。dialoguer からも transitive に入っている
 # が、直接依存として明示しておく。
-console = "0.16.3"
+console = "0.16.4"
 anyhow = "1.0.103"
 
 # Async & Process
