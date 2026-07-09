@@ -23,6 +23,7 @@ mod profile;
 mod profile_tui;
 mod self_update;
 mod tui;
+mod update_errors;
 mod update_log;
 mod url;
 mod view_stamp;

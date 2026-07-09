@@ -623,6 +623,15 @@ pub(crate) async fn run_sync(
         }
     }
 
+    // 残留した status メッセージを drain してから status_map を参照する。
+    // tokio::select! は 1 iteration で rx.recv か join_next の片方しか進めないので、
+    // 最後に完了したタスクの Failed 通知がまだ channel に残ったままループを抜けて
+    // いる可能性がある。これを取りこぼすと下の失敗サマリと update_errors 整合が
+    // その plugin を誤って成功扱いにして、実際の失敗を握り潰してしまう。
+    while let Ok((url, status)) = rx.try_recv() {
+        tui_state.update_status(&url, status);
+    }
+
     // JoinSet は完了順で返すので plugin_scripts が依存順になっていない。
     // config.plugins の順序 (sort_plugins 済み) に合わせて re-sort する。
     plugin_scripts.sort_by_key(|ps| {
@@ -850,6 +859,46 @@ pub(crate) async fn run_sync(
         eprintln!(
             "\u{26a0} failed to save {}: {} (fetch cache may be stale)",
             fetch_state_path.display(),
+            e
+        );
+    }
+
+    // update 失敗マーカーの整合 (#update-error-visibility): sync が成功した plugin は
+    // 記録を消し込み、失敗した plugin は記録する。これで `rvpm update` 失敗後に
+    // `rvpm sync` で復旧すれば `rvpm list` のマーカーも消え、逆に sync でコケたら
+    // 記録が残る。config.toml から外された plugin の entry は retain で drop。
+    // 変化が無ければファイルに触らない (dirty guard)。
+    let update_errors_path = resolve_update_errors_path(&cache_root);
+    let mut update_errors = crate::update_errors::UpdateErrors::load(&update_errors_path);
+    let now_ts = crate::fetch_state::now_rfc3339();
+    let mut errors_dirty = false;
+    for plugin in config.plugins.iter().filter(|p| !p.dev) {
+        match tui_state.status_map.get(&plugin.url) {
+            Some(PluginStatus::Failed(msg)) => {
+                update_errors.upsert(crate::update_errors::UpdateErrorEntry {
+                    name: plugin.display_name(),
+                    url: plugin.url.clone(),
+                    message: msg.clone(),
+                    timestamp: now_ts.clone(),
+                });
+                errors_dirty = true;
+            }
+            _ => {
+                if update_errors.remove_by_name(&plugin.display_name()) {
+                    errors_dirty = true;
+                }
+            }
+        }
+    }
+    let before_retain = update_errors.entries.len();
+    update_errors.retain_by_names(&active_names);
+    if update_errors.entries.len() != before_retain {
+        errors_dirty = true;
+    }
+    if errors_dirty && let Err(e) = update_errors.save(&update_errors_path) {
+        eprintln!(
+            "\u{26a0} failed to save {}: {} (rvpm list may not reflect update errors)",
+            update_errors_path.display(),
             e
         );
     }

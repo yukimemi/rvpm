@@ -84,6 +84,11 @@ pub enum PluginStatus {
     Syncing(String),
     Finished,
     Failed(String),
+    /// clone は健全だが「前回の `rvpm update` が失敗した」状態
+    /// (#update-error-visibility)。`rvpm list` が update_errors.json から
+    /// overlay して表示する専用マーカー。git status 上は Clean なので
+    /// Failed とは別扱いにして、赤 [Error] と混同させない。
+    UpdateFailed(String),
 }
 
 pub struct TuiState {
@@ -497,6 +502,17 @@ impl TuiState {
                         e.clone(),
                         Color::Red,
                     ),
+                    // 進捗 TUI (sync/update 実行中) では発生しないが exhaustive
+                    // match のため。万一渡っても update 失敗として黄色で見せる。
+                    PluginStatus::UpdateFailed(e) => (
+                        icons.failed,
+                        Color::Yellow,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                        e.clone(),
+                        Color::Yellow,
+                    ),
                 };
                 Row::new(vec![
                     Cell::from(format!(" {} ", icon))
@@ -714,6 +730,9 @@ impl TuiState {
                 PluginStatus::Finished => (icons.installed, Color::Green),
                 PluginStatus::Failed(m) if m == "Missing" => (icons.missing, Color::Red),
                 PluginStatus::Failed(_) => (icons.failed, Color::Red),
+                // update 失敗マーカー: clone は健全なので赤 [Error] とは別に、
+                // 黄色い failed アイコンで「前回 update がコケた」ことを示す。
+                PluginStatus::UpdateFailed(_) => (icons.failed, Color::Yellow),
                 PluginStatus::Syncing(m) if m.contains("Modified") => {
                     (icons.modified, Color::Yellow)
                 }
@@ -746,6 +765,7 @@ impl TuiState {
                     (trg.join(" "), Color::DarkGray)
                 }
                 PluginStatus::Failed(msg) => (msg.clone(), Color::Red),
+                PluginStatus::UpdateFailed(msg) => (format!("update failed: {msg}"), Color::Yellow),
                 PluginStatus::Syncing(msg) => (msg.clone(), Color::Yellow),
                 PluginStatus::Waiting => ("Checking...".to_string(), Color::DarkGray),
             };
