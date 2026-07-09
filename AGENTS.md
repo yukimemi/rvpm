@@ -189,6 +189,7 @@ src/
   merge_conflicts.rs — read/write of `<cache_root>/merge_conflicts.json` (most recent sync only; consumed by doctor)
   lockfile.rs   — read/write of `<config_root>/rvpm.lock` (reproducible plugin versions; intended to be committed to dotfiles)
   tui.rs        — ratatui-based progress / list display TUI
+  update_errors.rs — read/write of `<cache_root>/update_errors.json` (per-plugin last-failed `rvpm update`; surfaced by `rvpm list` as `UpdateFailed`, cleared by a later successful update/sync)
   update_log.rs — read/append of `<cache_root>/update_log.json`, BREAKING detection, render
 ```
 

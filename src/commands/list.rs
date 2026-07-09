@@ -26,6 +26,9 @@ pub(crate) async fn run_list(no_tui: bool) -> Result<bool> {
                     println!("  [Modified]  {}", url)
                 }
                 PluginStatus::Syncing(msg) => println!("  [Outdated]  {} ({})", url, msg),
+                PluginStatus::UpdateFailed(msg) => {
+                    println!("  [UpdateFailed] {} ({})", url, msg)
+                }
                 PluginStatus::Failed(msg) => println!("  [Error]     {} ({})", url, msg),
                 PluginStatus::Waiting => println!("  [Waiting]   {}", url),
             }
@@ -404,26 +407,62 @@ fn spawn_status_check(
     // drains `rx` — that combination deadlocked once a config had >100 plugins
     // (#247). The TUI path drains progressively, so it was never affected.
     let (tx, rx) = mpsc::channel::<(String, PluginStatus)>(config.plugins.len().max(1));
+    // 前回 update が失敗した plugin を overlay 表示するため、記録を読み込む
+    // (#update-error-visibility)。missing / malformed は empty fallback (resilience)。
+    let update_errors =
+        crate::update_errors::UpdateErrors::load(&resolve_update_errors_path(cache_root));
+    // name → &UpdateErrorEntry の lookup を先に組んで per-plugin の find を O(1) に
+    // する (sync.rs の fetch_lookup と同じ流儀。素朴に find すると N plugin × M entry
+    // の線形スキャンになる)。
+    let error_lookup: std::collections::HashMap<&str, &crate::update_errors::UpdateErrorEntry> =
+        update_errors
+            .entries
+            .iter()
+            .map(|e| (e.name.as_str(), e))
+            .collect();
     let mut set = JoinSet::new();
     for plugin in config.plugins.iter() {
         let plugin = plugin.clone();
         let cache_root = cache_root.to_path_buf();
         let tx = tx.clone();
+        // この plugin の update エラー記録 (URL 一致時のみ有効 — 同名で別 repo に
+        // 差し替えられたケースは別物なので無視する。lockfile / fetch_state と同思想)。
+        let update_err_msg = error_lookup
+            .get(plugin.display_name().as_str())
+            .filter(|e| urls_match(&e.url, &plugin.url))
+            .map(|e| e.message.clone());
         set.spawn(async move {
             let dst_path = resolve_plugin_dst(&plugin, &cache_root);
             let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
             let git_status = repo.get_status().await;
-            let plugin_status = match git_status {
-                crate::git::RepoStatus::Clean => PluginStatus::Finished,
-                crate::git::RepoStatus::NotInstalled => PluginStatus::Failed("Missing".to_string()),
-                crate::git::RepoStatus::Modified => PluginStatus::Syncing("Modified".to_string()),
-                crate::git::RepoStatus::Error(e) => PluginStatus::Failed(e),
-            };
+            let plugin_status = status_from_git(git_status, update_err_msg);
             let _ = tx.send((plugin.url.clone(), plugin_status)).await;
         });
     }
     drop(tx);
     (rx, set)
+}
+
+/// git status と「前回 update 失敗記録」から表示用の `PluginStatus` を決める
+/// pure function (#update-error-visibility)。
+///
+/// git の実状態が優先: `NotInstalled` / `Modified` / `Error` はそのまま返す
+/// (これらは今まさに actionable な状態で、過去の update 失敗より重要)。
+/// `Clean` のときだけ、update 失敗記録があれば `UpdateFailed` に overlay する
+/// (clone は健全だが「前回 update がコケた」痕跡を list に残す)。
+fn status_from_git(
+    git_status: crate::git::RepoStatus,
+    update_err_msg: Option<String>,
+) -> PluginStatus {
+    match git_status {
+        crate::git::RepoStatus::Clean => match update_err_msg {
+            Some(msg) => PluginStatus::UpdateFailed(msg),
+            None => PluginStatus::Finished,
+        },
+        crate::git::RepoStatus::NotInstalled => PluginStatus::Failed("Missing".to_string()),
+        crate::git::RepoStatus::Modified => PluginStatus::Syncing("Modified".to_string()),
+        crate::git::RepoStatus::Error(e) => PluginStatus::Failed(e),
+    }
 }
 
 async fn fetch_plugin_statuses(
@@ -442,6 +481,47 @@ async fn fetch_plugin_statuses(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::RepoStatus;
+
+    // ─── status_from_git: update エラー overlay の決定表 ──────────────────
+
+    #[test]
+    fn test_status_from_git_clean_without_error_is_finished() {
+        assert!(matches!(
+            status_from_git(RepoStatus::Clean, None),
+            PluginStatus::Finished
+        ));
+    }
+
+    #[test]
+    fn test_status_from_git_clean_with_error_overlays_update_failed() {
+        // clone は健全 (Clean) でも、前回 update の失敗記録があれば
+        // UpdateFailed として list に痕跡を残す。
+        let got = status_from_git(RepoStatus::Clean, Some("boom".to_string()));
+        assert!(matches!(got, PluginStatus::UpdateFailed(m) if m == "boom"));
+    }
+
+    #[test]
+    fn test_status_from_git_missing_ignores_update_error() {
+        // git の実状態 (未インストール) が優先。過去の update 失敗より重要。
+        let got = status_from_git(RepoStatus::NotInstalled, Some("boom".to_string()));
+        assert!(matches!(got, PluginStatus::Failed(m) if m == "Missing"));
+    }
+
+    #[test]
+    fn test_status_from_git_modified_ignores_update_error() {
+        let got = status_from_git(RepoStatus::Modified, Some("boom".to_string()));
+        assert!(matches!(got, PluginStatus::Syncing(m) if m.contains("Modified")));
+    }
+
+    #[test]
+    fn test_status_from_git_error_ignores_update_error() {
+        let got = status_from_git(
+            RepoStatus::Error("git blew up".to_string()),
+            Some("boom".to_string()),
+        );
+        assert!(matches!(got, PluginStatus::Failed(m) if m == "git blew up"));
+    }
 
     #[tokio::test]
     async fn fetch_plugin_statuses_does_not_deadlock_above_channel_capacity() {

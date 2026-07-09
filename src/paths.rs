@@ -200,6 +200,13 @@ pub(crate) fn resolve_cooldown_state_path(cache_root: &Path) -> PathBuf {
     cache_root.join("cooldown_state.json")
 }
 
+/// `rvpm update` が失敗した plugin の記録先 (#update-error-visibility)。
+/// `<cache_root>/update_errors.json` 固定 (fetch_state / cooldown_state と同じ場所)。
+/// `rvpm list` が overlay 表示に使い、成功した update / sync で消し込まれる。
+pub(crate) fn resolve_update_errors_path(cache_root: &Path) -> PathBuf {
+    cache_root.join("update_errors.json")
+}
+
 /// `Plugin` + `GitChange` から永続化向けの `ChangeRecord` を組み立てる小ヘルパー。
 /// run_sync / run_update / run_add で共通利用。
 pub(crate) fn change_record_from(

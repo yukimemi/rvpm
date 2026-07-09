@@ -172,6 +172,59 @@ pub(crate) async fn run_update(query: Option<String>, no_cooldown: bool) -> Resu
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
 
+    // 残留した status メッセージを drain してから失敗を集計する。tokio::select! は
+    // 1 iteration で rx.recv か join_next のどちらか片方しか進めないので、最後の
+    // Failed 通知が status_map に反映される前に while ループを抜けている可能性がある。
+    while let Ok((url, status)) = rx.try_recv() {
+        tui_state.update_status(&url, status);
+    }
+
+    // update 失敗の記録と表示 (#update-error-visibility):
+    //  - TUI を閉じた後にエラーサマリを stderr へ出す (sync と同じ流儀)。これが
+    //    無いと「update したのにエラーがどこにも出ない」罠になる。
+    //  - 併せて <cache_root>/update_errors.json を更新し、`rvpm list` から前回の
+    //    update 失敗が見えるようにする。失敗 → upsert、成功 → 消し込み (stale な
+    //    マーカーを残さない)。query で絞った部分 update では対象 plugin だけ触る
+    //    (更新対象外の記録を消さない — lockfile と同思想)。
+    let update_errors_path = resolve_update_errors_path(&cache_root);
+    let mut update_errors = crate::update_errors::UpdateErrors::load(&update_errors_path);
+    let now_ts = crate::fetch_state::now_rfc3339();
+    let mut failed: Vec<(&str, &str)> = Vec::new();
+    let mut errors_dirty = false;
+    for plugin in &target_plugins {
+        match tui_state.status_map.get(&plugin.url) {
+            Some(PluginStatus::Failed(msg)) => {
+                failed.push((plugin.url.as_str(), msg.as_str()));
+                update_errors.upsert(crate::update_errors::UpdateErrorEntry {
+                    name: plugin.display_name(),
+                    url: plugin.url.clone(),
+                    message: msg.clone(),
+                    timestamp: now_ts.clone(),
+                });
+                errors_dirty = true;
+            }
+            // Finished (成功) など失敗以外 → 過去のエラー記録を消し込む。
+            _ => {
+                if update_errors.remove_by_name(&plugin.display_name()) {
+                    errors_dirty = true;
+                }
+            }
+        }
+    }
+    if !failed.is_empty() {
+        eprintln!("\n{} error(s):", failed.len());
+        for (url, msg) in &failed {
+            eprintln!("  \u{2717} {}: {}", url, msg);
+        }
+    }
+    if errors_dirty && let Err(e) = update_errors.save(&update_errors_path) {
+        eprintln!(
+            "\u{26a0} failed to save {}: {} (rvpm list may not reflect update errors)",
+            update_errors_path.display(),
+            e
+        );
+    }
+
     // cooldown held-back サマリ (#supply-chain): tip 適用を見送った plugin を
     // 明示する。黙って古いままだと「update したのに進まない」罠になるため。
     if !held_by_cooldown.is_empty() {
