@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::Deserialize;
-use tera::{Context, Tera};
+use teravars::{Context, Engine};
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct Config {
@@ -632,6 +632,10 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     let mut vars_value = vars_parsed
         .vars
         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    // `is_windows` / `env` are exposed as context *values* (not functions), so a
+    // bare engine with no helpers registered is all rvpm needs. Reused across
+    // the resolution loop and the final whole-config render below.
+    let mut engine = Engine::new_minimal();
     let mut converged = false;
     for _ in 0..MAX_VARS_RESOLVE_ITERATIONS {
         let mut ctx = Context::new();
@@ -639,7 +643,7 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
         ctx.insert("env", &env_map);
         ctx.insert("is_windows", &cfg!(windows));
         let vars_str = serde_json::to_string(&vars_value)?;
-        let rendered_str = Tera::one_off(&vars_str, &ctx, false)?;
+        let rendered_str = engine.render(&vars_str, &ctx)?;
         let new_value: serde_json::Value = serde_json::from_str(&rendered_str)?;
         if new_value == vars_value {
             converged = true;
@@ -671,7 +675,7 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
     }
 
     // 7. 全体を Tera でレンダリング ({% if %} 等が動く)
-    let rendered = Tera::one_off(toml_str, &context, false)?;
+    let rendered = engine.render(toml_str, &context)?;
 
     // 8. 旧 `[options.store]` は v3.10 で `[options.browse]` に改名された。
     //    serde は未知のフィールドを黙って無視するので、そのままだと
@@ -1520,6 +1524,34 @@ dst = "{{ env.RVPM_TEST_ENV }}_{{ is_windows }}"
         let config = parse_config(toml_content).unwrap();
         let expected_dst = format!("hello_{}", cfg!(windows));
         assert_eq!(config.plugins[0].dst, Some(expected_dst));
+    }
+
+    #[test]
+    fn test_parse_config_does_not_html_escape_rendered_values() {
+        // parse_config renders the whole config through teravars::Engine. The
+        // old code passed `Tera::one_off(.., false)` to force autoescape off;
+        // `Engine::new_minimal().render` must preserve that. Pin the guarantee:
+        // a `{{ }}` value containing &/</> must survive verbatim, not turn into
+        // &amp; / &lt; / &gt;. (Quotes are left out — they'd break the TOML
+        // re-parse whether escaped or not, which is unrelated to autoescape.)
+        let toml_content = r#"
+[vars]
+special = "a & b < c > d"
+
+[options]
+
+[[plugins]]
+name = "test"
+url = "repo"
+dst = "{{ vars.special }}"
+"#;
+
+        let config = parse_config(toml_content).unwrap();
+        assert_eq!(
+            config.plugins[0].dst.as_deref(),
+            Some("a & b < c > d"),
+            "rendered values must not be HTML-escaped (autoescape must stay off)"
+        );
     }
 
     #[test]
