@@ -25,7 +25,7 @@ console = "0.16.4"
 anyhow = "1.0.103"
 
 # Async & Process
-tokio = { version = "1.52.4", features = ["full"] }
+tokio = { version = "1.53.0", features = ["full"] }
 # `async fn` を持つ trait を `dyn` 互換にするため (rvpm doctor の VersionResolver
 # は本番 SystemResolver / テスト MockResolver を Box<dyn> で差し替える)。
 async-trait = "0.1.89"
