@@ -1,11 +1,11 @@
 lockfile_version: '1'
-generated_at: '2026-07-13T05:09:45.107951+00:00'
-apm_version: 0.25.0
+generated_at: '2026-07-20T05:13:35.372300+00:00'
+apm_version: 0.26.0
 dependencies:
 - repo_url: yukimemi/renri
   name: renri
   host: github.com
-  resolved_commit: aa7341295e1de36b64cff5a161c2224fce2aae64
+  resolved_commit: eb0b855d2a53782e8b521ddac352be78dce5ab80
   resolved_ref: main
   version: 0.1.17
   package_type: apm_package
@@ -17,26 +17,8 @@ dependencies:
   deployed_file_hashes:
     .agents/skills/renri/SKILL.md: sha256:b0ef8bb599b5dc116a39dc2d3712dd95c722974b91f109a26263052c8d1090d6
     .claude/skills/renri/SKILL.md: sha256:b0ef8bb599b5dc116a39dc2d3712dd95c722974b91f109a26263052c8d1090d6
-  content_hash: sha256:fcb39a7a125ef5bafbdd2fc81d71e602f8124d7cd11867398101a325efec8dec
+  content_hash: sha256:f72b92d01bb1a8e9b9fe7d4404db915e96ee7fe79a0de346ef0eb2abad9007b8
 deployments:
-- kind: project-relative
-  target: agents
-  value: .agents/skills/renri
-  runtime: null
-  scope: project
-  owners:
-  - yukimemi/renri
-  active_owner: yukimemi/renri
-  content_hash: null
-- kind: project-relative
-  target: agents
-  value: .agents/skills/renri/SKILL.md
-  runtime: null
-  scope: project
-  owners:
-  - yukimemi/renri
-  active_owner: yukimemi/renri
-  content_hash: sha256:b0ef8bb599b5dc116a39dc2d3712dd95c722974b91f109a26263052c8d1090d6
 - kind: project-relative
   target: claude
   value: .claude/skills/renri
@@ -49,6 +31,24 @@ deployments:
 - kind: project-relative
   target: claude
   value: .claude/skills/renri/SKILL.md
+  runtime: null
+  scope: project
+  owners:
+  - yukimemi/renri
+  active_owner: yukimemi/renri
+  content_hash: sha256:b0ef8bb599b5dc116a39dc2d3712dd95c722974b91f109a26263052c8d1090d6
+- kind: project-relative
+  target: copilot
+  value: .agents/skills/renri
+  runtime: null
+  scope: project
+  owners:
+  - yukimemi/renri
+  active_owner: yukimemi/renri
+  content_hash: null
+- kind: project-relative
+  target: copilot
+  value: .agents/skills/renri/SKILL.md
   runtime: null
   scope: project
   owners:
