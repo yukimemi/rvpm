@@ -38,7 +38,7 @@ regex = "1.13.1"
 toml = "1.1.3"
 toml_edit = "0.25.13"
 
-# CLI subprocess discovery (`claude` / `gemini` / `codex` on PATH for AI add #93).
+# CLI subprocess discovery (`claude` / `agy` / `codex` on PATH for AI add #93).
 which = "8.0.5"
 
 # Self-update (`rvpm self-update`, background auto-update / check banner) — #125
@@ -59,7 +59,11 @@ unicode-width = "0.2.2"
 ansi-to-tui = "8.0.1"
 # `[options.store.readme_command]` で spawn する外部プロセスのタイムアウト。
 wait-timeout = "0.2.1"
-# 外部 renderer に `{file_path}` を渡す場合の一時ファイル作成。
+# 一時ファイル作成: 外部 renderer に `{file_path}` を渡す場合と、agy backend の
+# prompt 受け渡し (`agy -p "@<path>"`)。後者は prompt に user の config.toml と
+# plugin README がそのまま載るので、名前が当てられる temp file だと symlink を
+# 先回りで張られて無関係なファイルを潰されうるし、default perms のままだと
+# 同一ホストの他 user から読める。生成は tempfile に任せて両方塞ぐ。
 tempfile = "3.27.0"
 
 # HTTP client (for store)
