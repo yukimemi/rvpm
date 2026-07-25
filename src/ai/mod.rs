@@ -1,11 +1,11 @@
 // AI-assisted `rvpm add` (#93).
 //
 // このモジュールは静的 scan (#90, plugin_scan.rs) の代わりに外部 AI CLI
-// (claude / gemini / codex) を呼んで `[[plugins]]` 全体 + 必要な hook ファイル
-// を提案させる。設計トレードオフ:
+// (claude / agy / codex / opencode) を呼んで `[[plugins]]` 全体 + 必要な hook
+// ファイルを提案させる。設計トレードオフ:
 //
-//   - **CLI subprocess 経由**: API key 管理を user の `claude login` / `gemini auth`
-//     に委ねる。SDK 直叩きより薄く保ち、3 ツール統一インターフェース。
+//   - **CLI subprocess 経由**: API key 管理を user の `claude login` / `agy` の
+//     sign-in に委ねる。SDK 直叩きより薄く保ち、全ツール統一インターフェース。
 //   - **構造化出力**: AI 出力は `<rvpm:plugin_entry>` 等の XML tag で囲ませ、
 //     code fence や前置きが混ざっても robust に regex 抽出する。
 //   - **Mode A (内蔵 chat loop)** がメイン路: rvpm が会話履歴を保持し毎ターン
@@ -31,7 +31,16 @@ pub use chat::{ChatOutcome, run_ai_add, run_ai_tune};
 #[serde(rename_all = "lowercase")]
 pub enum Backend {
     Claude,
+    /// **Deprecated**: Google は 2026-06-18 に Free / AI Pro / Ultra の個人
+    /// アカウント向け Gemini CLI 提供を終了し、後継を Antigravity CLI
+    /// (`agy`, [`Backend::Agy`]) とした。有料 Google Cloud API key と
+    /// Enterprise ライセンスでは引き続き動くので backend 自体は残すが、
+    /// 選択時に一度だけ移行を促す (`warn_if_deprecated`)。
     Gemini,
+    /// Antigravity CLI (`agy`) — Gemini CLI の後継。Go 実装で、`-p` は
+    /// **stdin を読まない** ため prompt 受け渡しだけ他 backend と異なる
+    /// ([`PromptDelivery::FileRef`])。
+    Agy,
     Codex,
     Opencode,
 }
@@ -47,6 +56,7 @@ impl TryFrom<crate::config::AiBackend> for Backend {
         match value {
             crate::config::AiBackend::Claude => Ok(Backend::Claude),
             crate::config::AiBackend::Gemini => Ok(Backend::Gemini),
+            crate::config::AiBackend::Agy => Ok(Backend::Agy),
             crate::config::AiBackend::Codex => Ok(Backend::Codex),
             crate::config::AiBackend::Opencode => Ok(Backend::Opencode),
             crate::config::AiBackend::Off => Err(()),
@@ -60,6 +70,7 @@ impl Backend {
         match self {
             Backend::Claude => "claude",
             Backend::Gemini => "gemini",
+            Backend::Agy => "agy",
             Backend::Codex => "codex",
             Backend::Opencode => "opencode",
         }
@@ -77,9 +88,28 @@ impl Backend {
         match self {
             Backend::Claude => "Claude",
             Backend::Gemini => "Gemini",
+            Backend::Agy => "Antigravity",
             Backend::Codex => "Codex",
             Backend::Opencode => "OpenCode",
         }
+    }
+}
+
+/// 廃止予定の backend を選んだ user に一度だけ移行を促す。
+///
+/// `ensure_cli_installed` が oneshot / handoff 双方の入口なのでそこから呼ぶ。
+/// chat loop は毎ターン `invoke_oneshot` を呼ぶため、`Once` で 1 プロセス
+/// 1 回に絞らないと会話中ずっと同じ警告が出続ける。
+fn warn_if_deprecated(backend: Backend) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if matches!(backend, Backend::Gemini) {
+        WARNED.call_once(|| {
+            eprintln!(
+                "\u{26a0}\u{fe0f}  `gemini` is deprecated: Google retired Gemini CLI for Free / \
+                 AI Pro / Ultra personal accounts on 2026-06-18. Paid Google Cloud API keys and \
+                 Enterprise licences still work. Switch with `--ai agy` (or `ai = \"agy\"`)."
+            );
+        });
     }
 }
 
@@ -197,6 +227,7 @@ pub struct Proposal {
 
 /// AI CLI が PATH に無いときのエラー (install hint 込み)。
 pub fn ensure_cli_installed(backend: Backend) -> Result<()> {
+    warn_if_deprecated(backend);
     if backend.is_available() {
         return Ok(());
     }
@@ -204,6 +235,7 @@ pub fn ensure_cli_installed(backend: Backend) -> Result<()> {
     let hint = match backend {
         Backend::Claude => "https://docs.claude.com/claude-code",
         Backend::Gemini => "https://ai.google.dev/gemini-api/docs/cli",
+        Backend::Agy => "https://antigravity.google/cli",
         Backend::Codex => "https://github.com/openai/codex",
         Backend::Opencode => "https://opencode.ai",
     };
@@ -212,8 +244,115 @@ pub fn ensure_cli_installed(backend: Backend) -> Result<()> {
     ))
 }
 
+/// prompt を CLI にどう渡すか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptDelivery {
+    /// stdin に書いて close する (claude / gemini / codex / opencode)。
+    Stdin,
+    /// temp file に書き、`@<path>` 参照を引数で渡す (agy)。
+    FileRef,
+}
+
+/// backend ごとの prompt 受け渡し方式。
+///
+/// agy (Antigravity CLI) だけ `FileRef`。Go 実装なので `-p` は値必須で、
+/// `-p -` は `-` という **literal な prompt** として解釈され stdin は読まれない
+/// (v1.1.7 で実測)。かといって prompt を引数へ直に載せると、chat 2 turn 目以降は
+/// 50-100KB に育つ一方 Windows の `CreateProcess` は command line 全体で 32767
+/// 文字が上限なので破綻する。そこで temp file に書き、agy の `@<path>` context
+/// 構文で参照させる。agy は v1.1.6 から system temp dir への読み取りを既定で
+/// 許可しているので、非対話実行の途中で permission prompt に捕まることはない。
+fn prompt_delivery(backend: Backend) -> PromptDelivery {
+    match backend {
+        Backend::Agy => PromptDelivery::FileRef,
+        Backend::Claude | Backend::Gemini | Backend::Codex | Backend::Opencode => {
+            PromptDelivery::Stdin
+        }
+    }
+}
+
+/// 「one-shot non-interactive で prompt を投げ、結果を stdout に出す」起動引数。
+///
+/// `prompt_path` は [`PromptDelivery::FileRef`] backend では **必須**、
+/// [`PromptDelivery::Stdin`] backend では無視される。
+///
+/// FileRef で path を渡し忘れた場合に空参照 `-p @` を組み立ててしまうと、agy は
+/// 「`@` というファイルが無い」とは言わず **文脈の無い prompt として普通に応答
+/// する** ため、rvpm 側は tag 抽出に失敗するまで異常に気付けない。この不変条件
+/// 自体は `invoke_oneshot` が守っているが、FileRef backend が増えたときや
+/// `prompt_file` の構築順を動かしたときに黙って壊れないよう、ここで明示的に
+/// エラーにしておく。
+fn oneshot_args(backend: Backend, prompt_path: Option<&Path>) -> Result<Vec<String>> {
+    let args = match backend {
+        // claude / gemini: `-p -` で stdin から prompt を読む
+        Backend::Claude | Backend::Gemini => vec!["-p".into(), "-".into()],
+        // codex: `codex exec -` (ver 依存で `codex -p` のこともある)
+        Backend::Codex => vec!["exec".into(), "-".into()],
+        // opencode: `opencode run` で stdin から読み取り
+        Backend::Opencode => vec!["run".into()],
+        // agy: `agy -p "@<path>"` — `@` が agy の file-context 参照構文
+        Backend::Agy => {
+            let path = prompt_path.ok_or_else(|| {
+                anyhow!(
+                    "internal error: backend `{}` delivers its prompt by file reference \
+                     but no prompt path was provided",
+                    backend.cli_name()
+                )
+            })?;
+            vec!["-p".into(), format!("@{}", path.display())]
+        }
+    };
+    Ok(args)
+}
+
+/// [`PromptDelivery::FileRef`] 用の一時 prompt ファイル。drop で削除される。
+///
+/// 生成を `tempfile` に委ねるのは、名前が当てられる temp file を避けるため
+/// (CodeRabbit 指摘)。prompt には user の `config.toml` と plugin README が
+/// そのまま載るので:
+///
+/// - `pid + 連番` のような予測可能な名前だと、共有 temp dir に先回りで symlink を
+///   張られたとき `fs::write` が無関係なファイルを潰しうる。
+/// - default perms のまま置くと同一ホストの他 user から中身を読める。
+///
+/// `tempfile` は `O_EXCL` 相当 + owner-only perms で作るので両方塞がる。
+///
+/// **ハンドルは開いたまま保持する**: agy が読む前に消えないよう、この struct が
+/// 生きている間はファイルも生きている必要がある。tempfile は Windows でも
+/// share-read で開くため、別プロセスからの読み取りは妨げない (E2E テスト
+/// `agy_oneshot_round_trips_through_temp_file` で実証)。
+struct TempPromptFile {
+    inner: tempfile::NamedTempFile,
+}
+
+impl TempPromptFile {
+    /// prompt を安全な一時ファイルに書き出す。
+    fn write(prompt_text: &str) -> Result<Self> {
+        use std::io::Write;
+        let mut inner = tempfile::Builder::new()
+            .prefix("rvpm-ai-oneshot-")
+            .suffix(".md")
+            .tempfile()
+            .context("failed to create a temp file for the AI prompt")?;
+        inner
+            .write_all(prompt_text.as_bytes())
+            .context("failed to write the AI prompt to its temp file")?;
+        // flush してから CLI に渡す。BufWriter ではないので実質 no-op だが、
+        // 「子プロセスが読む時点で中身が揃っている」ことを明示しておく。
+        inner
+            .flush()
+            .context("failed to flush the AI prompt temp file")?;
+        Ok(Self { inner })
+    }
+
+    fn path(&self) -> &Path {
+        self.inner.path()
+    }
+}
+
 /// CLI を一発呼び出しモードで起動して prompt を投げ、応答を文字列で返す。
-/// stdin で prompt を渡す (shell escape & 長文対策)。
+/// prompt は stdin 経由 (shell escape & 長文対策)、agy のみ temp file 経由
+/// ([`prompt_delivery`] 参照)。
 ///
 /// **timeout**: 5 分 (300 秒)。当初 90 秒だったが、chat 2 turn 目以降は
 /// `build_followup_prompt` で `initial + prior_response + feedback` を全部
@@ -237,30 +376,31 @@ pub async fn invoke_oneshot(backend: Backend, prompt_text: &str) -> Result<Strin
         prompt_text.lines().count()
     );
 
-    // 各 CLI のフラグは「stdin から prompt を読み、結果を stdout に」のモードを選ぶ:
-    //   - claude: `claude -p` で one-shot non-interactive、stdin で prompt
-    //   - gemini: `gemini -p` 同様
-    //   - codex:  `codex exec`  (or `codex -p`、ver 依存)
-    //   - opencode: `opencode run` で stdin から読み取り
+    let delivery = prompt_delivery(backend);
+    // FileRef の場合だけ temp file を作る。guard は child の wait が終わるまで
+    // 生かす必要がある (先に drop すると agy が読む前にファイルが消える)。
+    let prompt_file = match delivery {
+        PromptDelivery::FileRef => Some(TempPromptFile::write(prompt_text)?),
+        PromptDelivery::Stdin => None,
+    };
+
     let mut cmd = Command::new(&resolved.program);
     cmd.args(&resolved.prefix_args);
-    match backend {
-        Backend::Claude | Backend::Gemini => {
-            cmd.arg("-p").arg("-");
-        }
-        Backend::Opencode => {
-            cmd.arg("run");
-        }
-        Backend::Codex => {
-            cmd.arg("exec").arg("-");
-        }
-    }
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        // tokio Command の `kill_on_drop` は default false。timeout で future が
-        // drop されたとき子プロセスを残さないように true にする (CodeRabbit Critical)。
-        .kill_on_drop(true);
+    cmd.args(oneshot_args(
+        backend,
+        prompt_file.as_ref().map(|f| f.path()),
+    )?);
+    cmd.stdin(match delivery {
+        PromptDelivery::Stdin => std::process::Stdio::piped(),
+        // agy は stdin を読まないので開けない。piped のまま渡すと閉じ忘れで
+        // 待たれる余地が残るため、null で即 EOF にしておく。
+        PromptDelivery::FileRef => std::process::Stdio::null(),
+    })
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    // tokio Command の `kill_on_drop` は default false。timeout で future が
+    // drop されたとき子プロセスを残さないように true にする (CodeRabbit Critical)。
+    .kill_on_drop(true);
 
     let mut child = cmd.spawn().with_context(|| {
         format!(
@@ -270,6 +410,8 @@ pub async fn invoke_oneshot(backend: Backend, prompt_text: &str) -> Result<Strin
     })?;
 
     // stdin に prompt を書き込んで close (EOF を AI に伝える)。
+    // FileRef backend では stdin が null なので `take()` は None になり、この
+    // ブロックごと skip される。
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(prompt_text.as_bytes())
@@ -294,6 +436,10 @@ pub async fn invoke_oneshot(backend: Backend, prompt_text: &str) -> Result<Strin
             )
         })?
         .with_context(|| format!("AI CLI `{}` failed to produce output", backend.cli_name()))?;
+
+    // ここまで来れば CLI は prompt を読み終えている。明示 drop でファイルを消す
+    // (関数末尾までの暗黙 drop に頼ると、意図しない早期 return で寿命が読みづらい)。
+    drop(prompt_file);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -442,7 +588,9 @@ pub fn should_emit_merged_with(backend: Backend, get_env: impl Fn(&str) -> Optio
     }
     match backend {
         Backend::Gemini => false,
-        Backend::Claude | Backend::Codex | Backend::Opencode => true,
+        // agy は gemini-cli とは別コードベース (Go 実装) で `_recoverFromLoop`
+        // を持たないため、Gemini の merged-OFF 特例は引き継がない。
+        Backend::Agy | Backend::Claude | Backend::Codex | Backend::Opencode => true,
     }
 }
 
@@ -453,8 +601,8 @@ enum FirstMessageStrategy {
     /// `<cli> "<msg>"` — positional arg で interactive を継続したまま最初の
     /// user message を送る。claude / codex / opencode 等。
     Positional,
-    /// `gemini -i "<msg>"` — `--prompt-interactive` 相当の short flag。
-    /// `-p` (non-interactive) と区別して対話継続する。
+    /// `gemini -i "<msg>"` / `agy -i "<msg>"` — `--prompt-interactive` 相当の
+    /// short flag。`-p` (non-interactive) と区別して対話継続する。
     InteractiveFlag,
     /// Auto-send が安全に出来ない backend 用フォールバック。argless で
     /// interactive 起動 + stderr に「コピペしてください」案内を出す。
@@ -469,7 +617,8 @@ fn first_message_strategy(backend: Backend) -> FirstMessageStrategy {
         // opencode: `opencode "<msg>"`
         Backend::Claude | Backend::Codex | Backend::Opencode => FirstMessageStrategy::Positional,
         // gemini: `gemini -i "<msg>"` (`-p` だと one-shot non-interactive)
-        Backend::Gemini => FirstMessageStrategy::InteractiveFlag,
+        // agy:    `agy -i "<msg>"` — `--prompt-interactive` の short alias で同形
+        Backend::Gemini | Backend::Agy => FirstMessageStrategy::InteractiveFlag,
     }
 }
 
@@ -711,6 +860,7 @@ mod tests {
         use crate::config::AiBackend as Cfg;
         assert_eq!(Backend::try_from(Cfg::Claude), Ok(Backend::Claude));
         assert_eq!(Backend::try_from(Cfg::Gemini), Ok(Backend::Gemini));
+        assert_eq!(Backend::try_from(Cfg::Agy), Ok(Backend::Agy));
         assert_eq!(Backend::try_from(Cfg::Codex), Ok(Backend::Codex));
         assert_eq!(Backend::try_from(Cfg::Opencode), Ok(Backend::Opencode));
         assert_eq!(Backend::try_from(Cfg::Off), Err(()));
@@ -725,6 +875,99 @@ mod tests {
         assert!(should_emit_merged_with(Backend::Codex, no_env));
         assert!(should_emit_merged_with(Backend::Opencode, no_env));
         assert!(!should_emit_merged_with(Backend::Gemini, no_env));
+        // agy は gemini-cli とは別実装 (Go) で `_recoverFromLoop` を持たないので、
+        // Gemini の merged-OFF 特例は引き継がない。
+        assert!(should_emit_merged_with(Backend::Agy, no_env));
+    }
+
+    #[test]
+    fn oneshot_args_per_backend() {
+        // stdin 経由の backend は prompt path を渡されても無視する。
+        assert_eq!(
+            oneshot_args(Backend::Claude, None).unwrap(),
+            vec!["-p", "-"]
+        );
+        assert_eq!(
+            oneshot_args(Backend::Gemini, None).unwrap(),
+            vec!["-p", "-"]
+        );
+        assert_eq!(
+            oneshot_args(Backend::Codex, None).unwrap(),
+            vec!["exec", "-"]
+        );
+        assert_eq!(oneshot_args(Backend::Opencode, None).unwrap(), vec!["run"]);
+        // agy は stdin を読まないので `@<path>` 参照で渡す。
+        assert_eq!(
+            oneshot_args(Backend::Agy, Some(Path::new("/tmp/p.md"))).unwrap(),
+            vec!["-p", "@/tmp/p.md"]
+        );
+    }
+
+    #[test]
+    fn oneshot_args_errors_when_file_ref_backend_has_no_path() {
+        // 空参照 `-p @` を組み立てると agy は「文脈の無い prompt」として普通に
+        // 応答してしまい、静かに誤動作する。loud に落ちることを固定する。
+        let err = oneshot_args(Backend::Agy, None).unwrap_err().to_string();
+        assert!(err.contains("agy"), "unexpected error message: {err}");
+        assert!(
+            !oneshot_args(Backend::Agy, Some(Path::new("/tmp/p.md")))
+                .unwrap()
+                .contains(&"@".to_string()),
+            "empty `@` reference must never be produced"
+        );
+    }
+
+    #[test]
+    fn prompt_delivery_is_file_ref_only_for_agy() {
+        assert_eq!(prompt_delivery(Backend::Agy), PromptDelivery::FileRef);
+        for b in [
+            Backend::Claude,
+            Backend::Gemini,
+            Backend::Codex,
+            Backend::Opencode,
+        ] {
+            assert_eq!(prompt_delivery(b), PromptDelivery::Stdin);
+        }
+    }
+
+    #[test]
+    fn temp_prompt_file_writes_then_deletes_on_drop() {
+        let path = {
+            let f = TempPromptFile::write("hello prompt").expect("write temp prompt");
+            // ハンドルを保持したままでも中身が読めること (agy が読む前提)。
+            assert_eq!(std::fs::read_to_string(f.path()).unwrap(), "hello prompt");
+            f.path().to_path_buf()
+        };
+        assert!(!path.exists(), "temp prompt file should be removed on drop");
+    }
+
+    #[test]
+    fn temp_prompt_file_names_are_unique_within_a_process() {
+        // chat loop は 1 プロセスで何度も呼ぶので、名前が被ると後続の呼び出しが
+        // 前の prompt を上書き/共有してしまう。
+        let a = TempPromptFile::write("a").unwrap();
+        let b = TempPromptFile::write("b").unwrap();
+        assert_ne!(a.path(), b.path());
+    }
+
+    /// agy backend の実 subprocess 経路 (temp file 書き出し → `@<path>` 参照 →
+    /// stdout 回収) を通しで確認する。
+    ///
+    /// `agy` の install と sign-in が要るので通常の `cargo test` からは外す。
+    /// 手動実行: `cargo test -- --ignored --nocapture agy_oneshot`
+    #[tokio::test]
+    #[ignore = "requires an installed, authenticated `agy` on PATH"]
+    async fn agy_oneshot_round_trips_through_temp_file() {
+        let prompt = "Reply with EXACTLY this line and nothing else, and do not \
+                      edit any files:\n<rvpm:explanation>ok</rvpm:explanation>";
+        let out = invoke_oneshot(Backend::Agy, prompt)
+            .await
+            .expect("agy one-shot invocation");
+        assert_eq!(
+            extract_tag(&out, "explanation").map(|s| s.trim().to_string()),
+            Some("ok".to_string()),
+            "unexpected agy response: {out}"
+        );
     }
 
     #[test]

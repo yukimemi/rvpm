@@ -156,9 +156,10 @@ enum Commands {
         no_lazy: bool,
 
         /// AI backend for this `add`. Replaces the static-scan + auto-lazy path:
-        /// the chosen CLI (`claude` / `gemini` / `codex`) reads the plugin's
-        /// README + your config and proposes the full `[[plugins]]` block plus
-        /// any per-plugin hook files. Overrides `options.ai` for this call.
+        /// the chosen CLI (`claude` / `agy` / `codex` / `opencode`) reads the
+        /// plugin's README + your config and proposes the full `[[plugins]]`
+        /// block plus any per-plugin hook files. Overrides `options.ai` for this
+        /// call. `gemini` is deprecated — prefer `agy`, its successor.
         #[arg(long, value_enum, conflicts_with = "no_ai")]
         ai: Option<crate::config::AiBackend>,
 
@@ -193,6 +194,7 @@ enum Commands {
         query: Option<String>,
 
         /// AI backend for this `tune`. Overrides `options.ai` for this call.
+        /// `gemini` is deprecated — prefer `agy`, its successor.
         #[arg(long, value_enum, conflicts_with = "no_ai")]
         ai: Option<crate::config::AiBackend>,
 

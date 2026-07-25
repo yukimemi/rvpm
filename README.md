@@ -166,7 +166,7 @@ for fully isolated test configs.
 | `fetch_interval` | duration string (`"6h"`, `"30m"`, `"45s"`, `"1d"`, `"0"`) | `"6h"` | Per-plugin fetch cache window. `sync` skips `git fetch` for plugins pulled within the last *fetch_interval*. Accepted units: `s` / `m` / `h` / `d`. Set to `"0"` to disable caching (pre-v3.19 behavior). Override per-run with `rvpm sync --refresh` / `--no-refresh` |
 | `cooldown` | duration string (`"1d"`, `"12h"`, `"0"`) | `"1d"` (**on by default**) | **Supply-chain cooldown** (minimum release age): `rvpm update` won't advance a plugin to a commit until rvpm has *first observed* it for at least this long (or the commit itself is older than the window). Malicious commits are typically detected and reverted within hours-to-days, so even `"1d"` skips most attack windows — same idea as npm/pnpm `minimumReleaseAge` (pnpm 11 also defaults to 1 day). While the tip is too fresh, update advances to the newest already-matured observed commit instead, so active plugins still move forward (delayed by the cooldown). Set `"0"` to disable. Explicit `rev` pins, `dev` plugins, and first installs are exempt. Per-plugin override: `[[plugins]] cooldown = "..."` (`"0"` opts a plugin out). Bypass once with `rvpm update --no-cooldown`. See [Advanced → Supply-chain cooldown](#advanced) |
 | `auto_lazy` | `"ask"` \| `"always"` \| `"never"` | `"ask"` | How `rvpm add` (and `rvpm browse → Enter`) handles the post-clone scan that looks for `nvim_create_user_command` / keymaps in the plugin's `plugin/` + `ftplugin/` + `after/plugin/` + `lua/` dirs. `"ask"` (default) prompts interactively on TTY and skips silently on non-TTY. `"always"` accepts the suggestion unconditionally. `"never"` skips the scan entirely. Per-call override via `--auto-lazy` / `--no-lazy` on `rvpm add`. Accepted suggestions cluster commands by 3-char LCP (3+ char shared prefix becomes `/^Prefix/` regex so future commands in that family auto-load) and enumerate keymaps (maps don't LCP well). **Ignored when `ai != "off"`** — the AI handles the design end-to-end |
-| `ai` | `"off"` \| `"claude"` \| `"gemini"` \| `"codex"` \| `"opencode"` | `"off"` | Use an AI CLI to design the full `[[plugins]]` block (plus per-plugin hook files) on `rvpm add`. The chosen CLI must already be installed and authenticated (`claude login`, `gemini auth`, etc.) — rvpm doesn't manage API keys. When set, the static-scan + auto-lazy path is skipped entirely. After the AI proposes, you can apply, refine via chat, hand off to the native CLI for free-form follow-up, or skip. Per-call override via `--ai <backend>` / `--no-ai` on `rvpm add` |
+| `ai` | `"off"` \| `"claude"` \| `"gemini"` \| `"agy"` \| `"codex"` \| `"opencode"` | `"off"` | Use an AI CLI to design the full `[[plugins]]` block (plus per-plugin hook files) on `rvpm add`. The chosen CLI must already be installed and authenticated (`claude login`, `agy` sign-in, etc.) — rvpm doesn't manage API keys. `"gemini"` is **deprecated** (Google retired Gemini CLI for personal accounts on 2026-06-18); use `"agy"` (Antigravity CLI, its successor). When set, the static-scan + auto-lazy path is skipped entirely. After the AI proposes, you can apply, refine via chat, hand off to the native CLI for free-form follow-up, or skip. Per-call override via `--ai <backend>` / `--no-ai` on `rvpm add` |
 | `ai_language` | string | `"en"` | Natural language for the AI's `<rvpm:explanation>` body and chat replies. The XML tag structure itself is always English so parsing stays predictable. Accepts BCP-47-ish codes (`"en"`, `"ja"`, `"zh"`, `"de"`) or free-form names |
 | `auto_update` | `"off"` \| `"notify"` \| `"install"` | `"install"` | Background self-update behaviour, run at the start of every command. `"install"` (default) silently downloads and swaps in a newer rvpm binary; the running process keeps the old binary and the new version takes effect on the next launch (a one-line `✓ rvpm X installed — restart to apply.` is printed to stderr when an update lands). `"notify"` only prints a banner pointing at `rvpm self-update` (never installs). `"off"` disables it entirely. Updates are serialised across processes by an OS advisory lock; dev builds are never overwritten; network failures / rate limits are silently swallowed (resilience). The env var `RVPM_NO_AUTOUPDATE=1` force-disables it regardless of config. **Deprecated:** the old `auto_update_check` boolean still works as an alias (`true` → `"notify"`, `false` → `"off"`) but emits a warning — migrate to `auto_update` |
 | `auto_update_check` | `boolean` | *(deprecated)* | Deprecated alias for `auto_update`. `true` maps to `"notify"`, `false` maps to `"off"`. Ignored (with a warning) when `auto_update` is also set. Kept so configs that disabled updates don't silently flip to auto-installing |
@@ -404,16 +404,22 @@ on_map = [
 </details>
 
 <details>
-<summary><b>AI-powered <code>rvpm add</code> (claude / gemini / codex / opencode)</b></summary>
+<summary><b>AI-powered <code>rvpm add</code> (claude / agy / codex / opencode)</b></summary>
 
 Set `options.ai` to a CLI you have installed and authenticated, and `rvpm add`
 delegates the design of the `[[plugins]]` entry to the AI:
 
 ```toml
 [options]
-ai = "claude"           # "off" (default) | "claude" | "gemini" | "codex" | "opencode"
+ai = "claude"           # "off" (default) | "claude" | "agy" | "codex" | "opencode" | "gemini" (deprecated)
 ai_language = "en"      # explanation language; structural output stays English
 ```
+
+> **`gemini` is deprecated.** Google retired Gemini CLI for Free / AI Pro /
+> Ultra personal accounts on 2026-06-18 in favour of **Antigravity CLI**
+> (`agy`). The backend is kept because paid Google Cloud API keys and
+> Enterprise licences still work against it, but rvpm prints a one-time
+> migration notice when you select it. Use `ai = "agy"` instead.
 
 Or per-call: `rvpm add owner/repo --ai claude`. The flag overrides the config
 value for that one invocation; `--no-ai` forces the static-scan path.
@@ -424,7 +430,11 @@ What it does:
 2. Builds a prompt from rvpm's TOML schema, the plugin's `README` + `doc/`,
    your current `config.toml` + `plugins/` tree, and any **existing
    per-plugin hook files** already on disk.
-3. Invokes the chosen CLI one-shot (`claude -p` / `gemini -p` / `codex exec` / `opencode -p`).
+3. Invokes the chosen CLI one-shot (`claude -p` / `codex exec` / `opencode run`,
+   all reading the prompt from stdin). `agy` is the exception: its `-p` takes the
+   prompt as a flag value and never reads stdin, so rvpm writes the prompt to a
+   temp file and passes `agy -p "@<path>"` (the prompt grows past the Windows
+   32 KB command-line limit, so it can't be inlined as an argument).
 4. Parses the response (XML tags `<rvpm:plugin_entry>`, `<rvpm:init_lua>`,
    `<rvpm:before_lua>`, `<rvpm:after_lua>`, `<rvpm:explanation>`, plus
    `<rvpm:..._merged>` variants when existing content was provided).
@@ -484,7 +494,7 @@ flow to an existing entry:
 ```bash
 rvpm tune                       # interactive picker
 rvpm tune telescope             # fuzzy match on URL
-rvpm tune folke/snacks.nvim --ai gemini
+rvpm tune folke/snacks.nvim --ai agy
 ```
 
 The AI sees your **current `[[plugins]]` block**, the cloned plugin's

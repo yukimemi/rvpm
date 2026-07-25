@@ -231,8 +231,14 @@ pub enum AiBackend {
     Off,
     /// Spawn the `claude` CLI as a subprocess.
     Claude,
-    /// Spawn the `gemini` CLI as a subprocess.
+    /// Spawn the `gemini` CLI as a subprocess (deprecated — see `agy`).
+    ///
+    /// Google retired Gemini CLI for Free / AI Pro / Ultra personal accounts on
+    /// 2026-06-18 in favour of Antigravity CLI (`agy`). Kept because paid Google
+    /// Cloud API keys and Enterprise licences still work against it.
     Gemini,
+    /// Spawn the `agy` (Antigravity) CLI as a subprocess — the Gemini CLI successor.
+    Agy,
     /// Spawn the `codex` CLI as a subprocess.
     Codex,
     /// Spawn the `opencode` CLI as a subprocess.

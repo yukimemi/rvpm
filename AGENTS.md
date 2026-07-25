@@ -78,7 +78,10 @@ concurrency = 16
 # auto_lazy = "ask"
 # Backend used to delegate `rvpm add` to an AI CLI (#93).
 #   "off" (default) — use the static scan + auto_lazy flow
-#   "claude" / "gemini" / "codex" / "opencode" — spawn the corresponding CLI as a subprocess
+#   "claude" / "agy" / "codex" / "opencode" — spawn the corresponding CLI as a subprocess
+#   "gemini" — deprecated; Gemini CLI was retired for Free / AI Pro / Ultra
+#              personal accounts on 2026-06-18 and "agy" (Antigravity CLI) is
+#              its successor. Still works with paid Google Cloud API keys.
 # Errors out if the CLI is not installed. `auto_lazy` is ignored.
 # CLI flags `--ai claude` / `--no-ai` allow per-call overrides.
 # ai = "claude"
