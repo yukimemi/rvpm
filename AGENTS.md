@@ -568,10 +568,12 @@ auto-tag" — that block also covers the `KATA_APPLY_TOKEN` and
 `delete_branch_on_merge` setup. What `release.yml` then does for
 a **CLI** crate:
 
-1. Cross-compiles binaries for x86_64 Linux / Windows / macOS,
-   plus aarch64 macOS (Apple Silicon) — full triples
-   `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`,
-   `x86_64-apple-darwin`, `aarch64-apple-darwin`.
+1. Cross-compiles binaries for **three** targets — full triples
+   `x86_64-unknown-linux-musl`, `x86_64-pc-windows-msvc`,
+   `aarch64-apple-darwin`. Linux is musl (statically linked, so the
+   binary runs on any glibc vintage); the Linux job installs
+   `musl-tools` first. Intel Mac (`x86_64-apple-darwin`) is
+   deliberately **not** built — Apple Silicon only.
 2. Uploads them as a GitHub Release with auto-generated notes.
 3. `cargo publish --locked` to crates.io using the
    `CARGO_REGISTRY_TOKEN` repo secret.
