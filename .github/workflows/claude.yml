@@ -63,6 +63,26 @@ jobs:
     # GHA's 360-minute default.
     timeout-minutes: 30
     steps:
+      # Same guard as claude-review.yml.tera: an empty credential
+      # makes claude-code-action exit 0 without responding, so a
+      # mention would silently go unanswered with a green check next
+      # to it. Accepts either `CLAUDE_CODE_OAUTH_TOKEN` (subscription)
+      # or `ANTHROPIC_API_KEY` (pay-as-you-go, where the consumer also
+      # swaps the input below to `anthropic_api_key`).
+      #
+      # Read via env rather than inlining the expressions into the
+      # script, so the values are never substituted into the shell
+      # source.
+      - name: Check responder credentials
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${CLAUDE_CODE_OAUTH_TOKEN}" ] && [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "::error title=claude responder is not configured::Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set on ${{ github.repository }}. Subscription path: generate a token with 'claude setup-token' and store it with 'gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo ${{ github.repository }}'. Pay-as-you-go path: set ANTHROPIC_API_KEY instead and swap the action input to anthropic_api_key. Until then @claude mentions in this repo go unanswered."
+            exit 1
+          fi
+
       - uses: actions/checkout@v6.1.0
         with:
           fetch-depth: 1

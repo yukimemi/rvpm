@@ -45,6 +45,30 @@ name: claude-review
 #    Pay-as-you-go alternative: store `ANTHROPIC_API_KEY` instead
 #    and swap the input below to `anthropic_api_key`.
 #
+# The credential check below exists because step 2 fails SILENTLY
+# otherwise: handed an empty token, claude-code-action exits 0
+# without posting anything, so the check turns green and the PR
+# looks reviewed when nothing ran. That is worse than a red X — it
+# went unnoticed on yukimemi/rvpm.nvim until the run log was read
+# by hand. Fail loudly instead.
+#
+# EXPECTED whenever a PR's copy of this file differs from the one
+# on the default branch: the action logs "Skipping action due to
+# workflow validation" and exits 0 without reviewing.
+# claude-code-action requires byte-identical content on the default
+# branch, otherwise a PR could rewrite the workflow to exfiltrate
+# the token. Two cases hit it:
+#   1. the PR that first adopts these templates, and
+#   2. any later PR that EDITS this file — e.g. hand-pulling an
+#      upstream fix into a consumer repo.
+# The second is the surprising one and reads like a regression; it
+# is not. Either way the check is green with no review attached.
+# Nothing to fix; merge on CI + owner approval, and reviews resume
+# on the next PR that leaves the workflows alone.
+#
+# Telling the two silent-green cases apart: no credential -> RED
+# (the guard below), workflow validation -> GREEN with no review.
+#
 # `when = "always"` (in template.toml): every consumer wants
 # identical review behaviour; fixes to the workflow itself flow
 # automatically on next apply.
@@ -82,6 +106,30 @@ jobs:
     # GHA's 360-minute default.
     timeout-minutes: 30
     steps:
+      # Fail fast when the consumer never set a credential. Without
+      # this the run is a green no-op (see header) — the one failure
+      # mode of this workflow that produces no visible signal at all.
+      #
+      # Accepts EITHER credential: `CLAUDE_CODE_OAUTH_TOKEN` (the
+      # subscription path this workflow wires up by default) or
+      # `ANTHROPIC_API_KEY` (the pay-as-you-go path the header
+      # documents, where the consumer also swaps the input below to
+      # `anthropic_api_key`). Checking only the former would hard-fail
+      # a consumer who followed the documented alternative.
+      #
+      # Read via env rather than inlining the expressions into the
+      # script, so the values are never substituted into the shell
+      # source.
+      - name: Check review credentials
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${CLAUDE_CODE_OAUTH_TOKEN}" ] && [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "::error title=claude-review is not configured::Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set on ${{ github.repository }}. Subscription path: generate a token with 'claude setup-token' and store it with 'gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo ${{ github.repository }}'. Pay-as-you-go path: set ANTHROPIC_API_KEY instead and swap the action input to anthropic_api_key. Either way, also install the Claude GitHub App (github.com/apps/claude). Until then no PR in this repo is being reviewed."
+            exit 1
+          fi
+
       - uses: actions/checkout@v6.1.0
         with:
           fetch-depth: 1

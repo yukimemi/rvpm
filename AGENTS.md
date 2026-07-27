@@ -298,6 +298,32 @@ here so each tool's auto-load behaviour still finds something.
   `chore/release-*`, `kata-apply/auto`, `apm-bump/auto`, and
   Renovate / Dependabot authors) — a missing Claude review on
   those PRs is expected, not a failure.
+- **Any PR that touches the Claude workflow files goes
+  unreviewed.** `claude-code-action` requires the workflow file to
+  already exist on the default branch **with identical content** —
+  otherwise a PR could rewrite the workflow to exfiltrate the
+  token. When the content differs it logs "Skipping action due to
+  workflow validation" and exits 0 without reviewing: a green
+  check with no review attached. This covers two cases, and the
+  second is the one that keeps surprising people:
+  - the PR that first adopts these templates (the workflow does
+    not exist on the default branch yet), and
+  - any later PR that **edits** `claude-review.yml` / `claude.yml`,
+    e.g. hand-pulling an upstream template fix.
+
+  Not fixable from this side — it is the mechanism that makes the
+  token safe to hand to the action at all. Expected: merge on CI +
+  owner approval; reviews resume on the next PR that leaves the
+  workflows alone. The `kata-apply/auto` branch is already excluded
+  by the job-level `if:`, so the daily template-refresh PRs do not
+  add noise here.
+- **A missing credential fails loudly instead.** If the repo has
+  neither `CLAUDE_CODE_OAUTH_TOKEN` nor `ANTHROPIC_API_KEY` set,
+  the guard step fails the job — set one and re-run (subscription
+  path: `claude setup-token` → `gh secret set`; pay-as-you-go:
+  store `ANTHROPIC_API_KEY` and swap the action input to
+  `anthropic_api_key`). Distinguishing the two: **red** means no
+  credential, **green with no review** means workflow validation.
 - **The Claude full review fires once, at PR open** (plus
   `ready_for_review` / `reopened`) — fix pushes do **not** re-trigger
   it (`synchronize` is deliberately off the trigger list; a full
