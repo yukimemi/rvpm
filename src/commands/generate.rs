@@ -222,11 +222,11 @@ pub(crate) async fn run_generate(force: bool) -> Result<()> {
                     PluginMergeMode::ViewWithDoc => {}
                 }
             }
-            if let Some(s) = &merged_stamp {
-                if let Err(e) = crate::view_stamp::write(tmp_merged, s) {
-                    // stamp が書けなくても merged 自体は有効 — 次回 rebuild に倒れるだけ。
-                    eprintln!("\u{26a0} failed to write merged stamp: {}", e);
-                }
+            if let Some(s) = &merged_stamp
+                && let Err(e) = crate::view_stamp::write(tmp_merged, s)
+            {
+                // stamp が書けなくても merged 自体は有効 — 次回 rebuild に倒れるだけ。
+                eprintln!("\u{26a0} failed to write merged stamp: {}", e);
             }
             Ok(())
         });
