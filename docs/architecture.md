@@ -149,6 +149,22 @@ Implementation notes:
 - `LockFile::save` performs a stable sort by name → minimizes dotfile diffs.
 - Malformed / missing files emit a warning on stderr and fall back to an empty
   LockFile (resilience).
+- **Shallow-clone recovery** (`checkout_with_pin_fetch_retry` in `src/git.rs`):
+  clones are depth 1 and fetches only `Deepen(1)`, so a lockfile pin more than
+  ~2 commits behind the remote tip is absent from the local object DB — e.g.
+  right after the user deletes `repos/` and re-syncs (fresh depth-1 clone vs.
+  an old lockfile pin). When checkout fails for a full 40-hex SHA, rvpm fetches
+  just that commit from origin (object-id want, equivalent to
+  `git fetch origin <sha>`, done in-process via a one-sided gix refspec) and
+  retries the checkout. Requires the server to allow SHA wants (GitHub allows
+  it for reachable commits); if the fetch also fails, the original
+  `rev '<sha>' not found` error is returned. Non-SHA revs (branch / tag /
+  `/regex/`) never trigger the retry and fail as before.
+- **Broken-clone recovery** (`sync_impl`): if `repos/<plug>/` exists but has no
+  valid `.git` (e.g. partially deleted by hand), sync removes the leftover dir
+  and re-clones instead of failing with "does not appear to be a git
+  repository". The auto-remove applies to **remote URLs only** — a local-path
+  dst (potential dev / mirror dir) is never deleted and keeps the old error.
 - `dev = true` plugins are excluded from the lockfile (they are local
   works-in-progress, so pinning a commit hash is meaningless).
 - When `options.chezmoi = true`, the lockfile — like config.toml / hooks —
