@@ -103,8 +103,9 @@ jobs:
     runs-on: ubuntu-latest
     # The action's SDK caps runs at 10 agent turns, but has no
     # wall-clock timeout of its own; bound a hung run well below
-    # GHA's 360-minute default.
-    timeout-minutes: 30
+    # GHA's 360-minute default. 45 rather than 30 because the review
+    # may now compile the project to check a claim, from a cold cache.
+    timeout-minutes: 45
     steps:
       # Fail fast when the consumer never set a credential. Without
       # this the run is a green no-op (see header) — the one failure
@@ -158,11 +159,51 @@ jobs:
             - Maintainability: readability, duplication, dead code
             - Tests: coverage for the changed behaviour
 
+            You can run this project's own verification commands
+            (`cargo make check` / `cargo test` / `bun test` and the
+            like). Use them when a finding is worth confirming — a
+            reviewer who ran the test is worth more than one who
+            inferred from the diff — and say which you ran. Keep it
+            targeted: a cold full build costs minutes, so reach for
+            the narrowest command that settles the question, and
+            don't build at all for findings the diff already proves.
+
             Post specific issues as inline comments on the relevant
             lines. Use one top-level comment for the overall
             summary. Be concise — no praise padding; if the PR is
             clean, say so briefly.
-          # Scope Claude to read-the-PR + comment tools only; the
-          # review job must not push code.
+          # Scope Claude to reading the PR, commenting, and running the
+          # project's own verification commands. It must not push code.
+          #
+          # The build/test entries let a reviewer CHECK a claim instead
+          # of reasoning about it — "this breaks the tests" is worth
+          # far more when the reviewer ran them. Without these the
+          # agent can only read the diff and infer, and it says so.
+          #
+          # Not a new exposure: `on: pull_request` (not
+          # `pull_request_target`) means a fork PR gets no secrets and
+          # the credential guard fails the job, so only in-repo
+          # branches reach this — and `ci.yml` already runs
+          # `cargo make check` on that same commit. Executing the
+          # branch's code here grants nothing CI didn't already.
+          #
+          # Verbs are enumerated rather than `Bash(cargo:*)` /
+          # `Bash(bun:*)` on purpose. The review job reads untrusted PR
+          # content (a diff, its own AGENTS.md), so a prompt-injection
+          # attempt inside a diff shouldn't be able to reach
+          # `cargo run` / `cargo publish` / `bun x`.
+          #
+          # `bun run` is pinned to named scripts rather than left as
+          # `bun run:*` for a sharper reason: `bun run -` EXECUTES
+          # STANDARD INPUT. That is the one primitive here that runs
+          # code which never existed in the repository — everything
+          # else (a test, a build script, a `cargo make` task) can only
+          # run what the PR itself contains, which CI already runs on
+          # the same commit. A payload the agent merely *read* while
+          # reviewing must not be reachable.
+          #
+          # Compiling still executes build.rs and test code, so the
+          # rest of this list bounds intent rather than capability.
+          # That is the accepted trade; the stdin path is not.
           claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(cargo make:*),Bash(cargo test:*),Bash(cargo clippy:*),Bash(cargo check:*),Bash(cargo fmt:*),Bash(bun install:*),Bash(bun test:*),Bash(bun run build:*),Bash(bun run test:*),Bash(bun run lint:*),Bash(bun run check:*),Bash(bun run typecheck:*)"
