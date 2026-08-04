@@ -562,6 +562,40 @@ gh pr merge --auto --squash --delete-branch
 Once CI is green the PR auto-merges. `auto-tag.yml` then pushes
 `vX.Y.Z`, which fires `release.yml`.
 
+**In a workspace, the version is in more than one place.** A member
+that is published and depended on by another member is declared
+with both a `path` and a `version` — crates.io needs a
+requirement it can resolve for somebody who is not building from
+the checkout, so a bare `path` will not do:
+
+```toml
+my-core = { path = "crates/my-core", version = "0.4.2" }
+```
+
+That literal does not follow `[workspace.package] version`.
+Nothing in Cargo makes it, and the release above will not either.
+
+**It fails late and quietly.** `version = "0.4.2"` means `^0.4.2`,
+so a stale pin keeps resolving through every *patch* release and
+stops only at the first bump that crosses the minor — where
+`cargo build` refuses with `candidate versions found which didn't
+match`, in the middle of cutting the release. Two repos on these
+templates hit exactly this, one of them three releases after its
+pins were last correct, and the other had already written the
+hazard down in prose and drifted anyway.
+
+So bump the pins in the same commit, keep them in
+`[workspace.dependencies]` rather than in each member, and assert
+it rather than remembering it. A test is the cheapest place —
+`cargo test` already runs in CI, and it needs no toolchain a Rust
+workspace does not have. [pj-rust-workspace's
+README](https://github.com/yukimemi/pj-rust-workspace#the-internal-version-pin-and-the-check-for-it)
+carries one to copy into any member's
+`tests/check_versions.rs`: `internal_pins_match_the_workspace_version`
+fails when a pin and the workspace version disagree, and
+`members_inherit_the_workspace_version` fails when a member writes
+its own version or reaches for a sibling by path.
+
 **Repo settings to set once:** enable
 `delete_branch_on_merge=true` (Settings → General →
 "Automatically delete head branches"). The `--delete-branch`

@@ -1,15 +1,15 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-08-02T04:25:58.908051927Z"
+applied_at = "2026-08-04T04:23:08.750211788Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "9f3a4087bc33b5f3fd08d8a02edd21a2ccd8159d"
-version = "0.13.0"
+rev = "b5f394660d08ef671e6c29204c366b3e7984868c"
+version = "0.14.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "4431c1cc08174025128ce7a2d7bb68af2dfffa93"
-version = "0.8.0"
+rev = "6409c21b281d21f53a294f4928c89ad6f2e2c399"
+version = "0.8.1"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust-cli"
@@ -41,10 +41,10 @@ content_hash = "406943795e69542d92d37a0d70051f22a899956dc0cbd1d70ebc16aea13d655a
 content_hash = "917be127933843d794f8f3074472b8d9e90cdb22ec90c025b5a8aa2607d1778f"
 
 [files.".github/workflows/claude-review.yml"]
-content_hash = "78b669b6a0965f84855acb8c21fdc1ad8a6877437a88d5919877c769e6bf44f1"
+content_hash = "9c07be16af6dc6f1e86b8a845a64a5c54b0d9092b8b34a9c4eefe31e84269509"
 
 [files.".github/workflows/claude.yml"]
-content_hash = "615406a64ab9faed907078fee7c31d17812d893f2d84c48dcec71c2456716c3f"
+content_hash = "2db473008ec9528565097a8e543c7a5586a6dd383d8f3e32e094ca78e8e9c2f5"
 
 [files.".github/workflows/kata-apply.yml"]
 content_hash = "45e8fc324f046621343be84f99ed8f3a338fa6d0ea007e87f5ce0c81b0ae2335"

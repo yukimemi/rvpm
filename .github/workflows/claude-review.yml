@@ -134,10 +134,14 @@ jobs:
       - uses: actions/checkout@v6.1.0
         with:
           fetch-depth: 1
-          # The action exchanges its own App token for git/API
-          # access; the checkout-persisted credential is unused.
-          # Same hardening as apm-bump.yml.tera.
-          persist-credentials: false
+          # persist-credentials stays ON (the default) on purpose: the
+          # action's setupBranch runs `git fetch origin <branch>` BEFORE
+          # it configures its own git auth, so with the credential
+          # scrubbed the fetch dies with "could not read Username for
+          # 'https://github.com'" on private repos — public repos only
+          # survive because the anonymous fetch happens to succeed
+          # (anthropics/claude-code-action#1236). The App token the
+          # action exchanges covers API calls, not that first fetch.
 
       - uses: anthropics/claude-code-action@v1
         with:
