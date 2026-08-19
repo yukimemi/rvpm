@@ -1,19 +1,19 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-08-18T03:30:45.437207666Z"
+applied_at = "2026-08-19T03:31:41.603314166Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "1a7c2be1758fd01c875b3d503201145f64df42ea"
+rev = "27e4c1fe27ce44731a04bf0d55590fa6a0db27d4"
 version = "0.14.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "6409c21b281d21f53a294f4928c89ad6f2e2c399"
+rev = "e9ed48b62025bbe80e1d35cdccca11ec2ee88d3e"
 version = "0.8.1"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust-cli"
-rev = "25189b4c1450b3aa9b6db6ada3c43703e13d4d98"
+rev = "29eb636eec8882f416878f3bc30134048eacdfe5"
 version = "0.4.1"
 
 [files.".agents/skills/renri/SKILL.md"]
@@ -94,7 +94,7 @@ once_applied = true
 content_hash = "2ada1cf4347db9e98fadd67ca72cd9e29042c5bf6ab719d666b5d71f97663e81"
 
 [files."renovate.json"]
-content_hash = "ea464978679041c69a3e18085f9a2ce846b9762ff02ab2801ed22cfbbf1487ae"
+content_hash = "531343c1f15a1744b9cb2589969c82eb39d4450fa6299f4600457156e98dc349"
 once_applied = true
 
 [files."renri.toml"]
