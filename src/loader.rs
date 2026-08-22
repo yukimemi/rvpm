@@ -12,6 +12,19 @@ pub struct DenopsPlugin {
     pub main_script: String,
 }
 
+/// `opts` から決まった setup 呼び出し 1 件。
+///
+/// generate 時に「どの module を require するか」「opts をどんな Lua literal に
+/// するか」まで確定させ、loader.lua には `rvpm_setup(name, mod, { ... })` の
+/// literal だけを焼き込む。 lazy.nvim が起動時にやる module 探索は発生しない。
+#[derive(Clone, Debug)]
+pub struct SetupSpec {
+    /// `require()` に渡す module 名 (例: `"autocursor"` / `"mini.pick"`)。
+    pub module: String,
+    /// setup の引数になる Lua table literal (例: `"{ throttle = 500 }"`)。
+    pub opts_lua: String,
+}
+
 #[derive(Clone)]
 pub struct PluginScripts {
     pub name: String,
@@ -78,6 +91,9 @@ pub struct PluginScripts {
     /// dev plugin は commit と無関係にローカル編集で中身が変わるため、
     /// view stamp による rebuild skip の対象外にする判定に使う。
     pub dev: bool,
+    /// `opts` 指定から解決された setup 呼び出し。`None` なら rvpm は setup を
+    /// 呼ばない (従来どおり after.lua 任せ)。
+    pub setup: Option<SetupSpec>,
 }
 
 impl PluginScripts {
@@ -112,6 +128,7 @@ impl PluginScripts {
             defined_user_events: Vec::new(),
             cond: None,
             dev: false,
+            setup: None,
         }
     }
 }
@@ -183,6 +200,109 @@ pub(crate) fn lua_quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// Lua の data 用 string literal。`lua_quote` と違い backslash を `/` に
+/// **正規化しない** — path ではなく user が書いた `opts` の値なので、
+/// `"\\"` や `"\t"` をそのまま意味として保つ必要がある。
+fn lua_data_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // その他の制御文字は 3 桁 zero-pad した decimal escape (`\ddd`)。
+            // Lua は `\` の後の数字を **最大 3 桁まで貪欲に** 食うので、pad 無しの
+            // `\1` は直後に literal な数字が来ると 1 個の escape に融合してしまう
+            // (`"\x012"` が `\12` = form feed 1 文字になる)。3 桁固定なら境界が確定する。
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\{:03}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Lua の予約語。table key を bare identifier で書けるかの判定に使う。
+const LUA_KEYWORDS: [&str; 22] = [
+    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in",
+    "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+];
+
+/// table key を Lua literal に変換。identifier として書けるなら `key = v`、
+/// そうでなければ `["key"] = v` にする (`on_ft` のような予約語混じり / 記号入り
+/// キーでも壊れない)。
+fn lua_table_key(key: &str) -> String {
+    let is_ident = !key.is_empty()
+        && !LUA_KEYWORDS.contains(&key)
+        && key
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if is_ident {
+        key.to_string()
+    } else {
+        format!("[{}]", lua_data_string(key))
+    }
+}
+
+/// float を Lua literal に変換。TOML は `nan` / `inf` を許すが Rust の `{}`
+/// 表記 (`NaN` / `inf`) は Lua として不正なので、Lua 側の表現に置き換える。
+/// 整数値の float は `1.0` の形を保って「float である」ことを残す。
+fn lua_float(f: f64) -> String {
+    if f.is_nan() {
+        return "0/0".to_string();
+    }
+    if f.is_infinite() {
+        return if f.is_sign_positive() {
+            "math.huge".to_string()
+        } else {
+            "-math.huge".to_string()
+        };
+    }
+    if f.fract() == 0.0 {
+        format!("{f:.1}")
+    } else {
+        f.to_string()
+    }
+}
+
+/// `opts` の TOML 値を Lua literal に変換する (generate 時 AOT)。
+///
+/// TOML の table は key 順が決定的 (toml crate の Map) なので、同じ config から
+/// 同じ loader.lua が出る (再現性は rvpm の前提)。
+///
+/// `Datetime` だけは Lua に対応する型が無いので RFC3339 文字列に落とす。
+/// plugin の `opts` に datetime を書く需要は事実上無いが、書かれても壊れた Lua を
+/// 生成しないための保険。
+pub fn toml_to_lua(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(s) => lua_data_string(s),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => lua_float(*f),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Datetime(dt) => lua_data_string(&dt.to_string()),
+        toml::Value::Array(items) if items.is_empty() => "{}".to_string(),
+        toml::Value::Array(items) => {
+            let inner: Vec<String> = items.iter().map(toml_to_lua).collect();
+            format!("{{ {} }}", inner.join(", "))
+        }
+        toml::Value::Table(t) if t.is_empty() => "{}".to_string(),
+        toml::Value::Table(t) => {
+            let inner: Vec<String> = t
+                .iter()
+                .map(|(k, v)| format!("{} = {}", lua_table_key(k), toml_to_lua(v)))
+                .collect();
+            format!("{{ {} }}", inner.join(", "))
+        }
+    }
 }
 
 /// `/regex/` 区切り entry を `defined` (プラグインの静的スキャン結果) と照合して展開する
@@ -570,7 +690,7 @@ pub fn generate_loader(
     // load_lazy helper — lazy プラグインの実行時ローダー
     // 事前 glob 済みファイルリストを受け取り、ftdetect を augroup で wrap
     // ======================================================
-    lua.push_str(r#"local function load_lazy(name, path, plugin_files, ftdetect_files, after_plugin_files, before, after, denops_plugins)
+    lua.push_str(r#"local function load_lazy(name, path, plugin_files, ftdetect_files, after_plugin_files, before, after, denops_plugins, setup)
   if _G["rvpm_loaded_" .. name] then return end
   _G["rvpm_loaded_" .. name] = true
   vim.opt.rtp:append(path)
@@ -582,6 +702,7 @@ pub fn generate_loader(
     vim.cmd("augroup END")
   end
   for _, f in ipairs(after_plugin_files) do vim.cmd("source " .. f) end
+  if setup then setup() end
   if after then dofile(after) end
   if denops_plugins and #denops_plugins > 0 and vim.fn.exists("*denops#plugin#load") == 1 then
     for _, dp in ipairs(denops_plugins) do
@@ -599,6 +720,22 @@ pub fn generate_loader(
 end
 
 "#);
+    // `opts` を持つ plugin が 1 つでもあれば setup helper を定義する。
+    //
+    // pcall で包む理由: setup() の失敗をそのまま投げると loader.lua の top-level
+    // error になり、後続プラグインと phase 7 の trigger 登録まで巻き添えで死ぬ。
+    // 「1 プラグインの失敗が全体を倒さない」原則を守るため warn に落として続行する
+    // (lazy.nvim の Util.try と同じ判断)。
+    if scripts.iter().any(|s| s.setup.is_some()) {
+        lua.push_str(
+            "local function rvpm_setup(name, mod, opts)\n\
+             \x20 local ok, err = pcall(function() require(mod).setup(opts) end)\n\
+             \x20 if not ok then\n\
+             \x20   vim.notify(\"rvpm: setup() failed for \" .. name .. \": \" .. tostring(err), vim.log.levels.ERROR)\n\
+             \x20 end\n\
+             end\n\n",
+        );
+    }
 
     // ======================================================
     // グローバル before.lua (全プラグインの前)
@@ -701,6 +838,18 @@ end
             body.push_str(&format!("vim.cmd(\"source {}\")\n", f.replace('\\', "/")));
         }
 
+        // opts → `require("<main>").setup(<opts>)`。
+        // after.lua の **前** に呼ぶ: after.lua は「setup 済みの状態に足す/上書きする」
+        // 場所という位置づけを保つ (lazy.nvim の opts → config の順と同じ)。
+        if let Some(setup) = &s.setup {
+            body.push_str(&format!(
+                "rvpm_setup({}, {}, {})\n",
+                lua_quote(&s.name),
+                lua_quote(&setup.module),
+                setup.opts_lua
+            ));
+        }
+
         // after.lua (plugin/ source 後)
         if let Some(after) = &s.after {
             body.push_str(&format!("dofile(\"{}\")\n", after.replace('\\', "/")));
@@ -779,6 +928,25 @@ end
             lua_denops_list(&s.denops_plugins)
         ));
 
+        // opts があるときだけ setup closure を local に置く。
+        // closure にするのは opts table の構築を **trigger 発火まで遅延** させる
+        // ため — startup 時に確定するのは closure 1 個ぶんだけで、table literal は
+        // ロードされなければ一度も構築されない。
+        let st_var = format!("_rvpm_st_{}", safe);
+        let setup_arg = match &s.setup {
+            Some(setup) => {
+                body.push_str(&format!(
+                    "local {} = function() rvpm_setup({}, {}, {}) end\n",
+                    st_var,
+                    lua_quote(&s.name),
+                    lua_quote(&setup.module),
+                    setup.opts_lua
+                ));
+                st_var
+            }
+            None => "nil".to_string(),
+        };
+
         // deps がある場合は load_lazy の前に依存先をロードするコードを生成
         // 依存先のファイルリスト変数も current plugin の body 内で宣言する
         let mut deps_load = String::new();
@@ -819,16 +987,28 @@ end
                         "local _rvpm_dn_{dsafe} = {}\n",
                         lua_denops_list(&dep_script.denops_plugins)
                     ));
+                    let dep_setup_arg = match &dep_script.setup {
+                        Some(dsetup) => {
+                            body.push_str(&format!(
+                                "local _rvpm_st_{dsafe} = function() rvpm_setup({}, {}, {}) end\n",
+                                lua_quote(&dep_script.name),
+                                lua_quote(&dsetup.module),
+                                dsetup.opts_lua
+                            ));
+                            format!("_rvpm_st_{dsafe}")
+                        }
+                        None => "nil".to_string(),
+                    };
                     deps_load.push_str(&format!(
-                        "load_lazy(\"{dep}\", \"{dp}\", _rvpm_pf_{dsafe}, _rvpm_fd_{dsafe}, _rvpm_ap_{dsafe}, {db}, {da}, _rvpm_dn_{dsafe})\n  ",
+                        "load_lazy(\"{dep}\", \"{dp}\", _rvpm_pf_{dsafe}, _rvpm_fd_{dsafe}, _rvpm_ap_{dsafe}, {db}, {da}, _rvpm_dn_{dsafe}, {dep_setup_arg})\n  ",
                     ));
                 }
             }
         }
 
         let load_call = format!(
-            "{deps_load}load_lazy(\"{}\", \"{}\", {}, {}, {}, {}, {}, {})",
-            s.name, path, pf_var, fd_var, ap_var, before, after, dn_var
+            "{deps_load}load_lazy(\"{}\", \"{}\", {}, {}, {}, {}, {}, {}, {})",
+            s.name, path, pf_var, fd_var, ap_var, before, after, dn_var, setup_arg
         );
 
         // ---- on_cmd: lazy.nvim 方式 ----
@@ -1052,9 +1232,22 @@ end
             let fd_inline = lua_str_list(&s.ftdetect_files);
             let ap_inline = lua_str_list(&s.after_plugin_files);
             let dn_inline = lua_denops_list(&s.denops_plugins);
+            // setup closure も同じ理由でインライン展開する。 phase 7 の
+            // `_rvpm_st_<name>` は `do ... end` スコープ内の local なのでここからは
+            // 参照できない。 ここを nil のままにすると「`:colorscheme` 経由で
+            // ロードされた lazy colorscheme だけ setup が呼ばれない」穴になる。
+            let st_inline = match &s.setup {
+                Some(setup) => format!(
+                    "function() rvpm_setup({}, {}, {}) end",
+                    lua_quote(&s.name),
+                    lua_quote(&setup.module),
+                    setup.opts_lua
+                ),
+                None => "nil".to_string(),
+            };
             for cs in &s.colorschemes {
                 cs_entries.push(format!(
-                    "[\"{cs}\"] = function() load_lazy(\"{name}\", \"{path}\", {pf}, {fd}, {ap}, {before}, {after}, {dn}) end",
+                    "[\"{cs}\"] = function() load_lazy(\"{name}\", \"{path}\", {pf}, {fd}, {ap}, {before}, {after}, {dn}, {st}) end",
                     cs = cs,
                     name = s.name,
                     path = path,
@@ -1064,6 +1257,7 @@ end
                     before = before,
                     after = after,
                     dn = dn_inline,
+                    st = st_inline,
                 ));
             }
         }
@@ -2452,15 +2646,16 @@ mod tests {
     }
 
     #[test]
-    fn test_load_lazy_invocation_has_eight_positional_args() {
+    fn test_load_lazy_invocation_has_nine_positional_args() {
         let mut s = make_lazy_plugin("p");
         s.on_cmd = Some(vec!["P".to_string()]);
         let lua = gen_loader(Path::new("/merged"), &[s]);
-        // load_lazy("p", "/path/p", _rvpm_pf_p, _rvpm_fd_p, _rvpm_ap_p, nil, nil, _rvpm_dn_p) になる
-        let expected = "load_lazy(\"p\", \"/path/p\", _rvpm_pf_p, _rvpm_fd_p, _rvpm_ap_p, nil, nil, _rvpm_dn_p)";
+        // load_lazy("p", "/path/p", _rvpm_pf_p, _rvpm_fd_p, _rvpm_ap_p, nil, nil, _rvpm_dn_p, nil)
+        // 9 番目は setup closure (`opts` 未指定なら nil)。
+        let expected = "load_lazy(\"p\", \"/path/p\", _rvpm_pf_p, _rvpm_fd_p, _rvpm_ap_p, nil, nil, _rvpm_dn_p, nil)";
         assert!(
             lua.contains(expected),
-            "load_lazy call must pass denops var as 8th arg.\nexpected: {}\ngot:\n{}",
+            "load_lazy call must pass denops var as 8th arg and setup as 9th.\nexpected: {}\ngot:\n{}",
             expected,
             lua
         );
@@ -2966,5 +3161,224 @@ mod tests {
         assert!(promoted.is_empty());
         assert!(!scripts[0].lazy);
         assert!(scripts[1].lazy);
+    }
+
+    // ========================================================
+    // opts → setup() 生成
+    // ========================================================
+
+    fn opts_table(src: &str) -> toml::Value {
+        // `str::parse::<toml::Value>` は「単一の TOML 値」を期待するので、
+        // `key = value` を並べた document を読むには from_str::<Table> を使う。
+        toml::Value::Table(toml::from_str(src).expect("test opts must be valid TOML"))
+    }
+
+    fn with_setup(mut s: PluginScripts, module: &str, opts_lua: &str) -> PluginScripts {
+        s.setup = Some(SetupSpec {
+            module: module.to_string(),
+            opts_lua: opts_lua.to_string(),
+        });
+        s
+    }
+
+    #[test]
+    fn toml_to_lua_renders_scalars_arrays_and_nested_tables() {
+        let lua = toml_to_lua(&opts_table(
+            r#"
+notify = false
+throttle = 300
+ratio = 0.5
+name = "auto"
+events = ["CursorHold", "WinEnter"]
+
+[cursorline]
+enable = true
+"#,
+        ));
+        assert!(lua.starts_with("{ ") && lua.ends_with(" }"), "got {lua}");
+        for frag in [
+            "notify = false",
+            "throttle = 300",
+            "ratio = 0.5",
+            "name = \"auto\"",
+            "events = { \"CursorHold\", \"WinEnter\" }",
+            "cursorline = { enable = true }",
+        ] {
+            assert!(lua.contains(frag), "missing `{frag}` in {lua}");
+        }
+    }
+
+    #[test]
+    fn toml_to_lua_renders_empty_table_and_array() {
+        // `opts = {}` は「引数なしで setup を呼ぶ」意味なので空 table を保つ。
+        assert_eq!(toml_to_lua(&opts_table("")), "{}");
+        assert_eq!(toml_to_lua(&opts_table("x = []")), "{ x = {} }");
+    }
+
+    #[test]
+    fn toml_to_lua_quotes_keys_that_are_not_lua_identifiers() {
+        assert_eq!(toml_to_lua(&opts_table("\"end\" = 1")), "{ [\"end\"] = 1 }");
+        assert_eq!(
+            toml_to_lua(&opts_table("\"foo-bar\" = 1")),
+            "{ [\"foo-bar\"] = 1 }"
+        );
+        assert_eq!(
+            toml_to_lua(&opts_table("\"2fast\" = 1")),
+            "{ [\"2fast\"] = 1 }"
+        );
+        assert_eq!(toml_to_lua(&opts_table("ok_1 = 1")), "{ ok_1 = 1 }");
+    }
+
+    #[test]
+    fn toml_to_lua_keeps_backslashes_in_data_strings() {
+        // path 用 `lua_quote` は `\` を `/` に正規化するが、opts は user データ。
+        // 正規化してしまうと `sep = "\\"` のような設定が別物になる。
+        assert_eq!(
+            toml_to_lua(&opts_table(r#"sep = "a\\b""#)),
+            "{ sep = \"a\\\\b\" }"
+        );
+    }
+
+    #[test]
+    fn toml_to_lua_zero_pads_control_character_escapes() {
+        // Lua は `\` 直後の数字を最大 3 桁まで食う。pad しないと制御文字の直後に
+        // literal な数字が続いたときに 1 個の escape に融合して値が化ける
+        // (`\1` + `'2'` → `\12` = form feed)。
+        assert_eq!(
+            toml_to_lua(&opts_table(r#"x = "\u00012""#)),
+            "{ x = \"\\0012\" }"
+        );
+        assert_eq!(
+            toml_to_lua(&opts_table(r#"x = "\u0001""#)),
+            "{ x = \"\\001\" }"
+        );
+        assert_eq!(
+            toml_to_lua(&opts_table(r#"x = "\u007F""#)),
+            "{ x = \"\\127\" }"
+        );
+        // 名前付き escape がある制御文字は従来どおり読める形を維持する
+        assert_eq!(
+            toml_to_lua(&opts_table(r#"x = "a\tb\nc""#)),
+            "{ x = \"a\\tb\\nc\" }"
+        );
+    }
+
+    #[test]
+    fn toml_to_lua_maps_non_finite_floats_to_lua_forms() {
+        // Rust の `{}` 表記 (`inf` / `NaN`) は Lua として不正なので置き換える。
+        assert_eq!(toml_to_lua(&opts_table("x = inf")), "{ x = math.huge }");
+        assert_eq!(toml_to_lua(&opts_table("x = -inf")), "{ x = -math.huge }");
+        assert_eq!(toml_to_lua(&opts_table("x = nan")), "{ x = 0/0 }");
+        assert_eq!(toml_to_lua(&opts_table("x = 2.0")), "{ x = 2.0 }");
+    }
+
+    #[test]
+    fn eager_setup_runs_before_after_lua() {
+        let mut s = PluginScripts::for_test("autocursor.nvim", "/path/autocursor");
+        s.after = Some("/config/autocursor/after.lua".to_string());
+        let lua = gen_loader(
+            Path::new("/merged"),
+            &[with_setup(s, "autocursor", "{ throttle = 300 }")],
+        );
+
+        assert!(lua.contains("local function rvpm_setup(name, mod, opts)"));
+        let setup_pos = lua
+            .find("rvpm_setup(\"autocursor.nvim\", \"autocursor\", { throttle = 300 })")
+            .expect("eager setup call must be emitted");
+        let after_pos = lua
+            .find("dofile(\"/config/autocursor/after.lua\")")
+            .expect("after.lua dofile must be emitted");
+        assert!(
+            setup_pos < after_pos,
+            "setup() must run before after.lua so the hook can adjust the configured state"
+        );
+    }
+
+    #[test]
+    fn setup_helper_is_omitted_when_no_plugin_uses_opts() {
+        let lua = gen_loader(
+            Path::new("/merged"),
+            &[PluginScripts::for_test("plain", "/path/plain")],
+        );
+        assert!(
+            !lua.contains("rvpm_setup"),
+            "setup helper must not be emitted when nothing needs it"
+        );
+    }
+
+    #[test]
+    fn lazy_setup_is_deferred_through_a_closure() {
+        let mut s = PluginScripts::for_test("autocursor.nvim", "/path/autocursor");
+        s.lazy = true;
+        s.on_cmd = Some(vec!["EnableAutoCursorLine".to_string()]);
+        let lua = gen_loader(
+            Path::new("/merged"),
+            &[with_setup(s, "autocursor", "{ notify = false }")],
+        );
+
+        // opts table の構築は closure の中 = trigger が踏まれるまで一度も走らない。
+        assert!(lua.contains(
+            "local _rvpm_st_autocursor_nvim = function() rvpm_setup(\"autocursor.nvim\", \"autocursor\", { notify = false }) end"
+        ));
+        // load_lazy の 9 番目引数として渡る。
+        assert!(lua.contains("_rvpm_dn_autocursor_nvim, _rvpm_st_autocursor_nvim)"));
+        assert!(lua.contains("if setup then setup() end"));
+    }
+
+    #[test]
+    fn lazy_plugin_without_opts_passes_nil_setup() {
+        let mut s = PluginScripts::for_test("plain", "/path/plain");
+        s.lazy = true;
+        s.on_cmd = Some(vec!["Plain".to_string()]);
+        let lua = gen_loader(Path::new("/merged"), &[s]);
+        assert!(lua.contains("_rvpm_dn_plain, nil)"));
+    }
+
+    #[test]
+    fn lazy_colorscheme_handler_passes_setup_closure() {
+        // `:colorscheme <name>` 経由のロードは phase 7 の trigger とは別経路
+        // (phase 8 の ColorSchemePre handler) なので、setup を渡し忘れると
+        // 「colorscheme だけ setup されない」穴になる。
+        let mut s = PluginScripts::for_test("tokyonight.nvim", "/path/tokyonight");
+        s.lazy = true;
+        s.colorschemes = vec!["tokyonight".to_string()];
+        let lua = gen_loader(
+            Path::new("/merged"),
+            &[with_setup(s, "tokyonight", "{ style = \"night\" }")],
+        );
+
+        assert!(
+            lua.contains(
+                "function() rvpm_setup(\"tokyonight.nvim\", \"tokyonight\", { style = \"night\" }) end) end"
+            ),
+            "ColorSchemePre handler must pass the setup closure as load_lazy's 9th arg:\n{lua}"
+        );
+    }
+
+    #[test]
+    fn lazy_colorscheme_handler_passes_nil_setup_without_opts() {
+        let mut s = PluginScripts::for_test("catppuccin", "/path/catppuccin");
+        s.lazy = true;
+        s.colorschemes = vec!["catppuccin".to_string()];
+        let lua = gen_loader(Path::new("/merged"), &[s]);
+        assert!(lua.contains("nil, nil, {}, nil) end"), "got:\n{lua}");
+    }
+    #[test]
+    fn lazy_dep_setup_is_passed_to_the_dep_load_call() {
+        let mut dep = PluginScripts::for_test("blink.lib", "/path/blink-lib");
+        dep.lazy = true;
+        dep.on_cmd = Some(vec!["BlinkLib".to_string()]);
+        let dep = with_setup(dep, "blink.lib", "{}");
+
+        let mut main = PluginScripts::for_test("blink.cmp", "/path/blink-cmp");
+        main.lazy = true;
+        main.on_cmd = Some(vec!["BlinkCmp".to_string()]);
+        main.depends = Some(vec!["blink.lib".to_string()]);
+
+        let lua = gen_loader(Path::new("/merged"), &[dep, main]);
+        assert!(lua.contains(
+            "local _rvpm_st_blink_lib = function() rvpm_setup(\"blink.lib\", \"blink.lib\", {}) end"
+        ));
+        assert!(lua.contains("_rvpm_dn_blink_lib, _rvpm_st_blink_lib)"));
     }
 }
