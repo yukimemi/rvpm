@@ -3714,7 +3714,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rvpm"
-version = "3.45.0"
+version = "3.46.0"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
