@@ -182,6 +182,14 @@ fn resolve_url(url: &str) -> String {
     }
 }
 
+/// URL が remote (https://... / git@... / file://... 等) かどうか。
+/// local path (`/`, `~`, `.`, `\`, `C:\` 始まり) は false。判定ルールは
+/// `resolve_url` の local 判定と揃える。壊れた clone の自動削除が local path
+/// (= user の dev dir の可能性) を巻き込まないためのガードに使う。
+fn is_remote_url(url: &str) -> bool {
+    url.contains("://") || url.contains('@')
+}
+
 // ======================================================
 // clone / fetch — gix で in-process 実行
 // checkout — gix の checkout API は複雑なため git コマンドにフォールバック
@@ -190,11 +198,29 @@ fn resolve_url(url: &str) -> String {
 
 fn sync_impl(url: &str, dst: &Path, rev: Option<&str>) -> Result<Option<GitChange>> {
     if dst.exists() {
+        // `.git` が欠損した壊れた clone (disk 節約で dir だけ消した残骸、user
+        // 報告の LuaSnip ケース) は、このままだと fetch_impl が
+        // "does not appear to be a git repository" でコケるだけなので、ここで
+        // 検知して fresh clone に fall through させる。
+        // 削除は **remote URL の場合に限る** — local path URL の dst は user の
+        // dev 作業 dir の可能性があり絶対に消せない。なお dev = true プラグ
+        // インは run_sync / run_update が Repo::sync に到達する前に skip する
+        // ので通常この経路には来ない (非 dev の local-path plugin = ミラー等
+        // への保険ガード)。
+        let broken = !dst.join(".git").exists() || gix::open(dst).is_err();
+        if broken && is_remote_url(url) {
+            eprintln!(
+                "Warning: '{}' is not a valid git repository; removing it and re-cloning",
+                dst.display()
+            );
+            std::fs::remove_dir_all(dst)?;
+        }
+    }
+    if dst.exists() {
         let before = read_head(dst).ok();
         fetch_impl(dst)?;
         if let Some(rev) = rev {
-            let resolved = resolve_rev_for_checkout(dst, rev)?;
-            gix_checkout(dst, &resolved)?;
+            checkout_with_pin_fetch_retry(dst, rev)?;
         } else {
             gix_reset_to_remote(dst)?;
         }
@@ -213,8 +239,7 @@ fn sync_impl(url: &str, dst: &Path, rev: Option<&str>) -> Result<Option<GitChang
             // でも `refs/tags/*` として一緒に降りてくるので、resolve_rev_for_checkout
             // が local DB から正しい候補を選べる。
             fetch_impl(dst)?;
-            let resolved = resolve_rev_for_checkout(dst, rev)?;
-            gix_checkout(dst, &resolved)?;
+            checkout_with_pin_fetch_retry(dst, rev)?;
         }
         let after = read_head(dst)?;
         // 新規 clone は from = None。subjects は空のまま。
@@ -235,13 +260,84 @@ fn update_impl(_url: &str, dst: &Path, rev: Option<&str>) -> Result<Option<GitCh
     let before = read_head(dst).ok();
     fetch_impl(dst)?;
     if let Some(rev) = rev {
-        let resolved = resolve_rev_for_checkout(dst, rev)?;
-        gix_checkout(dst, &resolved)?;
+        checkout_with_pin_fetch_retry(dst, rev)?;
     } else {
         gix_reset_to_remote(dst)?;
     }
     let after = read_head(dst)?;
     Ok(build_change(dst, before, after))
+}
+
+/// `rev` を local DB で解決して checkout する。
+/// checkout 失敗時、`rev` (解決後) が **full 40 桁 lowercase hex SHA** (= rvpm.lock
+/// の pin commit) の場合に限り、その commit を origin から depth 1 で個別 fetch
+/// してから retry する。
+///
+/// 背景: clone は depth 1、fetch も Deepen(1) ずつなので、tip から 2 commit 以上
+/// 離れた pin commit は local DB に存在しない。user が clone dir を削除してから
+/// `rvpm sync` すると、再 clone 直後に rvpm.lock の古い commit へ checkout できず
+/// "rev '<sha>' not found" が大量発生した (user 報告)。
+///
+/// branch 名 / tag / `/regex/` pattern が失敗した場合は従来どおり即エラー
+/// (remote に無い branch を毎回 fetch しに行く等の無駄な往復を避ける)。
+fn checkout_with_pin_fetch_retry(dst: &Path, rev: &str) -> Result<()> {
+    let resolved = resolve_rev_for_checkout(dst, rev)?;
+    match gix_checkout(dst, &resolved) {
+        Ok(()) => Ok(()),
+        Err(e) if is_full_hex_sha(&resolved) => {
+            // pin commit だけを object id want で fetch してから retry。
+            // fetch 自体が失敗した場合 (remote に commit が存在しない、server が
+            // SHA want を許可していない等) は元の "rev not found" エラーに
+            // fetch 失敗の情報を添えて返す。
+            if let Err(fetch_err) = fetch_commit_by_sha(dst, &resolved) {
+                return Err(e.context(format!(
+                    "(also failed to fetch pinned commit from origin: {fetch_err:#})"
+                )));
+            }
+            gix_checkout(dst, &resolved)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `s` が full 40 桁 lowercase hex SHA (= lockfile pin) かどうか。
+/// short SHA / 大文字混じりは対象外 (fetch-and-retry fallback は lockfile pin の
+/// ケースだけに限定する)。
+fn is_full_hex_sha(s: &str) -> bool {
+    s.len() == 40
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// 特定 commit を SHA 指定で depth 1 fetch する (`git fetch --depth 1 origin <sha>` 相当)。
+///
+/// **gix の in-process fetch で実現している理由**: gix-refspec は one-sided fetch
+/// refspec の src が full hex なら object id want として扱う
+/// (`match_group::util::Needle::Object` — `git fetch origin <sha>` と同じ protocol
+/// 上の振る舞い) ので、git CLI への shell out は不要。local ref は一切書かれず、
+/// object DB に commit だけが降りる (detached HEAD への checkout は
+/// `rev_parse_single(sha)` で直接解決できる)。
+///
+/// 注意: server 側が `uploadpack.allowAnySHA1InWant` (pin が ref から reachable なら
+/// `allowReachableSHA1InWant`) を許可していないと失敗する。GitHub は reachable
+/// commit の SHA fetch を許可している。test の local origin は git CLI の
+/// upload-pack を使うため `uploadpack.allowAnySHA1InWant true` が必要。
+fn fetch_commit_by_sha(dst: &Path, sha: &str) -> Result<()> {
+    let repo = gix::open(dst)?;
+    let remote = repo
+        .find_default_remote(gix::remote::Direction::Fetch)
+        .ok_or_else(|| anyhow::anyhow!("no remote configured"))??;
+    let spec = gix::refspec::parse(sha.into(), gix::refspec::parse::Operation::Fetch)
+        .map_err(|e| anyhow::anyhow!("failed to build refspec for pinned commit: {}", e))?
+        .to_owned();
+    let mut opts = gix::remote::ref_map::Options::default();
+    opts.extra_refspecs.push(spec);
+    remote
+        .connect(gix::remote::Direction::Fetch)?
+        .prepare_fetch(gix::progress::Discard, opts)?
+        .with_shallow(gix::remote::fetch::Shallow::Deepen(1))
+        .receive(gix::progress::Discard, &gix::interrupt::IS_INTERRUPTED)?;
+    Ok(())
 }
 
 /// clone path の HEAD commit hash を同期 (in-process gix) で読む。
@@ -317,6 +413,14 @@ fn resolve_revision_impl(dst: &Path, rev: &str) -> Result<Option<String>> {
 /// remote tracking branch の tip を読み取る。HEAD は動かさない。
 /// tracking branch (`refs/remotes/<remote>/<branch>`) が見つからなければ
 /// `refs/remotes/<remote>/HEAD` に fallback。それも無ければ `Ok(None)`。
+///
+/// detached HEAD (rev pin による checkout) では `head_name()` が `None` に
+/// なるため、まず `.git/config` の `[branch "<name>"]` (remote がこの remote、
+/// merge が refs/heads/<name>) から「この clone が追跡している branch」を
+/// 解決して tracking ref を読む。pinned checkout 後の held-back 判定はこの
+/// 経路に依存する — `refs/remotes/<remote>/HEAD` は gix >= 0.85 で clone 時点の
+/// snapshot として **direct ref** で書かれるようになり (git の symbolic
+/// `origin/HEAD` と違い追従しない)、stale な値しか返せないため。
 fn read_remote_head(dst: &Path) -> Result<Option<String>> {
     let repo = gix::open(dst)?;
     let remote_name = repo
@@ -336,6 +440,30 @@ fn read_remote_head(dst: &Path) -> Result<Option<String>> {
         {
             return Ok(Some(id.detach().to_string()));
         }
+    } else if let Some(tracked_branch) = tracked_branch_from_config(&repo, &remote_name) {
+        // detached HEAD: config の追跡 branch の tracking ref を読む。
+        // 期待される「ref が無い」(branch が削除された等) は静かに fallback へ、
+        // それ以外の運用エラー (破損した ref 等) は警告して held-back 判定を
+        // 黙って無効化しない (resilience: 警告は出すが処理は続行)。
+        let tracking = format!("refs/remotes/{}/{}", remote_name, tracked_branch);
+        match repo.find_reference(&tracking) {
+            Ok(mut tr) => match tr.peel_to_id() {
+                Ok(id) => return Ok(Some(id.detach().to_string())),
+                Err(e) => eprintln!(
+                    "Warning: failed to peel tracking ref {} in {}: {}",
+                    tracking,
+                    dst.display(),
+                    e
+                ),
+            },
+            Err(gix::reference::find::existing::Error::NotFound { .. }) => {}
+            Err(e) => eprintln!(
+                "Warning: failed to read tracking ref {} in {}: {}",
+                tracking,
+                dst.display(),
+                e
+            ),
+        }
     }
 
     let remote_head_ref = format!("refs/remotes/{}/HEAD", remote_name);
@@ -345,6 +473,29 @@ fn read_remote_head(dst: &Path) -> Result<Option<String>> {
         return Ok(Some(id.detach().to_string()));
     }
     Ok(None)
+}
+
+/// `.git/config` から「この clone の追跡 branch」を取り出す。
+/// clone は default branch について `[branch "<name>"]` (`remote` + `merge =
+/// refs/heads/<name>`) を書く。detached HEAD (pinned) 時の held-back 判定に使う。
+/// 見つからない場合は `None` (判定不能 → 呼び出し側で `origin/HEAD` fallback)。
+///
+/// 実装は gix の config 解決に丸投げする (`branch_remote_tracking_ref_name` は
+/// `branch.<name>.remote` / `branch.<name>.merge` を key の順序や `=` 周辺の空白
+/// に依存せず解決する — 手書き INI 解析は fragile で CodeRabbit / Claude 指摘に
+/// なったため使わない)。複数 branch が同一 remote を追跡する場合は
+/// branch 名のソート順で最初のものを返す (決定的)。
+fn tracked_branch_from_config(repo: &gix::Repository, remote_name: &str) -> Option<String> {
+    let remote_prefix = format!("refs/remotes/{}/", remote_name);
+    repo.branch_names().into_iter().find_map(|short_name| {
+        let full_name = format!("refs/heads/{short_name}");
+        let full_ref: &gix::refs::FullNameRef = full_name.as_str().try_into().ok()?;
+        let tracking = repo
+            .branch_remote_tracking_ref_name(full_ref, gix::remote::Direction::Fetch)?
+            .ok()?;
+        let tracking = tracking.as_bstr().to_string();
+        tracking.strip_prefix(&remote_prefix).map(str::to_string)
+    })
 }
 
 /// `rev` の committer date を読む。失敗系はすべて `Ok(None)` に丸める
@@ -2658,6 +2809,203 @@ mod tests {
         );
     }
 
+    // ─── shallow clone × lockfile pin 救済 (#shallow-pin-fallback) ──────────
+    // depth-1 clone + Deepen(1) fetch では tip から 2 commit 以上離れた pin
+    // commit が local DB に無い。checkout 失敗時に pin commit を object id
+    // want で個別 fetch して retry する fallback の回帰テスト群。
+
+    /// SHA fetch を許可する設定を origin repo に入れる。
+    /// gix の file transport は `git upload-pack` を spawn するが、git CLI の
+    /// upload-pack はデフォルトで非 advertise の SHA want を拒否する。
+    /// (GitHub は reachable commit の SHA fetch を許可しているので本番では
+    /// 問題にならないが、local origin のテストでは明示が必要。)
+    async fn allow_any_sha1_in_want(dir: &Path) {
+        git_cmd(dir)
+            .args(["config", "uploadpack.allowAnySHA1InWant", "true"])
+            .output()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sync_fetches_pinned_sha_missing_from_fresh_clone() {
+        // user 報告の再現: clone dir を削除 → rvpm sync が depth-1 で再 clone
+        // → rvpm.lock の古い pin commit が local DB に無く "rev not found"。
+        // fresh clone 経路でも fallback が発動して pin commit に checkout
+        // できることを確認。
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_init_with_user(&src).await;
+        allow_any_sha1_in_want(&src).await;
+        let pinned = commit_to(&src, "v1", "init").await;
+        commit_to(&src, "v2", "bump-2").await;
+        let tip = commit_to(&src, "v3", "bump-3").await;
+
+        // depth-1 clone (= tip のみ) + fetch_impl の Deepen(1) (= 1 commit
+        // 深掘り) では pinned (2 commit 前) は降りてこない。
+        let repo = Repo::new(src.to_str().unwrap(), &dst, Some(pinned.as_str()));
+        repo.sync()
+            .await
+            .expect("sync must recover the pinned commit via per-SHA fetch");
+        assert_eq!(repo.head_commit().await.unwrap(), pinned);
+        assert_ne!(repo.head_commit().await.unwrap(), tip);
+        assert_eq!(fs::read_to_string(dst.join("hello.txt")).unwrap(), "v1");
+    }
+
+    #[tokio::test]
+    async fn test_sync_existing_clone_fetches_missing_pinned_sha() {
+        // 既存 clone 経路でも同じ fallback が効くこと。rev=None で sync した
+        // depth-1 clone (= tip のみ保持) に対し、2 commit 前の pin を指定して
+        // 再 sync すると、Deepen(1) だけでは pin commit は降りてこない。
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_init_with_user(&src).await;
+        allow_any_sha1_in_want(&src).await;
+        let pinned = commit_to(&src, "v1", "init").await;
+        commit_to(&src, "v2", "bump-2").await;
+        commit_to(&src, "v3", "bump-3").await;
+
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        repo.sync().await.unwrap();
+
+        let pinned_repo = Repo::new(src.to_str().unwrap(), &dst, Some(pinned.as_str()));
+        pinned_repo
+            .sync()
+            .await
+            .expect("existing clone must also recover the pinned commit");
+        assert_eq!(pinned_repo.head_commit().await.unwrap(), pinned);
+        assert_eq!(fs::read_to_string(dst.join("hello.txt")).unwrap(), "v1");
+    }
+
+    #[tokio::test]
+    async fn test_update_fetches_missing_pinned_sha() {
+        // update_impl 経路でも同じ fallback が効くこと。
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_init_with_user(&src).await;
+        allow_any_sha1_in_want(&src).await;
+        let pinned = commit_to(&src, "v1", "init").await;
+        commit_to(&src, "v2", "bump-2").await;
+        commit_to(&src, "v3", "bump-3").await;
+
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        repo.sync().await.unwrap();
+
+        let pinned_repo = Repo::new(src.to_str().unwrap(), &dst, Some(pinned.as_str()));
+        pinned_repo
+            .update()
+            .await
+            .expect("update must recover the pinned commit via per-SHA fetch");
+        assert_eq!(pinned_repo.head_commit().await.unwrap(), pinned);
+    }
+
+    #[tokio::test]
+    async fn test_sync_missing_branch_rev_keeps_original_error() {
+        // 40-hex SHA 以外 (branch 名等) の checkout 失敗は fetch-and-retry を
+        // 発動せず、従来どおりの "rev not found" エラーを返す。
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_init_with_user(&src).await;
+        commit_to(&src, "v1", "init").await;
+
+        let repo = Repo::new(src.to_str().unwrap(), &dst, Some("no-such-branch"));
+        let err = repo.sync().await.unwrap_err();
+        assert!(
+            err.to_string().contains("rev 'no-such-branch' not found"),
+            "actual: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_unfetchable_pinned_sha_surfaces_error() {
+        // remote に存在しない 40-hex SHA は fallback の fetch 自体も失敗する
+        // ので、最終的にエラーが表面化する (silent success しない)。
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_init_with_user(&src).await;
+        allow_any_sha1_in_want(&src).await;
+        commit_to(&src, "v1", "init").await;
+
+        let repo = Repo::new(
+            src.to_str().unwrap(),
+            &dst,
+            Some("ffffffffffffffffffffffffffffffffffffffff"),
+        );
+        assert!(repo.sync().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sync_reclones_when_dst_is_not_a_git_repo() {
+        // user 報告の LuaSnip ケース: dir だけ残って `.git` が無い壊れた clone
+        // は、fetch_impl が "not a git repository" でコケる代わりに、削除して
+        // fresh clone に fall through する。remote URL (file:// 含む) 限定 —
+        // local path URL は user の dev dir の可能性があるので絶対に消さない。
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_init_with_user(&src).await;
+        commit_to(&src, "hello", "init").await;
+
+        let url = format!("file://{}", src.display());
+        let repo = Repo::new(&url, &dst, None);
+        repo.sync().await.unwrap();
+        assert!(dst.join(".git").exists());
+
+        // `.git` を消して壊れた状態を再現。
+        fs::remove_dir_all(dst.join(".git")).unwrap();
+        repo.sync()
+            .await
+            .expect("broken clone must be removed and re-cloned");
+        assert!(dst.join(".git").exists());
+        assert_eq!(fs::read_to_string(dst.join("hello.txt")).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn test_sync_keeps_local_path_dst_even_if_broken() {
+        // local path URL (= dev / mirror の可能性) の dst は壊れていても絶対に
+        // 削除しない — 従来どおりのエラーで止まる (データ損壊防止ガード)。
+        let root = tempdir().unwrap();
+        let src = root.path().join("src");
+        let dst = root.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        git_init_with_user(&src).await;
+        commit_to(&src, "hello", "init").await;
+
+        // dst を「.git の無い壊れた dir」として作る。
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("hello.txt"), "precious user data").unwrap();
+
+        let repo = Repo::new(src.to_str().unwrap(), &dst, None);
+        assert!(
+            repo.sync().await.is_err(),
+            "local-path dst must not be auto-removed"
+        );
+        // 中身が消えていないこと。
+        assert_eq!(
+            fs::read_to_string(dst.join("hello.txt")).unwrap(),
+            "precious user data"
+        );
+    }
+
     #[tokio::test]
     async fn test_resolve_revision_locally_with_pattern() {
         // fast-path 比較経路: pattern → tag 解決 → commit SHA が返ること。
@@ -2947,5 +3295,91 @@ mod tests {
         let held = outcome.unwrap().held.expect("tip itself is still held");
         assert_eq!(held.tip, new_tip);
         assert_eq!(held.fallback.as_deref(), Some(mid.as_str()));
+    }
+
+    fn config_repo(config_body: &str) -> tempfile::TempDir {
+        // clone 後の .git/config 相当: 追跡 branch 解決は `branch.<name>.remote/merge` に
+        // 加えて `[remote "origin"]` (url + fetch spec) が存在して初めて成立する
+        // (gix の branch_remote_tracking_ref_name 経由)。なので remote セクションを
+        // 常に含める。
+        let root = tempdir().unwrap();
+        let dst = root.path().join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&dst)
+            .status()
+            .unwrap();
+        fs::write(
+            dst.join(".git").join("config"),
+            format!(
+                "[remote \"origin\"]\n\turl = /dev/null\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n{}",
+                config_body
+            ),
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn tracked_branch_from_config_reads_merge_before_remote() {
+        // git config key order is not semantic; `merge` may precede `remote`.
+        let root = config_repo("[branch \"main\"]\n\tmerge = refs/heads/main\n\tremote = origin\n");
+        let repo = gix::open(root.path().join("dst")).unwrap();
+        assert_eq!(
+            tracked_branch_from_config(&repo, "origin").as_deref(),
+            Some("main"),
+            "key order within a branch section must not matter",
+        );
+    }
+
+    #[test]
+    fn tracked_branch_from_config_skips_other_remotes() {
+        let root = config_repo(
+            "[branch \"main\"]\n\tremote = upstream\n\tmerge = refs/heads/main\n\
+             [branch \"dev\"]\n\tremote = origin\n\tmerge = refs/heads/dev\n",
+        );
+        let repo = gix::open(root.path().join("dst")).unwrap();
+        assert_eq!(
+            tracked_branch_from_config(&repo, "origin").as_deref(),
+            Some("dev"),
+            "only sections tracking the requested remote are considered",
+        );
+    }
+
+    #[test]
+    fn tracked_branch_from_config_picks_deterministic_first_section() {
+        // 複数 branch が同一 remote を追跡していても、branch 名ソート順で
+        // 最初の1つに決まる (ファイル順・key 順に依存しない)。
+        let root = config_repo(
+            "[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n\
+             [branch \"dev\"]\n\tremote = origin\n\tmerge = refs/heads/dev\n",
+        );
+        let repo = gix::open(root.path().join("dst")).unwrap();
+        assert_eq!(
+            tracked_branch_from_config(&repo, "origin").as_deref(),
+            Some("dev"),
+            "one deterministic origin-tracking branch is selected",
+        );
+    }
+
+    #[test]
+    fn tracked_branch_from_config_tolerates_loose_spacing() {
+        let root =
+            config_repo("[branch \"main\"]\n\tremote\t=\torigin\n\tmerge = refs/heads/main\n");
+        let repo = gix::open(root.path().join("dst")).unwrap();
+        assert_eq!(
+            tracked_branch_from_config(&repo, "origin").as_deref(),
+            Some("main"),
+            "whitespace around '=' in git config is not semantic",
+        );
+    }
+
+    #[test]
+    fn tracked_branch_from_config_none_when_unmatched() {
+        let root =
+            config_repo("[branch \"main\"]\n\tremote = upstream\n\tmerge = refs/heads/main\n");
+        let repo = gix::open(root.path().join("dst")).unwrap();
+        assert_eq!(tracked_branch_from_config(&repo, "origin"), None);
     }
 }

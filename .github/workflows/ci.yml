@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6.1.0
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@v2.9.2
         with:
           # Skip cache save on PR runs — the Post step's tar.exe is
           # flaky on windows-latest (file locks under target/ make
@@ -53,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6.1.0
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
         # See the check job above for why continue-on-error is set
@@ -97,7 +97,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
         # See the check job above for why continue-on-error is set
@@ -115,7 +115,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6.1.0
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
         # See the check job above for why continue-on-error is set
@@ -138,7 +138,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
         # See the check job above for why continue-on-error is set

@@ -390,6 +390,10 @@ pub(crate) fn build_plugin_scripts(
         mode,
         PluginMergeMode::Full | PluginMergeMode::ViewWithoutDoc
     );
+    let init = crate::find_lua(plugin_config_dir, "init.lua");
+    let before = crate::find_lua(plugin_config_dir, "before.lua");
+    let after = crate::find_lua(plugin_config_dir, "after.lua");
+    let setup = resolve_setup(plugin, plugin_path, [&before, &after]);
     crate::loader::PluginScripts {
         name: plugin.display_name(),
         path: plugin_path.to_string_lossy().replace('\\', "/"),
@@ -397,9 +401,9 @@ pub(crate) fn build_plugin_scripts(
         merge: plugin.merge,
         merge_doc: plugin.merge_doc,
         uses_merged,
-        init: crate::find_lua(plugin_config_dir, "init.lua"),
-        before: crate::find_lua(plugin_config_dir, "before.lua"),
-        after: crate::find_lua(plugin_config_dir, "after.lua"),
+        init,
+        before,
+        after,
         plugin_files: collect_source_files(plugin_path, "plugin"),
         ftdetect_files: collect_source_files(plugin_path, "ftdetect"),
         after_plugin_files: collect_source_files(plugin_path, "after/plugin"),
@@ -418,7 +422,56 @@ pub(crate) fn build_plugin_scripts(
         defined_user_events: scan.user_events,
         cond: plugin.cond.clone(),
         dev: plugin.dev,
+        setup,
     }
+}
+
+/// `opts` から `SetupSpec` (require する module + Lua literal 化した opts) を決める。
+///
+/// - `opts` 未指定 → `None` (rvpm は setup を呼ばない = 従来どおり hook 任せ)
+/// - main module が解決できない → warn して `None`。 `main = "..."` の明示を促す。
+///   resilience: ここで落とさず、その plugin の setup だけを諦める。
+/// - hook (`before.lua` / `after.lua`) が既に `.setup(` を呼んでいそうなら warn。
+///   二重 setup は plugin 側の内部状態を壊しうるので黙って重ねない。
+fn resolve_setup(
+    plugin: &crate::config::Plugin,
+    plugin_path: &Path,
+    hooks: [&Option<String>; 2],
+) -> Option<crate::loader::SetupSpec> {
+    let opts = plugin.opts.as_ref()?;
+    let display = plugin.display_name();
+    let module = match &plugin.main {
+        Some(m) => m.clone(),
+        None => crate::plugin_scan::resolve_main_module(plugin_path, &display).or_else(|| {
+            eprintln!(
+                "\u{26a0} {display}: `opts` is set but rvpm could not tell which lua module to \
+                 require (no top-level module under lua/ matches the plugin name, and there is \
+                 not exactly one candidate). Add `main = \"<module>\"` to the entry, or move the \
+                 setup call into after.lua. setup() skipped."
+            );
+            None
+        })?,
+    };
+    for hook in hooks.into_iter().flatten() {
+        if hook_calls_setup(hook) {
+            eprintln!(
+                "\u{26a0} {display}: `opts` is set and {hook} also calls .setup() \u{2014} setup() \
+                 will run twice. Keep one: `opts` for plain data, the hook for anything that needs \
+                 Lua functions."
+            );
+        }
+    }
+    Some(crate::loader::SetupSpec {
+        module,
+        opts_lua: crate::loader::toml_to_lua(opts),
+    })
+}
+
+/// hook ファイルが `.setup(` を呼んでいそうかの判定 (二重 setup warn 用)。
+/// 読めないファイルは「呼んでいない」扱い — 警告のためだけの判定なので、
+/// I/O エラーで generate を止めたり騒いだりしない。
+fn hook_calls_setup(hook_path: &str) -> bool {
+    std::fs::read_to_string(hook_path).is_ok_and(|src| src.contains(".setup("))
 }
 
 #[cfg(test)]
@@ -790,5 +843,102 @@ mod tests {
             err.contains("failed to spawn") || err.contains("nvim"),
             "error should mention nvim: {err}"
         );
+    }
+
+    // ── opts → setup 解決 (resolve_setup) ────────────────────────────────
+
+    fn opts_of(src: &str) -> Option<toml::Value> {
+        Some(toml::Value::Table(
+            toml::from_str(src).expect("test opts must be valid TOML"),
+        ))
+    }
+
+    #[test]
+    fn resolve_setup_returns_none_without_opts() {
+        let root = tempdir().unwrap();
+        write_file(&root.path().join("lua/foo/init.lua"), "return {}");
+        let plugin = Plugin {
+            url: "owner/foo.nvim".into(),
+            ..Default::default()
+        };
+        assert!(resolve_setup(&plugin, root.path(), [&None, &None]).is_none());
+    }
+
+    #[test]
+    fn resolve_setup_skips_when_module_is_ambiguous() {
+        // lua/ に候補が 2 つあって名前一致も無い → 推測せず setup を諦める
+        // (warn は stderr へ。ここでは「黙って別 module を setup しない」ことを固定する)。
+        let root = tempdir().unwrap();
+        write_file(&root.path().join("lua/alpha.lua"), "return {}");
+        write_file(&root.path().join("lua/beta.lua"), "return {}");
+        let plugin = Plugin {
+            url: "owner/unrelated.nvim".into(),
+            opts: opts_of(""),
+            ..Default::default()
+        };
+        assert!(resolve_setup(&plugin, root.path(), [&None, &None]).is_none());
+    }
+
+    #[test]
+    fn resolve_setup_honors_explicit_main_over_scanning() {
+        let root = tempdir().unwrap();
+        write_file(&root.path().join("lua/alpha.lua"), "return {}");
+        write_file(&root.path().join("lua/beta.lua"), "return {}");
+        let plugin = Plugin {
+            url: "owner/unrelated.nvim".into(),
+            main: Some("chosen.mod".into()),
+            opts: opts_of("throttle = 7"),
+            ..Default::default()
+        };
+        let spec = resolve_setup(&plugin, root.path(), [&None, &None]).expect("explicit main wins");
+        assert_eq!(spec.module, "chosen.mod");
+        assert_eq!(spec.opts_lua, "{ throttle = 7 }");
+    }
+
+    #[test]
+    fn resolve_setup_resolves_module_from_lua_tree() {
+        let root = tempdir().unwrap();
+        write_file(&root.path().join("lua/autocursor/init.lua"), "return {}");
+        let plugin = Plugin {
+            url: "yukimemi/autocursor.nvim".into(),
+            opts: opts_of(""),
+            ..Default::default()
+        };
+        let spec = resolve_setup(&plugin, root.path(), [&None, &None]).expect("resolved");
+        assert_eq!(spec.module, "autocursor");
+        assert_eq!(spec.opts_lua, "{}");
+    }
+
+    #[test]
+    fn resolve_setup_still_emits_when_a_hook_also_calls_setup() {
+        // 二重 setup は warn するが、生成は user の指定どおり続ける
+        // (どちらを消すかは user の判断。黙って opts を無効化しない)。
+        let root = tempdir().unwrap();
+        write_file(&root.path().join("lua/foo/init.lua"), "return {}");
+        let hook = root.path().join("after.lua");
+        write_file(&hook, "require('foo').setup({ a = 1 })\n");
+        let hook_path = Some(hook.to_string_lossy().to_string());
+        let plugin = Plugin {
+            url: "owner/foo.nvim".into(),
+            opts: opts_of(""),
+            ..Default::default()
+        };
+        assert!(resolve_setup(&plugin, root.path(), [&None, &hook_path]).is_some());
+        assert!(hook_calls_setup(hook_path.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn hook_calls_setup_detects_only_real_calls() {
+        let root = tempdir().unwrap();
+        let plain = root.path().join("plain.lua");
+        write_file(&plain, "vim.keymap.set('n', 'gx', '<Plug>(x)')\n");
+        let dotted = root.path().join("dotted.lua");
+        write_file(&dotted, "local m = require('m')\nm.setup( { a = 1 } )\n");
+        assert!(!hook_calls_setup(plain.to_str().unwrap()));
+        assert!(hook_calls_setup(dotted.to_str().unwrap()));
+        // 読めないパスは false (警告用の判定なので I/O エラーで騒がない)
+        assert!(!hook_calls_setup(
+            root.path().join("missing.lua").to_str().unwrap()
+        ));
     }
 }

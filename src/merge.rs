@@ -402,12 +402,11 @@ pub(crate) fn build_view_if_needed(
     conflicts: &mut Vec<crate::merge_conflicts::MergeConflictReport>,
     merge_view_fn: fn(&Path, &Path) -> anyhow::Result<crate::link::MergeResult>,
 ) -> bool {
-    if !force {
-        if let Some(expected) = expected_stamp {
-            if crate::view_stamp::is_current(view_dir, expected) {
-                return false;
-            }
-        }
+    if !force
+        && let Some(expected) = expected_stamp
+        && crate::view_stamp::is_current(view_dir, expected)
+    {
+        return false;
     }
     build_view_atomically(
         src,
@@ -452,15 +451,15 @@ pub(crate) fn build_view_atomically(
         }
         // stamp は build 完走後の tmp に書く → atomic rename で view と一緒に
         // 公開される。 「stamp が在る ⟺ その fingerprint で build 完走済」を保つ。
-        if let Some(s) = stamp {
-            if let Err(e) = crate::view_stamp::write(tmp, s) {
-                // stamp が書けなくても view 自体は有効 — 次回 rebuild に倒れるだけ。
-                eprintln!(
-                    "\u{26a0} failed to write view stamp {}: {}",
-                    view_dir.display(),
-                    e
-                );
-            }
+        if let Some(s) = stamp
+            && let Err(e) = crate::view_stamp::write(tmp, s)
+        {
+            // stamp が書けなくても view 自体は有効 — 次回 rebuild に倒れるだけ。
+            eprintln!(
+                "\u{26a0} failed to write view stamp {}: {}",
+                view_dir.display(),
+                e
+            );
         }
         merge_result = Some(Ok(m));
         Ok(())

@@ -1,6 +1,6 @@
 [package]
 name = "rvpm"
-version = "3.43.0"
+version = "3.45.0"
 edition = "2024"
 description = "Fast Neovim plugin manager with pre-compiled loader and merge optimization"
 license = "MIT"
@@ -12,8 +12,8 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 # CLI & UI
-clap = { version = "4.6.4", features = ["derive"] }
-clap_complete = "4.6.7"
+clap = { version = "4.6.6", features = ["derive"] }
+clap_complete = "4.6.9"
 ratatui = "0.30.2"
 crossterm = { version = "0.29", features = ["events"] }
 indicatif = "0.18.6"
@@ -28,21 +28,21 @@ anyhow = "1.0.104"
 tokio = { version = "1.53.1", features = ["full"] }
 # `async fn` を持つ trait を `dyn` 互換にするため (rvpm doctor の VersionResolver
 # は本番 SystemResolver / テスト MockResolver を Box<dyn> で差し替える)。
-async-trait = "0.1.91"
+async-trait = "0.1.92"
 
 # Template & Config
 teravars = "0.2.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 regex = "1.13.1"
-toml = "1.1.3"
+toml = "1.1.4"
 toml_edit = "0.25.13"
 
 # CLI subprocess discovery (`claude` / `agy` / `codex` on PATH for AI add #93).
 which = "8.0.5"
 
 # Self-update (`rvpm self-update`, background auto-update / check banner) — #125
-kaishin = "0.6.3"
+kaishin = "0.6.4"
 # Version 比較 (current `Cargo.toml` の version vs. 取得した `tag_name`)。
 semver = "1.0.28"
 
@@ -79,14 +79,14 @@ reqwest = { version = "0.13.4", default-features = false, features = [
     "charset",
     "system-proxy",
 ] }
-open = "5.4.0"
+open = "5.4.1"
 
 # File System & Path
 dirs = "6.0"
 walkdir = "2.5"
 
 # Git (in-process, no fork)
-gix = { version = "0.84.0", default-features = false, features = [
+gix = { version = "0.86.0", default-features = false, features = [
     "sha1",
     "blocking-network-client",
     "blocking-http-transport-reqwest-rust-tls",

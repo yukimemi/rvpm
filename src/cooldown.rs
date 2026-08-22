@@ -245,11 +245,11 @@ pub fn humanize_duration(d: Duration) -> String {
     if secs == 0 {
         return "0".to_string();
     }
-    if secs % 86400 == 0 {
+    if secs.is_multiple_of(86400) {
         format!("{}d", secs / 86400)
-    } else if secs % 3600 == 0 {
+    } else if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{}s", secs)

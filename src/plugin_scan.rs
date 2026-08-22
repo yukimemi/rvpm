@@ -32,7 +32,7 @@
 use regex::Regex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 /// user-facing キーマップ 1 件。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -746,6 +746,127 @@ fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
     }
     &a[..end]
 }
+
+// ── main module 解決 (`opts` → `setup()` 用) ────────────────────────────
+//
+// lazy.nvim の `Loader.get_main` と同じ規則で「`require(...)` すべき module 名」を
+// 決める。 lazy.nvim は起動時に plugin dir を走査して解決するが、 rvpm は
+// **generate 時** に解決して loader.lua に literal で焼き込む: 起動時コストが 0 に
+// なり、 解決不能は runtime error ではなく generate 時 warn になる (resilience)。
+//
+// 規則 (lazy.nvim 準拠):
+//   1. `main = "..."` 明示 → それ (呼び出し側で処理)
+//   2. `mini.xxx` (mini.nvim 本体を除く) → display name そのまま
+//   3. `lua/` 直下の top-level module を列挙し、 正規化名が plugin 名と一致 → それ
+//   4. top-level module がちょうど 1 個 → それ
+//   5. どれでもない → None (曖昧なので推測しない)
+
+/// lazy.nvim `Util.normname` 互換の正規化。
+///
+/// `telescope.nvim` / `nvim-telescope` / `nvim-tree.lua` のような命名ゆらぎを
+/// 畳んで module 名と plugin 名を比較できるようにする。 処理順も lazy.nvim と同じ:
+/// lowercase → 先頭 `vim-` / `nvim-` 除去 → 末尾 `.vim` / `.nvim` 除去 →
+/// `.lua` / `-lua` を全箇所除去 → `[^a-z]` を除去。
+pub fn normname(name: &str) -> String {
+    let lower = name.to_lowercase();
+    let stripped = lower
+        .strip_prefix("nvim-")
+        .or_else(|| lower.strip_prefix("vim-"))
+        .unwrap_or(&lower);
+    let stripped = stripped
+        .strip_suffix(".nvim")
+        .or_else(|| stripped.strip_suffix(".vim"))
+        .unwrap_or(stripped);
+    stripped
+        .replace(".lua", "")
+        .replace("-lua", "")
+        .chars()
+        .filter(char::is_ascii_lowercase)
+        .collect()
+}
+
+/// `lua/` 直下から `require()` 可能な top-level module 名を列挙 (sorted + dedup)。
+///
+/// 対象は `lua/<mod>.lua` と `lua/<mod>/init.lua` の 2 形だけ。
+/// `lua/<mod>/<sub>.lua` は `require("<mod>")` では引けないので数えない。
+/// `lua/init.lua` は module 名が空になるので除外。
+pub fn lua_top_modules(plugin_root: &Path) -> Vec<String> {
+    let dir = plugin_root.join("lua");
+    let mut mods: Vec<String> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| top_module_name(&e.path()))
+        .collect();
+    mods.sort();
+    mods.dedup();
+    mods
+}
+
+/// `lua/` 直下の 1 エントリを top-level module 名に変換 (対象外なら `None`)。
+///
+/// `is_dir` / `is_file` は symlink を follow する — dev plugin や mono-repo で
+/// `lua/<mod>` が symlink になっているケースを拾うため (`collect_denops_plugins`
+/// と同じ理由)。
+fn top_module_name(path: &Path) -> Option<String> {
+    if path.is_dir() {
+        if !path.join("init.lua").is_file() {
+            return None;
+        }
+        return path.file_name()?.to_str().map(str::to_string);
+    }
+    if path.extension()?.to_str()? != "lua" {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    (stem != "init").then(|| stem.to_string())
+}
+
+/// `display_name` の plugin について `require()` すべき main module を解決する。
+/// 曖昧なら `None` — 呼び出し側は warn して setup 呼び出しを諦める
+/// (user には `main = "..."` の明示を促す)。
+pub fn resolve_main_module(plugin_root: &Path, display_name: &str) -> Option<String> {
+    // mini.nvim 系: `mini.pick` 等は repo が `lua/mini/pick.lua` だけを持ち
+    // `lua/mini/init.lua` が無いので通常の列挙では 0 件になる。 module 名は
+    // display name とそのまま一致するので特例で先に返す (lazy.nvim も同じ特例)。
+    if display_name != "mini.nvim" && display_name.starts_with("mini.") {
+        return Some(display_name.to_string());
+    }
+    let mods = lua_top_modules(plugin_root);
+    let target = normname(display_name);
+    if let Some(hit) = mods.iter().find(|m| normname(m) == target) {
+        return Some(hit.clone());
+    }
+    if mods.len() == 1 {
+        return Some(mods[0].clone());
+    }
+    None
+}
+
+/// `module` が `setup()` を公開しているかを静的に判定する。
+///
+/// 用途は `rvpm add` の「`opts = {}` を書いておくか」提案だけ。 false negative
+/// (動的に組み立てた setup など) は提案が出ないだけで害が無いので、 regex は
+/// 素直な宣言形だけを見る。
+pub fn has_setup_function(plugin_root: &Path, module: &str) -> bool {
+    let rel = module.replace('.', "/");
+    let lua = plugin_root.join("lua");
+    [
+        lua.join(format!("{rel}.lua")),
+        lua.join(&rel).join("init.lua"),
+    ]
+    .iter()
+    .filter_map(|p| std::fs::read_to_string(p).ok())
+    .any(|src| SETUP_DECL_RE.is_match(&src))
+}
+
+/// `function M.setup(` / `M.setup = ` / `setup = function` / `["setup"] =` を拾う。
+static SETUP_DECL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"function\s+[A-Za-z_][A-Za-z0-9_.]*[.:]setup\s*\(|[A-Za-z_][A-Za-z0-9_.]*\.setup\s*=|\bsetup\s*=\s*function|\[\s*["']setup["']\s*\]\s*="#,
+    )
+    .expect("setup declaration regex must compile")
+});
 
 #[cfg(test)]
 mod tests {
@@ -1531,5 +1652,137 @@ vim.keymap.set("n", "live", "<Plug>(x)")
                 modes: vec!["n".into()],
             }]
         );
+    }
+
+    // ── main module 解決 (`opts` → `setup()`) ─────────────────────────────
+
+    fn write(path: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn normname_folds_lazy_nvim_naming_variants() {
+        // lazy.nvim Util.normname と同じ畳み方であることを固定する。
+        assert_eq!(normname("telescope.nvim"), "telescope");
+        assert_eq!(normname("nvim-lspconfig"), "lspconfig");
+        assert_eq!(normname("vim-surround"), "surround");
+        assert_eq!(normname("nvim-tree.lua"), "tree");
+        assert_eq!(normname("which-key.nvim"), "whichkey");
+        assert_eq!(normname("autocursor.nvim"), "autocursor");
+        // module 名側も同じ関数で畳むので突き合わせが効く
+        assert_eq!(normname("which-key"), normname("which-key.nvim"));
+    }
+
+    #[test]
+    fn lua_top_modules_lists_only_requireable_top_level_modules() {
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path();
+        write(&p.join("lua/autocursor/init.lua"), "return {}");
+        write(&p.join("lua/autocursor/util.lua"), "return {}"); // 下位は数えない
+        write(&p.join("lua/helper.lua"), "return {}");
+        write(&p.join("lua/init.lua"), "return {}"); // module 名が空になるので除外
+        write(&p.join("lua/nested/mod.lua"), "return {}"); // init.lua 無し → require 不可
+        write(&p.join("lua/notlua.txt"), "x");
+
+        assert_eq!(lua_top_modules(p), vec!["autocursor", "helper"]);
+    }
+
+    #[test]
+    fn lua_top_modules_is_empty_without_lua_dir() {
+        let root = tempfile::tempdir().unwrap();
+        write(&root.path().join("plugin/foo.vim"), "echo 'x'");
+        assert!(lua_top_modules(root.path()).is_empty());
+    }
+
+    #[test]
+    fn resolve_main_module_prefers_normalized_name_match() {
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path();
+        // 複数 module があっても正規化名一致が勝つ
+        write(&p.join("lua/telescope/init.lua"), "return {}");
+        write(&p.join("lua/telescope_extra.lua"), "return {}");
+        assert_eq!(
+            resolve_main_module(p, "telescope.nvim").as_deref(),
+            Some("telescope")
+        );
+    }
+
+    #[test]
+    fn resolve_main_module_falls_back_to_sole_module() {
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path();
+        // repo 名と module 名が食い違う (vim-illuminate → illuminate) ケース
+        write(&p.join("lua/illuminate/init.lua"), "return {}");
+        assert_eq!(
+            resolve_main_module(p, "vim-illuminate").as_deref(),
+            Some("illuminate")
+        );
+    }
+
+    #[test]
+    fn resolve_main_module_is_none_when_ambiguous() {
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path();
+        write(&p.join("lua/foo.lua"), "return {}");
+        write(&p.join("lua/bar.lua"), "return {}");
+        // 2 個以上あって名前一致も無い → 推測しない
+        assert!(resolve_main_module(p, "unrelated.nvim").is_none());
+        // lua/ 自体が無い場合も None
+        let empty = tempfile::tempdir().unwrap();
+        assert!(resolve_main_module(empty.path(), "whatever.nvim").is_none());
+    }
+
+    #[test]
+    fn resolve_main_module_keeps_mini_submodule_name() {
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path();
+        // mini.pick は lua/mini/pick.lua しか持たない (lua/mini/init.lua が無い)
+        write(&p.join("lua/mini/pick.lua"), "return {}");
+        assert_eq!(
+            resolve_main_module(p, "mini.pick").as_deref(),
+            Some("mini.pick")
+        );
+        // mini.nvim 本体は特例から外れて通常解決
+        write(&p.join("lua/mini/init.lua"), "return {}");
+        assert_eq!(resolve_main_module(p, "mini.nvim").as_deref(), Some("mini"));
+    }
+
+    #[test]
+    fn has_setup_function_detects_common_declaration_forms() {
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path();
+        write(
+            &p.join("lua/a/init.lua"),
+            "local M = {}\nfunction M.setup(opts)\nend\nreturn M",
+        );
+        write(
+            &p.join("lua/b.lua"),
+            "local M = {}\nM.setup = function(o) end\nreturn M",
+        );
+        write(&p.join("lua/c.lua"), "return { setup = function(o) end }");
+        write(
+            &p.join("lua/d.lua"),
+            "return { [\"setup\"] = function(o) end }",
+        );
+        write(&p.join("lua/e.lua"), "return { render = function() end }");
+
+        assert!(has_setup_function(p, "a"));
+        assert!(has_setup_function(p, "b"));
+        assert!(has_setup_function(p, "c"));
+        assert!(has_setup_function(p, "d"));
+        assert!(!has_setup_function(p, "e"));
+        assert!(!has_setup_function(p, "missing"));
+    }
+
+    #[test]
+    fn has_setup_function_resolves_dotted_module_path() {
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path();
+        write(
+            &p.join("lua/mini/pick.lua"),
+            "local M = {}\nfunction M.setup(o) end\nreturn M",
+        );
+        assert!(has_setup_function(p, "mini.pick"));
     }
 }

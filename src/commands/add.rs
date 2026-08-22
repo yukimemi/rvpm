@@ -300,28 +300,34 @@ pub(crate) async fn run_add(
                         }
                     }
                 } else {
-                    // ── auto-lazy scan + prompt (#87) — 従来路 ──────────
+                    // ── auto-lazy / setup scan + prompt (#87) — 従来路 ──────
                     let policy = resolve_add_lazy_policy(policy_override, &config_data);
-                    let skip_for_explicit_eager = plugin.lazy_raw == Some(false);
-                    if !skip_for_explicit_eager
-                        && !matches!(policy, crate::config::AutoLazyPolicy::Never)
-                        && let Some(suggestion) =
-                            build_add_suggestion(&crate::plugin_scan::scan_plugin(&dst_path))
-                        && let Some(applied) =
-                            decide_add_lazy_apply(suggestion, policy, &plugin.display_name())
-                    {
-                        let latest = std::fs::read_to_string(&config_path)?;
-                        let mut doc_patch = latest.parse::<DocumentMut>()?;
-                        patch_plugin_entry_triggers(&mut doc_patch, &stored_url, &applied);
-                        let patched = doc_patch.to_string();
-                        let wp =
-                            chezmoi::write_path(config_data.options.chezmoi, &config_path).await;
-                        std::fs::write(&wp, &patched)?;
-                        chezmoi::apply(&wp, &config_path).await;
-                        println!(
-                            "Recorded lazy triggers for {} in config.toml.",
-                            plugin.display_name()
-                        );
+                    if !matches!(policy, crate::config::AutoLazyPolicy::Never) {
+                        let scan = crate::plugin_scan::scan_plugin(&dst_path);
+                        // trigger 提案は明示 eager (`--no-lazy` / `lazy = false`) では出さない。
+                        // `opts` 提案はそれとは独立 — eager 固定でも setup() は必要なので、
+                        // lazy gate で一緒に落とすと「setup だけの after.lua」を書かせる元の
+                        // 手間に戻ってしまう。
+                        let triggers_allowed = plugin.lazy_raw != Some(false);
+                        let setup_module = suggest_setup_module(&dst_path, &plugin);
+                        if let Some(suggestion) =
+                            build_add_suggestion(&scan, triggers_allowed, setup_module)
+                            && let Some(applied) =
+                                decide_add_lazy_apply(suggestion, policy, &plugin.display_name())
+                        {
+                            let latest = std::fs::read_to_string(&config_path)?;
+                            let mut doc_patch = latest.parse::<DocumentMut>()?;
+                            patch_plugin_entry_suggestion(&mut doc_patch, &stored_url, &applied);
+                            let patched = doc_patch.to_string();
+                            let wp = chezmoi::write_path(config_data.options.chezmoi, &config_path)
+                                .await;
+                            std::fs::write(&wp, &patched)?;
+                            chezmoi::apply(&wp, &config_path).await;
+                            println!(
+                                "Recorded scan results for {} in config.toml.",
+                                plugin.display_name()
+                            );
+                        }
                     }
                 }
 
@@ -414,17 +420,21 @@ fn read_persisted_plugin_name(config_path: &Path, stored_url: &str, fallback_url
         .unwrap_or_else(derive_default)
 }
 
-/// `rvpm add` の scan 後に決まる、config.toml に書き込むべき trigger 候補。
+/// `rvpm add` の scan 後に決まる、config.toml に書き込むべき候補。
+#[derive(Clone)]
 struct AddTriggerSuggestion {
     /// on_cmd に入れる文字列 (exact 名 + `/regex/` の mixed list、ソート済)。
     on_cmd: Vec<String>,
     /// on_map に入れる候補 (lhs の enumerate のみ、regex 提案なし: 記号混じりで LCP 無意味)。
     on_map: Vec<crate::config::MapSpec>,
+    /// `opts = {}` を書くなら、その `require()` 先 module 名。`None` なら書かない。
+    /// setup() だけの after.lua を user に書かせずに済ませるための提案。
+    setup_module: Option<String>,
 }
 
 impl AddTriggerSuggestion {
     fn is_empty(&self) -> bool {
-        self.on_cmd.is_empty() && self.on_map.is_empty()
+        self.on_cmd.is_empty() && self.on_map.is_empty() && self.setup_module.is_none()
     }
 }
 
@@ -436,33 +446,66 @@ fn is_interactive_tty() -> bool {
 }
 
 /// scan 結果から suggestion を組み立てる。0 件なら `None` — 提案する中身が無い。
-fn build_add_suggestion(scan: &crate::plugin_scan::ScanResult) -> Option<AddTriggerSuggestion> {
-    let on_cmd = crate::plugin_scan::suggest_cmd_triggers_smart(&scan.commands, 3);
-    // on_map は regex 化せず enumerate のみ (lhs に記号混じりで LCP 無意味)。
-    let on_map: Vec<crate::config::MapSpec> = scan
-        .user_maps
-        .iter()
-        .map(|m| crate::config::MapSpec {
-            lhs: m.lhs.clone(),
-            mode: m.modes.clone(),
-            desc: None,
-        })
-        .collect();
-    let s = AddTriggerSuggestion { on_cmd, on_map };
+///
+/// `include_triggers = false` (明示 eager) のときは trigger 提案だけを落として、
+/// `opts` 提案は残す。
+fn build_add_suggestion(
+    scan: &crate::plugin_scan::ScanResult,
+    include_triggers: bool,
+    setup_module: Option<String>,
+) -> Option<AddTriggerSuggestion> {
+    let (on_cmd, on_map) = if include_triggers {
+        // on_map は regex 化せず enumerate のみ (lhs に記号混じりで LCP 無意味)。
+        (
+            crate::plugin_scan::suggest_cmd_triggers_smart(&scan.commands, 3),
+            scan.user_maps
+                .iter()
+                .map(|m| crate::config::MapSpec {
+                    lhs: m.lhs.clone(),
+                    mode: m.modes.clone(),
+                    desc: None,
+                })
+                .collect(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let s = AddTriggerSuggestion {
+        on_cmd,
+        on_map,
+        setup_module,
+    };
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// 対話プロンプトで user に選ばせて、適用する trigger を返す。
+/// `opts = {}` を提案すべきなら `require()` 先 module 名を返す。
+///
+/// 条件は 2 つ: main module が解決でき、その module が `setup` を宣言していること。
+/// entry 側に `opts` が既にある場合は user の指定が先なので提案しない。
+fn suggest_setup_module(plugin_path: &Path, plugin: &crate::config::Plugin) -> Option<String> {
+    if plugin.opts.is_some() {
+        return None;
+    }
+    let module = plugin
+        .main
+        .clone()
+        .or_else(|| crate::plugin_scan::resolve_main_module(plugin_path, &plugin.display_name()))?;
+    crate::plugin_scan::has_setup_function(plugin_path, &module).then_some(module)
+}
+
+/// 対話プロンプトで user に選ばせて、適用する候補を返す。
 ///   - `Some(suggestion)` → 適用
-///   - `None`             → eager のまま
+///   - `None`             → entry をそのまま (eager / opts なし)
 fn prompt_lazy_decision(
     display_name: &str,
     suggestion: &AddTriggerSuggestion,
 ) -> Option<AddTriggerSuggestion> {
     use dialoguer::{Select, theme::ColorfulTheme};
 
+    let has_triggers = !suggestion.on_cmd.is_empty() || !suggestion.on_map.is_empty();
+
     println!();
-    println!("[{}] detected lazy triggers:", display_name);
+    println!("[{}] scan results:", display_name);
     if !suggestion.on_cmd.is_empty() {
         println!("  on_cmd = {}", toml_array_preview(&suggestion.on_cmd));
     }
@@ -470,8 +513,16 @@ fn prompt_lazy_decision(
         let lhs: Vec<String> = suggestion.on_map.iter().map(|m| m.lhs.clone()).collect();
         println!("  on_map = {}", toml_array_preview(&lhs));
     }
+    if let Some(module) = &suggestion.setup_module {
+        println!("  opts = {{}}   # rvpm will call require(\"{module}\").setup({{}})");
+    }
 
-    let choices = ["accept (lazy-load)", "skip (eager install)"];
+    let accept = match (has_triggers, suggestion.setup_module.is_some()) {
+        (true, true) => "accept (lazy-load + setup via opts)",
+        (true, false) => "accept (lazy-load)",
+        _ => "accept (setup via opts)",
+    };
+    let choices = [accept, "skip (leave the entry as-is)"];
     let sel = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("How should rvpm install this plugin?")
         .items(choices.as_slice())
@@ -480,10 +531,7 @@ fn prompt_lazy_decision(
         .ok()?;
 
     match sel {
-        0 => Some(AddTriggerSuggestion {
-            on_cmd: suggestion.on_cmd.clone(),
-            on_map: suggestion.on_map.clone(),
-        }),
+        0 => Some(suggestion.clone()),
         _ => None,
     }
 }
@@ -525,8 +573,8 @@ fn decide_add_lazy_apply(
 }
 
 /// 既存 config.toml 内の `[[plugins]]` のうち url が一致するエントリに
-/// `on_cmd` / `on_map` を書き込む。toml_edit で in-place patch。
-fn patch_plugin_entry_triggers(
+/// `on_cmd` / `on_map` / `opts` を書き込む。toml_edit で in-place patch。
+fn patch_plugin_entry_suggestion(
     doc: &mut DocumentMut,
     stored_url: &str,
     applied: &AddTriggerSuggestion,
@@ -580,6 +628,11 @@ fn patch_plugin_entry_triggers(
                 t["on_map"] = value(arr);
             }
         }
+        // `opts` も同じ「既存があれば触らない」規則。user が手で書いた opts や
+        // `--ai` 経路で入った opts を空 table で潰さない。
+        if applied.setup_module.is_some() && t.get("opts").is_none() {
+            t["opts"] = value(toml_edit::InlineTable::new());
+        }
         break;
     }
 }
@@ -591,7 +644,7 @@ mod tests {
     use toml_edit::DocumentMut;
 
     #[test]
-    fn patch_plugin_entry_triggers_does_not_overwrite_existing_on_cmd() {
+    fn patch_plugin_entry_suggestion_does_not_overwrite_existing_on_cmd() {
         // user が `--on-cmd MyCmd` で明示指定した / 手編集で既に書いた entry は
         // scan 結果で上書きしてはいけない (PR #91 review 指摘)。
         let initial = r#"[[plugins]]
@@ -602,8 +655,9 @@ on_cmd = ["MyCmd"]
         let applied = AddTriggerSuggestion {
             on_cmd: vec!["ScannedFoo".into(), "ScannedBar".into()],
             on_map: vec![],
+            setup_module: None,
         };
-        patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
+        patch_plugin_entry_suggestion(&mut doc, "owner/repo", &applied);
         let out = doc.to_string();
         assert!(
             out.contains(r#"on_cmd = ["MyCmd"]"#),
@@ -616,7 +670,7 @@ on_cmd = ["MyCmd"]
     }
 
     #[test]
-    fn patch_plugin_entry_triggers_does_not_overwrite_existing_on_map() {
+    fn patch_plugin_entry_suggestion_does_not_overwrite_existing_on_map() {
         let initial = r#"[[plugins]]
 url = "owner/repo"
 on_map = [{lhs = "<leader>x", mode = ["n", "x"], desc = "custom"}]
@@ -629,8 +683,9 @@ on_map = [{lhs = "<leader>x", mode = ["n", "x"], desc = "custom"}]
                 mode: vec!["n".into()],
                 desc: None,
             }],
+            setup_module: None,
         };
-        patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
+        patch_plugin_entry_suggestion(&mut doc, "owner/repo", &applied);
         let out = doc.to_string();
         assert!(
             out.contains("<leader>x"),
@@ -640,7 +695,7 @@ on_map = [{lhs = "<leader>x", mode = ["n", "x"], desc = "custom"}]
     }
 
     #[test]
-    fn patch_plugin_entry_triggers_writes_when_field_absent() {
+    fn patch_plugin_entry_suggestion_writes_when_field_absent() {
         // 既存 entry に on_cmd が無ければ scan 結果を書く (通常パス)。
         let initial = r#"[[plugins]]
 url = "owner/repo"
@@ -649,9 +704,62 @@ url = "owner/repo"
         let applied = AddTriggerSuggestion {
             on_cmd: vec!["ScannedFoo".into()],
             on_map: vec![],
+            setup_module: None,
         };
-        patch_plugin_entry_triggers(&mut doc, "owner/repo", &applied);
+        patch_plugin_entry_suggestion(&mut doc, "owner/repo", &applied);
         let out = doc.to_string();
         assert!(out.contains("ScannedFoo"));
+    }
+
+    #[test]
+    fn patch_plugin_entry_suggestion_writes_empty_opts_table() {
+        // setup() を持つ plugin は `opts = {}` を書いておく: これだけで rvpm が
+        // `require("<main>").setup({})` を loader.lua に焼き込む。
+        let initial = r#"[[plugins]]
+url = "owner/repo"
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let applied = AddTriggerSuggestion {
+            on_cmd: vec![],
+            on_map: vec![],
+            setup_module: Some("repo".into()),
+        };
+        patch_plugin_entry_suggestion(&mut doc, "owner/repo", &applied);
+        let out = doc.to_string();
+        assert!(out.contains("opts = {}"), "got:\n{out}");
+    }
+
+    #[test]
+    fn patch_plugin_entry_suggestion_keeps_existing_opts() {
+        let initial = r#"[[plugins]]
+url = "owner/repo"
+opts = { throttle = 500 }
+"#;
+        let mut doc = initial.parse::<DocumentMut>().unwrap();
+        let applied = AddTriggerSuggestion {
+            on_cmd: vec![],
+            on_map: vec![],
+            setup_module: Some("repo".into()),
+        };
+        patch_plugin_entry_suggestion(&mut doc, "owner/repo", &applied);
+        let out = doc.to_string();
+        assert!(out.contains("throttle = 500"), "got:\n{out}");
+    }
+
+    #[test]
+    fn build_add_suggestion_keeps_opts_when_triggers_are_disallowed() {
+        // `--no-lazy` で eager 固定した plugin でも setup 提案は残る。
+        let scan = crate::plugin_scan::ScanResult {
+            commands: vec!["Foo".into()],
+            ..Default::default()
+        };
+        let s = build_add_suggestion(&scan, false, Some("foo".into())).expect("opts only");
+        assert!(s.on_cmd.is_empty(), "triggers must be dropped");
+        assert_eq!(s.setup_module.as_deref(), Some("foo"));
+
+        // trigger も opts も無ければ提案しない
+        assert!(
+            build_add_suggestion(&crate::plugin_scan::ScanResult::default(), true, None).is_none()
+        );
     }
 }

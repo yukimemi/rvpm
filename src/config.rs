@@ -2,7 +2,9 @@ use anyhow::Result;
 use serde::Deserialize;
 use teravars::{Context, Engine};
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+// `Plugin.opts` が `toml::Value` (中に f64 を含みうる) を持つため `Eq` は付けられない。
+// 比較は test の `assert_eq!` 用途しかないので `PartialEq` で足りる。
+#[derive(Debug, Deserialize, PartialEq)]
 pub struct Config {
     pub vars: Option<serde_json::Value>,
     pub options: Options,
@@ -330,7 +332,7 @@ impl MapSpec {
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq, Default, Clone)]
+#[derive(Debug, Deserialize, PartialEq, Default, Clone)]
 pub struct Plugin {
     pub name: Option<String>,
     pub url: String,
@@ -351,6 +353,21 @@ pub struct Plugin {
     ///   自動 false 化される)
     #[serde(default)]
     pub merge_doc: Option<bool>,
+    /// `require("<main>").setup(<opts>)` に渡す options。
+    ///
+    /// **フィールドの存在そのものが setup 呼び出しのスイッチ** — lazy.nvim の `opts`
+    /// と同じ規約で、`opts = {}` は「引数なしで setup を呼べ」を意味する。 未指定
+    /// (`None`) なら rvpm は setup を一切呼ばない (従来どおり after.lua に任せる)。
+    ///
+    /// 値は generate 時に Lua の table literal へ変換されて loader.lua に焼き込まれる。
+    /// TOML で表現できない値 (Lua 関数など) は書けないので、callback を渡す設定は
+    /// 従来どおり `after.lua` に書く。
+    #[serde(default)]
+    pub opts: Option<toml::Value>,
+    /// `opts` を渡す `require()` 先 module 名の明示 override。
+    /// 未指定なら plugin の `lua/` を generate 時に走査して解決する
+    /// (lazy.nvim の `main` と同じ役割・同じ解決規則)。
+    pub main: Option<String>,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub on_cmd: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]

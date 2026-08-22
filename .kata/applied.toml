@@ -1,19 +1,19 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-07-26T04:26:42.007095063Z"
+applied_at = "2026-08-22T03:29:43.644797448Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "8226510d21d7211eec3ce4fd03e18915a4e0326e"
-version = "0.13.0"
+rev = "8217f1a99c55240c7337f40b8afb35d9e9232499"
+version = "0.14.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "4431c1cc08174025128ce7a2d7bb68af2dfffa93"
-version = "0.8.0"
+rev = "e9ed48b62025bbe80e1d35cdccca11ec2ee88d3e"
+version = "0.8.1"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust-cli"
-rev = "25189b4c1450b3aa9b6db6ada3c43703e13d4d98"
+rev = "29eb636eec8882f416878f3bc30134048eacdfe5"
 version = "0.4.1"
 
 [files.".agents/skills/renri/SKILL.md"]
@@ -38,13 +38,13 @@ content_hash = "e7140a937a36ec588351ab68be92345bdcc4c020e57060802a9e3709bd105b07
 content_hash = "406943795e69542d92d37a0d70051f22a899956dc0cbd1d70ebc16aea13d655a"
 
 [files.".github/workflows/ci.yml"]
-content_hash = "917be127933843d794f8f3074472b8d9e90cdb22ec90c025b5a8aa2607d1778f"
+content_hash = "521b8e878a7b463a74b3006a8774ace3009d24abc62f2cba0a9dc0166384ec3b"
 
 [files.".github/workflows/claude-review.yml"]
-content_hash = "8804c503c1960abdda86578c0bb0bdd727daf41c0d482975d45947d27768b2ec"
+content_hash = "9c07be16af6dc6f1e86b8a845a64a5c54b0d9092b8b34a9c4eefe31e84269509"
 
 [files.".github/workflows/claude.yml"]
-content_hash = "81eb918f932e08a95f3deb8e64c13e57976691bc5723c4d7cb56501d6566994c"
+content_hash = "2db473008ec9528565097a8e543c7a5586a6dd383d8f3e32e094ca78e8e9c2f5"
 
 [files.".github/workflows/kata-apply.yml"]
 content_hash = "45e8fc324f046621343be84f99ed8f3a338fa6d0ea007e87f5ce0c81b0ae2335"
@@ -94,7 +94,7 @@ once_applied = true
 content_hash = "2ada1cf4347db9e98fadd67ca72cd9e29042c5bf6ab719d666b5d71f97663e81"
 
 [files."renovate.json"]
-content_hash = "ea464978679041c69a3e18085f9a2ce846b9762ff02ab2801ed22cfbbf1487ae"
+content_hash = "531343c1f15a1744b9cb2589969c82eb39d4450fa6299f4600457156e98dc349"
 once_applied = true
 
 [files."renri.toml"]
