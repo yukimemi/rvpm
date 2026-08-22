@@ -453,11 +453,11 @@ fn resolve_setup(
         })?,
     };
     for hook in hooks.into_iter().flatten() {
-        if hook_calls_setup(hook) {
+        if hook_calls_setup(hook, &module) {
             eprintln!(
-                "\u{26a0} {display}: `opts` is set and {hook} also calls .setup() \u{2014} setup() \
-                 will run twice. Keep one: `opts` for plain data, the hook for anything that needs \
-                 Lua functions."
+                "\u{26a0} {display}: `opts` is set and {hook} also calls \
+                 require(\"{module}\").setup() \u{2014} setup() will run twice. Keep one: `opts` \
+                 for plain data, the hook for anything that needs Lua functions."
             );
         }
     }
@@ -467,11 +467,48 @@ fn resolve_setup(
     })
 }
 
-/// hook ファイルが `.setup(` を呼んでいそうかの判定 (二重 setup warn 用)。
+/// hook ファイルが **この plugin の `module`** の `.setup` を呼んでいそうかの判定
+/// (二重 setup warn 用)。
+///
+/// 判定は「その `require` の戻り値に対する `.setup` 呼び出し」に束縛する。
+/// module 名の言及と `.setup` の存在を独立に見ると
+/// `require("chronicle")` + `require("telescope").setup({})` を二重 setup と
+/// 誤検知するため (CodeRabbit / Claude 指摘)。拾う形は 2 つ:
+///
+/// - 直接 chain: `require("mod").setup <args>`
+/// - alias 経由: `local m = require("mod")` … `m.setup <args>`
+///
+/// `<args>` は Lua の呼び出し糖衣を含む (`(...)` / `{...}` / `"..."` /
+/// long-bracket `[[...]]` / `[=[...]=]`)。 `[` 単体は table index なので
+/// 呼び出しとみなさない (`setup[handler]`)。`.setups` のような別識別子も弾く。
+///
 /// 読めないファイルは「呼んでいない」扱い — 警告のためだけの判定なので、
 /// I/O エラーで generate を止めたり騒いだりしない。
-fn hook_calls_setup(hook_path: &str) -> bool {
-    std::fs::read_to_string(hook_path).is_ok_and(|src| src.contains(".setup("))
+fn hook_calls_setup(hook_path: &str, module: &str) -> bool {
+    let Ok(src) = std::fs::read_to_string(hook_path) else {
+        return false;
+    };
+    let quoted = regex::escape(module);
+    // 呼び出し開始: `(` / `{` / 短い文字列 / long-bracket。`[` 単体は除外。
+    const CALL_OPENER: &str = r#"(?:\(|\{|"|'|\[=*\[)"#;
+    let direct = regex::Regex::new(&format!(
+        r#"require\s*\(?\s*['"]{quoted}['"]\s*\)?\s*\.\s*setup\s*{CALL_OPENER}"#
+    ));
+    if direct.is_ok_and(|re| re.is_match(&src)) {
+        return true;
+    }
+    let alias_binding = regex::Regex::new(&format!(
+        r#"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*require\s*\(?\s*['"]{quoted}['"]"#
+    ));
+    alias_binding.is_ok_and(|re| {
+        re.captures_iter(&src).any(|caps| {
+            let alias = regex::escape(&caps[1]);
+            regex::Regex::new(&format!(
+                r#"(?:^|[^A-Za-z0-9_.]){alias}\s*\.\s*setup\s*{CALL_OPENER}"#
+            ))
+            .is_ok_and(|call| call.is_match(&src))
+        })
+    })
 }
 
 #[cfg(test)]
@@ -924,7 +961,7 @@ mod tests {
             ..Default::default()
         };
         assert!(resolve_setup(&plugin, root.path(), [&None, &hook_path]).is_some());
-        assert!(hook_calls_setup(hook_path.as_deref().unwrap()));
+        assert!(hook_calls_setup(hook_path.as_deref().unwrap(), "foo"));
     }
 
     #[test]
@@ -934,11 +971,93 @@ mod tests {
         write_file(&plain, "vim.keymap.set('n', 'gx', '<Plug>(x)')\n");
         let dotted = root.path().join("dotted.lua");
         write_file(&dotted, "local m = require('m')\nm.setup( { a = 1 } )\n");
-        assert!(!hook_calls_setup(plain.to_str().unwrap()));
-        assert!(hook_calls_setup(dotted.to_str().unwrap()));
+        assert!(!hook_calls_setup(plain.to_str().unwrap(), "m"));
+        assert!(hook_calls_setup(dotted.to_str().unwrap(), "m"));
         // 読めないパスは false (警告用の判定なので I/O エラーで騒がない)
         assert!(!hook_calls_setup(
-            root.path().join("missing.lua").to_str().unwrap()
+            root.path().join("missing.lua").to_str().unwrap(),
+            "m"
         ));
+    }
+
+    #[test]
+    fn hook_calls_setup_detects_lua_call_sugar() {
+        // Lua は `f{...}` / `f"..."` が `f({...})` / `f("...")` の糖衣。
+        // `.setup(` だけを見ていると括弧なしの呼び出しを取りこぼす。
+        let root = tempdir().unwrap();
+        for (name, src) in [
+            ("brace.lua", "require('foo').setup{ a = 1 }\n"),
+            ("brace_ws.lua", "require('foo').setup { a = 1 }\n"),
+            ("brace_nl.lua", "require('foo').setup\n  { a = 1 }\n"),
+            ("str.lua", "require('foo').setup\"dark\"\n"),
+            ("paren_ws.lua", "require('foo').setup ({ a = 1 })\n"),
+        ] {
+            let p = root.path().join(name);
+            write_file(&p, src);
+            assert!(
+                hook_calls_setup(p.to_str().unwrap(), "foo"),
+                "{name}: call sugar must count as a setup call"
+            );
+        }
+        // `.setup` で始まるだけの別識別子は呼び出しではない
+        let ident = root.path().join("ident.lua");
+        write_file(&ident, "local x = require('foo').setups\n");
+        assert!(!hook_calls_setup(ident.to_str().unwrap(), "foo"));
+    }
+
+    #[test]
+    fn hook_calls_setup_ignores_other_plugins_setup() {
+        // plugin A の after.lua が別 plugin B を setup するのは二重 setup では
+        // ないので warn の対象外 (誤検知でノイズを出さない)。
+        let root = tempdir().unwrap();
+        let hook = root.path().join("after.lua");
+        write_file(&hook, "require('telescope').setup({})\n");
+        assert!(!hook_calls_setup(hook.to_str().unwrap(), "chronicle"));
+        assert!(hook_calls_setup(hook.to_str().unwrap(), "telescope"));
+    }
+
+    #[test]
+    fn hook_calls_setup_requires_the_module_to_own_the_call() {
+        // module 名の言及と `.setup` 呼び出しが別 statement なら二重 setup ではない
+        // (CodeRabbit / Claude 指摘: 独立した存在チェックだと誤検知が残る)。
+        let root = tempdir().unwrap();
+        let mixed = root.path().join("mixed.lua");
+        write_file(
+            &mixed,
+            "-- depends on chronicle for something\nrequire('chronicle')\nrequire('telescope').setup({})\n",
+        );
+        assert!(!hook_calls_setup(mixed.to_str().unwrap(), "chronicle"));
+        assert!(hook_calls_setup(mixed.to_str().unwrap(), "telescope"));
+
+        // alias 経由 (`local m = require("mod")` → `m.setup{}`) は同一 module の呼び出し
+        let alias = root.path().join("alias.lua");
+        write_file(
+            &alias,
+            "local m = require('chronicle')\nm.setup { notify = true }\n",
+        );
+        assert!(hook_calls_setup(alias.to_str().unwrap(), "chronicle"));
+
+        // alias を取っただけで setup していないなら warn しない
+        let unused = root.path().join("unused.lua");
+        write_file(&unused, "local m = require('chronicle')\nm.read()\n");
+        assert!(!hook_calls_setup(unused.to_str().unwrap(), "chronicle"));
+    }
+
+    #[test]
+    fn hook_calls_setup_rejects_index_access() {
+        // `[` は long-bracket 文字列の開始でもあるが table index でもある。
+        // `setup[handler]` は呼び出しではない (CodeRabbit 指摘)。
+        let root = tempdir().unwrap();
+        let index = root.path().join("index.lua");
+        write_file(&index, "local h = require('foo').setup[handler]\n");
+        assert!(!hook_calls_setup(index.to_str().unwrap(), "foo"));
+
+        let long_str = root.path().join("long.lua");
+        write_file(&long_str, "require('foo').setup[[dark]]\n");
+        assert!(hook_calls_setup(long_str.to_str().unwrap(), "foo"));
+
+        let long_eq = root.path().join("long_eq.lua");
+        write_file(&long_eq, "require('foo').setup[==[dark]==]\n");
+        assert!(hook_calls_setup(long_eq.to_str().unwrap(), "foo"));
     }
 }
