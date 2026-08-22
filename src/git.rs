@@ -413,6 +413,14 @@ fn resolve_revision_impl(dst: &Path, rev: &str) -> Result<Option<String>> {
 /// remote tracking branch の tip を読み取る。HEAD は動かさない。
 /// tracking branch (`refs/remotes/<remote>/<branch>`) が見つからなければ
 /// `refs/remotes/<remote>/HEAD` に fallback。それも無ければ `Ok(None)`。
+///
+/// detached HEAD (rev pin による checkout) では `head_name()` が `None` に
+/// なるため、まず `.git/config` の `[branch "<name>"]` (remote がこの remote、
+/// merge が refs/heads/<name>) から「この clone が追跡している branch」を
+/// 解決して tracking ref を読む。pinned checkout 後の held-back 判定はこの
+/// 経路に依存する — `refs/remotes/<remote>/HEAD` は gix >= 0.85 で clone 時点の
+/// snapshot として **direct ref** で書かれるようになり (git の symbolic
+/// `origin/HEAD` と違い追従しない)、stale な値しか返せないため。
 fn read_remote_head(dst: &Path) -> Result<Option<String>> {
     let repo = gix::open(dst)?;
     let remote_name = repo
@@ -432,6 +440,30 @@ fn read_remote_head(dst: &Path) -> Result<Option<String>> {
         {
             return Ok(Some(id.detach().to_string()));
         }
+    } else if let Some(tracked_branch) = tracked_branch_from_config(&repo, &remote_name) {
+        // detached HEAD: config の追跡 branch の tracking ref を読む。
+        // 期待される「ref が無い」(branch が削除された等) は静かに fallback へ、
+        // それ以外の運用エラー (破損した ref 等) は警告して held-back 判定を
+        // 黙って無効化しない (resilience: 警告は出すが処理は続行)。
+        let tracking = format!("refs/remotes/{}/{}", remote_name, tracked_branch);
+        match repo.find_reference(&tracking) {
+            Ok(mut tr) => match tr.peel_to_id() {
+                Ok(id) => return Ok(Some(id.detach().to_string())),
+                Err(e) => eprintln!(
+                    "Warning: failed to peel tracking ref {} in {}: {}",
+                    tracking,
+                    dst.display(),
+                    e
+                ),
+            },
+            Err(gix::reference::find::existing::Error::NotFound { .. }) => {}
+            Err(e) => eprintln!(
+                "Warning: failed to read tracking ref {} in {}: {}",
+                tracking,
+                dst.display(),
+                e
+            ),
+        }
     }
 
     let remote_head_ref = format!("refs/remotes/{}/HEAD", remote_name);
@@ -441,6 +473,29 @@ fn read_remote_head(dst: &Path) -> Result<Option<String>> {
         return Ok(Some(id.detach().to_string()));
     }
     Ok(None)
+}
+
+/// `.git/config` から「この clone の追跡 branch」を取り出す。
+/// clone は default branch について `[branch "<name>"]` (`remote` + `merge =
+/// refs/heads/<name>`) を書く。detached HEAD (pinned) 時の held-back 判定に使う。
+/// 見つからない場合は `None` (判定不能 → 呼び出し側で `origin/HEAD` fallback)。
+///
+/// 実装は gix の config 解決に丸投げする (`branch_remote_tracking_ref_name` は
+/// `branch.<name>.remote` / `branch.<name>.merge` を key の順序や `=` 周辺の空白
+/// に依存せず解決する — 手書き INI 解析は fragile で CodeRabbit / Claude 指摘に
+/// なったため使わない)。複数 branch が同一 remote を追跡する場合は
+/// branch 名のソート順で最初のものを返す (決定的)。
+fn tracked_branch_from_config(repo: &gix::Repository, remote_name: &str) -> Option<String> {
+    let remote_prefix = format!("refs/remotes/{}/", remote_name);
+    repo.branch_names().into_iter().find_map(|short_name| {
+        let full_name = format!("refs/heads/{short_name}");
+        let full_ref: &gix::refs::FullNameRef = full_name.as_str().try_into().ok()?;
+        let tracking = repo
+            .branch_remote_tracking_ref_name(full_ref, gix::remote::Direction::Fetch)?
+            .ok()?;
+        let tracking = tracking.as_bstr().to_string();
+        tracking.strip_prefix(&remote_prefix).map(str::to_string)
+    })
 }
 
 /// `rev` の committer date を読む。失敗系はすべて `Ok(None)` に丸める
@@ -3240,5 +3295,91 @@ mod tests {
         let held = outcome.unwrap().held.expect("tip itself is still held");
         assert_eq!(held.tip, new_tip);
         assert_eq!(held.fallback.as_deref(), Some(mid.as_str()));
+    }
+
+    fn config_repo(config_body: &str) -> tempfile::TempDir {
+        // clone 後の .git/config 相当: 追跡 branch 解決は `branch.<name>.remote/merge` に
+        // 加えて `[remote "origin"]` (url + fetch spec) が存在して初めて成立する
+        // (gix の branch_remote_tracking_ref_name 経由)。なので remote セクションを
+        // 常に含める。
+        let root = tempdir().unwrap();
+        let dst = root.path().join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&dst)
+            .status()
+            .unwrap();
+        fs::write(
+            dst.join(".git").join("config"),
+            format!(
+                "[remote \"origin\"]\n\turl = /dev/null\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n{}",
+                config_body
+            ),
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn tracked_branch_from_config_reads_merge_before_remote() {
+        // git config key order is not semantic; `merge` may precede `remote`.
+        let root = config_repo("[branch \"main\"]\n\tmerge = refs/heads/main\n\tremote = origin\n");
+        let repo = gix::open(root.path().join("dst")).unwrap();
+        assert_eq!(
+            tracked_branch_from_config(&repo, "origin").as_deref(),
+            Some("main"),
+            "key order within a branch section must not matter",
+        );
+    }
+
+    #[test]
+    fn tracked_branch_from_config_skips_other_remotes() {
+        let root = config_repo(
+            "[branch \"main\"]\n\tremote = upstream\n\tmerge = refs/heads/main\n\
+             [branch \"dev\"]\n\tremote = origin\n\tmerge = refs/heads/dev\n",
+        );
+        let repo = gix::open(root.path().join("dst")).unwrap();
+        assert_eq!(
+            tracked_branch_from_config(&repo, "origin").as_deref(),
+            Some("dev"),
+            "only sections tracking the requested remote are considered",
+        );
+    }
+
+    #[test]
+    fn tracked_branch_from_config_picks_deterministic_first_section() {
+        // 複数 branch が同一 remote を追跡していても、branch 名ソート順で
+        // 最初の1つに決まる (ファイル順・key 順に依存しない)。
+        let root = config_repo(
+            "[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n\
+             [branch \"dev\"]\n\tremote = origin\n\tmerge = refs/heads/dev\n",
+        );
+        let repo = gix::open(root.path().join("dst")).unwrap();
+        assert_eq!(
+            tracked_branch_from_config(&repo, "origin").as_deref(),
+            Some("dev"),
+            "one deterministic origin-tracking branch is selected",
+        );
+    }
+
+    #[test]
+    fn tracked_branch_from_config_tolerates_loose_spacing() {
+        let root =
+            config_repo("[branch \"main\"]\n\tremote\t=\torigin\n\tmerge = refs/heads/main\n");
+        let repo = gix::open(root.path().join("dst")).unwrap();
+        assert_eq!(
+            tracked_branch_from_config(&repo, "origin").as_deref(),
+            Some("main"),
+            "whitespace around '=' in git config is not semantic",
+        );
+    }
+
+    #[test]
+    fn tracked_branch_from_config_none_when_unmatched() {
+        let root =
+            config_repo("[branch \"main\"]\n\tremote = upstream\n\tmerge = refs/heads/main\n");
+        let repo = gix::open(root.path().join("dst")).unwrap();
+        assert_eq!(tracked_branch_from_config(&repo, "origin"), None);
     }
 }
