@@ -145,6 +145,16 @@ on_map = [
   "<leader>?",
   { lhs = "<leader>v", mode = ["n", "x"], desc = "Visual leader" },
 ]
+
+[[plugins]]
+url      = "yukimemi/autocursor.nvim"
+on_event = ["BufReadPre", "BufNewFile"]
+# `opts` is present → rvpm calls require("autocursor").setup({}) for you,
+# right before this plugin's after.lua. Same convention as lazy.nvim's `opts`:
+# `opts = {}` means "call setup with no options"; omit the field entirely and
+# rvpm never calls setup at all.
+opts     = {}
+# opts = { throttle = 500, cursorline = { enable = true } }
 ```
 
 ### `[options]` reference
@@ -294,6 +304,8 @@ separate, hand-maintained list and is not affected by this command.
 | `rev` | `string` | HEAD | Branch, tag, or commit hash to check out after clone/pull |
 | `cooldown` | `string` | inherits `options.cooldown` | Per-plugin supply-chain cooldown override (`"7d"` for stricter, `"0"` to opt this plugin out). Meaningless when `rev` pins an exact commit/tag — the pin already wins |
 | `depends` | `string[]` | none | Plugins that must be loaded before this one. Accepts `display_name` (e.g. `"snacks.nvim"`) or `url` (e.g. `"folke/snacks.nvim"`). Eager → lazy dep auto-promotes the dep to eager (with a warning); lazy → lazy dep loads dep first inside the trigger callback |
+| `opts` | `table` | none | Options handed to the plugin's `setup()`. **The presence of the field is the switch** — when it is set, rvpm emits `require("<main>").setup(<opts>)` for this plugin, and `opts = {}` means "call setup with no options" (the same convention as lazy.nvim's `opts`). Omit the field entirely and rvpm never calls setup (your `after.lua` stays in charge, as before). The value is converted to a **Lua table literal at `generate` time**, so it can only hold data — a Lua function / callback / `vim.*` call has no TOML representation and belongs in `after.lua`. Ordering is **setup → `after.lua`**, so `after.lua` is where you extend or override an already-set-up plugin. The module to require is resolved at generate time too; when resolution fails rvpm warns and skips only that setup call |
+| `main` | `string` | auto | Explicit override of the module `opts` is passed to (`require("<main>").setup(...)`). Resolution normally happens at `generate` time from the plugin's `lua/` tree (lazy.nvim's `main` rules), so set this only when that resolution fails (rvpm warns and tells you) or picks the wrong module |
 | `when` | `string` | none | **Compile-time** exclusion condition, evaluated at `generate` / `sync` after Tera rendering. If the rendered string is truthy (`"true"` / `"1"` / `"yes"` / `"on"`, case-insensitive) the plugin is kept; anything else (`"false"` / `"0"` / empty) removes it **entirely** — no clone, no merge, no `loader.lua`, not in dependency resolution. Use Tera to gate on OS / env / vars: `when = "{{ is_windows }}"`, `when = "{{ env.RVPM_ENABLE_DEV }}"`, `when = "{{ vars.enable_custom }}"`. Contrast with `cond` (runtime). Both may be set: `when` is checked first, and if it passes, `cond` still wraps the generated Lua |
 | `cond` | `string` | none | Lua expression. When set, the plugin's loader code is wrapped in `if <cond> then ... end` |
 | `build` | `string` | none | Shell command to run after clone / update. Vim-style `:Cmd` is invoked via `nvim --headless` with the plugin and its transitive depends on `runtimepath`. 5-minute timeout. Failures are reported in the sync summary but don't stop other plugins (resilience) |
@@ -555,6 +567,13 @@ require("telescope").setup({
 })
 vim.keymap.set("n", "<leader>ff", "<cmd>Telescope find_files<cr>")
 ```
+
+The `setup({ ... })` half of that example can move into the plugin's
+`opts` field, since it is plain data; `after.lua` then only carries the
+keymap. Rule of thumb: **data-only setup goes in `opts`, anything that
+needs a Lua function stays in `after.lua`** — and because rvpm runs
+`opts` setup *before* `after.lua`, the hook still sees a fully set-up
+plugin.
 
 </details>
 
@@ -846,6 +865,7 @@ Phase 6: eager plugins in dependency order:
              source plugin/**/*.{vim,lua}    -- pre-globbed at generate time
              source ftdetect/** in augroup filetypedetect
              source after/plugin/**
+             require("<main>").setup(<opts>) -- only when `opts` is set
              after.lua
              User autocmd "rvpm_loaded_<name>"
 Phase 7: lazy trigger registrations         -- on_cmd / on_ft / on_map / etc
@@ -858,6 +878,11 @@ Phase 9: global after.lua                   -- ~/.config/rvpm/<appname>/after.lu
 Because file lists are baked in at `rvpm generate` time, the loader does
 zero runtime glob work. `rvpm sync` (or `rvpm generate`) pays the I/O
 cost; Neovim startup just sources a fixed list of files.
+
+The same holds for `opts`: the module name and the Lua table literal are
+resolved at generate time, so the setup call costs nothing to look up at
+startup. For a lazy plugin it lives inside the trigger callback, in the
+same slot — after `after/plugin/**`, before `after.lua`.
 
 </details>
 
