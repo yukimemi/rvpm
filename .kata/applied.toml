@@ -1,10 +1,10 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-08-22T03:29:43.644797448Z"
+applied_at = "2026-08-23T03:34:55.605395614Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "8217f1a99c55240c7337f40b8afb35d9e9232499"
-version = "0.14.0"
+rev = "0424dfa03771babdeca3c22f08fe003f2811f820"
+version = "0.16.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
@@ -32,22 +32,22 @@ content_hash = "486c974de88903113ed99b4e643432b7050e88f1031276f5263e8da7b43fe11e
 content_hash = "6d380d1ecc2f882c2011429d548a6f3c774b74f0c757d884453e4667172acc2a"
 
 [files.".github/workflows/apm-bump.yml"]
-content_hash = "e7140a937a36ec588351ab68be92345bdcc4c020e57060802a9e3709bd105b07"
+content_hash = "f1cf3615e0f5ff443860722da8d7f74530eaa37e755e65f4392a0c25cd83917e"
 
 [files.".github/workflows/auto-tag.yml"]
-content_hash = "406943795e69542d92d37a0d70051f22a899956dc0cbd1d70ebc16aea13d655a"
+content_hash = "4e2735f40c2ae61014810159a2458da2edc1646589f5f65d9f2f3d099366c9a8"
 
 [files.".github/workflows/ci.yml"]
-content_hash = "521b8e878a7b463a74b3006a8774ace3009d24abc62f2cba0a9dc0166384ec3b"
+content_hash = "db97d026a267859e3b93bcac29f69e7ae65be5ad760cf739b2f7622c77d27f6f"
 
 [files.".github/workflows/claude-review.yml"]
-content_hash = "9c07be16af6dc6f1e86b8a845a64a5c54b0d9092b8b34a9c4eefe31e84269509"
+content_hash = "4589425f4f2dd857f64116c2a8e0ae8746df423dd4cdf1de6c7e582b13fe245f"
 
 [files.".github/workflows/claude.yml"]
-content_hash = "2db473008ec9528565097a8e543c7a5586a6dd383d8f3e32e094ca78e8e9c2f5"
+content_hash = "e018b9c422cac8cb57d832c4100697a56bbd4b5f5a9a2abd6c803149665525a7"
 
 [files.".github/workflows/kata-apply.yml"]
-content_hash = "45e8fc324f046621343be84f99ed8f3a338fa6d0ea007e87f5ce0c81b0ae2335"
+content_hash = "c70c39b08f0e914a44c1dc6c558b3ce2439933fbd64c51674fe64dbc640f02bc"
 
 [files.".github/workflows/release.yml"]
 content_hash = "ef4db54ac86c63962de0e95bcdca4fe7d6ca8f6b28c358a65c98686aa984b5f0"
@@ -57,7 +57,7 @@ once_applied = true
 content_hash = "4bebd1c3417c33f9d1c51f011694f6d82b098bbb1a5a102ba56e97ab01a866ef"
 
 [files.".kata/vars.toml"]
-content_hash = "393b2b94540e792790ef9357e46e5bc259eb3064605794ca2373ae458999cb23"
+content_hash = "8e573305bc9b45b40e4c4c24c0da7728771a12d81c4c1631d6e35f25a189cf84"
 once_applied = true
 
 [files."AGENTS.md"]

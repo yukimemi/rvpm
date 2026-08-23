@@ -47,7 +47,7 @@ jobs:
       # use. Without this the tag push goes out under the default
       # `GITHUB_TOKEN` and downstream workflows stay silent.
       - name: Checkout
-        uses: actions/checkout@v6.1.0
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 2
           token: ${{ secrets.KATA_APPLY_TOKEN }}
