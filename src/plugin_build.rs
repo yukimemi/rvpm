@@ -426,28 +426,46 @@ pub(crate) fn build_plugin_scripts(
     }
 }
 
-/// `opts` から `SetupSpec` (require する module + Lua literal 化した opts) を決める。
+/// `setup` フィールドから `SetupSpec` (require する module + Lua literal 化した
+/// 引数) を決める。
 ///
-/// - `opts` 未指定 → `None` (rvpm は setup を呼ばない = 従来どおり hook 任せ)
-/// - main module が解決できない → warn して `None`。 `main = "..."` の明示を促す。
+/// - `setup` 未指定 → `None` (rvpm は setup を呼ばない = hook 任せ)
+/// - `setup` が table でない → warn して `None`
+/// - main module が解決できない → warn して `None`。descriptor 形での明示を促す。
 ///   resilience: ここで落とさず、その plugin の setup だけを諦める。
-/// - hook (`before.lua` / `after.lua`) が既に `.setup(` を呼んでいそうなら warn。
-///   二重 setup は plugin 側の内部状態を壊しうるので黙って重ねない。
+/// - hook (`before.lua` / `after.lua`) が同じ module の `.setup` を呼んでいそうなら
+///   warn。二重 setup は plugin 側の内部状態を壊しうるので黙って重ねない。
 fn resolve_setup(
     plugin: &crate::config::Plugin,
     plugin_path: &Path,
     hooks: [&Option<String>; 2],
 ) -> Option<crate::loader::SetupSpec> {
-    let opts = plugin.opts.as_ref()?;
+    let raw = plugin.setup.as_ref()?;
     let display = plugin.display_name();
-    let module = match &plugin.main {
-        Some(m) => m.clone(),
+    let Some(field) = crate::config::interpret_setup(raw) else {
+        eprintln!(
+            "\u{26a0} {display}: `setup` must be a table \u{2014} `setup = {{}}`, \
+             `setup = {{ notify = true }}` or \
+             `setup = {{ main = \"<module>\", opts = {{ … }} }}`. setup() skipped."
+        );
+        return None;
+    };
+    if field.mixed_main {
+        eprintln!(
+            "\u{26a0} {display}: `setup` mixes a `main` key with plugin options, so the whole \
+             table is passed to setup(). Write \
+             `setup = {{ main = \"<module>\", opts = {{ … }} }}` if you meant the module override."
+        );
+    }
+    let module = match field.main {
+        Some(m) => m,
         None => crate::plugin_scan::resolve_main_module(plugin_path, &display).or_else(|| {
             eprintln!(
-                "\u{26a0} {display}: `opts` is set but rvpm could not tell which lua module to \
+                "\u{26a0} {display}: `setup` is set but rvpm could not tell which lua module to \
                  require (no top-level module under lua/ matches the plugin name, and there is \
-                 not exactly one candidate). Add `main = \"<module>\"` to the entry, or move the \
-                 setup call into after.lua. setup() skipped."
+                 not exactly one candidate). Name it with \
+                 `setup = {{ main = \"<module>\", opts = {{ … }} }}`, or move the setup call into \
+                 after.lua. setup() skipped."
             );
             None
         })?,
@@ -455,15 +473,15 @@ fn resolve_setup(
     for hook in hooks.into_iter().flatten() {
         if hook_calls_setup(hook, &module) {
             eprintln!(
-                "\u{26a0} {display}: `opts` is set and {hook} also calls \
-                 require(\"{module}\").setup() \u{2014} setup() will run twice. Keep one: `opts` \
+                "\u{26a0} {display}: `setup` is set and {hook} also calls \
+                 require(\"{module}\").setup() \u{2014} setup() will run twice. Keep one: `setup` \
                  for plain data, the hook for anything that needs Lua functions."
             );
         }
     }
     Some(crate::loader::SetupSpec {
         module,
-        opts_lua: crate::loader::toml_to_lua(opts),
+        opts_lua: crate::loader::toml_to_lua(&field.opts),
     })
 }
 
@@ -882,11 +900,11 @@ mod tests {
         );
     }
 
-    // ── opts → setup 解決 (resolve_setup) ────────────────────────────────
+    // ── setup → SetupSpec 解決 (resolve_setup) ───────────────────────────
 
-    fn opts_of(src: &str) -> Option<toml::Value> {
+    fn setup_of(src: &str) -> Option<toml::Value> {
         Some(toml::Value::Table(
-            toml::from_str(src).expect("test opts must be valid TOML"),
+            toml::from_str(src).expect("test setup must be valid TOML"),
         ))
     }
 
@@ -910,7 +928,7 @@ mod tests {
         write_file(&root.path().join("lua/beta.lua"), "return {}");
         let plugin = Plugin {
             url: "owner/unrelated.nvim".into(),
-            opts: opts_of(""),
+            setup: setup_of(""),
             ..Default::default()
         };
         assert!(resolve_setup(&plugin, root.path(), [&None, &None]).is_none());
@@ -923,8 +941,7 @@ mod tests {
         write_file(&root.path().join("lua/beta.lua"), "return {}");
         let plugin = Plugin {
             url: "owner/unrelated.nvim".into(),
-            main: Some("chosen.mod".into()),
-            opts: opts_of("throttle = 7"),
+            setup: setup_of("main = \"chosen.mod\"\nopts = { throttle = 7 }"),
             ..Default::default()
         };
         let spec = resolve_setup(&plugin, root.path(), [&None, &None]).expect("explicit main wins");
@@ -938,7 +955,7 @@ mod tests {
         write_file(&root.path().join("lua/autocursor/init.lua"), "return {}");
         let plugin = Plugin {
             url: "yukimemi/autocursor.nvim".into(),
-            opts: opts_of(""),
+            setup: setup_of(""),
             ..Default::default()
         };
         let spec = resolve_setup(&plugin, root.path(), [&None, &None]).expect("resolved");
@@ -949,7 +966,7 @@ mod tests {
     #[test]
     fn resolve_setup_still_emits_when_a_hook_also_calls_setup() {
         // 二重 setup は warn するが、生成は user の指定どおり続ける
-        // (どちらを消すかは user の判断。黙って opts を無効化しない)。
+        // (どちらを消すかは user の判断。黙って setup を無効化しない)。
         let root = tempdir().unwrap();
         write_file(&root.path().join("lua/foo/init.lua"), "return {}");
         let hook = root.path().join("after.lua");
@@ -957,7 +974,7 @@ mod tests {
         let hook_path = Some(hook.to_string_lossy().to_string());
         let plugin = Plugin {
             url: "owner/foo.nvim".into(),
-            opts: opts_of(""),
+            setup: setup_of(""),
             ..Default::default()
         };
         assert!(resolve_setup(&plugin, root.path(), [&None, &hook_path]).is_some());
@@ -1059,5 +1076,46 @@ mod tests {
         let long_eq = root.path().join("long_eq.lua");
         write_file(&long_eq, "require('foo').setup[==[dark]==]\n");
         assert!(hook_calls_setup(long_eq.to_str().unwrap(), "foo"));
+    }
+
+    #[test]
+    fn resolve_setup_uses_descriptor_main_and_opts() {
+        // `setup = { main = ..., opts = ... }` は module 明示 + 引数の両方を運ぶ。
+        let root = tempdir().unwrap();
+        write_file(&root.path().join("lua/unrelated/init.lua"), "return {}");
+        let plugin = Plugin {
+            url: "echasnovski/mini.nvim".into(),
+            setup: setup_of("main = \"mini.pick\"\nopts = { n = 7 }"),
+            ..Default::default()
+        };
+        let spec = resolve_setup(&plugin, root.path(), [&None, &None]).expect("descriptor");
+        assert_eq!(spec.module, "mini.pick");
+        assert_eq!(spec.opts_lua, "{ n = 7 }");
+    }
+
+    #[test]
+    fn resolve_setup_treats_plain_table_as_opts() {
+        let root = tempdir().unwrap();
+        write_file(&root.path().join("lua/foo/init.lua"), "return {}");
+        let plugin = Plugin {
+            url: "owner/foo.nvim".into(),
+            setup: setup_of("notify = true"),
+            ..Default::default()
+        };
+        let spec = resolve_setup(&plugin, root.path(), [&None, &None]).expect("plain opts");
+        assert_eq!(spec.module, "foo");
+        assert_eq!(spec.opts_lua, "{ notify = true }");
+    }
+
+    #[test]
+    fn resolve_setup_skips_non_table_setup() {
+        let root = tempdir().unwrap();
+        write_file(&root.path().join("lua/foo/init.lua"), "return {}");
+        let plugin = Plugin {
+            url: "owner/foo.nvim".into(),
+            setup: Some(toml::Value::Boolean(true)),
+            ..Default::default()
+        };
+        assert!(resolve_setup(&plugin, root.path(), [&None, &None]).is_none());
     }
 }

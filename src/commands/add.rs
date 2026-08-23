@@ -10,6 +10,7 @@ pub(crate) async fn run_add(
     on_map: Option<String>,
     on_event: Option<String>,
     rev: Option<String>,
+    setup: Option<String>,
     policy_override: Option<crate::config::AutoLazyPolicy>,
     ai_override: Option<crate::config::AiBackend>,
 ) -> Result<()> {
@@ -80,6 +81,9 @@ pub(crate) async fn run_add(
         if on_event.is_some() {
             k.push("on_event");
         }
+        if setup.is_some() {
+            k.push("setup");
+        }
         k
     };
 
@@ -93,6 +97,9 @@ pub(crate) async fn run_add(
     }
     if let Some(r) = &rev {
         new_plugin["rev"] = value(r.as_str());
+    }
+    if let Some(raw) = &setup {
+        new_plugin["setup"] = parse_setup_cli(raw)?;
     }
     if let Item::Table(t) = new_plugin {
         plugins.push(t);
@@ -305,7 +312,7 @@ pub(crate) async fn run_add(
                     if !matches!(policy, crate::config::AutoLazyPolicy::Never) {
                         let scan = crate::plugin_scan::scan_plugin(&dst_path);
                         // trigger 提案は明示 eager (`--no-lazy` / `lazy = false`) では出さない。
-                        // `opts` 提案はそれとは独立 — eager 固定でも setup() は必要なので、
+                        // `setup` 提案はそれとは独立 — eager 固定でも setup() は必要なので、
                         // lazy gate で一緒に落とすと「setup だけの after.lua」を書かせる元の
                         // 手間に戻ってしまう。
                         let triggers_allowed = plugin.lazy_raw != Some(false);
@@ -420,6 +427,34 @@ fn read_persisted_plugin_name(config_path: &Path, stored_url: &str, fallback_url
         .unwrap_or_else(derive_default)
 }
 
+/// `--setup` の値を TOML item に変換する。
+///
+/// 受けるのは inline table だけ — `{}` / `{ notify = true }` /
+/// `{ main = "mini.pick", opts = {} }`。config スキーマ側の規則と同じで、
+/// table 以外は generate 時に warn される形なので CLI では即エラーにする。
+fn parse_setup_cli(raw: &str) -> Result<Item> {
+    let trimmed = raw.trim();
+    let doc = format!("setup = {trimmed}")
+        .parse::<DocumentMut>()
+        .with_context(|| {
+            format!(
+                "--setup must be a TOML inline table (e.g. '{{}}' or '{{ notify = true }}'), \
+                 got: {trimmed}"
+            )
+        })?;
+    let item = doc
+        .get("setup")
+        .context("--setup value could not be parsed")?
+        .clone();
+    if !matches!(item.as_value(), Some(toml_edit::Value::InlineTable(_))) {
+        anyhow::bail!(
+            "--setup must be a TOML inline table (e.g. '{{}}' or '{{ notify = true }}'), \
+             got: {trimmed}"
+        );
+    }
+    Ok(item)
+}
+
 /// `rvpm add` の scan 後に決まる、config.toml に書き込むべき候補。
 #[derive(Clone)]
 struct AddTriggerSuggestion {
@@ -427,7 +462,7 @@ struct AddTriggerSuggestion {
     on_cmd: Vec<String>,
     /// on_map に入れる候補 (lhs の enumerate のみ、regex 提案なし: 記号混じりで LCP 無意味)。
     on_map: Vec<crate::config::MapSpec>,
-    /// `opts = {}` を書くなら、その `require()` 先 module 名。`None` なら書かない。
+    /// `setup = {}` を書くなら、その `require()` 先 module 名。`None` なら書かない。
     /// setup() だけの after.lua を user に書かせずに済ませるための提案。
     setup_module: Option<String>,
 }
@@ -448,7 +483,7 @@ fn is_interactive_tty() -> bool {
 /// scan 結果から suggestion を組み立てる。0 件なら `None` — 提案する中身が無い。
 ///
 /// `include_triggers = false` (明示 eager) のときは trigger 提案だけを落として、
-/// `opts` 提案は残す。
+/// `setup` 提案は残す。
 fn build_add_suggestion(
     scan: &crate::plugin_scan::ScanResult,
     include_triggers: bool,
@@ -478,24 +513,21 @@ fn build_add_suggestion(
     if s.is_empty() { None } else { Some(s) }
 }
 
-/// `opts = {}` を提案すべきなら `require()` 先 module 名を返す。
+/// `setup = {}` を提案すべきなら `require()` 先 module 名を返す。
 ///
 /// 条件は 2 つ: main module が解決でき、その module が `setup` を宣言していること。
-/// entry 側に `opts` が既にある場合は user の指定が先なので提案しない。
+/// entry 側に `setup` が既にある場合は user の指定が先なので提案しない。
 fn suggest_setup_module(plugin_path: &Path, plugin: &crate::config::Plugin) -> Option<String> {
-    if plugin.opts.is_some() {
+    if plugin.setup.is_some() {
         return None;
     }
-    let module = plugin
-        .main
-        .clone()
-        .or_else(|| crate::plugin_scan::resolve_main_module(plugin_path, &plugin.display_name()))?;
+    let module = crate::plugin_scan::resolve_main_module(plugin_path, &plugin.display_name())?;
     crate::plugin_scan::has_setup_function(plugin_path, &module).then_some(module)
 }
 
 /// 対話プロンプトで user に選ばせて、適用する候補を返す。
 ///   - `Some(suggestion)` → 適用
-///   - `None`             → entry をそのまま (eager / opts なし)
+///   - `None`             → entry をそのまま (eager / setup なし)
 fn prompt_lazy_decision(
     display_name: &str,
     suggestion: &AddTriggerSuggestion,
@@ -514,13 +546,13 @@ fn prompt_lazy_decision(
         println!("  on_map = {}", toml_array_preview(&lhs));
     }
     if let Some(module) = &suggestion.setup_module {
-        println!("  opts = {{}}   # rvpm will call require(\"{module}\").setup({{}})");
+        println!("  setup = {{}}   # rvpm will call require(\"{module}\").setup({{}})");
     }
 
     let accept = match (has_triggers, suggestion.setup_module.is_some()) {
-        (true, true) => "accept (lazy-load + setup via opts)",
+        (true, true) => "accept (lazy-load + call setup())",
         (true, false) => "accept (lazy-load)",
-        _ => "accept (setup via opts)",
+        _ => "accept (call setup())",
     };
     let choices = [accept, "skip (leave the entry as-is)"];
     let sel = Select::with_theme(&ColorfulTheme::default())
@@ -573,7 +605,7 @@ fn decide_add_lazy_apply(
 }
 
 /// 既存 config.toml 内の `[[plugins]]` のうち url が一致するエントリに
-/// `on_cmd` / `on_map` / `opts` を書き込む。toml_edit で in-place patch。
+/// `on_cmd` / `on_map` / `setup` を書き込む。toml_edit で in-place patch。
 fn patch_plugin_entry_suggestion(
     doc: &mut DocumentMut,
     stored_url: &str,
@@ -628,10 +660,10 @@ fn patch_plugin_entry_suggestion(
                 t["on_map"] = value(arr);
             }
         }
-        // `opts` も同じ「既存があれば触らない」規則。user が手で書いた opts や
-        // `--ai` 経路で入った opts を空 table で潰さない。
-        if applied.setup_module.is_some() && t.get("opts").is_none() {
-            t["opts"] = value(toml_edit::InlineTable::new());
+        // `setup` も同じ「既存があれば触らない」規則。user が手で書いた setup や
+        // `--ai` 経路で入った setup を空 table で潰さない。
+        if applied.setup_module.is_some() && t.get("setup").is_none() {
+            t["setup"] = value(toml_edit::InlineTable::new());
         }
         break;
     }
@@ -712,9 +744,9 @@ url = "owner/repo"
     }
 
     #[test]
-    fn patch_plugin_entry_suggestion_writes_empty_opts_table() {
-        // setup() を持つ plugin は `opts = {}` を書いておく: これだけで rvpm が
-        // `require("<main>").setup({})` を loader.lua に焼き込む。
+    fn patch_plugin_entry_suggestion_writes_empty_setup_table() {
+        // setup() を持つ plugin は `setup = {}` を書いておく: これだけで rvpm が
+        // `require("<module>").setup({})` を loader.lua に焼き込む。
         let initial = r#"[[plugins]]
 url = "owner/repo"
 "#;
@@ -726,14 +758,14 @@ url = "owner/repo"
         };
         patch_plugin_entry_suggestion(&mut doc, "owner/repo", &applied);
         let out = doc.to_string();
-        assert!(out.contains("opts = {}"), "got:\n{out}");
+        assert!(out.contains("setup = {}"), "got:\n{out}");
     }
 
     #[test]
-    fn patch_plugin_entry_suggestion_keeps_existing_opts() {
+    fn patch_plugin_entry_suggestion_keeps_existing_setup() {
         let initial = r#"[[plugins]]
 url = "owner/repo"
-opts = { throttle = 500 }
+setup = { throttle = 500 }
 "#;
         let mut doc = initial.parse::<DocumentMut>().unwrap();
         let applied = AddTriggerSuggestion {
@@ -761,5 +793,44 @@ opts = { throttle = 500 }
         assert!(
             build_add_suggestion(&crate::plugin_scan::ScanResult::default(), true, None).is_none()
         );
+    }
+
+    // ── --setup フラグのパース (parse_setup_cli) ──────────────────────────
+
+    #[test]
+    fn parse_setup_cli_accepts_inline_tables() {
+        for raw in [
+            "{}",
+            "{ notify = true }",
+            "{ main = \"mini.pick\", opts = {} }",
+            "  { throttle = 500 }  ",
+        ] {
+            let item = parse_setup_cli(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert!(
+                matches!(item.as_value(), Some(toml_edit::Value::InlineTable(_))),
+                "{raw} must parse to an inline table"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_setup_cli_rejects_non_tables() {
+        // table 以外は generate 時に warn される形なので CLI で弾く。
+        for raw in ["true", "\"mini.pick\"", "[1, 2]", "notify = true", "{ oops"] {
+            assert!(parse_setup_cli(raw).is_err(), "{raw} must be rejected");
+        }
+    }
+
+    #[test]
+    fn parse_setup_cli_output_lands_in_the_entry() {
+        let item = parse_setup_cli("{ main = \"mini.pick\", opts = { n = 1 } }").unwrap();
+        let mut doc = "[[plugins]]\nurl = \"owner/repo\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let plugins = doc["plugins"].as_array_of_tables_mut().unwrap();
+        plugins.get_mut(0).unwrap()["setup"] = item;
+        let out = doc.to_string();
+        assert!(out.contains("main = \"mini.pick\""), "got:\n{out}");
+        assert!(out.contains("opts = { n = 1 }"), "got:\n{out}");
     }
 }

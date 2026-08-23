@@ -459,6 +459,7 @@ pub(crate) async fn run_browse() -> Result<bool> {
                             None,
                             None,
                             None,
+                            None,
                         )
                         .await;
                         let added = result.is_ok();

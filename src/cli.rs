@@ -142,6 +142,15 @@ enum Commands {
         #[arg(long)]
         rev: Option<String>,
 
+        /// Set setup, as a TOML inline table. rvpm then calls the plugin's
+        /// `setup()` for you: `--setup '{}'` calls it with no options,
+        /// `--setup '{ notify = true }'` passes that table, and
+        /// `--setup '{ main = "mini.pick", opts = {} }'` also names the module
+        /// to require. Data only — options needing Lua functions belong in
+        /// after.lua.
+        #[arg(long)]
+        setup: Option<String>,
+
         /// Accept auto-scanned on_cmd / on_map without prompting.
         /// Overrides `options.auto_lazy` for this call (== "always").
         /// Useful for non-TTY scripts that want lazy-by-default.
@@ -507,6 +516,7 @@ async fn run_cli() -> Result<()> {
             on_map,
             on_event,
             rev,
+            setup,
             auto_lazy,
             no_lazy,
             ai,
@@ -535,6 +545,7 @@ async fn run_cli() -> Result<()> {
                 on_map,
                 on_event,
                 rev,
+                setup,
                 policy_override,
                 ai_override,
             )
