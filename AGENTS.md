@@ -119,18 +119,20 @@ depends = ["snacks.nvim"]
 # Appends self + transitive depends to rtp; stdpath() reflects the real env, so
 # native lib installs (e.g. blink.cmp) land properly in the user's data dir.
 # build_lua = "require('blink.cmp').build():wait(60000)"
-# opts: options handed to the plugin's setup(). THE PRESENCE OF THE FIELD IS THE
-# SWITCH (same convention as lazy.nvim's `opts`): rvpm emits
-# `require("<main>").setup(<opts>)` for this plugin. `opts = {}` means "call setup
-# with no options"; omit the field and rvpm never calls setup (hooks stay in charge).
-# The value is turned into a Lua table literal at generate time, so it can hold
-# data only — callbacks / `vim.*` calls belong in after.lua. Order: setup -> after.lua.
-# opts = {}
-# opts = { defaults = { layout_strategy = "vertical" } }
-# main: explicit override of the module to require. Normally omit it — rvpm resolves
-# the module from the plugin's `lua/` tree at generate time (lazy.nvim `get_main`
-# rules) and warns + skips just that setup call when it cannot decide.
-# main = "telescope"
+# setup: the plugin's setup() call. THE PRESENCE OF THE FIELD IS THE SWITCH — rvpm
+# emits `require("<module>").setup(<opts>)` for this plugin; omit the field and rvpm
+# never calls setup (hooks stay in charge). The value is turned into a Lua table
+# literal at generate time, so it can hold data only — callbacks / `vim.*` calls
+# belong in after.lua. Order: setup -> after.lua.
+# setup = {}                                       # call setup with no options
+# setup = { defaults = { layout_strategy = "vertical" } }   # the table IS the options
+# setup = { main = "mini.pick", opts = { n = 7 } } # descriptor: name the module to
+#   require. A table whose keys are only `main` / `opts` is read as this descriptor;
+#   normally omit it because rvpm resolves the module from the plugin's `lua/` tree at
+#   generate time and warns + skips just that setup call when it cannot decide. Options
+#   literally named `main` go through `setup = { opts = { main = ... } }`.
+#   One entry = one setup call; repos needing several (mini.nvim etc.) keep the extra
+#   calls in after.lua (rvpm#358).
 
 # Lazy-loading triggers (writing any one of these auto-infers lazy = true)
 on_cmd    = ["Telescope", "/^Chezmoi/"]      # exact name or /regex/ (expanded by rvpm generate)
@@ -184,12 +186,15 @@ Per-plugin Lua config files can be placed under `options.config_root` using the 
 | `before.lua` | **Right after RTP append, before sourcing `plugin/*`** | Override setup, `require` lua/ modules, etc. |
 | `after.lua` | **After sourcing `plugin/*`** | Post-setup that calls plugin functions, keymap configuration |
 
-**`opts` vs `after.lua`.** Data-only `setup({ ... })` belongs in the entry's
-`opts` field — rvpm then calls `require("<main>").setup(<opts>)` itself, right
+**`setup` vs `after.lua`.** Data-only `setup({ ... })` belongs in the entry's
+`setup` field — rvpm then calls `require("<module>").setup(<opts>)` itself, right
 before this plugin's `after.lua`. Anything that needs a Lua function (callbacks,
 keymaps, autocmds, `vim.*` calls) has no TOML representation and stays in
-`after.lua`; mixed cases split, data into `opts` and statements into `after.lua`.
-Never call setup in both places — rvpm warns about the double setup at generate time.
+`after.lua` — and when a *single* setup call needs both data and a Lua value, the
+whole call stays in `after.lua` with no `setup` field, because splitting it would
+mean setting up the same module twice. Never set up the **same module** in both
+places — rvpm warns about the double setup at generate time (setting up a
+different module from a hook is fine).
 
 At generate time rvpm checks each file's existence and embeds `dofile(...)` in loader.lua only for ones that exist (pre-compiled).
 

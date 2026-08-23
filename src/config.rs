@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use teravars::{Context, Engine};
 
-// `Plugin.opts` が `toml::Value` (中に f64 を含みうる) を持つため `Eq` は付けられない。
+// `Plugin.setup` が `toml::Value` (中に f64 を含みうる) を持つため `Eq` は付けられない。
 // 比較は test の `assert_eq!` 用途しかないので `PartialEq` で足りる。
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct Config {
@@ -353,21 +353,23 @@ pub struct Plugin {
     ///   自動 false 化される)
     #[serde(default)]
     pub merge_doc: Option<bool>,
-    /// `require("<main>").setup(<opts>)` に渡す options。
+    /// この plugin の `setup()` 呼び出し指定。
     ///
-    /// **フィールドの存在そのものが setup 呼び出しのスイッチ** — lazy.nvim の `opts`
-    /// と同じ規約で、`opts = {}` は「引数なしで setup を呼べ」を意味する。 未指定
-    /// (`None`) なら rvpm は setup を一切呼ばない (従来どおり after.lua に任せる)。
+    /// **フィールドの存在そのものがスイッチ** — 書けば rvpm が
+    /// `require("<module>").setup(<opts>)` を生成し、書かなければ setup は
+    /// 一切呼ばない (hook 任せ)。書ける形は 3 つ:
+    ///
+    /// ```toml
+    /// setup = {}                                  # 引数なしで setup を呼ぶ
+    /// setup = { notify = true }                   # table 全体が setup() の引数
+    /// setup = { main = "mini.pick", opts = {} }   # require 先 module を明示
+    /// ```
     ///
     /// 値は generate 時に Lua の table literal へ変換されて loader.lua に焼き込まれる。
     /// TOML で表現できない値 (Lua 関数など) は書けないので、callback を渡す設定は
-    /// 従来どおり `after.lua` に書く。
+    /// `after.lua` に書く。
     #[serde(default)]
-    pub opts: Option<toml::Value>,
-    /// `opts` を渡す `require()` 先 module 名の明示 override。
-    /// 未指定なら plugin の `lua/` を generate 時に走査して解決する
-    /// (lazy.nvim の `main` と同じ役割・同じ解決規則)。
-    pub main: Option<String>,
+    pub setup: Option<toml::Value>,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub on_cmd: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
@@ -439,6 +441,52 @@ where
         StringOrVec::String(s) => vec![s],
         StringOrVec::Vec(v) => v,
     }))
+}
+
+/// `[[plugins]] setup` の解釈結果。
+#[derive(Debug, PartialEq)]
+pub struct SetupField {
+    /// descriptor 形で明示された require 先 module。`None` なら generate 時に
+    /// plugin の `lua/` から解決する。
+    pub main: Option<String>,
+    /// `setup()` に渡す値 (Lua table literal に変換される)。
+    pub opts: toml::Value,
+    /// plain opts 形なのに `main` キーを含んでいた = descriptor の書き間違いっぽい。
+    /// 呼び出し側が warn するためのフラグ (解釈自体は plain opts として続行)。
+    pub mixed_main: bool,
+}
+
+/// `setup` の値を「require 先 module」と「setup() の引数」に解釈する。
+///
+/// - キーが `main` / `opts` だけ → descriptor
+///   (`setup = { main = "mini.pick", opts = { … } }`)
+/// - それ以外のキーを含む → table 全体が setup() の引数 (`setup = { notify = true }`)
+/// - `setup = {}` は「引数なしで呼べ」— どちらの解釈でも結果は同じ
+/// - table 以外 (`setup = true` 等) → `None`。呼び出し側が warn して setup を諦める
+///
+/// plugin 自身のオプションに `main` / `opts` というキーがある場合は descriptor 形で
+/// 包めば渡せる (`setup = { opts = { main = … } }`)。
+pub fn interpret_setup(value: &toml::Value) -> Option<SetupField> {
+    let table = value.as_table()?;
+    let descriptor = table.keys().all(|k| k == "main" || k == "opts");
+    if descriptor {
+        return Some(SetupField {
+            main: table
+                .get("main")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            opts: table
+                .get("opts")
+                .cloned()
+                .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new())),
+            mixed_main: false,
+        });
+    }
+    Some(SetupField {
+        main: None,
+        opts: value.clone(),
+        mixed_main: table.contains_key("main"),
+    })
 }
 
 /// Vec<String> を文字列形式 ("n") または配列形式 (["n", "x"]) で受ける。
@@ -1964,5 +2012,101 @@ dst = "~/src/owner/repo"
 "#;
         let config = parse_config(toml).unwrap();
         assert!(config.plugins[0].dev);
+    }
+
+    // ── setup フィールドの解釈 (interpret_setup) ──────────────────────────
+
+    fn setup_value(src: &str) -> toml::Value {
+        toml::Value::Table(toml::from_str(src).expect("test setup must be valid TOML"))
+    }
+
+    fn empty_opts() -> toml::Value {
+        toml::Value::Table(toml::map::Map::new())
+    }
+
+    #[test]
+    fn interpret_setup_empty_table_means_call_with_no_options() {
+        let got = interpret_setup(&setup_value("")).expect("table");
+        assert_eq!(got.main, None);
+        assert_eq!(got.opts, empty_opts());
+        assert!(!got.mixed_main);
+    }
+
+    #[test]
+    fn interpret_setup_plain_table_is_the_options() {
+        let got = interpret_setup(&setup_value("notify = true\nthrottle = 500")).expect("table");
+        assert_eq!(got.main, None);
+        assert_eq!(got.opts, setup_value("notify = true\nthrottle = 500"));
+        assert!(!got.mixed_main);
+    }
+
+    #[test]
+    fn interpret_setup_descriptor_carries_main_and_opts() {
+        let got = interpret_setup(&setup_value(
+            "main = \"mini.pick\"\nopts = { window = { config = { width = 40 } } }",
+        ))
+        .expect("table");
+        assert_eq!(got.main.as_deref(), Some("mini.pick"));
+        assert_eq!(
+            got.opts,
+            setup_value("window = { config = { width = 40 } }")
+        );
+        assert!(!got.mixed_main);
+    }
+
+    #[test]
+    fn interpret_setup_descriptor_without_opts_calls_with_no_options() {
+        let got = interpret_setup(&setup_value("main = \"mini.pick\"")).expect("table");
+        assert_eq!(got.main.as_deref(), Some("mini.pick"));
+        assert_eq!(got.opts, empty_opts());
+    }
+
+    #[test]
+    fn interpret_setup_descriptor_form_can_pass_main_as_an_option() {
+        // plugin 自身のオプションに `main` がある場合の逃げ道。
+        let got = interpret_setup(&setup_value("opts = { main = \"left\" }")).expect("table");
+        assert_eq!(got.main, None);
+        assert_eq!(got.opts, setup_value("main = \"left\""));
+        assert!(!got.mixed_main);
+    }
+
+    #[test]
+    fn interpret_setup_flags_main_mixed_with_options() {
+        // descriptor の書き間違いっぽいケース: table 全体が opts として渡るので
+        // 呼び出し側が warn できるようフラグを立てる。
+        let got =
+            interpret_setup(&setup_value("main = \"mini.pick\"\nnotify = true")).expect("table");
+        assert_eq!(got.main, None);
+        assert!(got.mixed_main);
+        assert_eq!(got.opts, setup_value("main = \"mini.pick\"\nnotify = true"));
+    }
+
+    #[test]
+    fn interpret_setup_rejects_non_table_values() {
+        assert!(interpret_setup(&toml::Value::Boolean(true)).is_none());
+        assert!(interpret_setup(&toml::Value::String("mini.pick".into())).is_none());
+    }
+
+    #[test]
+    fn parse_config_reads_setup_field() {
+        let toml = r#"
+[options]
+
+[[plugins]]
+url = "echasnovski/mini.nvim"
+setup = { main = "mini.pick", opts = {} }
+
+[[plugins]]
+url = "owner/plain.nvim"
+setup = {}
+
+[[plugins]]
+url = "owner/none.nvim"
+"#;
+        let config = parse_config(toml).unwrap();
+        let d = interpret_setup(config.plugins[0].setup.as_ref().expect("setup")).expect("table");
+        assert_eq!(d.main.as_deref(), Some("mini.pick"));
+        assert!(config.plugins[1].setup.is_some());
+        assert!(config.plugins[2].setup.is_none());
     }
 }

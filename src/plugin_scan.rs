@@ -747,7 +747,7 @@ fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
     &a[..end]
 }
 
-// ── main module 解決 (`opts` → `setup()` 用) ────────────────────────────
+// ── main module 解決 (`setup` → `setup()` 用) ───────────────────────────
 //
 // lazy.nvim の `Loader.get_main` と同じ規則で「`require(...)` すべき module 名」を
 // 決める。 lazy.nvim は起動時に plugin dir を走査して解決するが、 rvpm は
@@ -755,7 +755,7 @@ fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
 // なり、 解決不能は runtime error ではなく generate 時 warn になる (resilience)。
 //
 // 規則 (lazy.nvim 準拠):
-//   1. `main = "..."` 明示 → それ (呼び出し側で処理)
+//   1. `setup = { main = "..." }` 明示 → それ (呼び出し側で処理)
 //   2. `mini.xxx` (mini.nvim 本体を除く) → display name そのまま
 //   3. `lua/` 直下の top-level module を列挙し、 正規化名が plugin 名と一致 → それ
 //   4. top-level module がちょうど 1 個 → それ
@@ -824,7 +824,7 @@ fn top_module_name(path: &Path) -> Option<String> {
 
 /// `display_name` の plugin について `require()` すべき main module を解決する。
 /// 曖昧なら `None` — 呼び出し側は warn して setup 呼び出しを諦める
-/// (user には `main = "..."` の明示を促す)。
+/// (user には `setup = { main = "..." }` の明示を促す)。
 pub fn resolve_main_module(plugin_root: &Path, display_name: &str) -> Option<String> {
     // mini.nvim 系: `mini.pick` 等は repo が `lua/mini/pick.lua` だけを持ち
     // `lua/mini/init.lua` が無いので通常の列挙では 0 件になる。 module 名は
@@ -845,7 +845,7 @@ pub fn resolve_main_module(plugin_root: &Path, display_name: &str) -> Option<Str
 
 /// `module` が `setup()` を公開しているかを静的に判定する。
 ///
-/// 用途は `rvpm add` の「`opts = {}` を書いておくか」提案だけ。 false negative
+/// 用途は `rvpm add` の「`setup = {}` を書いておくか」提案だけ。 false negative
 /// (動的に組み立てた setup など) は提案が出ないだけで害が無いので、 regex は
 /// 素直な宣言形だけを見る。
 pub fn has_setup_function(plugin_root: &Path, module: &str) -> bool {
@@ -1654,7 +1654,7 @@ vim.keymap.set("n", "live", "<Plug>(x)")
         );
     }
 
-    // ── main module 解決 (`opts` → `setup()`) ─────────────────────────────
+    // ── main module 解決 (`setup` → `setup()`) ────────────────────────────
 
     fn write(path: &std::path::Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

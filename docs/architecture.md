@@ -23,7 +23,7 @@ Phase 6:   process eager plugins in dep order:
              source plugin/**/*.{vim,lua} directly using pre-globbed file names
              source ftdetect/**/*.{vim,lua} inside augroup filetypedetect
              source after/plugin/**/*.{vim,lua}
-             require("<main>").setup(<opts>)     ← only when `opts` is set
+             require("<module>").setup(<opts>)   ← only when `setup` is set
              after.lua
              fire User autocmd "rvpm_loaded_<name>" (for on_source chaining)
 Phase 7:   register lazy plugin triggers      ← on_cmd / on_ft / on_map / on_event / on_path / on_source
@@ -44,12 +44,25 @@ Key design points:
 - **Auto-detected colorschemes**: when `colors/*.{vim,lua}` exists in the clone path of a lazy plugin, `generate_loader()` scans for those file names at generate time and auto-emits a phase 8 `ColorSchemePre` autocmd handler. No config file edits required. Eager plugins are unaffected because `colors/` is already on the RTP.
 - **Auto-registered denops plugins**: when `denops/<name>/main.{ts,js}` exists in the clone path of a lazy plugin, `generate_loader()` scans for those paths at generate time and passes `{ {"<name>", "<abs main>"}, ... }` as the trailing argument to the `load_lazy()` call. Inside `load_lazy`, `pcall(vim.fn["denops#plugin#load"], name, script)` is issued so that after the rtp append + plugin/* source the plugin is explicitly registered with the denops daemon (denops.vim's auto-discover only fires once at VimEnter and does not pick up plugins that arrive on rtp later via lazy loading, so explicit registration is required). When denops.vim itself is not yet loaded, `pcall` silently skips it. Eager plugins do not need this because the VimEnter-time denops discovery walks the entire rtp.
 
-### `opts` → `setup()` (module resolution is AOT)
+### `setup` → `setup()` (module resolution is AOT)
 
-When a `[[plugins]]` entry carries `opts`, rvpm emits the plugin's
-`require("<main>").setup(<opts>)` call itself. The **presence** of the field is
-the switch (same convention as lazy.nvim's `opts`); `opts = {}` means "call
-setup with no options", and an absent field means rvpm never calls setup.
+When a `[[plugins]]` entry carries `setup`, rvpm emits the plugin's
+`require("<module>").setup(<opts>)` call itself. The **presence** of the field
+is the switch; an absent field means rvpm never calls setup. Three forms:
+
+```toml
+setup = {}                                  # call setup with no options
+setup = { notify = true }                   # the table IS the options
+setup = { main = "mini.pick", opts = {} }   # descriptor: name the module
+```
+
+`config::interpret_setup` decides which form a value is: a table whose keys are
+only `main` / `opts` is the descriptor, anything else is the options table
+itself. `setup = {}` lands on the same result either way. Options that are
+literally named `main` therefore go through the descriptor
+(`setup = { opts = { main = … } }`), and a table that mixes `main` with other
+keys gets a generate-time warning because it is nearly always a mistyped
+descriptor. A non-table `setup` (e.g. `setup = true`) warns and is skipped.
 
 **Where the call sits.** For an eager plugin it is emitted inside phase 6,
 after `after/plugin/**` is sourced and **immediately before that plugin's
@@ -57,18 +70,16 @@ after `after/plugin/**` is sourced and **immediately before that plugin's
 (`if setup then setup() end` between the `after_plugin_files` loop and
 `dofile(after)`), so it fires when the trigger fires. The order is therefore
 always **setup → after.lua**: `after.lua` is the place that adds to or
-overrides an already-set-up plugin, mirroring lazy.nvim's `opts` → `config`.
+overrides an already-set-up plugin.
 
 **Resolution is generate-time, not startup-time.** `plugin_build.rs` decides
-the module name and renders `opts` into a Lua table literal during `generate`
-/ `sync`, and loader.lua receives only the finished literal
-(`rvpm_setup("<name>", "<module>", { ... })`). lazy.nvim walks the plugin
-directory at startup to find the main module; rvpm pays that cost once at
-generate time, so startup cost is zero and an unresolvable module is a
-generate-time warning instead of a runtime error. `plugin_scan::resolve_main_module`
-follows lazy.nvim's `Loader.get_main` rules in order:
+the module name and renders the options into a Lua table literal during
+`generate` / `sync`, and loader.lua receives only the finished literal
+(`rvpm_setup("<name>", "<module>", { ... })`). Startup cost is zero and an
+unresolvable module is a generate-time warning instead of a runtime error.
+`plugin_scan::resolve_main_module` decides in order:
 
-1. explicit `main = "..."` on the entry — used verbatim;
+1. explicit `setup = { main = "..." }` — used verbatim;
 2. a `mini.xxx` display name (`mini.nvim` itself excluded) — the display name
    *is* the module, because those repos ship only `lua/mini/xxx.lua`;
 3. the top-level modules under the plugin's `lua/` (`lua/<mod>.lua` and
@@ -76,38 +87,41 @@ follows lazy.nvim's `Loader.get_main` rules in order:
    `<mod>`) whose normalized name equals the plugin's normalized display name;
 4. otherwise, the sole top-level module if there is exactly one
    (`vim-illuminate` → `illuminate`);
-5. otherwise nothing — rvpm warns, asks for an explicit `main`, and **skips
+5. otherwise nothing — rvpm warns, asks for the descriptor form, and **skips
    only that plugin's setup call** (resilience: the rest of loader.lua is
    generated normally).
 
-Normalization (`plugin_scan::normname`) is `Util.normname`-compatible:
-lowercase → strip leading `vim-` / `nvim-` → strip trailing `.vim` / `.nvim`
-→ remove `.lua` / `-lua` → drop every non-`[a-z]` character. That folds
-`telescope.nvim` / `nvim-telescope` / `which-key.nvim` onto the module names
-those repos actually expose.
+Normalization (`plugin_scan::normname`) is lowercase → strip leading `vim-` /
+`nvim-` → strip trailing `.vim` / `.nvim` → remove `.lua` / `-lua` → drop every
+non-`[a-z]` character. That folds `telescope.nvim` / `nvim-telescope` /
+`which-key.nvim` onto the module names those repos actually expose.
 
 **Lazy plugins build the table lazily.** The emitted setup for a lazy plugin is
 wrapped in a closure (`local _rvpm_st_<name> = function() rvpm_setup(...) end`)
 that is passed to `load_lazy`. Only the closure is constructed at startup; the
-`opts` table literal itself is never built if the trigger never fires. Lazy
+options table literal itself is never built if the trigger never fires. Lazy
 deps loaded from inside a trigger callback get the same treatment.
 
 **Failures stay local.** `rvpm_setup` (emitted next to the `load_lazy` helper,
-and only when at least one plugin has `opts`) wraps the call in `pcall` and
+and only when at least one plugin has `setup`) wraps the call in `pcall` and
 reports through `vim.notify(..., vim.log.levels.ERROR)`. A plugin whose
 `setup()` throws must not take down the remaining eager plugins or the phase 7
-trigger registrations — the same reasoning as lazy.nvim's `Util.try`.
+trigger registrations.
 
 **Two guardrails at generate time.** (1) Unresolvable module → warn + skip, as
-above. (2) Double setup: when `opts` is set *and* the plugin's `before.lua` /
-`after.lua` contains a `.setup(` call, rvpm warns that setup would run twice
-and asks the user to keep exactly one (`opts` for plain data, the hook for
-anything needing Lua functions).
+above. (2) Double setup: when `setup` is set *and* the plugin's `before.lua` /
+`after.lua` calls `.setup` **on the same resolved module**, rvpm warns that
+setup would run twice and asks the user to keep exactly one (`setup` for plain
+data, the hook for anything needing Lua functions). The check binds the call to
+the module — `require("<other>").setup{}` in a hook is a different module and
+stays silent — and understands Lua's call sugar (`setup{...}`, `setup"..."`,
+`setup[[...]]`), so neither form slips through nor produces false positives.
 
-**Known limit.** `opts` is TOML, so it can only express data — strings,
+**Known limit.** `setup` is TOML, so it can only express data — strings,
 numbers, booleans, arrays, nested tables. Callbacks (`on_attach = function()
-... end`) and `vim.*` calls have no TOML form and belong in `after.lua`, the
-same escape hatch lazy.nvim users reach for with `config = function() ... end`.
+... end`) and `vim.*` calls have no TOML form and belong in `after.lua`. One
+entry also emits exactly one setup call; repos needing several (monorepos like
+`mini.nvim`) put the extra calls in `after.lua` (see #358).
 
 ## Lazy trigger implementation
 
@@ -479,7 +493,7 @@ Config / cache are **fixed at `~/.config/rvpm/` and `~/.cache/rvpm/` across all 
 
 | Helper | Purpose | Override |
 |---|---|---|
-| `rvpm_config_path()` | `~/.config/rvpm/config.toml` | **Fixed** (avoids chicken-and-egg) |
+| `rvpm_config_path()` | `~/.config/rvpm/<appname>/config.toml` | Per-appname, like the other roots |
 | `resolve_cache_root(opt)` | `~/.cache/rvpm/<appname>` or tilde-expanded `opt` | `options.cache_root` |
 | `resolve_repos_dir(cache_root)` | `{cache_root}/plugins/repos` | — |
 | `resolve_merged_dir(cache_root)` | `{cache_root}/plugins/merged` | — |
@@ -506,7 +520,7 @@ In other words, setting just `options.cache_root` moves repos / merged / views /
 
 | Path | Purpose |
 |------|------|
-| `~/.config/rvpm/config.toml` | Main configuration file (**fixed regardless of appname** — to avoid chicken-and-egg) |
+| `~/.config/rvpm/<appname>/config.toml` | Main configuration file (per-appname, so `$RVPM_APPNAME` / `$NVIM_APPNAME` gives a fully separate plugin set) |
 | `~/.config/rvpm/<appname>/before.lua` | Global before hook (phase 3, before all init.lua; auto-applied if present) |
 | `~/.config/rvpm/<appname>/after.lua` | Global after hook (phase 9, after all lazy triggers are registered; auto-applied if present) |
 | `~/.config/rvpm/<appname>/plugins/<host>/<owner>/<repo>/` | Per-plugin init/before/after.lua (override via `options.config_root`) |

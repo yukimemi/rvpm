@@ -12,11 +12,11 @@ pub struct DenopsPlugin {
     pub main_script: String,
 }
 
-/// `opts` から決まった setup 呼び出し 1 件。
+/// `setup` から決まった setup 呼び出し 1 件。
 ///
-/// generate 時に「どの module を require するか」「opts をどんな Lua literal に
+/// generate 時に「どの module を require するか」「引数をどんな Lua literal に
 /// するか」まで確定させ、loader.lua には `rvpm_setup(name, mod, { ... })` の
-/// literal だけを焼き込む。 lazy.nvim が起動時にやる module 探索は発生しない。
+/// literal だけを焼き込む。起動時の module 探索は発生しない。
 #[derive(Clone, Debug)]
 pub struct SetupSpec {
     /// `require()` に渡す module 名 (例: `"autocursor"` / `"mini.pick"`)。
@@ -91,8 +91,8 @@ pub struct PluginScripts {
     /// dev plugin は commit と無関係にローカル編集で中身が変わるため、
     /// view stamp による rebuild skip の対象外にする判定に使う。
     pub dev: bool,
-    /// `opts` 指定から解決された setup 呼び出し。`None` なら rvpm は setup を
-    /// 呼ばない (従来どおり after.lua 任せ)。
+    /// `setup` 指定から解決された setup 呼び出し。`None` なら rvpm は setup を
+    /// 呼ばない (after.lua 任せ)。
     pub setup: Option<SetupSpec>,
 }
 
@@ -203,7 +203,7 @@ pub(crate) fn lua_quote(s: &str) -> String {
 }
 
 /// Lua の data 用 string literal。`lua_quote` と違い backslash を `/` に
-/// **正規化しない** — path ではなく user が書いた `opts` の値なので、
+/// **正規化しない** — path ではなく user が書いた `setup` の値なので、
 /// `"\\"` や `"\t"` をそのまま意味として保つ必要がある。
 fn lua_data_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -274,13 +274,13 @@ fn lua_float(f: f64) -> String {
     }
 }
 
-/// `opts` の TOML 値を Lua literal に変換する (generate 時 AOT)。
+/// `setup` の TOML 値を Lua literal に変換する (generate 時 AOT)。
 ///
 /// TOML の table は key 順が決定的 (toml crate の Map) なので、同じ config から
 /// 同じ loader.lua が出る (再現性は rvpm の前提)。
 ///
 /// `Datetime` だけは Lua に対応する型が無いので RFC3339 文字列に落とす。
-/// plugin の `opts` に datetime を書く需要は事実上無いが、書かれても壊れた Lua を
+/// plugin の `setup` に datetime を書く需要は事実上無いが、書かれても壊れた Lua を
 /// 生成しないための保険。
 pub fn toml_to_lua(value: &toml::Value) -> String {
     match value {
@@ -720,7 +720,7 @@ pub fn generate_loader(
 end
 
 "#);
-    // `opts` を持つ plugin が 1 つでもあれば setup helper を定義する。
+    // `setup` を持つ plugin が 1 つでもあれば setup helper を定義する。
     //
     // pcall で包む理由: setup() の失敗をそのまま投げると loader.lua の top-level
     // error になり、後続プラグインと phase 7 の trigger 登録まで巻き添えで死ぬ。
@@ -838,9 +838,9 @@ end
             body.push_str(&format!("vim.cmd(\"source {}\")\n", f.replace('\\', "/")));
         }
 
-        // opts → `require("<main>").setup(<opts>)`。
+        // setup → `require("<module>").setup(<opts>)`。
         // after.lua の **前** に呼ぶ: after.lua は「setup 済みの状態に足す/上書きする」
-        // 場所という位置づけを保つ (lazy.nvim の opts → config の順と同じ)。
+        // 場所という位置づけを保つ。
         if let Some(setup) = &s.setup {
             body.push_str(&format!(
                 "rvpm_setup({}, {}, {})\n",
@@ -928,8 +928,8 @@ end
             lua_denops_list(&s.denops_plugins)
         ));
 
-        // opts があるときだけ setup closure を local に置く。
-        // closure にするのは opts table の構築を **trigger 発火まで遅延** させる
+        // setup があるときだけ setup closure を local に置く。
+        // closure にするのは引数 table の構築を **trigger 発火まで遅延** させる
         // ため — startup 時に確定するのは closure 1 個ぶんだけで、table literal は
         // ロードされなければ一度も構築されない。
         let st_var = format!("_rvpm_st_{}", safe);
