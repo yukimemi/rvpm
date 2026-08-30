@@ -749,8 +749,13 @@ fn write_loader_to_path(
 /// デフォルト並列数。GitHub の rate limit を避けるため控えめに。
 const DEFAULT_CONCURRENCY: usize = 13;
 
+/// `options.concurrency` を Semaphore の permit 数に落とす。
+///
+/// `0` は `Semaphore::new(0)` になり、permit を待つ全タスクが永久に
+/// `acquire().await` で止まる (sync / update / generate / list 全経路が無反応に
+/// なる)。設定ミスで固まるより逐次実行に落ちる方が親切なので 1 に丸める。
 fn resolve_concurrency(config_value: Option<usize>) -> usize {
-    config_value.unwrap_or(DEFAULT_CONCURRENCY)
+    config_value.unwrap_or(DEFAULT_CONCURRENCY).max(1)
 }
 
 pub(crate) fn plural_s(n: usize) -> &'static str {
@@ -1478,6 +1483,13 @@ url = "owner/repo"
     fn test_resolve_concurrency_uses_config_value() {
         let result = resolve_concurrency(Some(5));
         assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn test_resolve_concurrency_clamps_zero_to_one() {
+        // `Semaphore::new(0)` は全タスクが acquire() で永久に待つデッドロック
+        // になるので、`concurrency = 0` は逐次実行 (1) に丸める。
+        assert_eq!(resolve_concurrency(Some(0)), 1);
     }
 
     #[test]

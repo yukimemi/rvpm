@@ -91,6 +91,80 @@ pub enum PluginStatus {
     UpdateFailed(String),
 }
 
+/// `init.lua` / `before.lua` / `after.lua` の存在フラグ。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HookFlags {
+    pub init: bool,
+    pub before: bool,
+    pub after: bool,
+}
+
+impl HookFlags {
+    fn any(&self) -> bool {
+        self.init || self.before || self.after
+    }
+
+    /// `I B A` 列の表示テキストと色。
+    fn render(&self, icons: &Icons) -> (String, Color) {
+        let mark = |on: bool| if on { icons.hook_on } else { icons.hook_off };
+        (
+            format!(
+                "{} {} {}",
+                mark(self.init),
+                mark(self.before),
+                mark(self.after)
+            ),
+            if self.any() {
+                Color::Green
+            } else {
+                Color::DarkGray
+            },
+        )
+    }
+}
+
+/// `draw_list` が使う hook 存在フラグのスナップショット。
+///
+/// `exists()` は Windows の NTFS + リアルタイムスキャン下では 1 回あたり
+/// 0.1ms 規模かかる。252 plugin × 3 file を毎フレーム叩くと 1 描画で 150ms
+/// 近くになり、j/k のカーソル移動が体感で詰まる (#list-tui-latency)。
+/// config を読んだタイミングで 1 度だけ走査して、描画側は参照するだけにする。
+pub struct HookCache {
+    /// `[ Global hooks ]` sentinel 行の分。`None` なら sentinel を描かない。
+    pub global: Option<HookFlags>,
+    /// `config.plugins` と同じ並び / 同じ長さ。
+    pub plugins: Vec<HookFlags>,
+}
+
+impl HookCache {
+    /// `config_root` 配下の per-plugin hook と、global hook の存在を走査する。
+    /// `nvim_init_lua` に `Some` を渡したときだけ sentinel 行の分を作る。
+    pub fn scan(
+        config: &crate::config::Config,
+        config_root: &std::path::Path,
+        nvim_init_lua: Option<&std::path::Path>,
+    ) -> Self {
+        let global = nvim_init_lua.map(|init_lua| HookFlags {
+            init: init_lua.exists(),
+            before: config_root.join("before.lua").exists(),
+            after: config_root.join("after.lua").exists(),
+        });
+        let plugins = config
+            .plugins
+            .iter()
+            .map(|p| {
+                let dir = crate::paths::resolve_plugin_config_dir(config_root, p);
+                HookFlags {
+                    init: dir.join("init.lua").exists(),
+                    before: dir.join("before.lua").exists(),
+                    after: dir.join("after.lua").exists(),
+                }
+            })
+            .collect();
+        Self { global, plugins }
+    }
+}
+
 pub struct TuiState {
     pub plugins: Vec<String>,
     pub status_map: HashMap<String, PluginStatus>,
@@ -601,13 +675,12 @@ impl TuiState {
         &mut self,
         f: &mut Frame,
         config: &crate::config::Config,
-        config_root: &std::path::Path,
         icons: &Icons,
-        // 一番上に [ Global hooks ] sentinel 行を描く。`None` を渡せば従来通り
-        // plugin だけを描く (将来 list 以外の用途を想定して Option にしてある)。
-        // Some の場合、`tui_state.plugins[0]` は空文字 sentinel で、selected_url()
-        // が `Some("")` を返す前提。
-        nvim_init_lua_path: Option<&std::path::Path>,
+        // hook 存在フラグは `HookCache::scan` で config 読み込み時に 1 度だけ
+        // 走査したものを受け取る。`hooks.global` が `Some` のときだけ一番上に
+        // `[ Global hooks ]` sentinel 行を描く (その場合 `tui_state.plugins[0]`
+        // は空文字 sentinel で、`selected_url()` が `Some("")` を返す前提)。
+        hooks: &HookCache,
     ) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -686,22 +759,11 @@ impl TuiState {
 
         let mut rows: Vec<Row> = Vec::with_capacity(config.plugins.len() + 1);
 
-        if let Some(init_lua_path) = nvim_init_lua_path {
+        if let Some(global) = hooks.global {
             // [ Global hooks ] sentinel 行: per-plugin の I/B/A 表記と揃えて、
-            // init.lua は Neovim 本体の path、before/after は <config_root> 配下を見る。
-            // exists() を 1 ファイルにつき 1 回だけ叩く (TUI ループは ~50ms ごと
-            // に redraw されるので、毎フレーム重複 stat を避ける)。
-            let has_i = init_lua_path.exists();
-            let has_b = config_root.join("before.lua").exists();
-            let has_a = config_root.join("after.lua").exists();
-            let hook_i = if has_i { icons.hook_on } else { icons.hook_off };
-            let hook_b = if has_b { icons.hook_on } else { icons.hook_off };
-            let hook_a = if has_a { icons.hook_on } else { icons.hook_off };
-            let hooks_color = if has_i || has_b || has_a {
-                Color::Green
-            } else {
-                Color::DarkGray
-            };
+            // init.lua は Neovim 本体の path、before/after は <config_root> 配下。
+            // 存在チェックは HookCache::scan 済みなので、ここでは stat しない。
+            let (hooks_text, hooks_color) = global.render(icons);
             rows.push(Row::new(vec![
                 Cell::from(icons.installed).style(Style::default().fg(Color::Cyan)),
                 Cell::from("[ Global hooks ]").style(
@@ -712,14 +774,13 @@ impl TuiState {
                 Cell::from("-").style(Style::default().fg(Color::DarkGray)),
                 Cell::from("-").style(Style::default().fg(Color::DarkGray)),
                 Cell::from("-").style(Style::default().fg(Color::DarkGray)),
-                Cell::from(format!("{} {} {}", hook_i, hook_b, hook_a))
-                    .style(Style::default().fg(hooks_color)),
+                Cell::from(hooks_text).style(Style::default().fg(hooks_color)),
                 Cell::from("nvim init.lua + global before/after.lua")
                     .style(Style::default().fg(Color::DarkGray)),
             ]));
         }
 
-        rows.extend(config.plugins.iter().map(|p| {
+        rows.extend(config.plugins.iter().enumerate().map(|(idx, p)| {
             // インストール状態アイコン
             let install_status = self
                 .status_map
@@ -784,23 +845,15 @@ impl TuiState {
             };
             let rev = p.rev.as_deref().unwrap_or("-");
 
-            // I B A 列: init/before/after.lua の存在チェック
-            // per-plugin hook は <config_root>/plugins/<host>/<owner>/<repo>/
-            // exists() は 1 ファイルにつき 1 回だけ叩く (TUI ループの redraw 頻度
-            // で N プラグイン × 6 stat → N × 3 stat に削減)。
-            let pcdir = config_root.join("plugins").join(p.canonical_path());
-            let has_i = pcdir.join("init.lua").exists();
-            let has_b = pcdir.join("before.lua").exists();
-            let has_a = pcdir.join("after.lua").exists();
-            let hook_i = if has_i { icons.hook_on } else { icons.hook_off };
-            let hook_b = if has_b { icons.hook_on } else { icons.hook_off };
-            let hook_a = if has_a { icons.hook_on } else { icons.hook_off };
-            let hooks_text = format!("{} {} {}", hook_i, hook_b, hook_a);
-            let hooks_color = if has_i || has_b || has_a {
-                Color::Green
-            } else {
-                Color::DarkGray
-            };
+            // I B A 列: init/before/after.lua の存在チェック。stat は
+            // HookCache::scan で config 読み込み時に済ませてある。cache 長が
+            // config とズレていても行は落とさず、hook 無しとして描く (resilience)。
+            let (hooks_text, hooks_color) = hooks
+                .plugins
+                .get(idx)
+                .copied()
+                .unwrap_or_default()
+                .render(icons);
 
             Row::new(vec![
                 Cell::from(inst_icon).style(Style::default().fg(inst_color)),
@@ -1057,6 +1110,64 @@ mod tests {
         assert_eq!(TuiState::progress_color(0.74), Color::Cyan);
         assert_eq!(TuiState::progress_color(0.75), Color::Green);
         assert_eq!(TuiState::progress_color(1.0), Color::Green);
+    }
+
+    #[test]
+    fn hook_cache_scan_reflects_files_on_disk() {
+        use crate::config::{Config, Plugin};
+        let tmp = tempfile::tempdir().unwrap();
+        let config_root = tmp.path();
+
+        // global: before.lua だけ置く (init.lua は nvim 側の path を別に渡す)
+        std::fs::write(config_root.join("before.lua"), "").unwrap();
+
+        // plugin A: init.lua と after.lua あり / plugin B: hook 無し
+        let a = Plugin {
+            url: "owner/a.nvim".to_string(),
+            ..Default::default()
+        };
+        let b = Plugin {
+            url: "owner/b.nvim".to_string(),
+            ..Default::default()
+        };
+        let adir = crate::paths::resolve_plugin_config_dir(config_root, &a);
+        std::fs::create_dir_all(&adir).unwrap();
+        std::fs::write(adir.join("init.lua"), "").unwrap();
+        std::fs::write(adir.join("after.lua"), "").unwrap();
+
+        let config = Config {
+            vars: None,
+            options: crate::config::Options::default(),
+            plugins: vec![a, b],
+        };
+
+        let init_lua = config_root.join("nvim-init.lua");
+        std::fs::write(&init_lua, "").unwrap();
+        let hooks = HookCache::scan(&config, config_root, Some(&init_lua));
+
+        assert_eq!(
+            hooks.global,
+            Some(HookFlags {
+                init: true,
+                before: true,
+                after: false,
+            })
+        );
+        assert_eq!(
+            hooks.plugins,
+            vec![
+                HookFlags {
+                    init: true,
+                    before: false,
+                    after: true,
+                },
+                HookFlags::default(),
+            ]
+        );
+
+        // sentinel を出さない呼び出しでは global を走査しない
+        let no_global = HookCache::scan(&config, config_root, None);
+        assert_eq!(no_global.global, None);
     }
 
     #[test]
