@@ -378,7 +378,7 @@ Resilience: if `nvim` is not on PATH, only a warning is emitted and rvpm continu
 
 ## Parallel execution and Semaphore
 
-`run_sync()` and `run_update()` spawn parallel tasks via `tokio::task::JoinSet`. When `config.options.concurrency` is set, task count is bounded by `tokio::sync::Semaphore`.
+`run_sync()` and `run_update()` spawn parallel tasks via `tokio::task::JoinSet`. When `config.options.concurrency` is set, task count is bounded by `tokio::sync::Semaphore`. `run_list()`'s background status check uses the same bound: `Repo::get_status()` runs on `spawn_blocking`, so an unbounded fan-out would start one OS thread per plugin and have them fight over the disk.
 
 ```rust
 let concurrency = resolve_concurrency(config.options.concurrency);
@@ -386,6 +386,26 @@ let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 // At the top of each task:
 let _permit = sem.acquire_owned().await.unwrap();
 ```
+
+## `rvpm list` TUI latency (`src/tui.rs::HookCache`, `src/commands/list.rs`)
+
+The list TUI used to rebuild every row on a fixed 50ms tick, and each row ran
+three `exists()` calls for `init.lua` / `before.lua` / `after.lua` (the `I B A`
+column). At 233 plugins that is ~700 stats per frame — measured at ~50ms warm
+and ~150ms under Windows real-time scanning, so `j` / `k` visibly lagged: the
+redraw monopolised the loop and key events queued behind it.
+
+Two changes fix it, both in the "don't recompute what didn't change" family:
+
+- **`HookCache::scan()`** walks the hooks once per config load (startup and
+  after every `reload!()`), and `draw_list` only reads the cached `HookFlags`.
+  Frame cost drops to ~2.7ms for 233 plugins.
+- **Dirty-flag redraw.** The list TUI has no time-driven element (no spinner),
+  so it draws only when something moved: a key press, a `Resize` event, or a
+  status message arriving from the background check. Idle frames cost nothing.
+
+The sync / update progress TUI (`TuiState::draw`) keeps its unconditional
+redraw — its spinner and elapsed-time display are time-driven.
 
 ## TOML config templating
 

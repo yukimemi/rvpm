@@ -57,6 +57,17 @@ pub(crate) async fn run_list(no_tui: bool) -> Result<bool> {
     let (mut rx, mut set) = spawn_status_check(&config, &cache_root);
     let mut bg_done = false;
 
+    // env vars (RVPM_APPNAME / NVIM_APPNAME) は run_list 実行中に変わらないので
+    // ループ外で 1 回だけ resolve。
+    let init_lua = nvim_init_lua_path();
+    // hook (init/before/after.lua) の存在は config 読み込み時に 1 度だけ走査
+    // する。毎フレーム stat すると 252 plugin × 3 file で 1 描画 150ms 級に
+    // なり、j/k のカーソル移動が目に見えてもたつく (#list-tui-latency)。
+    let mut hooks = crate::tui::HookCache::scan(&config, &config_root, Some(&init_lua));
+    // 再描画が必要かどうか。list TUI にはアニメーション要素が無いので、キー
+    // 入力 / リサイズ / ステータス受信が無い限り描き直す意味が無い。
+    let mut dirty = true;
+
     // `b` キーで browse TUI に遷移したいフラグ。ループ終了後 main.rs 側に返す。
     let mut goto_browse = false;
 
@@ -83,7 +94,9 @@ pub(crate) async fn run_list(no_tui: bool) -> Result<bool> {
             rx = new_rx;
             set = new_set;
             config_root = new_config_root;
+            hooks = crate::tui::HookCache::scan(&config, &config_root, Some(&init_lua));
             bg_done = false;
+            dirty = true;
         }};
     }
 
@@ -178,15 +191,12 @@ pub(crate) async fn run_list(no_tui: bool) -> Result<bool> {
         Ok((config, tui_state, rx, set, config_root))
     }
 
-    // env vars (RVPM_APPNAME / NVIM_APPNAME) は run_list 実行中に変わらないので
-    // ループ外で 1 回だけ resolve。draw_list の毎フレーム再呼び出しを避ける。
-    let init_lua = nvim_init_lua_path();
-
     loop {
         // バックグラウンドのステータス更新を非ブロッキングで受信
         if !bg_done {
             while let Ok((url, status)) = rx.try_recv() {
                 tui_state.update_status(&url, status);
+                dirty = true;
             }
             if set.is_empty() {
                 bg_done = true;
@@ -195,15 +205,36 @@ pub(crate) async fn run_list(no_tui: bool) -> Result<bool> {
             while let Some(Ok(_)) = set.try_join_next() {}
         }
 
-        terminal
-            .draw(|f| tui_state.draw_list(f, &config, &config_root, &icons, Some(&init_lua)))?;
+        // list TUI はスピナー等の時間駆動要素を持たないので、状態が動いた
+        // ときだけ描く。無条件 redraw だと 50ms ごとに全 plugin 分の Row を
+        // 組み直すことになり、キー入力の処理が後ろに詰まる。
+        if dirty {
+            terminal.draw(|f| tui_state.draw_list(f, &config, &icons, &hooks))?;
+            dirty = false;
+        }
 
-        if crossterm::event::poll(std::time::Duration::from_millis(50))?
-            && let crossterm::event::Event::Key(key) = crossterm::event::read()?
-        {
-            if key.kind != crossterm::event::KeyEventKind::Press {
-                continue;
+        let key = if crossterm::event::poll(std::time::Duration::from_millis(50))? {
+            match crossterm::event::read()? {
+                crossterm::event::Event::Key(k)
+                    if k.kind == crossterm::event::KeyEventKind::Press =>
+                {
+                    Some(k)
+                }
+                // リサイズはレイアウト再計算が要るので再描画だけ発火させる。
+                crossterm::event::Event::Resize(..) => {
+                    dirty = true;
+                    None
+                }
+                _ => None,
             }
+        } else {
+            None
+        };
+
+        if let Some(key) = key {
+            // キー入力は選択位置・検索状態のいずれかを動かしうるので、
+            // 個別ハンドラで判定せずまとめて再描画対象にする。
+            dirty = true;
 
             // ── 検索モード: インライン入力 ──
             if tui_state.search_mode {
@@ -420,11 +451,18 @@ fn spawn_status_check(
             .iter()
             .map(|e| (e.name.as_str(), e))
             .collect();
+    // gix の status は spawn_blocking 経由なので、無制限に spawn すると plugin
+    // 数だけ OS スレッドが立ち上がってディスクを叩き合う (252 plugin の実配置で
+    // 起動が体感で重くなる)。sync と同じ concurrency 上限で絞る。
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(resolve_concurrency(
+        config.options.concurrency,
+    )));
     let mut set = JoinSet::new();
     for plugin in config.plugins.iter() {
         let plugin = plugin.clone();
         let cache_root = cache_root.to_path_buf();
         let tx = tx.clone();
+        let semaphore = Arc::clone(&semaphore);
         // この plugin の update エラー記録 (URL 一致時のみ有効 — 同名で別 repo に
         // 差し替えられたケースは別物なので無視する。lockfile / fetch_state と同思想)。
         let update_err_msg = error_lookup
@@ -432,6 +470,8 @@ fn spawn_status_check(
             .filter(|e| urls_match(&e.url, &plugin.url))
             .map(|e| e.message.clone());
         set.spawn(async move {
+            // Semaphore は close されないので acquire は失敗しない。
+            let _permit = semaphore.acquire().await;
             let dst_path = resolve_plugin_dst(&plugin, &cache_root);
             let repo = Repo::new(&plugin.url, &dst_path, plugin.rev.as_deref());
             let git_status = repo.get_status().await;
