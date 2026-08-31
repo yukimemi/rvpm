@@ -560,7 +560,7 @@ covers git workflow, PR review cycle, and worktree usage.
 ### Build / lint / test
 
 ```sh
-cargo make check                    # fmt --check + clippy + test + lock-check (the pre-push gate)
+cargo make check                    # editorconfig-check + fmt --check + clippy + test + lock-check (the pre-push gate)
 cargo make setup                    # one-time hook install + apm install
 cargo build                         # debug build
 cargo build --release               # release build

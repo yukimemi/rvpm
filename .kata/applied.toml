@@ -1,14 +1,14 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-08-30T03:29:47.787146436Z"
+applied_at = "2026-08-31T03:32:51.354286994Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "10cd49c09b95af8add4daf71c5151835821cb670"
+rev = "b205d49d8676a2d3b78efa020749b7f012921159"
 version = "0.18.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "e9ed48b62025bbe80e1d35cdccca11ec2ee88d3e"
+rev = "148d044fd11530b1f92bf0c5a7f9563049710a14"
 version = "0.8.1"
 
 [[templates]]
@@ -23,6 +23,7 @@ once_applied = true
 once_applied = true
 
 [files.".editorconfig"]
+content_hash = "f50ceb17e736856f0a6d3ddbcbcc251e7df3d7c1542dd143dd0d228b834697e0"
 once_applied = true
 
 [files.".gemini/settings.json"]
@@ -38,13 +39,13 @@ content_hash = "0ac5ed2847ab6e1041e34209dcc2396a582722ea9537d03bd950e1db1851a4b7
 content_hash = "4e2735f40c2ae61014810159a2458da2edc1646589f5f65d9f2f3d099366c9a8"
 
 [files.".github/workflows/ci.yml"]
-content_hash = "db97d026a267859e3b93bcac29f69e7ae65be5ad760cf739b2f7622c77d27f6f"
+content_hash = "bbc5b62bfe5f37033ea9d4d5fb9f0ef4e4df460a6a7920e1408b43dbb87b9304"
 
 [files.".github/workflows/claude-review.yml"]
 content_hash = "4a8e47aabb3cdf2a59030d5194467022f0efb53bb1819d4495752020d10be773"
 
 [files.".github/workflows/claude.yml"]
-content_hash = "c83b52d5f483fdec494028b932facf98018500ce757718cc2e3703328688f5ad"
+content_hash = "7bb6c538ec5c2688e01b54e983232fa99f65e24ee16172c4270341345cbdac34"
 
 [files.".github/workflows/kata-apply.yml"]
 content_hash = "7000353151b01b5d14cb8f56e314b1a25b020e22bdf5842dcaf5686efb59facb"
@@ -57,7 +58,7 @@ once_applied = true
 content_hash = "4bebd1c3417c33f9d1c51f011694f6d82b098bbb1a5a102ba56e97ab01a866ef"
 
 [files.".kata/vars.toml"]
-content_hash = "8e573305bc9b45b40e4c4c24c0da7728771a12d81c4c1631d6e35f25a189cf84"
+content_hash = "84daa3d716a28510f2dba69e3c95eb43936d89916df8f16c39b60d0473f9e818"
 once_applied = true
 
 [files."AGENTS.md"]
@@ -73,7 +74,7 @@ content_hash = "3670f70a2f0be4013926bab6e878b90a42ad64c17899080aef4d193b246fa390
 once_applied = true
 
 [files."Makefile.toml"]
-content_hash = "930554e54d2c4090b4e0ba6014dd0692a05884ff6af803897f9d1c1647818b94"
+content_hash = "23145feefcd54c44e8b8fee83baab72b6b5114ea076022c5cb81decda34f358f"
 
 [files."OPENCODE.md"]
 content_hash = "11993dc7feec5fca8e83934f135de33879b88f100c48aeba0729de2f57a11a48"
