@@ -80,6 +80,21 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  editorconfig:
+    # Enforces the repo's `.editorconfig` (LF, trimmed trailing
+    # whitespace, per-filetype indent width) across every tracked file,
+    # not just Rust sources. `cargo make check`'s `editorconfig-check`
+    # task runs the same tool locally but skips gracefully when the
+    # `editorconfig-checker` binary isn't on PATH (it isn't a Rust
+    # crate, so `cargo install` can't fetch it) — this job is the
+    # actual enforcement gate.
+    name: editorconfig
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: editorconfig-checker/action-editorconfig-checker@v2
+      - run: editorconfig-checker
+
   clippy:
     # Matrix across all three OSes so OS-specific dead code (e.g. helpers
     # gated under `cfg(target_os = "windows")`) is caught everywhere, not

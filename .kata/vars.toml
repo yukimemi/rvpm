@@ -21,3 +21,6 @@ create_pull_request = "v8.1.1"
 swatinem_rust_cache = "v2.9.2"
 # renovate: datasource=github-tags depName=anthropics/claude-code-action
 claude_code_action = "v1.0.195"
+
+# renovate: datasource=github-tags depName=editorconfig-checker/action-editorconfig-checker
+editorconfig_checker = "v2"
