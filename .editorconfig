@@ -1,47 +1,94 @@
-root = true
+# This project's own notes — outside every kata marker, and `.editorconfig` is
+# `once_applied` in `.kata/applied.toml`, so `kata apply` leaves them alone.
+# Comments only up here: a section before pj-base's `root = true` below would
+# push that declaration out of the preamble, where EditorConfig ignores it —
+# the checker would then walk up and pick up a parent `.editorconfig`.
+#
+# Deliberately no indentation rules: pj-base dropped `indent_style` /
+# `indent_size` / `trim_trailing_whitespace` / `insert_final_newline` on
+# purpose (see its block below) because a formatter already owns those bytes,
+# and this repo restated them here from before the templates were adopted.
+# rustfmt owns Rust indentation and CI enforces it via `cargo fmt --check`;
+# comment/prose alignment (continuations under `- ` or a text column) is
+# 3 columns wide and can never satisfy an indent-width rule.
 
-[*]
-indent_style = space
-indent_size = 2
-end_of_line = lf
-charset = utf-8
-trim_trailing_whitespace = true
-insert_final_newline = true
-
-[*.{rs,toml}]
-indent_size = 4
-
-[Makefile,*.mk]
-indent_style = tab
 # kata:editorconfig:base:begin
-# kata-managed universal EditorConfig rules (yukimemi/pj-base). Normalizes
-# indentation and line endings at edit time so contributors on different
-# editors/OSes converge instead of round-tripping CRLF/LF or mixed indent
-# widths. Companion to `.gitattributes` (`* text=auto eol=lf`, which
-# normalizes at commit time) — this file targets the editor instead.
+# kata-managed universal EditorConfig rules (yukimemi/pj-base). Scope is
+# deliberately narrow: **encoding and line endings only**. Companion to
+# `.gitattributes` (`* text=auto eol=lf`, which normalizes at commit time) —
+# this file targets the editor instead.
+#
+# Why no `indent_style` / `indent_size` here: every language in these
+# templates already ships a formatter that owns indentation — rustfmt for
+# Rust, prettier/biome for web, deno fmt for Deno — and those run in CI as
+# their own jobs. Stating indent width a second time in `.editorconfig` does
+# not add enforcement, it adds a SECOND OPINION about the same bytes, and
+# when the two disagree the formatter wins while the `editorconfig` CI job
+# goes red on code that is correctly formatted.
+#
+# That was not hypothetical. Measured on `yukimemi/nagi` (2026-09-02) with
+# the indent rules in force: `editorconfig-checker` reported **323 errors**
+# while `cargo fmt --check` and `cargo clippy` were clean on the very same
+# tree. Removing `indent_style`/`indent_size` took it to **18** — and 16 of
+# those are a vendored dependency with its own `.editorconfig`, leaving 2
+# real findings (two files stored CRLF against `end_of_line = lf`, i.e.
+# exactly what this file is for). The `editorconfig` job had failed on every
+# single run since it landed, so it never provided signal, only noise that
+# each PR had to be triaged against.
+#
+# The cause is structural rather than a formatting slip: the dominant comment
+# style aligns continuation lines under `/* ` or `- `, which is 3 columns and
+# therefore never a multiple of 2 or 4. No amount of tidying makes an
+# aligned comment satisfy an indent-width rule.
+#
+# `insert_final_newline` / `trim_trailing_whitespace` are gone for the same
+# reason — formatters handle both — and dropping them costs 2 findings on
+# that same measurement, both in files a formatter already covers. Removing
+# `trim_trailing_whitespace` also makes the old `[*.md]` exemption (two
+# trailing spaces is a hard line break) unnecessary.
+#
 # Language layers (pj-rust, ...) append file-type sections via
 # merge-section; see `# kata:editorconfig:*:begin/end` markers in the
-# rendered `.editorconfig`.
+# rendered `.editorconfig`. A layer that only wants to restate its
+# formatter's indent width should ship nothing.
 root = true
 
 [*]
 charset = utf-8
 end_of_line = lf
-insert_final_newline = true
-trim_trailing_whitespace = true
-indent_style = space
-indent_size = 2
-
-# Markdown: two trailing spaces is a hard line break, not noise.
-[*.md]
-trim_trailing_whitespace = false
 # kata:editorconfig:base:end
 # kata:editorconfig:rust:begin
-# Rust-layer EditorConfig section — appended (via kata merge-section) to
-# the `[*]` defaults pj-base ships. `indent_size = 4` matches rustfmt's
-# default `tab_spaces` (`rustfmt.toml` only pins `edition`, so the 4-space
-# default stands); everything else (TOML/YAML/JSON/Markdown at 2 spaces,
-# LF, trimmed trailing whitespace) is inherited from pj-base's `[*]`.
-[*.rs]
-indent_size = 4
+# Rust-layer EditorConfig section — intentionally EMPTY of rules.
+#
+# This layer used to ship `[*.rs] indent_size = 4`, and its own comment gave
+# the reason it should not: it "matches rustfmt's default `tab_spaces`". That
+# is a duplicate of a setting rustfmt already owns and CI already enforces
+# (`cargo fmt --check`), so it added a second opinion about the same bytes
+# rather than any enforcement — and when the two disagreed, rustfmt was right
+# and the `editorconfig` job was the one going red.
+#
+# Measured on `yukimemi/nagi` (2026-09-02) with both indent rules in force:
+# `editorconfig-checker` reported **323 errors** on a tree where
+# `cargo fmt --check` and `cargo clippy` were both clean, **248 of them
+# `want multiple of 4`** from this very rule. The job had failed on every run
+# since it landed, so it never gave signal, only per-PR triage.
+#
+# It is not a formatting slip that could be tidied away: rustfmt leaves
+# `//` and `/* */` comment bodies alone, and the dominant style aligns
+# continuation lines under `/* `, which is 3 columns and therefore never a
+# multiple of 4. The two tools cannot both be satisfied.
+#
+# The file is kept rather than deleted on purpose. Its `[[file]]` entry is
+# `how = "merge-section"` with `when = "always"`, so keeping it lets the next
+# `kata apply` REWRITE the `# kata:editorconfig:rust:*` block in every
+# consumer down to these comments. Dropping the entry instead would leave the
+# old block — `indent_size = 4` included — stranded in every already-
+# initialized repo, since kata would no longer be told the section exists.
+#
+# If a future Rust-specific rule is genuinely about encoding or line endings
+# rather than formatting, this is where it goes.
 # kata:editorconfig:rust:end
+
+# Real Makefiles need hard tabs; nothing else in this repo does.
+[Makefile,*.mk]
+indent_style = tab

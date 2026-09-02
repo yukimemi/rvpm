@@ -1,14 +1,14 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-08-31T03:32:51.354286994Z"
+applied_at = "2026-09-02T18:45:38.1661169Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "b205d49d8676a2d3b78efa020749b7f012921159"
+rev = "6dddfa1a3b889a9ec28382d8ae18f6985c5c9b9e"
 version = "0.18.0"
 
 [[templates]]
 source = "github.com/yukimemi/pj-rust"
-rev = "148d044fd11530b1f92bf0c5a7f9563049710a14"
+rev = "f94771ad56008e68553341d4df4341d192d58e0d"
 version = "0.8.1"
 
 [[templates]]
@@ -23,7 +23,7 @@ once_applied = true
 once_applied = true
 
 [files.".editorconfig"]
-content_hash = "f50ceb17e736856f0a6d3ddbcbcc251e7df3d7c1542dd143dd0d228b834697e0"
+content_hash = "02e4337db1bb05d6b19fdfb51328eb000ceb17c635273c63a66767698242b0a4"
 once_applied = true
 
 [files.".gemini/settings.json"]
