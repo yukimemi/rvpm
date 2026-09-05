@@ -4248,9 +4248,9 @@ dependencies = [
 
 [[package]]
 name = "teravars"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "443fe898f5f3e6bd9d5d1dcfb0cd02f8e63fc26f9f407b922157c97a80e1a50d"
+checksum = "2d1721aca263e9a1d8d82519ff0206eec8915bf0eb08af00a79e560275381d09"
 dependencies = [
  "dirs",
  "serde",
