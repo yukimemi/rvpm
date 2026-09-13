@@ -2,6 +2,9 @@
 alias = "check"
 
 [tasks.check]
+# Aggregate only: do not inherit cargo-make's built-in cargo check command.
+clear = true
+category = "Test"
 description = "Run editorconfig-check + fmt + clippy + test + lock-check (same as CI)"
 dependencies = ["editorconfig-check", "fmt-check", "clippy", "test", "lock-check"]
 
@@ -33,6 +36,9 @@ command = "cargo"
 args = ["clippy", "--locked", "--all-targets", "--", "-D", "warnings"]
 
 [tasks.test]
+# Dependencies cover all tests; the built-in cargo test would run them again.
+clear = true
+category = "Test"
 description = "Run all tests (targets + doc)"
 # `cargo test --all-targets` covers lib / bins / tests / benches /
 # examples but EXCLUDES doc tests. Run --doc separately so the
