@@ -117,7 +117,7 @@ pub(crate) async fn run_update(query: Option<String>, no_cooldown: bool) -> Resu
     let mut cooldown_state_dirty = false;
 
     while finished_tasks < total_tasks {
-        terminal.draw(|f| tui_state.draw(f, "updating...", &icons))?;
+        terminal.draw(|f| tui_state.draw(f, "updating...", &icons, &config.options.theme))?;
 
         // sync/update 中のイベントキューを drain してスクロール操作を受け付ける
         while crossterm::event::poll(std::time::Duration::from_millis(0))? {
@@ -166,7 +166,7 @@ pub(crate) async fn run_update(query: Option<String>, no_cooldown: bool) -> Resu
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
         }
     }
-    terminal.draw(|f| tui_state.draw(f, "updating...", &icons))?;
+    terminal.draw(|f| tui_state.draw(f, "updating...", &icons, &config.options.theme))?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);

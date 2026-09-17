@@ -2,7 +2,7 @@ use crate::browse::GitHubRepo;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row, Table, TableState, Wrap},
 };
@@ -796,12 +796,13 @@ impl BrowseTuiState {
         self.readme_prepared_key = Some(key);
     }
 
-    pub fn draw(&mut self, f: &mut Frame) {
+    pub fn draw(&mut self, f: &mut Frame, theme: &crate::theme::Theme) {
         // 毎フレームまず全セルを空白 + 既定スタイルに戻してから widget を重ねる。
         // 個別 pane 単位の Clear だと highlight-code (ansi-to-tui) の styled span が
         // scroll 位置変更時に残骸を残すケースがあるため、フレーム丸ごと洗う。
         // ratatui の diff 機構により実際の端末出力は変化したセルのみ。
         f.render_widget(ratatui::widgets::Clear, f.area());
+        f.render_widget(Block::default().style(theme.base_style()), f.area());
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -830,23 +831,23 @@ impl BrowseTuiState {
                 Span::styled(
                     " rvpm browse ",
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
+                        .fg(theme.inverse)
+                        .bg(theme.browse_accent)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     prompt,
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme.browse_accent)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(&self.search_input, Style::default().fg(Color::White)),
-                Span::styled("\u{2588}", Style::default().fg(Color::Yellow)), // cursor
-                Span::styled(match_info, Style::default().fg(Color::DarkGray)),
+                Span::styled(&self.search_input, Style::default().fg(theme.foreground)),
+                Span::styled("\u{2588}", Style::default().fg(theme.browse_accent)), // cursor
+                Span::styled(match_info, Style::default().fg(theme.muted)),
             ])
         } else {
             let info = if let Some(msg) = &self.message {
-                Span::styled(format!("  {}", msg), Style::default().fg(Color::Green))
+                Span::styled(format!("  {}", msg), Style::default().fg(theme.success))
             } else if let Some(pat) = &self.search_pattern {
                 Span::styled(
                     format!(
@@ -855,7 +856,7 @@ impl BrowseTuiState {
                         self.search_matches.len(),
                         self.sort_mode.label()
                     ),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.muted),
                 )
             } else {
                 Span::styled(
@@ -864,15 +865,15 @@ impl BrowseTuiState {
                         self.plugins.len(),
                         self.sort_mode.label()
                     ),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.muted),
                 )
             };
             Line::from(vec![
                 Span::styled(
                     " rvpm browse ",
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
+                        .fg(theme.inverse)
+                        .bg(theme.browse_accent)
                         .add_modifier(Modifier::BOLD),
                 ),
                 info,
@@ -881,7 +882,7 @@ impl BrowseTuiState {
         let title = Paragraph::new(title_content).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(theme.muted)),
         );
         f.render_widget(title, chunks[0]);
 
@@ -914,7 +915,7 @@ impl BrowseTuiState {
                 let installed_cell = if self.is_installed(repo) {
                     ratatui::widgets::Cell::from(Span::styled(
                         "\u{2713}",
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(theme.success),
                     ))
                 } else {
                     ratatui::widgets::Cell::from(" ")
@@ -932,12 +933,13 @@ impl BrowseTuiState {
                 Row::new(vec![
                     installed_cell,
                     ratatui::widgets::Cell::from(format!(" \u{2605}{}", repo.stars_display()))
-                        .style(Style::default().fg(Color::Yellow)),
-                    ratatui::widgets::Cell::from(name_str).style(Style::default().fg(Color::White)),
+                        .style(Style::default().fg(theme.browse_accent)),
+                    ratatui::widgets::Cell::from(name_str)
+                        .style(Style::default().fg(theme.foreground)),
                     ratatui::widgets::Cell::from(desc_truncated)
-                        .style(Style::default().fg(Color::DarkGray)),
+                        .style(Style::default().fg(theme.muted)),
                     ratatui::widgets::Cell::from(topics_str)
-                        .style(Style::default().fg(Color::DarkGray)),
+                        .style(Style::default().fg(theme.muted)),
                 ])
             })
             .collect();
@@ -967,14 +969,14 @@ impl BrowseTuiState {
                 .title(" Plugins ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(if self.focus == Focus::List {
-                    Color::Yellow
+                    theme.browse_accent
                 } else {
-                    Color::DarkGray
+                    theme.muted
                 })),
         )
         .row_highlight_style(
             Style::default()
-                .bg(Color::Indexed(237))
+                .bg(theme.selection_background)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("\u{25b8} ");
@@ -1023,9 +1025,9 @@ impl BrowseTuiState {
                     .title(readme_title)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(if self.focus == Focus::Readme {
-                        Color::Cyan
+                        theme.info
                     } else {
-                        Color::DarkGray
+                        theme.muted
                     })),
             )
             .wrap(Wrap { trim: false })
@@ -1035,6 +1037,7 @@ impl BrowseTuiState {
         // セル状態を厳密に保持するホストで顕在化する)。Clear でペイン全体を空白に
         // してから Paragraph を重ねる。
         f.render_widget(ratatui::widgets::Clear, main_chunks[1]);
+        f.render_widget(Block::default().style(theme.base_style()), main_chunks[1]);
         f.render_widget(readme, main_chunks[1]);
 
         // ── Footer ──
@@ -1045,10 +1048,10 @@ impl BrowseTuiState {
                 ":confirm "
             };
             Paragraph::new(Line::from(vec![
-                Span::styled(" Enter", Style::default().fg(Color::Yellow)),
-                Span::styled(confirm_label, Style::default().fg(Color::DarkGray)),
-                Span::styled("Esc", Style::default().fg(Color::Yellow)),
-                Span::styled(":cancel", Style::default().fg(Color::DarkGray)),
+                Span::styled(" Enter", Style::default().fg(theme.browse_accent)),
+                Span::styled(confirm_label, Style::default().fg(theme.muted)),
+                Span::styled("Esc", Style::default().fg(theme.browse_accent)),
+                Span::styled(":cancel", Style::default().fg(theme.muted)),
             ]))
         } else {
             let focus_label = match self.focus {
@@ -1056,27 +1059,27 @@ impl BrowseTuiState {
                 Focus::Readme => "list",
             };
             Paragraph::new(Line::from(vec![
-                Span::styled(" /", Style::default().fg(Color::Yellow)),
-                Span::styled(":search ", Style::default().fg(Color::DarkGray)),
-                Span::styled("n/N", Style::default().fg(Color::Yellow)),
-                Span::styled(":next/prev ", Style::default().fg(Color::DarkGray)),
-                Span::styled("S", Style::default().fg(Color::Yellow)),
-                Span::styled(":api-search ", Style::default().fg(Color::DarkGray)),
-                Span::styled("Tab", Style::default().fg(Color::Yellow)),
+                Span::styled(" /", Style::default().fg(theme.browse_accent)),
+                Span::styled(":search ", Style::default().fg(theme.muted)),
+                Span::styled("n/N", Style::default().fg(theme.browse_accent)),
+                Span::styled(":next/prev ", Style::default().fg(theme.muted)),
+                Span::styled("S", Style::default().fg(theme.browse_accent)),
+                Span::styled(":api-search ", Style::default().fg(theme.muted)),
+                Span::styled("Tab", Style::default().fg(theme.browse_accent)),
                 Span::styled(
                     format!(":{} ", focus_label),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.muted),
                 ),
-                Span::styled("Enter", Style::default().fg(Color::Yellow)),
-                Span::styled(":add ", Style::default().fg(Color::DarkGray)),
-                Span::styled("l", Style::default().fg(Color::Yellow)),
-                Span::styled(":list ", Style::default().fg(Color::DarkGray)),
-                Span::styled("c", Style::default().fg(Color::Yellow)),
-                Span::styled(":config ", Style::default().fg(Color::DarkGray)),
-                Span::styled("?", Style::default().fg(Color::Yellow)),
-                Span::styled(":help ", Style::default().fg(Color::DarkGray)),
-                Span::styled("q", Style::default().fg(Color::Yellow)),
-                Span::styled(":quit", Style::default().fg(Color::DarkGray)),
+                Span::styled("Enter", Style::default().fg(theme.browse_accent)),
+                Span::styled(":add ", Style::default().fg(theme.muted)),
+                Span::styled("l", Style::default().fg(theme.browse_accent)),
+                Span::styled(":list ", Style::default().fg(theme.muted)),
+                Span::styled("c", Style::default().fg(theme.browse_accent)),
+                Span::styled(":config ", Style::default().fg(theme.muted)),
+                Span::styled("?", Style::default().fg(theme.browse_accent)),
+                Span::styled(":help ", Style::default().fg(theme.muted)),
+                Span::styled("q", Style::default().fg(theme.browse_accent)),
+                Span::styled(":quit", Style::default().fg(theme.muted)),
             ]))
         };
         f.render_widget(
@@ -1092,108 +1095,117 @@ impl BrowseTuiState {
                 Line::from(vec![Span::styled(
                     "  Navigation",
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme.browse_accent)
                         .add_modifier(Modifier::BOLD),
                 )]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("  j / k       ", Style::default().fg(Color::Yellow)),
-                    Span::styled("Move / scroll down / up", Style::default().fg(Color::White)),
+                    Span::styled("  j / k       ", Style::default().fg(theme.browse_accent)),
+                    Span::styled(
+                        "Move / scroll down / up",
+                        Style::default().fg(theme.foreground),
+                    ),
                 ]),
                 Line::from(vec![
-                    Span::styled("  g / G       ", Style::default().fg(Color::Yellow)),
-                    Span::styled("Go to top / bottom", Style::default().fg(Color::White)),
+                    Span::styled("  g / G       ", Style::default().fg(theme.browse_accent)),
+                    Span::styled("Go to top / bottom", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  C-d / C-u   ", Style::default().fg(Color::Yellow)),
-                    Span::styled("Half page down / up", Style::default().fg(Color::White)),
+                    Span::styled("  C-d / C-u   ", Style::default().fg(theme.browse_accent)),
+                    Span::styled("Half page down / up", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  C-f / C-b   ", Style::default().fg(Color::Yellow)),
-                    Span::styled("Full page down / up", Style::default().fg(Color::White)),
+                    Span::styled("  C-f / C-b   ", Style::default().fg(theme.browse_accent)),
+                    Span::styled("Full page down / up", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Tab         ", Style::default().fg(Color::Yellow)),
+                    Span::styled("  Tab         ", Style::default().fg(theme.browse_accent)),
                     Span::styled(
                         "Switch focus: list / readme",
-                        Style::default().fg(Color::White),
+                        Style::default().fg(theme.foreground),
                     ),
                 ]),
                 Line::from(""),
                 Line::from(vec![Span::styled(
                     "  Search",
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme.browse_accent)
                         .add_modifier(Modifier::BOLD),
                 )]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("  /           ", Style::default().fg(Color::Yellow)),
+                    Span::styled("  /           ", Style::default().fg(theme.browse_accent)),
                     Span::styled(
                         "Local incremental (name + desc + topics)",
-                        Style::default().fg(Color::White),
+                        Style::default().fg(theme.foreground),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("  n / N       ", Style::default().fg(Color::Yellow)),
-                    Span::styled("Next / prev match", Style::default().fg(Color::White)),
+                    Span::styled("  n / N       ", Style::default().fg(theme.browse_accent)),
+                    Span::styled("Next / prev match", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  S           ", Style::default().fg(Color::Yellow)),
+                    Span::styled("  S           ", Style::default().fg(theme.browse_accent)),
                     Span::styled(
                         "GitHub API search (fetch)",
-                        Style::default().fg(Color::White),
+                        Style::default().fg(theme.foreground),
                     ),
                 ]),
                 Line::from(""),
                 Line::from(vec![Span::styled(
                     "  Actions",
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme.browse_accent)
                         .add_modifier(Modifier::BOLD),
                 )]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("  Enter       ", Style::default().fg(Color::Yellow)),
-                    Span::styled("Add plugin to config", Style::default().fg(Color::White)),
+                    Span::styled("  Enter       ", Style::default().fg(theme.browse_accent)),
+                    Span::styled(
+                        "Add plugin to config",
+                        Style::default().fg(theme.foreground),
+                    ),
                 ]),
                 Line::from(vec![
-                    Span::styled("  l           ", Style::default().fg(Color::Yellow)),
-                    Span::styled("Switch to list TUI", Style::default().fg(Color::White)),
+                    Span::styled("  l           ", Style::default().fg(theme.browse_accent)),
+                    Span::styled("Switch to list TUI", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  c           ", Style::default().fg(Color::Yellow)),
-                    Span::styled("Open config.toml", Style::default().fg(Color::White)),
+                    Span::styled("  c           ", Style::default().fg(theme.browse_accent)),
+                    Span::styled("Open config.toml", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  o           ", Style::default().fg(Color::Yellow)),
-                    Span::styled("Open in browser", Style::default().fg(Color::White)),
+                    Span::styled("  o           ", Style::default().fg(theme.browse_accent)),
+                    Span::styled("Open in browser", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  s           ", Style::default().fg(Color::Yellow)),
-                    Span::styled("Cycle sort mode", Style::default().fg(Color::White)),
+                    Span::styled("  s           ", Style::default().fg(theme.browse_accent)),
+                    Span::styled("Cycle sort mode", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  R           ", Style::default().fg(Color::Yellow)),
-                    Span::styled("Refresh (clear cache)", Style::default().fg(Color::White)),
+                    Span::styled("  R           ", Style::default().fg(theme.browse_accent)),
+                    Span::styled(
+                        "Refresh (clear cache)",
+                        Style::default().fg(theme.foreground),
+                    ),
                 ]),
                 Line::from(vec![
-                    Span::styled("  q / Esc     ", Style::default().fg(Color::Yellow)),
-                    Span::styled("Quit", Style::default().fg(Color::White)),
+                    Span::styled("  q / Esc     ", Style::default().fg(theme.browse_accent)),
+                    Span::styled("Quit", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(""),
                 Line::from(vec![Span::styled(
                     "  Legend",
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme.browse_accent)
                         .add_modifier(Modifier::BOLD),
                 )]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("  \u{2713}           ", Style::default().fg(Color::Green)),
+                    Span::styled("  \u{2713}           ", Style::default().fg(theme.success)),
                     Span::styled(
                         "Already installed in your config",
-                        Style::default().fg(Color::White),
+                        Style::default().fg(theme.foreground),
                     ),
                 ]),
             ];
@@ -1208,12 +1220,13 @@ impl BrowseTuiState {
                 popup_h,
             );
             f.render_widget(Clear, popup);
+            f.render_widget(Block::default().style(theme.base_style()), popup);
             f.render_widget(
                 Paragraph::new(help_lines).block(
                     Block::default()
                         .title(" Help [?] ")
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow)),
+                        .border_style(Style::default().fg(theme.browse_accent)),
                 ),
                 popup,
             );
@@ -1224,6 +1237,29 @@ impl BrowseTuiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_browse_background_survives_clears_and_help() {
+        let config = crate::config::parse_config("[options.theme]\nbackground = 52").unwrap();
+        let mut state = BrowseTuiState::new();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 50)).unwrap();
+        for help in [false, true] {
+            state.show_help = help;
+            terminal
+                .draw(|f| state.draw(f, &config.options.theme))
+                .unwrap();
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .all(|cell| cell.bg == ratatui::style::Color::Indexed(52)
+                        || cell.bg == config.options.theme.browse_accent)
+            );
+        }
+    }
 
     fn make_repo(name: &str, stars: u64) -> GitHubRepo {
         GitHubRepo {

@@ -209,7 +209,8 @@ pub(crate) async fn run_list(no_tui: bool) -> Result<bool> {
         // ときだけ描く。無条件 redraw だと 50ms ごとに全 plugin 分の Row を
         // 組み直すことになり、キー入力の処理が後ろに詰まる。
         if dirty {
-            terminal.draw(|f| tui_state.draw_list(f, &config, &icons, &hooks))?;
+            terminal
+                .draw(|f| tui_state.draw_list(f, &config, &icons, &hooks, &config.options.theme))?;
             dirty = false;
         }
 

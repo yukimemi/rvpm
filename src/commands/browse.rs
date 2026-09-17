@@ -11,10 +11,11 @@ pub(crate) async fn run_browse() -> Result<bool> {
             resolve_cache_root(None),
             std::collections::HashSet::<String>::new(),
             None::<Vec<String>>,
+            crate::theme::Theme::default(),
         )
     };
     // `c` ハンドラで options.cache_root が変わった場合も追従できるよう `let mut`。
-    let (mut cache_root, installed, readme_command) = 'resolve: {
+    let (mut cache_root, installed, readme_command, mut theme) = 'resolve: {
         if !config_path.exists() {
             break 'resolve defaults();
         }
@@ -38,7 +39,7 @@ pub(crate) async fn run_browse() -> Result<bool> {
                     .browse
                     .readme_command
                     .filter(|v| !v.is_empty());
-                (cache, set, cmd)
+                (cache, set, cmd, config.options.theme)
             }
             Err(e) => {
                 eprintln!(
@@ -97,7 +98,7 @@ pub(crate) async fn run_browse() -> Result<bool> {
             terminal.clear()?;
             last_readme_scroll = state.readme_scroll;
         }
-        terminal.draw(|f| state.draw(f))?;
+        terminal.draw(|f| state.draw(f, &theme))?;
 
         // README 非同期受信
         if let Ok((full_name, content)) = readme_rx.try_recv()
@@ -226,7 +227,7 @@ pub(crate) async fn run_browse() -> Result<bool> {
                         let query = state.search_input.clone();
                         state.search_input.clear();
                         state.message = Some(format!("Searching '{}'...", query));
-                        terminal.draw(|f| state.draw(f))?;
+                        terminal.draw(|f| state.draw(f, &theme))?;
                         let cache_root_bg = cache_root.clone();
                         let result = tokio::task::spawn_blocking(move || {
                             crate::browse::search_plugins(&cache_root_bg, &query)
@@ -367,6 +368,7 @@ pub(crate) async fn run_browse() -> Result<bool> {
                             // 再 resolve。installed (`✓`) と readme_command も更新。
                             cache_root =
                                 resolve_cache_root(new_config.options.cache_root.as_deref());
+                            theme = new_config.options.theme;
                             state.installed = new_config
                                 .plugins
                                 .iter()
@@ -404,7 +406,7 @@ pub(crate) async fn run_browse() -> Result<bool> {
                 crossterm::event::KeyCode::Char('R') => {
                     crate::browse::clear_search_cache(&cache_root);
                     state.message = Some("Cache cleared. Searching...".to_string());
-                    terminal.draw(|f| state.draw(f))?;
+                    terminal.draw(|f| state.draw(f, &theme))?;
                     let cache_root_bg = cache_root.clone();
                     let result = tokio::task::spawn_blocking(move || {
                         crate::browse::fetch_popular(&cache_root_bg)

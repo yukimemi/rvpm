@@ -29,6 +29,44 @@ behavior and per-command edge cases.
 **Removed commands:**
 - `status` → folded into `list --no-tui` (plain text output is feature-equivalent).
 
+## TUI theme
+
+Set `[options.theme]` in `config.toml` to customize the sync, update, list,
+and browse screens. Omitted fields retain the existing colors; there are no
+named presets. Values accept color names (such as `"cyan"`, `"dark-gray"`, or
+`"reset"`), `"#RRGGBB"`, or integer palette indices from 0 to 255. Invalid
+values warn and fall back independently; unknown fields warn and are ignored.
+
+```toml
+[options.theme]
+foreground = "#cdd6f4"
+background = "#1e1e2e"
+terminal_foreground = "#cdd6f4"
+secondary = "#bac2de"
+muted = "#6c7086"
+success = "#a6e3a1"
+warning = "#f9e2af"
+error = "#f38ba8"
+info = "#89dceb"
+accent = "#cba6f7"
+browse_accent = "#f9e2af"
+selection_background = "#313244"
+inverse = "#1e1e2e"
+header_background = "#1e1e2e"
+```
+
+`foreground` colors primary text; `terminal_foreground` colors otherwise
+unstyled text (default `"reset"`). `secondary` and `muted` color secondary text
+and dimmed labels/borders. Status colors are `success`, `warning`, `error`,
+and `info`; `accent` colors revision/dev labels, while `browse_accent` colors
+browse controls. `inverse` is the foreground on colored badges.
+`background`, `selection_background`, and `header_background` control the
+screen, selected rows, and list header respectively.
+
+This does not change the profile TUI, dialoguer prompts, plain-text output,
+or README renderer syntax colors. In browse, editing the config with `c`
+reloads the theme on return.
+
 ## Checklist when adding CLI flags / subcommands
 
 When you **add, rename, or remove** a subcommand flag (`--prune` / `--ai` / `--no-tui` etc.) or **add a new subcommand**, also keep `lua/rvpm/command.lua` in [rvpm.nvim](https://github.com/yukimemi/rvpm.nvim) in sync. Specifically:

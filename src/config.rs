@@ -50,6 +50,8 @@ pub struct Options {
     /// TUI アイコンスタイル: "nerd" (default), "unicode", "ascii"
     #[serde(default)]
     pub icons: IconStyle,
+    #[serde(default)]
+    pub theme: crate::theme::Theme,
     /// chezmoi 連携を有効にするか。`true` なら rvpm が `config.toml` や
     /// per-plugin hook を書き換えた後に `chezmoi re-add` / `chezmoi add` を
     /// 自動実行して source 側へ同期する。`chezmoi` コマンドが無い環境では
@@ -257,6 +259,7 @@ impl Default for Options {
             concurrency: None,
             cache_root: None,
             icons: IconStyle::default(),
+            theme: crate::theme::Theme::default(),
             chezmoi: false,
             auto_clean: false,
             auto_helptags: default_auto_helptags(),
@@ -881,6 +884,29 @@ pub fn sort_plugins(plugins: &mut Vec<Plugin>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_parses_custom_colors_and_falls_back_per_field() {
+        use ratatui::style::Color;
+        let config = parse_config(
+            r##"
+[options.theme]
+foreground = "#123456"
+selection_background = 42
+error = "light-red"
+success = "not-a-color"
+"##,
+        )
+        .unwrap();
+        assert_eq!(config.options.theme.foreground, Color::Rgb(18, 52, 86));
+        assert_eq!(
+            config.options.theme.selection_background,
+            Color::Indexed(42)
+        );
+        assert_eq!(config.options.theme.error, Color::LightRed);
+        assert_eq!(config.options.theme.success, Color::Green);
+        assert_eq!(config.options.theme.muted, Color::DarkGray);
+    }
 
     #[test]
     fn test_parse_config_accepts_cooldown_global_and_per_plugin() {

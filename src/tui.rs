@@ -105,7 +105,7 @@ impl HookFlags {
     }
 
     /// `I B A` 列の表示テキストと色。
-    fn render(&self, icons: &Icons) -> (String, Color) {
+    fn render(&self, icons: &Icons, theme: &crate::theme::Theme) -> (String, Color) {
         let mark = |on: bool| if on { icons.hook_on } else { icons.hook_off };
         (
             format!(
@@ -115,9 +115,9 @@ impl HookFlags {
                 mark(self.after)
             ),
             if self.any() {
-                Color::Green
+                theme.success
             } else {
-                Color::DarkGray
+                theme.muted
             },
         )
     }
@@ -241,15 +241,15 @@ impl TuiState {
 
     /// progress ratio (0.0..=1.0) から段階的にゲージ色を決める。
     /// 0-25% 赤, -50% 黄, -75% シアン, それ以上は緑。
-    fn progress_color(ratio: f64) -> Color {
+    fn progress_color(ratio: f64, theme: &crate::theme::Theme) -> Color {
         if ratio < 0.25 {
-            Color::Red
+            theme.error
         } else if ratio < 0.5 {
-            Color::Yellow
+            theme.warning
         } else if ratio < 0.75 {
-            Color::Cyan
+            theme.info
         } else {
-            Color::Green
+            theme.success
         }
     }
 
@@ -430,7 +430,14 @@ impl TuiState {
         }
     }
 
-    pub fn draw(&mut self, f: &mut Frame, message: &str, icons: &Icons) {
+    pub fn draw(
+        &mut self,
+        f: &mut Frame,
+        message: &str,
+        icons: &Icons,
+        theme: &crate::theme::Theme,
+    ) {
+        f.render_widget(Block::default().style(theme.base_style()), f.area());
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -463,7 +470,7 @@ impl TuiState {
         } else {
             1.0
         };
-        let gauge_color = Self::progress_color(ratio);
+        let gauge_color = Self::progress_color(ratio, theme);
 
         // "syncing..." を dots animation 付きで、末尾に mm:ss と N in flight を足す。
         let message_trim = message.trim_end_matches(['.', ' ']);
@@ -473,29 +480,29 @@ impl TuiState {
             Span::styled(
                 " rvpm ",
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(theme.inverse)
                     .bg(gauge_color)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("  {}  ", animated_msg),
-                Style::default().fg(Color::Gray),
+                Style::default().fg(theme.secondary),
             ),
             Span::styled(
                 format!("{}", finished_count),
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("/", Style::default().fg(Color::DarkGray)),
+            Span::styled("/", Style::default().fg(theme.muted)),
             Span::styled(
                 format!("{}", self.plugins.len()),
-                Style::default().fg(Color::White),
+                Style::default().fg(theme.foreground),
             ),
             if syncing_count > 0 {
                 Span::styled(
                     format!("  {}{} ", self.spinner_frame(icons.style), syncing_count),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(theme.info),
                 )
             } else {
                 Span::raw("  ")
@@ -503,7 +510,9 @@ impl TuiState {
             if failed_count > 0 {
                 Span::styled(
                     format!(" {}err", failed_count),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.error)
+                        .add_modifier(Modifier::BOLD),
                 )
             } else {
                 Span::raw("")
@@ -511,14 +520,14 @@ impl TuiState {
             Span::styled("   ", Style::default()),
             Span::styled(
                 format!("⏱ {}", self.elapsed_str()),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.muted),
             ),
         ]))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(theme.muted)),
         );
         f.render_widget(title, chunks[0]);
 
@@ -548,44 +557,44 @@ impl TuiState {
                 let (icon, icon_color, url_style, msg, msg_color) = match &status {
                     PluginStatus::Waiting => (
                         icons.waiting,
-                        Color::DarkGray,
-                        Style::default().fg(Color::DarkGray),
+                        theme.muted,
+                        Style::default().fg(theme.muted),
                         "Waiting…".to_string(),
-                        Color::DarkGray,
+                        theme.muted,
                     ),
                     PluginStatus::Syncing(m) => (
                         spinner_char,
-                        Color::Cyan,
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
+                        theme.info,
+                        Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
                         m.clone(),
-                        Color::Cyan,
+                        theme.info,
                     ),
                     PluginStatus::Finished => (
                         icons.finished,
-                        Color::Green,
-                        Style::default().fg(Color::Gray),
+                        theme.success,
+                        Style::default().fg(theme.secondary),
                         "Finished".to_string(),
-                        Color::DarkGray,
+                        theme.muted,
                     ),
                     PluginStatus::Failed(e) => (
                         icons.failed,
-                        Color::Red,
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        theme.error,
+                        Style::default()
+                            .fg(theme.error)
+                            .add_modifier(Modifier::BOLD),
                         e.clone(),
-                        Color::Red,
+                        theme.error,
                     ),
                     // 進捗 TUI (sync/update 実行中) では発生しないが exhaustive
                     // match のため。万一渡っても update 失敗として黄色で見せる。
                     PluginStatus::UpdateFailed(e) => (
                         icons.failed,
-                        Color::Yellow,
+                        theme.warning,
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(theme.warning)
                             .add_modifier(Modifier::BOLD),
                         e.clone(),
-                        Color::Yellow,
+                        theme.warning,
                     ),
                 };
                 Row::new(vec![
@@ -603,13 +612,13 @@ impl TuiState {
         //  - 全 Waiting (ジョブまだ始まってない): DarkGray
         //  - 全 Finished: 緑
         let table_border_color = if failed_count > 0 {
-            Color::Red
+            theme.error
         } else if syncing_count > 0 {
             gauge_color
         } else if done_count == self.plugins.len() && !self.plugins.is_empty() {
-            Color::Green
+            theme.success
         } else {
-            Color::DarkGray
+            theme.muted
         };
         let table = Table::new(
             rows,
@@ -625,12 +634,12 @@ impl TuiState {
                     Span::styled(
                         " Plugins ",
                         Style::default()
-                            .fg(Color::White)
+                            .fg(theme.foreground)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("({} in flight) ", syncing_count),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme.muted),
                     ),
                 ]))
                 .borders(Borders::ALL)
@@ -639,7 +648,7 @@ impl TuiState {
         )
         .row_highlight_style(
             Style::default()
-                .bg(Color::Indexed(237))
+                .bg(theme.selection_background)
                 .add_modifier(Modifier::BOLD),
         );
         f.render_stateful_widget(table, chunks[1], &mut self.table_state);
@@ -664,7 +673,7 @@ impl TuiState {
                 // 矛盾した表示になる。
                 format!("{:>3}%   {}/{}", percent, done_count, self.plugins.len()),
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(theme.inverse)
                     .add_modifier(Modifier::BOLD),
             ))
             .ratio(ratio.clamp(0.0, 1.0));
@@ -681,7 +690,9 @@ impl TuiState {
         // `[ Global hooks ]` sentinel 行を描く (その場合 `tui_state.plugins[0]`
         // は空文字 sentinel で、`selected_url()` が `Some("")` を返す前提)。
         hooks: &HookCache,
+        theme: &crate::theme::Theme,
     ) {
+        f.render_widget(Block::default().style(theme.base_style()), f.area());
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -708,37 +719,40 @@ impl TuiState {
             Span::styled(
                 " rvpm ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(theme.inverse)
+                    .bg(theme.info)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("  {}:", config.plugins.len()),
-                Style::default().fg(Color::White),
+                Style::default().fg(theme.foreground),
             ),
-            Span::styled("total ", Style::default().fg(Color::DarkGray)),
+            Span::styled("total ", Style::default().fg(theme.muted)),
             Span::styled(
                 format!("{}:", eager_count),
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme.success),
             ),
-            Span::styled("eager ", Style::default().fg(Color::DarkGray)),
+            Span::styled("eager ", Style::default().fg(theme.muted)),
             Span::styled(
                 format!("{}:", lazy_count),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme.warning),
             ),
-            Span::styled("lazy ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{}:", error_count), Style::default().fg(Color::Red)),
-            Span::styled("err ", Style::default().fg(Color::DarkGray)),
+            Span::styled("lazy ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{}:", error_count),
+                Style::default().fg(theme.error),
+            ),
+            Span::styled("err ", Style::default().fg(theme.muted)),
             Span::styled(
                 format!("{}:", modified_count),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme.warning),
             ),
-            Span::styled("mod", Style::default().fg(Color::DarkGray)),
+            Span::styled("mod", Style::default().fg(theme.muted)),
         ]))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(theme.muted)),
         );
         f.render_widget(title, chunks[0]);
 
@@ -746,14 +760,11 @@ impl TuiState {
             ["", "Plugin", "Mode", "Merge", "Rev", "I B A", "Detail"]
                 .iter()
                 .map(|h| {
-                    Cell::from(*h).style(
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )
+                    Cell::from(*h)
+                        .style(Style::default().fg(theme.info).add_modifier(Modifier::BOLD))
                 }),
         )
-        .style(Style::default().bg(Color::Black))
+        .style(Style::default().bg(theme.header_background))
         .height(1)
         .bottom_margin(1);
 
@@ -763,20 +774,17 @@ impl TuiState {
             // [ Global hooks ] sentinel 行: per-plugin の I/B/A 表記と揃えて、
             // init.lua は Neovim 本体の path、before/after は <config_root> 配下。
             // 存在チェックは HookCache::scan 済みなので、ここでは stat しない。
-            let (hooks_text, hooks_color) = global.render(icons);
+            let (hooks_text, hooks_color) = global.render(icons, theme);
             rows.push(Row::new(vec![
-                Cell::from(icons.installed).style(Style::default().fg(Color::Cyan)),
-                Cell::from("[ Global hooks ]").style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Cell::from("-").style(Style::default().fg(Color::DarkGray)),
-                Cell::from("-").style(Style::default().fg(Color::DarkGray)),
-                Cell::from("-").style(Style::default().fg(Color::DarkGray)),
+                Cell::from(icons.installed).style(Style::default().fg(theme.info)),
+                Cell::from("[ Global hooks ]")
+                    .style(Style::default().fg(theme.info).add_modifier(Modifier::BOLD)),
+                Cell::from("-").style(Style::default().fg(theme.muted)),
+                Cell::from("-").style(Style::default().fg(theme.muted)),
+                Cell::from("-").style(Style::default().fg(theme.muted)),
                 Cell::from(hooks_text).style(Style::default().fg(hooks_color)),
                 Cell::from("nvim init.lua + global before/after.lua")
-                    .style(Style::default().fg(Color::DarkGray)),
+                    .style(Style::default().fg(theme.muted)),
             ]));
         }
 
@@ -788,17 +796,17 @@ impl TuiState {
                 .cloned()
                 .unwrap_or(PluginStatus::Waiting);
             let (inst_icon, inst_color) = match &install_status {
-                PluginStatus::Finished => (icons.installed, Color::Green),
-                PluginStatus::Failed(m) if m == "Missing" => (icons.missing, Color::Red),
-                PluginStatus::Failed(_) => (icons.failed, Color::Red),
+                PluginStatus::Finished => (icons.installed, theme.success),
+                PluginStatus::Failed(m) if m == "Missing" => (icons.missing, theme.error),
+                PluginStatus::Failed(_) => (icons.failed, theme.error),
                 // update 失敗マーカー: clone は健全なので赤 [Error] とは別に、
                 // 黄色い failed アイコンで「前回 update がコケた」ことを示す。
-                PluginStatus::UpdateFailed(_) => (icons.failed, Color::Yellow),
+                PluginStatus::UpdateFailed(_) => (icons.failed, theme.warning),
                 PluginStatus::Syncing(m) if m.contains("Modified") => {
-                    (icons.modified, Color::Yellow)
+                    (icons.modified, theme.warning)
                 }
-                PluginStatus::Syncing(_) => (icons.syncing, Color::Cyan),
-                PluginStatus::Waiting => (icons.waiting, Color::DarkGray),
+                PluginStatus::Syncing(_) => (icons.syncing, theme.info),
+                PluginStatus::Waiting => (icons.waiting, theme.muted),
             };
 
             // 詳細列: エラー/変更時はその内容、正常時はトリガー情報
@@ -823,25 +831,25 @@ impl TuiState {
                     if p.cond.is_some() {
                         trg.push("cond".to_string());
                     }
-                    (trg.join(" "), Color::DarkGray)
+                    (trg.join(" "), theme.muted)
                 }
-                PluginStatus::Failed(msg) => (msg.clone(), Color::Red),
-                PluginStatus::UpdateFailed(msg) => (format!("update failed: {msg}"), Color::Yellow),
-                PluginStatus::Syncing(msg) => (msg.clone(), Color::Yellow),
-                PluginStatus::Waiting => ("Checking...".to_string(), Color::DarkGray),
+                PluginStatus::Failed(msg) => (msg.clone(), theme.error),
+                PluginStatus::UpdateFailed(msg) => (format!("update failed: {msg}"), theme.warning),
+                PluginStatus::Syncing(msg) => (msg.clone(), theme.warning),
+                PluginStatus::Waiting => ("Checking...".to_string(), theme.muted),
             };
 
             let mode = if p.dev {
-                ("Dev", Color::Magenta)
+                ("Dev", theme.accent)
             } else if p.lazy {
-                ("Lazy", Color::Yellow)
+                ("Lazy", theme.warning)
             } else {
-                ("Eager", Color::Green)
+                ("Eager", theme.success)
             };
             let merged = if p.merge {
-                (icons.installed, Color::Cyan)
+                (icons.installed, theme.info)
             } else {
-                ("-", Color::DarkGray)
+                ("-", theme.muted)
             };
             let rev = p.rev.as_deref().unwrap_or("-");
 
@@ -853,14 +861,14 @@ impl TuiState {
                 .get(idx)
                 .copied()
                 .unwrap_or_default()
-                .render(icons);
+                .render(icons, theme);
 
             Row::new(vec![
                 Cell::from(inst_icon).style(Style::default().fg(inst_color)),
-                Cell::from(p.display_name()).style(Style::default().fg(Color::White)),
+                Cell::from(p.display_name()).style(Style::default().fg(theme.foreground)),
                 Cell::from(mode.0).style(Style::default().fg(mode.1)),
                 Cell::from(merged.0).style(Style::default().fg(merged.1)),
-                Cell::from(rev).style(Style::default().fg(Color::Magenta)),
+                Cell::from(rev).style(Style::default().fg(theme.accent)),
                 Cell::from(hooks_text).style(Style::default().fg(hooks_color)),
                 Cell::from(detail_text).style(Style::default().fg(detail_color)),
             ])
@@ -899,11 +907,11 @@ impl TuiState {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(theme.info)),
         )
         .row_highlight_style(
             Style::default()
-                .bg(Color::Indexed(237)) // #3a3a3a — 落ち着いたダークグレー
+                .bg(theme.selection_background) // #3a3a3a — 落ち着いたダークグレー
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("\u{25b8} "); // ▸
@@ -925,46 +933,44 @@ impl TuiState {
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     "/",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(&self.search_input, Style::default().fg(Color::White)),
+                Span::styled(&self.search_input, Style::default().fg(theme.foreground)),
                 Span::styled(
                     "\u{2588}", // █ カーソル
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(theme.info),
                 ),
-                Span::styled(match_info, Style::default().fg(Color::DarkGray)),
+                Span::styled(match_info, Style::default().fg(theme.muted)),
             ]))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(theme.info)),
             )
         } else {
             Paragraph::new(Line::from(vec![
-                Span::styled(" b", Style::default().fg(Color::Cyan)),
-                Span::styled(":browse ", Style::default().fg(Color::DarkGray)),
-                Span::styled("c", Style::default().fg(Color::Cyan)),
-                Span::styled(":config ", Style::default().fg(Color::DarkGray)),
-                Span::styled("e", Style::default().fg(Color::Cyan)),
-                Span::styled(":edit ", Style::default().fg(Color::DarkGray)),
-                Span::styled("s", Style::default().fg(Color::Cyan)),
-                Span::styled(":set ", Style::default().fg(Color::DarkGray)),
-                Span::styled("t", Style::default().fg(Color::Cyan)),
-                Span::styled(":tune ", Style::default().fg(Color::DarkGray)),
-                Span::styled("S", Style::default().fg(Color::Cyan)),
-                Span::styled(":sync ", Style::default().fg(Color::DarkGray)),
-                Span::styled("u/U", Style::default().fg(Color::Cyan)),
-                Span::styled(":update ", Style::default().fg(Color::DarkGray)),
-                Span::styled("d", Style::default().fg(Color::Cyan)),
-                Span::styled(":delete ", Style::default().fg(Color::DarkGray)),
-                Span::styled("/", Style::default().fg(Color::Cyan)),
-                Span::styled(":search ", Style::default().fg(Color::DarkGray)),
-                Span::styled("?", Style::default().fg(Color::Cyan)),
-                Span::styled(":help ", Style::default().fg(Color::DarkGray)),
-                Span::styled("q", Style::default().fg(Color::Cyan)),
-                Span::styled(":quit", Style::default().fg(Color::DarkGray)),
+                Span::styled(" b", Style::default().fg(theme.info)),
+                Span::styled(":browse ", Style::default().fg(theme.muted)),
+                Span::styled("c", Style::default().fg(theme.info)),
+                Span::styled(":config ", Style::default().fg(theme.muted)),
+                Span::styled("e", Style::default().fg(theme.info)),
+                Span::styled(":edit ", Style::default().fg(theme.muted)),
+                Span::styled("s", Style::default().fg(theme.info)),
+                Span::styled(":set ", Style::default().fg(theme.muted)),
+                Span::styled("t", Style::default().fg(theme.info)),
+                Span::styled(":tune ", Style::default().fg(theme.muted)),
+                Span::styled("S", Style::default().fg(theme.info)),
+                Span::styled(":sync ", Style::default().fg(theme.muted)),
+                Span::styled("u/U", Style::default().fg(theme.info)),
+                Span::styled(":update ", Style::default().fg(theme.muted)),
+                Span::styled("d", Style::default().fg(theme.info)),
+                Span::styled(":delete ", Style::default().fg(theme.muted)),
+                Span::styled("/", Style::default().fg(theme.info)),
+                Span::styled(":search ", Style::default().fg(theme.muted)),
+                Span::styled("?", Style::default().fg(theme.info)),
+                Span::styled(":help ", Style::default().fg(theme.muted)),
+                Span::styled("q", Style::default().fg(theme.info)),
+                Span::styled(":quit", Style::default().fg(theme.muted)),
             ]))
             .block(Block::default().borders(Borders::ALL))
         };
@@ -975,81 +981,86 @@ impl TuiState {
             let help_lines = vec![
                 Line::from(vec![Span::styled(
                     "  Navigation",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
                 )]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("  j / k       ", Style::default().fg(Color::Cyan)),
-                    Span::styled("Move down / up", Style::default().fg(Color::White)),
+                    Span::styled("  j / k       ", Style::default().fg(theme.info)),
+                    Span::styled("Move down / up", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  g / G       ", Style::default().fg(Color::Cyan)),
-                    Span::styled("Go to top / bottom", Style::default().fg(Color::White)),
+                    Span::styled("  g / G       ", Style::default().fg(theme.info)),
+                    Span::styled("Go to top / bottom", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  C-d / C-u   ", Style::default().fg(Color::Cyan)),
-                    Span::styled("Half page down / up", Style::default().fg(Color::White)),
+                    Span::styled("  C-d / C-u   ", Style::default().fg(theme.info)),
+                    Span::styled("Half page down / up", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  C-f / C-b   ", Style::default().fg(Color::Cyan)),
-                    Span::styled("Full page down / up", Style::default().fg(Color::White)),
+                    Span::styled("  C-f / C-b   ", Style::default().fg(theme.info)),
+                    Span::styled("Full page down / up", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  / n N       ", Style::default().fg(Color::Cyan)),
-                    Span::styled("Search / next / prev", Style::default().fg(Color::White)),
+                    Span::styled("  / n N       ", Style::default().fg(theme.info)),
+                    Span::styled(
+                        "Search / next / prev",
+                        Style::default().fg(theme.foreground),
+                    ),
                 ]),
                 Line::from(""),
                 Line::from(vec![Span::styled(
                     "  Actions",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.info).add_modifier(Modifier::BOLD),
                 )]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("  b           ", Style::default().fg(Color::Cyan)),
-                    Span::styled("Switch to browse TUI", Style::default().fg(Color::White)),
-                ]),
-                Line::from(vec![
-                    Span::styled("  c           ", Style::default().fg(Color::Cyan)),
-                    Span::styled("Open config.toml", Style::default().fg(Color::White)),
-                ]),
-                Line::from(vec![
-                    Span::styled("  e           ", Style::default().fg(Color::Cyan)),
-                    Span::styled("Edit hooks", Style::default().fg(Color::White)),
-                ]),
-                Line::from(vec![
-                    Span::styled("  s           ", Style::default().fg(Color::Cyan)),
-                    Span::styled("Set plugin options", Style::default().fg(Color::White)),
-                ]),
-                Line::from(vec![
-                    Span::styled("  t           ", Style::default().fg(Color::Cyan)),
+                    Span::styled("  b           ", Style::default().fg(theme.info)),
                     Span::styled(
-                        "Tune (AI refine selected)",
-                        Style::default().fg(Color::White),
+                        "Switch to browse TUI",
+                        Style::default().fg(theme.foreground),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("  S           ", Style::default().fg(Color::Cyan)),
-                    Span::styled("Sync all", Style::default().fg(Color::White)),
+                    Span::styled("  c           ", Style::default().fg(theme.info)),
+                    Span::styled("Open config.toml", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  R           ", Style::default().fg(Color::Cyan)),
-                    Span::styled("Sync all (rebuild)", Style::default().fg(Color::White)),
+                    Span::styled("  e           ", Style::default().fg(theme.info)),
+                    Span::styled("Edit hooks", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  u / U       ", Style::default().fg(Color::Cyan)),
-                    Span::styled("Update selected / all", Style::default().fg(Color::White)),
+                    Span::styled("  s           ", Style::default().fg(theme.info)),
+                    Span::styled("Set plugin options", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  d           ", Style::default().fg(Color::Cyan)),
-                    Span::styled("Delete selected", Style::default().fg(Color::White)),
+                    Span::styled("  t           ", Style::default().fg(theme.info)),
+                    Span::styled(
+                        "Tune (AI refine selected)",
+                        Style::default().fg(theme.foreground),
+                    ),
                 ]),
                 Line::from(vec![
-                    Span::styled("  q / Esc     ", Style::default().fg(Color::Cyan)),
-                    Span::styled("Quit", Style::default().fg(Color::White)),
+                    Span::styled("  S           ", Style::default().fg(theme.info)),
+                    Span::styled("Sync all", Style::default().fg(theme.foreground)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  R           ", Style::default().fg(theme.info)),
+                    Span::styled("Sync all (rebuild)", Style::default().fg(theme.foreground)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  u / U       ", Style::default().fg(theme.info)),
+                    Span::styled(
+                        "Update selected / all",
+                        Style::default().fg(theme.foreground),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  d           ", Style::default().fg(theme.info)),
+                    Span::styled("Delete selected", Style::default().fg(theme.foreground)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  q / Esc     ", Style::default().fg(theme.info)),
+                    Span::styled("Quit", Style::default().fg(theme.foreground)),
                 ]),
             ];
 
@@ -1065,12 +1076,13 @@ impl TuiState {
             );
 
             f.render_widget(Clear, popup);
+            f.render_widget(Block::default().style(theme.base_style()), popup);
             f.render_widget(
                 Paragraph::new(help_lines).block(
                     Block::default()
                         .title(" Help [?] ")
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)),
+                        .border_style(Style::default().fg(theme.info)),
                 ),
                 popup,
             );
@@ -1081,6 +1093,69 @@ impl TuiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_sync_and_list_render_custom_statuses_and_selection() {
+        let config = crate::config::parse_config("[options.theme]\nsuccess = 101\nerror = 102\nwarning = 103\ninfo = 104\nmuted = 105\nselection_background = 106\nbackground = 107\n[[plugins]]\nurl = 'owner/plugin'").unwrap();
+        let theme = config.options.theme;
+        let icons = Icons::from_style(crate::config::IconStyle::Ascii);
+        let hooks = HookCache {
+            global: None,
+            plugins: vec![HookFlags::default()],
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+        let mut state = TuiState::new(vec!["owner/plugin".into()]);
+        for (status, color) in [
+            (PluginStatus::Waiting, theme.muted),
+            (PluginStatus::Syncing("Fetching".into()), theme.info),
+            (PluginStatus::Finished, theme.success),
+            (PluginStatus::Failed("Failed".into()), theme.error),
+            (
+                PluginStatus::UpdateFailed("Update failed".into()),
+                theme.warning,
+            ),
+        ] {
+            state.update_status("owner/plugin", status);
+            terminal
+                .draw(|f| state.draw(f, "syncing", &icons, &theme))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(2, 4)].fg, color);
+            assert_eq!(buffer[(2, 4)].bg, theme.selection_background);
+            terminal
+                .draw(|f| state.draw_list(f, &config, &icons, &hooks, &theme))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(3, 6)].fg, color);
+            assert_eq!(buffer[(3, 6)].bg, theme.selection_background);
+        }
+        state.start_search();
+        state.search_type('p');
+        state.show_help = true;
+        terminal
+            .draw(|f| state.draw_list(f, &config, &icons, &hooks, &theme))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(50, 20)].bg, theme.background);
+    }
+
+    #[test]
+    fn theme_list_header_uses_configured_background() {
+        let config =
+            crate::config::parse_config("[options.theme]\nheader_background = 52").unwrap();
+        let mut state = TuiState::new(Vec::new());
+        let icons = Icons::from_style(crate::config::IconStyle::Ascii);
+        let hooks = HookCache {
+            global: None,
+            plugins: Vec::new(),
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|f| state.draw_list(f, &config, &icons, &hooks, &config.options.theme))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(5, 4)].bg, Color::Indexed(52));
+    }
 
     #[test]
     fn test_tui_state_update() {
@@ -1102,14 +1177,15 @@ mod tests {
 
     #[test]
     fn test_progress_color_buckets() {
-        assert_eq!(TuiState::progress_color(0.0), Color::Red);
-        assert_eq!(TuiState::progress_color(0.24), Color::Red);
-        assert_eq!(TuiState::progress_color(0.25), Color::Yellow);
-        assert_eq!(TuiState::progress_color(0.49), Color::Yellow);
-        assert_eq!(TuiState::progress_color(0.5), Color::Cyan);
-        assert_eq!(TuiState::progress_color(0.74), Color::Cyan);
-        assert_eq!(TuiState::progress_color(0.75), Color::Green);
-        assert_eq!(TuiState::progress_color(1.0), Color::Green);
+        let theme = crate::theme::Theme::default();
+        assert_eq!(TuiState::progress_color(0.0, &theme), theme.error);
+        assert_eq!(TuiState::progress_color(0.24, &theme), theme.error);
+        assert_eq!(TuiState::progress_color(0.25, &theme), theme.warning);
+        assert_eq!(TuiState::progress_color(0.49, &theme), theme.warning);
+        assert_eq!(TuiState::progress_color(0.5, &theme), theme.info);
+        assert_eq!(TuiState::progress_color(0.74, &theme), theme.info);
+        assert_eq!(TuiState::progress_color(0.75, &theme), theme.success);
+        assert_eq!(TuiState::progress_color(1.0, &theme), theme.success);
     }
 
     #[test]
