@@ -1,0 +1,95 @@
+# magi competing on the rvpm repository.
+#
+# **Only what is peculiar to this checkout lives here.** The roster, the seat
+# assignment, the shape of a run and the update policy live at the machine
+# layer (`<config_dir>/magi/config.toml`), because none of them are facts
+# about this repository: they are facts about which agent CLIs are installed
+# and what the operator is willing to spend. Stating them once there is the
+# point of having layers, and it keeps this file to the things a different
+# machine would still need to be told.
+#
+# What that leaves, and why each one has to be here:
+#
+# - `[verify]` runs `cargo`. The machine layer doesn't know this checkout is
+#   a Rust crate, let alone which commands verify it.
+# - `[merge] base` names this repository's branch, and is required at all
+#   because of how this checkout is set up (see below). `mode` overrides the
+#   machine layer's default for this repository specifically.
+# - `[prompts]` are this project's conventions.
+#
+# Note that an array may be declared in exactly one layer
+# (`Config::refuse_split_arrays`), so `[verify]`'s arrays being here is also
+# why the roster's arrays are *only* over there.
+#
+# Rendered by teravars. Tera braces are live everywhere in this file, but
+# comments are stripped before Tera sees them (teravars >= 0.2.2), so a
+# comment may quote `{{ ... }}` freely.
+
+[vars]
+# Shared build cache for the verification commands. Override per machine with
+# MAGI_CACHE. Lives beside its only consumer: `[vars]` is rendered per file,
+# so a value used by this file's templates is stated in this file.
+cache = "{{ env.MAGI_CACHE | default(value='/tmp') }}"
+
+[verify]
+# The real-machine leg, run in the winner's worktree once per review round.
+#
+# CARGO_TARGET_DIR is shared on purpose: each candidate worktree would
+# otherwise compile this crate from scratch, which is by far the slowest
+# thing in a review round on a Rust repo. Only the winner's worktree runs
+# these commands, and only one at a time, so nothing contends on cargo's
+# lock.
+e2e = ["CARGO_TARGET_DIR={{ vars.cache }}/rvpm-target cargo test --locked --all-targets"]
+# Must match what `.github/workflows/ci.yml` runs, or a clean run here can
+# still redden the PR — the one failure mode this whole setup can't absorb.
+#
+# `Makefile.toml`'s `[tasks.check]` already claims to be "same as CI" and
+# lists its dependencies as editorconfig-check + fmt-check + clippy + test +
+# lock-check, so `cargo make check` is used here rather than re-listing
+# cargo invocations by hand. Checked against ci.yml's jobs when this file was
+# written:
+#   - fmt-check           <-> fmt job (cargo fmt --all -- --check, identical)
+#   - clippy               <-> clippy job (Makefile adds --locked, strictly
+#                               stricter than CI's unlocked run)
+#   - test (+ test-doc)   <-> test job (same --all-targets run, plus the same
+#                               `src/lib.rs`-gated --doc step; Makefile again
+#                               adds --locked)
+#   - lock-check           <-> covers both the `check` job (cargo check
+#                               --all-targets) and the `lockfile` job (cargo
+#                               check --locked --all-targets) — the locked
+#                               variant is a strict superset of the unlocked
+#                               one, so one task covers both jobs
+#   - editorconfig-check   <-> editorconfig job. Present on both sides, which
+#                               is the state to check for: Makefile's task
+#                               only *enforces* it locally when the
+#                               `editorconfig-checker` binary is on PATH
+#                               (skips with a warning otherwise), but CI's
+#                               dedicated job always enforces it, so nothing
+#                               tracked by CI goes unchecked by the gate.
+# CI's `coverage` job (cargo llvm-cov + Codecov upload) is deliberately left
+# out: it doesn't gate merges in CI either (`fail_ci_if_error: false`), so
+# failing the magi gate over it would block a clean run on something that
+# was never going to redden the PR in the first place.
+gate = ["CARGO_TARGET_DIR={{ vars.cache }}/rvpm-target cargo make check"]
+
+[merge]
+# `base` is set explicitly because this is a jj-colocated checkout: jj keeps
+# git's HEAD detached at the working-copy commit, so the `git symbolic-ref
+# HEAD` fallback magi would otherwise use to infer the base branch fails
+# here.
+base = "main"
+# Overrides the machine layer's default (`mode = "pr"`): this repository
+# stays on manual landing, so `magi review` only verifies and reports — it
+# never pushes a branch or opens a PR by itself.
+mode = "none"
+
+# Project conventions appended to the node prompts, never merged into them.
+# Repository-wide context lives in AGENTS.md, which every agent already
+# reads from the checkout; this is the one thing specific to how a magi
+# *node*'s worktree sits inside this checkout.
+[prompts]
+all = """
+This repository uses jj (Jujutsu) with a colocated git repo. `git commit` works \
+in a candidate worktree and is what magi expects, but never run `jj` commands \
+and never touch the main working copy.
+"""
