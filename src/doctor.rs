@@ -1476,6 +1476,7 @@ mod tests {
                 concurrency: None,
                 cache_root: None,
                 icons: IconStyle::Unicode,
+                theme: crate::theme::Theme::default(),
                 chezmoi: false,
                 auto_clean: false,
                 auto_helptags: false,

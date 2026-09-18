@@ -22,6 +22,7 @@ mod plugin_scan;
 mod profile;
 mod profile_tui;
 mod self_update;
+mod theme;
 mod tui;
 mod update_errors;
 mod update_log;

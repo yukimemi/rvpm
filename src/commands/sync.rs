@@ -533,7 +533,7 @@ pub(crate) async fn run_sync(
     let total_tasks = config.plugins.len() - dev_count;
 
     while finished_tasks < total_tasks {
-        terminal.draw(|f| tui_state.draw(f, "syncing...", &icons))?;
+        terminal.draw(|f| tui_state.draw(f, "syncing...", &icons, &config.options.theme))?;
 
         // sync/update 中のイベントキューを drain してスクロール操作を受け付ける
         while crossterm::event::poll(std::time::Duration::from_millis(0))? {
@@ -688,7 +688,7 @@ pub(crate) async fn run_sync(
     // 両方が一括で消える。
     prune_stale_views(&views_dir, &expected_views);
 
-    terminal.draw(|f| tui_state.draw(f, "syncing...", &icons))?;
+    terminal.draw(|f| tui_state.draw(f, "syncing...", &icons, &config.options.theme))?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     // TUI cleanup — 各ステップが失敗しても次を続行してターミナルを確実に復元する
     let _ = disable_raw_mode();
