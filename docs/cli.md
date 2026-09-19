@@ -32,12 +32,10 @@ behavior and per-command edge cases.
 ## TUI theme
 
 Set `[options.theme]` in `config.toml` to customize the sync, update, list,
-and browse screens. Omitted fields retain the existing colors; rvpm has no
-built-in preset selector (no `theme_preset = "..."` key) — copy one of the
-blocks below into `[options.theme]` instead. Values accept color names (such
-as `"cyan"`, `"dark-gray"`, or `"reset"`), `"#RRGGBB"`, or integer palette
-indices from 0 to 255. Invalid values warn and fall back independently;
-unknown fields warn and are ignored.
+and browse screens. Omitted fields retain the existing colors. Values accept
+color names (such as `"cyan"`, `"dark-gray"`, or `"reset"`), `"#RRGGBB"`, or
+integer palette indices from 0 to 255. Invalid values warn and fall back
+independently; unknown fields warn and are ignored.
 
 ### Copy-paste presets
 
@@ -144,6 +142,39 @@ inverse = "#282a36"
 header_background = "#282a36"
 ```
 
+### Named presets & the `T` picker
+
+Beyond copy-pasting, `rvpm list` has an interactive picker: press `T` to open
+a live-preview list of theme presets, move with `j`/`k` (the whole TUI
+recolors immediately as you move — nothing is written yet), `Enter` to apply
+the highlighted preset, or `Esc` to close without changing anything.
+
+Applying a preset overwrites `[options.theme]` in `config.toml` wholesale
+(all 14 fields, so any colors you hand-tuned there are gone and there is no
+in-app undo), which is why `Enter` does not write straight away: the first
+`Enter` shows `Overwrite [options.theme] with '<name>'?` and only a second
+`Enter` (or `y`) actually writes. `Esc`/`n` backs out of that prompt and
+leaves you in the picker, and moving with `j`/`k` cancels it too. The applied
+preset name is also recorded in `options.theme_preset` (purely informational
+— it only pre-selects that row the next time you open the picker; the actual
+colors always come from `[options.theme]`).
+
+The picker lists the five built-in presets above plus any custom ones you
+define under `[options.theme_presets.<name>]` — same field syntax as
+`[options.theme]` itself:
+
+```toml
+[options.theme_presets.office]
+foreground = "#e0e0e0"
+background = "#101418"
+accent = "#7aa2f7"
+# omitted fields fall back to the built-in defaults, same as [options.theme]
+```
+
+A custom preset with the same name as a built-in one (e.g.
+`[options.theme_presets.nord]`) takes precedence over the built-in in the
+picker.
+
 ### Field reference
 
 `foreground` colors primary text; `terminal_foreground` colors otherwise
@@ -155,8 +186,9 @@ browse controls. `inverse` is the foreground on colored badges.
 screen, selected rows, and list header respectively.
 
 This does not change the profile TUI, dialoguer prompts, plain-text output,
-or README renderer syntax colors. In browse, editing the config with `c`
-reloads the theme on return.
+or README renderer syntax colors. The `T` picker lives in `rvpm list` only;
+`sync` / `update` / `browse` pick up a change on their next launch (browse
+also reloads on returning from `c`).
 
 ## Checklist when adding CLI flags / subcommands
 

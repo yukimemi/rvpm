@@ -3,7 +3,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, TableState},
+    widgets::{
+        Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row,
+        Table, TableState,
+    },
 };
 use std::collections::HashMap;
 use std::time::Instant;
@@ -165,6 +168,74 @@ impl HookCache {
     }
 }
 
+/// `rvpm list` の theme picker (`T` キー) が保持する選択状態。
+/// `presets` は `Config::options.theme_preset_list()` の結果 (組み込み +
+/// custom をマージ済み、アルファベット順) をそのまま持つ。
+pub struct ThemePickerState {
+    /// `(name, theme, is_custom)`。
+    pub presets: Vec<(String, crate::theme::Theme, bool)>,
+    pub selected: usize,
+    /// Enter が 1 度押されて確認待ちになっている状態。preset 適用は
+    /// `[options.theme]` の 14 field を丸ごと捨てる破壊的な書き込みで、
+    /// 手書きした色を戻す手段がアプリ内に無い (しかも初回は `theme_preset`
+    /// 未設定なので選択行は一覧の先頭 = ユーザーの現在の色とは無関係)。
+    /// `run_remove` が `dialoguer::Confirm` を挟むのと同じ理由で、実際に
+    /// 書き込むのは確認待ち中の 2 度目の Enter (または `y`) だけにする。
+    pub confirming: bool,
+}
+
+impl ThemePickerState {
+    /// `active_name` が `presets` に見つかればその行を初期選択にする
+    /// (前回 picker で適用した preset を再度開いたときにハイライトされる)。
+    /// 見つからなければ先頭 (0) を選択。
+    pub fn new(
+        presets: Vec<(String, crate::theme::Theme, bool)>,
+        active_name: Option<&str>,
+    ) -> Self {
+        let selected = active_name
+            .and_then(|name| presets.iter().position(|(n, _, _)| n == name))
+            .unwrap_or(0);
+        Self {
+            presets,
+            selected,
+            confirming: false,
+        }
+    }
+
+    /// 選択を動かしたら確認待ちは必ず解除する (確認プロンプトに出ている
+    /// preset 名と、実際に書き込まれる preset がズレないように)。
+    pub fn next(&mut self) {
+        self.confirming = false;
+        if !self.presets.is_empty() {
+            self.selected = (self.selected + 1) % self.presets.len();
+        }
+    }
+
+    pub fn previous(&mut self) {
+        self.confirming = false;
+        if !self.presets.is_empty() {
+            self.selected = (self.selected + self.presets.len() - 1) % self.presets.len();
+        }
+    }
+
+    /// Enter 1 度目: 選択中 preset の適用を確認待ちにする。選択できる行が
+    /// 無ければ (preset 0 件) 確認するものも無いので何もしない。
+    pub fn request_confirm(&mut self) {
+        if !self.presets.is_empty() {
+            self.confirming = true;
+        }
+    }
+
+    /// 確認待ちを取り消す (picker 自体は開いたまま)。
+    pub fn cancel_confirm(&mut self) {
+        self.confirming = false;
+    }
+
+    pub fn current(&self) -> Option<&(String, crate::theme::Theme, bool)> {
+        self.presets.get(self.selected)
+    }
+}
+
 pub struct TuiState {
     pub plugins: Vec<String>,
     pub status_map: HashMap<String, PluginStatus>,
@@ -183,6 +254,10 @@ pub struct TuiState {
     pub show_help: bool,
     /// TUI 起動時刻。Syncing スピナーや経過時間表示の基準にする。
     pub started_at: Instant,
+    /// `T` キーで開く theme picker のモーダル状態。`Some` の間は j/k で
+    /// プリセットをライブプレビューしながら選び、Enter で確定・config.toml へ
+    /// 永続化、Esc でキャンセル (config は無変更)。
+    pub theme_picker: Option<ThemePickerState>,
 }
 
 impl TuiState {
@@ -206,6 +281,7 @@ impl TuiState {
             search_input: String::new(),
             show_help: false,
             started_at: Instant::now(),
+            theme_picker: None,
         }
     }
 
@@ -692,6 +768,17 @@ impl TuiState {
         hooks: &HookCache,
         theme: &crate::theme::Theme,
     ) {
+        // theme picker が開いている間は、選択中の行の色でフレーム全体を
+        // ライブプレビューする (Enter で確定するまで config.toml も
+        // `config.options.theme` も一切変更しない)。
+        let picker_preview_theme;
+        let theme: &crate::theme::Theme = match &self.theme_picker {
+            Some(picker) => {
+                picker_preview_theme = picker.current().map(|(_, t, _)| *t).unwrap_or(*theme);
+                &picker_preview_theme
+            }
+            None => theme,
+        };
         f.render_widget(Block::default().style(theme.base_style()), f.area());
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -959,6 +1046,8 @@ impl TuiState {
                 Span::styled(":set ", Style::default().fg(theme.muted)),
                 Span::styled("t", Style::default().fg(theme.info)),
                 Span::styled(":tune ", Style::default().fg(theme.muted)),
+                Span::styled("T", Style::default().fg(theme.info)),
+                Span::styled(":theme ", Style::default().fg(theme.muted)),
                 Span::styled("S", Style::default().fg(theme.info)),
                 Span::styled(":sync ", Style::default().fg(theme.muted)),
                 Span::styled("u/U", Style::default().fg(theme.info)),
@@ -1040,6 +1129,13 @@ impl TuiState {
                     ),
                 ]),
                 Line::from(vec![
+                    Span::styled("  T           ", Style::default().fg(theme.info)),
+                    Span::styled(
+                        "Pick theme preset (live preview)",
+                        Style::default().fg(theme.foreground),
+                    ),
+                ]),
+                Line::from(vec![
                     Span::styled("  S           ", Style::default().fg(theme.info)),
                     Span::styled("Sync all", Style::default().fg(theme.foreground)),
                 ]),
@@ -1086,6 +1182,94 @@ impl TuiState {
                 ),
                 popup,
             );
+        }
+
+        // ── Theme picker overlay ──
+        // アクティブなプリセットのライブプレビューは関数冒頭で `theme` を
+        // 差し替え済みなので、ここでは一覧のオーバーレイを描くだけでよい。
+        if let Some(picker) = &self.theme_picker {
+            let items: Vec<ListItem> = picker
+                .presets
+                .iter()
+                .enumerate()
+                .map(|(i, (name, _, is_custom))| {
+                    let label = if *is_custom {
+                        format!("{name} (custom)")
+                    } else {
+                        name.clone()
+                    };
+                    let style = if i == picker.selected {
+                        Style::default()
+                            .fg(theme.foreground)
+                            .bg(theme.selection_background)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.foreground)
+                    };
+                    ListItem::new(format!(" {label}")).style(style)
+                })
+                .collect();
+
+            let area = f.area();
+            let popup_w = 40u16.min(area.width.saturating_sub(4));
+            let popup_h = (picker.presets.len() as u16 + 4).min(area.height.saturating_sub(4));
+            let popup = Rect::new(
+                (area.width.saturating_sub(popup_w)) / 2,
+                (area.height.saturating_sub(popup_h)) / 2,
+                popup_w,
+                popup_h,
+            );
+
+            f.render_widget(Clear, popup);
+            f.render_widget(Block::default().style(theme.base_style()), popup);
+            let (title, border) = if picker.confirming {
+                (" Theme [T] — confirm ", theme.warning)
+            } else {
+                (" Theme [T] ", theme.info)
+            };
+            let mut list_state = ListState::default().with_selected(Some(picker.selected));
+            f.render_stateful_widget(
+                List::new(items).block(
+                    Block::default()
+                        .title(title)
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(border)),
+                ),
+                popup,
+                &mut list_state,
+            );
+            let hint_y = (popup.y + popup.height).min(area.height.saturating_sub(1));
+            if picker.confirming {
+                // 確認プロンプトは popup 幅 (40) に収まらないので frame 全幅を
+                // 使う。書き込む対象 (`[options.theme]`) と preset 名を明示して、
+                // 「今の色が丸ごと消える」ことが読めるようにする。
+                let name = picker.current().map(|(n, _, _)| n.as_str()).unwrap_or("");
+                let hint_area = Rect::new(0, hint_y, area.width, 1);
+                f.render_widget(Clear, hint_area);
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            format!(" Overwrite [options.theme] with '{name}'? "),
+                            Style::default().fg(theme.warning),
+                        ),
+                        Span::styled(
+                            "Enter/y:apply  Esc/n:cancel",
+                            Style::default().fg(theme.muted),
+                        ),
+                    ]))
+                    .style(theme.base_style()),
+                    hint_area,
+                );
+            } else {
+                let hint_area = Rect::new(popup.x, hint_y, popup.width, 1);
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![Span::styled(
+                        " j/k:preview  Enter:apply  Esc:cancel",
+                        Style::default().fg(theme.muted),
+                    )])),
+                    hint_area,
+                );
+            }
         }
     }
 }
@@ -1155,6 +1339,252 @@ mod tests {
             .draw(|f| state.draw_list(f, &config, &icons, &hooks, &config.options.theme))
             .unwrap();
         assert_eq!(terminal.backend().buffer()[(5, 4)].bg, Color::Indexed(52));
+    }
+
+    #[test]
+    fn theme_picker_state_new_selects_active_name_or_falls_back_to_first() {
+        let presets = vec![
+            ("dracula".to_string(), crate::theme::Theme::default(), false),
+            ("nord".to_string(), crate::theme::Theme::default(), false),
+        ];
+        let picker = ThemePickerState::new(presets.clone(), Some("nord"));
+        assert_eq!(picker.selected, 1);
+        assert_eq!(picker.current().unwrap().0, "nord");
+
+        let picker = ThemePickerState::new(presets.clone(), Some("not-listed"));
+        assert_eq!(
+            picker.selected, 0,
+            "unknown active name falls back to first"
+        );
+
+        let picker = ThemePickerState::new(presets, None);
+        assert_eq!(picker.selected, 0);
+        assert!(
+            !picker.confirming,
+            "a freshly opened picker must not be armed to overwrite [options.theme]"
+        );
+    }
+
+    #[test]
+    fn theme_picker_confirm_must_be_armed_before_applying_and_navigation_disarms_it() {
+        let presets = vec![
+            ("a".to_string(), crate::theme::Theme::default(), false),
+            ("b".to_string(), crate::theme::Theme::default(), false),
+        ];
+        let mut picker = ThemePickerState::new(presets, None);
+
+        picker.request_confirm();
+        assert!(picker.confirming, "Enter arms the overwrite confirmation");
+
+        picker.cancel_confirm();
+        assert!(!picker.confirming, "Esc / n backs out of the confirmation");
+
+        // 確認中に選択を動かしたら解除される — プロンプトに出ていた preset と
+        // 別の preset が書き込まれるのを防ぐため。
+        picker.request_confirm();
+        picker.next();
+        assert!(!picker.confirming, "moving down cancels a pending confirm");
+        picker.request_confirm();
+        picker.previous();
+        assert!(!picker.confirming, "moving up cancels a pending confirm");
+    }
+
+    #[test]
+    fn theme_picker_confirm_cannot_be_armed_with_no_presets() {
+        let mut picker = ThemePickerState::new(Vec::new(), None);
+        picker.request_confirm();
+        assert!(
+            !picker.confirming,
+            "there is nothing to apply, so nothing to confirm"
+        );
+    }
+
+    #[test]
+    fn theme_picker_state_next_previous_wrap_around() {
+        let presets = vec![
+            ("a".to_string(), crate::theme::Theme::default(), false),
+            ("b".to_string(), crate::theme::Theme::default(), false),
+            ("c".to_string(), crate::theme::Theme::default(), false),
+        ];
+        let mut picker = ThemePickerState::new(presets, None);
+        assert_eq!(picker.selected, 0);
+        picker.previous();
+        assert_eq!(
+            picker.selected, 2,
+            "previous from 0 wraps to the last entry"
+        );
+        picker.next();
+        assert_eq!(picker.selected, 0, "next from the last entry wraps to 0");
+        picker.next();
+        assert_eq!(picker.selected, 1);
+    }
+
+    #[test]
+    fn theme_picker_state_next_previous_are_no_ops_when_empty() {
+        let mut picker = ThemePickerState::new(Vec::new(), None);
+        picker.next();
+        picker.previous();
+        assert_eq!(picker.selected, 0);
+        assert!(picker.current().is_none());
+    }
+
+    #[test]
+    fn theme_picker_live_preview_recolors_the_whole_frame_without_touching_config() {
+        // Moving the picker selection must repaint using the *previewed*
+        // preset's colors, while `config.options.theme` (the persisted
+        // theme) stays untouched until Enter is pressed elsewhere.
+        let config = crate::config::parse_config("[options]").unwrap();
+        let persisted_theme = config.options.theme;
+        let dracula = crate::theme::builtin_preset("dracula").unwrap();
+        let nord = crate::theme::builtin_preset("nord").unwrap();
+        assert_ne!(dracula.background, nord.background);
+        assert_ne!(persisted_theme.background, dracula.background);
+
+        let icons = Icons::from_style(crate::config::IconStyle::Ascii);
+        let hooks = HookCache {
+            global: None,
+            plugins: Vec::new(),
+        };
+        let mut state = TuiState::new(Vec::new());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+
+        state.theme_picker = Some(ThemePickerState {
+            presets: vec![
+                ("dracula".to_string(), dracula, false),
+                ("nord".to_string(), nord, false),
+            ],
+            selected: 0,
+            confirming: false,
+        });
+        terminal
+            .draw(|f| state.draw_list(f, &config, &icons, &hooks, &persisted_theme))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(0, 0)].bg, dracula.background);
+
+        state.theme_picker.as_mut().unwrap().selected = 1;
+        terminal
+            .draw(|f| state.draw_list(f, &config, &icons, &hooks, &persisted_theme))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(0, 0)].bg, nord.background);
+
+        // Config itself was never mutated by navigating the preview.
+        assert_eq!(config.options.theme, persisted_theme);
+
+        state.theme_picker = None;
+        terminal
+            .draw(|f| state.draw_list(f, &config, &icons, &hooks, &persisted_theme))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(0, 0)].bg,
+            persisted_theme.background,
+            "closing the picker without applying restores the persisted theme"
+        );
+    }
+
+    #[test]
+    fn theme_picker_confirming_draws_the_overwrite_prompt() {
+        // 破壊的な書き込みの前に、何が上書きされるのかが画面に出ていること。
+        let config = crate::config::parse_config("[options]").unwrap();
+        let persisted_theme = config.options.theme;
+        let icons = Icons::from_style(crate::config::IconStyle::Ascii);
+        let hooks = HookCache {
+            global: None,
+            plugins: Vec::new(),
+        };
+        let mut state = TuiState::new(Vec::new());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+
+        state.theme_picker = Some(ThemePickerState {
+            presets: vec![(
+                "nord".to_string(),
+                crate::theme::builtin_preset("nord").unwrap(),
+                false,
+            )],
+            selected: 0,
+            confirming: false,
+        });
+        let rendered = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+
+        terminal
+            .draw(|f| state.draw_list(f, &config, &icons, &hooks, &persisted_theme))
+            .unwrap();
+        assert!(
+            !rendered(&terminal).contains("Overwrite [options.theme]"),
+            "no prompt before Enter arms the confirmation"
+        );
+
+        state.theme_picker.as_mut().unwrap().request_confirm();
+        terminal
+            .draw(|f| state.draw_list(f, &config, &icons, &hooks, &persisted_theme))
+            .unwrap();
+        let out = rendered(&terminal);
+        assert!(
+            out.contains("Overwrite [options.theme] with 'nord'?"),
+            "the pending overwrite must name the target and the preset; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn theme_picker_scrolls_so_the_selection_stays_visible() {
+        // R1-2-2: with more presets than the clamped popup height can show,
+        // a `List` rendered without `ListState` never scrolls, so selecting
+        // past the last visible row leaves the highlighted preset (and its
+        // name) permanently off-screen. `render_stateful_widget` +
+        // `ListState::with_selected` is what makes ratatui compute a scroll
+        // offset that keeps the selected row in view.
+        let config = crate::config::parse_config("[options]").unwrap();
+        let persisted_theme = config.options.theme;
+        let icons = Icons::from_style(crate::config::IconStyle::Ascii);
+        let hooks = HookCache {
+            global: None,
+            plugins: Vec::new(),
+        };
+        let presets: Vec<(String, crate::theme::Theme, bool)> = (0..30)
+            .map(|i| {
+                (
+                    format!("preset-{i:02}"),
+                    crate::theme::Theme::default(),
+                    true,
+                )
+            })
+            .collect();
+        let last = presets.len() - 1;
+        let mut state = TuiState::new(Vec::new());
+        // Small terminal: the popup height is clamped well below
+        // `presets.len()`, so this only passes if the widget actually
+        // scrolls rather than always drawing from the top of the list.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
+
+        state.theme_picker = Some(ThemePickerState {
+            presets,
+            selected: last,
+            confirming: false,
+        });
+        terminal
+            .draw(|f| state.draw_list(f, &config, &icons, &hooks, &persisted_theme))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains(&format!("preset-{last:02}")),
+            "selecting the last preset must scroll it into view; got:\n{rendered}"
+        );
     }
 
     #[test]

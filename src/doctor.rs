@@ -1477,6 +1477,8 @@ mod tests {
                 cache_root: None,
                 icons: IconStyle::Unicode,
                 theme: crate::theme::Theme::default(),
+                theme_preset: None,
+                theme_presets: std::collections::BTreeMap::new(),
                 chezmoi: false,
                 auto_clean: false,
                 auto_helptags: false,
