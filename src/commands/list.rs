@@ -249,6 +249,67 @@ pub(crate) async fn run_list(no_tui: bool) -> Result<bool> {
                 continue;
             }
 
+            // ── theme picker モード: j/k でライブプレビュー、Enter で確認 →
+            // もう一度 Enter (または `y`) で確定・永続化 ──
+            if tui_state.theme_picker.is_some() {
+                let confirming = tui_state
+                    .theme_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.confirming);
+                match key.code {
+                    // 確認待ち中の Esc は「適用しない」だけで picker は開いたまま。
+                    // 確認待ちでなければ picker ごと閉じる (config は無変更)。
+                    crossterm::event::KeyCode::Esc => match tui_state.theme_picker.as_mut() {
+                        Some(picker) if picker.confirming => picker.cancel_confirm(),
+                        _ => tui_state.theme_picker = None,
+                    },
+                    crossterm::event::KeyCode::Char('n') if confirming => {
+                        if let Some(picker) = tui_state.theme_picker.as_mut() {
+                            picker.cancel_confirm();
+                        }
+                    }
+                    crossterm::event::KeyCode::Char('j') | crossterm::event::KeyCode::Down => {
+                        if let Some(picker) = tui_state.theme_picker.as_mut() {
+                            picker.next();
+                        }
+                    }
+                    crossterm::event::KeyCode::Char('k') | crossterm::event::KeyCode::Up => {
+                        if let Some(picker) = tui_state.theme_picker.as_mut() {
+                            picker.previous();
+                        }
+                    }
+                    // 1 度目の Enter は確認プロンプトを出すだけ。ここで
+                    // config.toml には一切触らない。
+                    crossterm::event::KeyCode::Enter if !confirming => {
+                        if let Some(picker) = tui_state.theme_picker.as_mut() {
+                            picker.request_confirm();
+                        }
+                    }
+                    crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char('y')
+                        if confirming =>
+                    {
+                        if let Some((preset_name, preset_theme, _)) = tui_state
+                            .theme_picker
+                            .as_ref()
+                            .and_then(|p| p.current())
+                            .cloned()
+                        {
+                            leave_tui(&mut terminal)?;
+                            if let Err(e) =
+                                apply_theme_preset(&config_path, &preset_name, &preset_theme).await
+                            {
+                                eprintln!("\nError applying theme preset: {e}");
+                                wait_for_keypress("\nPress any key to return to list...")?;
+                            }
+                            tui_state.theme_picker = None;
+                            reload!();
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             match key.code {
                 crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => break,
 
@@ -375,6 +436,13 @@ pub(crate) async fn run_list(no_tui: bool) -> Result<bool> {
                         reload!();
                     }
                 }
+                crossterm::event::KeyCode::Char('T') => {
+                    tui_state.show_help = false;
+                    tui_state.theme_picker = Some(crate::tui::ThemePickerState::new(
+                        config.options.theme_preset_list(),
+                        config.options.theme_preset.as_deref(),
+                    ));
+                }
                 crossterm::event::KeyCode::Char('S') => {
                     leave_tui(&mut terminal)?;
                     let _ = run_sync(false, false, false, None, false, false).await;
@@ -424,6 +492,44 @@ pub(crate) async fn run_list(no_tui: bool) -> Result<bool> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(goto_browse)
+}
+
+/// `[options.theme]` を丸ごと `theme` の値で置き換え、`options.theme_preset`
+/// に `name` を記録する (picker で再度開いたときのハイライト用、純粋に情報)。
+/// 既存の `[options.theme]` にあった手書きフィールドはプリセット選択時点で
+/// 意味を失う (プリセットが 14 field 全部を決めるため) ので、部分マージは
+/// せず丸ごと置き換える — `run_set` / `run_remove` が `[[plugins]]` entry を
+/// 丸ごと置き換えるのと同じ発想。
+fn write_theme_preset_into_doc(doc: &mut DocumentMut, name: &str, theme: &crate::theme::Theme) {
+    if doc.get("options").is_none() {
+        doc["options"] = Item::Table(toml_edit::Table::new());
+    }
+    let options_table = doc["options"]
+        .as_table_mut()
+        .expect("doc[\"options\"] was just ensured to be a table");
+
+    let mut theme_table = toml_edit::Table::new();
+    for (field, color) in theme.fields() {
+        theme_table.insert(field, value(color.to_string()));
+    }
+    options_table.insert("theme", Item::Table(theme_table));
+    options_table.insert("theme_preset", value(name));
+}
+
+/// `write_theme_preset_into_doc` を実 config.toml に対して適用し、chezmoi
+/// routing を経由して永続化する (`run_set` / `run_remove` と同じ read →
+/// mutate → `chezmoi::write_routed` の型)。
+async fn apply_theme_preset(
+    config_path: &Path,
+    name: &str,
+    theme: &crate::theme::Theme,
+) -> Result<()> {
+    let toml_content = std::fs::read_to_string(config_path)?;
+    let mut doc = toml_content.parse::<DocumentMut>()?;
+    write_theme_preset_into_doc(&mut doc, name, theme);
+    let chezmoi_enabled = read_chezmoi_flag(config_path);
+    chezmoi::write_routed(chezmoi_enabled, config_path, doc.to_string()).await?;
+    Ok(())
 }
 
 /// 全プラグインの git 状態を並列で調べ、url -> PluginStatus のマップを返す。
@@ -586,5 +692,56 @@ mod tests {
         .await
         .expect("fetch_plugin_statuses timed out — possible deadlock regression");
         assert_eq!(result.len(), 150);
+    }
+
+    // ─── write_theme_preset_into_doc: theme picker (`T`) の永続化 ─────────
+
+    #[test]
+    fn write_theme_preset_into_doc_creates_missing_options_table() {
+        let mut doc = "[[plugins]]\nurl = \"owner/repo\"\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        write_theme_preset_into_doc(
+            &mut doc,
+            "nord",
+            &crate::theme::builtin_preset("nord").unwrap(),
+        );
+        let out = doc.to_string();
+        assert!(out.contains("[options.theme]"), "got:\n{out}");
+        assert!(out.contains("theme_preset = \"nord\""), "got:\n{out}");
+        assert!(out.contains("foreground = \"#D8DEE9\""), "got:\n{out}");
+        // The `[[plugins]]` entry must survive untouched.
+        assert!(out.contains("url = \"owner/repo\""), "got:\n{out}");
+    }
+
+    #[test]
+    fn write_theme_preset_into_doc_replaces_existing_theme_wholesale() {
+        let mut doc =
+            "[options]\n[options.theme]\nforeground = \"#000000\"\nwarning = \"#111111\"\n"
+                .parse::<DocumentMut>()
+                .unwrap();
+        write_theme_preset_into_doc(
+            &mut doc,
+            "dracula",
+            &crate::theme::builtin_preset("dracula").unwrap(),
+        );
+        let out = doc.to_string();
+        // Old hand-set values must be gone (whole-table replace, not merge).
+        assert!(!out.contains("#000000"), "got:\n{out}");
+        assert!(!out.contains("#111111"), "got:\n{out}");
+        assert!(out.contains("foreground = \"#F8F8F2\""), "got:\n{out}");
+        assert!(out.contains("theme_preset = \"dracula\""), "got:\n{out}");
+    }
+
+    #[test]
+    fn write_theme_preset_into_doc_round_trips_through_theme_deserialize() {
+        // The persisted TOML must re-parse to exactly the applied theme —
+        // this is what the picker's `reload!()` depends on.
+        let mut doc = "[options]\n".parse::<DocumentMut>().unwrap();
+        let applied = crate::theme::builtin_preset("gruvbox-dark").unwrap();
+        write_theme_preset_into_doc(&mut doc, "gruvbox-dark", &applied);
+        let config = crate::config::parse_config(&doc.to_string()).unwrap();
+        assert_eq!(config.options.theme, applied);
+        assert_eq!(config.options.theme_preset.as_deref(), Some("gruvbox-dark"));
     }
 }

@@ -52,6 +52,19 @@ pub struct Options {
     pub icons: IconStyle,
     #[serde(default)]
     pub theme: crate::theme::Theme,
+    /// 直近に `rvpm list` の theme picker (`T` キー) で選んだ preset 名。
+    /// 純粋に情報用途 — 実際に描画で使われる色は常に `theme` (上記) が持つ。
+    /// picker が再度開かれたとき、どの行を選択済み表示するかにだけ使う。
+    #[serde(default)]
+    pub theme_preset: Option<String>,
+    /// user 定義の named theme preset。`[options.theme_presets.<name>]` は
+    /// `[options.theme]` と同じ緩やかな per-field parsing (`Theme` の
+    /// `Deserialize`) を使う。`rvpm list` の theme picker (`T` キー) で
+    /// 組み込み preset (`crate::theme::builtin_presets()`) と並んで選択肢に
+    /// 出る。同名の組み込み preset があれば custom 側が勝つ
+    /// (`Config::theme_preset_list` 参照)。
+    #[serde(default)]
+    pub theme_presets: std::collections::BTreeMap<String, crate::theme::Theme>,
     /// chezmoi 連携を有効にするか。`true` なら rvpm が `config.toml` や
     /// per-plugin hook を書き換えた後に `chezmoi re-add` / `chezmoi add` を
     /// 自動実行して source 側へ同期する。`chezmoi` コマンドが無い環境では
@@ -206,6 +219,26 @@ impl Options {
             None => AutoUpdateMode::default(),
         }
     }
+
+    /// 組み込み preset (`crate::theme::builtin_presets()`) と
+    /// `[options.theme_presets]` の custom preset をマージして、
+    /// `rvpm list` の theme picker (`T` キー) に出す選択肢を返す。
+    /// アルファベット順、同名なら custom 側が組み込みを上書きする
+    /// (`(name, theme, is_custom)` の `is_custom` で picker がラベル付けできる)。
+    pub fn theme_preset_list(&self) -> Vec<(String, crate::theme::Theme, bool)> {
+        let mut presets: std::collections::BTreeMap<String, (crate::theme::Theme, bool)> =
+            crate::theme::builtin_presets()
+                .into_iter()
+                .map(|(name, theme)| (name.to_string(), (theme, false)))
+                .collect();
+        for (name, theme) in &self.theme_presets {
+            presets.insert(name.clone(), (*theme, true));
+        }
+        presets
+            .into_iter()
+            .map(|(name, (theme, is_custom))| (name, theme, is_custom))
+            .collect()
+    }
 }
 
 fn default_ai_language() -> String {
@@ -260,6 +293,8 @@ impl Default for Options {
             cache_root: None,
             icons: IconStyle::default(),
             theme: crate::theme::Theme::default(),
+            theme_preset: None,
+            theme_presets: std::collections::BTreeMap::new(),
             chezmoi: false,
             auto_clean: false,
             auto_helptags: default_auto_helptags(),
@@ -906,6 +941,63 @@ success = "not-a-color"
         assert_eq!(config.options.theme.error, Color::LightRed);
         assert_eq!(config.options.theme.success, Color::Green);
         assert_eq!(config.options.theme.muted, Color::DarkGray);
+    }
+
+    #[test]
+    fn theme_presets_parse_and_appear_in_theme_preset_list() {
+        let config = parse_config(
+            r##"
+[options]
+theme_preset = "office"
+
+[options.theme_presets.office]
+foreground = "#111111"
+background = "#222222"
+
+[options.theme_presets.nord]
+foreground = "#000001"
+"##,
+        )
+        .unwrap();
+        assert_eq!(config.options.theme_preset.as_deref(), Some("office"));
+        assert_eq!(config.options.theme_presets.len(), 2);
+        assert_eq!(
+            config.options.theme_presets["office"].foreground,
+            ratatui::style::Color::Rgb(0x11, 0x11, 0x11)
+        );
+
+        let list = config.options.theme_preset_list();
+        // built-ins (5) + 1 genuinely new custom name ("office"); "nord"
+        // overrides the built-in "nord" rather than adding a 7th entry.
+        assert_eq!(list.len(), crate::theme::BUILTIN_PRESET_NAMES.len() + 1);
+
+        let office = list
+            .iter()
+            .find(|(name, _, _)| name == "office")
+            .expect("custom-only preset must be listed");
+        assert!(office.2, "custom preset must be flagged is_custom");
+        assert_eq!(
+            office.1.foreground,
+            ratatui::style::Color::Rgb(0x11, 0x11, 0x11)
+        );
+
+        let nord = list
+            .iter()
+            .find(|(name, _, _)| name == "nord")
+            .expect("custom override of a built-in name must still be listed");
+        assert!(
+            nord.2,
+            "custom preset overriding a built-in name must win and be flagged custom"
+        );
+        assert_eq!(nord.1.foreground, ratatui::style::Color::Rgb(0, 0, 1));
+    }
+
+    #[test]
+    fn theme_preset_list_is_builtins_only_when_no_custom_presets_configured() {
+        let config = parse_config("[options]").unwrap();
+        let list = config.options.theme_preset_list();
+        assert_eq!(list.len(), crate::theme::BUILTIN_PRESET_NAMES.len());
+        assert!(list.iter().all(|(_, _, is_custom)| !is_custom));
     }
 
     #[test]
