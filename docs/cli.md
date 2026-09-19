@@ -32,10 +32,19 @@ behavior and per-command edge cases.
 ## TUI theme
 
 Set `[options.theme]` in `config.toml` to customize the sync, update, list,
-and browse screens. Omitted fields retain the existing colors; there are no
-named presets. Values accept color names (such as `"cyan"`, `"dark-gray"`, or
-`"reset"`), `"#RRGGBB"`, or integer palette indices from 0 to 255. Invalid
-values warn and fall back independently; unknown fields warn and are ignored.
+and browse screens. Omitted fields retain the existing colors; rvpm has no
+built-in preset selector (no `theme_preset = "..."` key) — copy one of the
+blocks below into `[options.theme]` instead. Values accept color names (such
+as `"cyan"`, `"dark-gray"`, or `"reset"`), `"#RRGGBB"`, or integer palette
+indices from 0 to 255. Invalid values warn and fall back independently;
+unknown fields warn and are ignored.
+
+### Copy-paste presets
+
+Ported from each colorscheme's published palette; not pixel-perfect
+matches to any specific Neovim plugin version.
+
+**Catppuccin Mocha:**
 
 ```toml
 [options.theme]
@@ -54,6 +63,88 @@ selection_background = "#313244"
 inverse = "#1e1e2e"
 header_background = "#1e1e2e"
 ```
+
+**Gruvbox Dark:**
+
+```toml
+[options.theme]
+foreground = "#ebdbb2"
+background = "#282828"
+terminal_foreground = "#ebdbb2"
+secondary = "#d5c4a1"
+muted = "#928374"
+success = "#b8bb26"
+warning = "#fabd2f"
+error = "#fb4934"
+info = "#83a598"
+accent = "#d3869b"
+browse_accent = "#fabd2f"
+selection_background = "#3c3836"
+inverse = "#282828"
+header_background = "#282828"
+```
+
+**Nord:**
+
+```toml
+[options.theme]
+foreground = "#d8dee9"
+background = "#2e3440"
+terminal_foreground = "#d8dee9"
+secondary = "#e5e9f0"
+muted = "#4c566a"
+success = "#a3be8c"
+warning = "#ebcb8b"
+error = "#bf616a"
+info = "#88c0d0"
+accent = "#b48ead"
+browse_accent = "#ebcb8b"
+selection_background = "#434c5e"
+inverse = "#2e3440"
+header_background = "#2e3440"
+```
+
+**Tokyo Night (Storm):**
+
+```toml
+[options.theme]
+foreground = "#c0caf5"
+background = "#1a1b26"
+terminal_foreground = "#c0caf5"
+secondary = "#a9b1d6"
+muted = "#565f89"
+success = "#9ece6a"
+warning = "#e0af68"
+error = "#f7768e"
+info = "#7dcfff"
+accent = "#bb9af7"
+browse_accent = "#e0af68"
+selection_background = "#283457"
+inverse = "#1a1b26"
+header_background = "#1a1b26"
+```
+
+**Dracula:**
+
+```toml
+[options.theme]
+foreground = "#f8f8f2"
+background = "#282a36"
+terminal_foreground = "#f8f8f2"
+secondary = "#f8f8f2"
+muted = "#6272a4"
+success = "#50fa7b"
+warning = "#f1fa8c"
+error = "#ff5555"
+info = "#8be9fd"
+accent = "#bd93f9"
+browse_accent = "#ffb86c"
+selection_background = "#44475a"
+inverse = "#282a36"
+header_background = "#282a36"
+```
+
+### Field reference
 
 `foreground` colors primary text; `terminal_foreground` colors otherwise
 unstyled text (default `"reset"`). `secondary` and `muted` color secondary text
