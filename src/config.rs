@@ -748,8 +748,12 @@ pub fn parse_config(toml_str: &str) -> Result<Config> {
         context.insert(*key, &literal);
     }
 
-    // 7. 全体を Tera でレンダリング ({% if %} 等が動く)
-    let rendered = engine.render(toml_str, &context)?;
+    // 7. 全体を Tera でレンダリング ({% if %} 等が動く)。`render_toml` は raw
+    //    TOML の `#` コメントを事前に取り除いてから渡すため、コメント中に
+    //    書いた `{{ ... }}` / `{% ... %}` サンプルが誤って評価されない
+    //    (`render` だとコメントも生テキストとして Tera に渡り、未定義
+    //    変数参照などがそのままレンダーエラーになっていた)。
+    let rendered = engine.render_toml(toml_str, &context)?;
 
     // 8. 旧 `[options.store]` は v3.10 で `[options.browse]` に改名された。
     //    serde は未知のフィールドを黙って無視するので、そのままだと
@@ -1649,6 +1653,34 @@ dst = "{{ vars.special }}"
             Some("a & b < c > d"),
             "rendered values must not be HTML-escaped (autoescape must stay off)"
         );
+    }
+
+    #[test]
+    fn test_parse_config_ignores_tera_syntax_inside_comments() {
+        // parse_config renders the *entire* raw file text through Tera
+        // (`Engine::render_toml`, not plain `render`). A `#` comment that
+        // happens to contain `{{ }}` example syntax (e.g. documenting the
+        // templating feature inline, or referencing an undefined var as a
+        // "don't do this" example) must never reach Tera's evaluator — it
+        // used to blow up `parse_config` with an undefined-variable render
+        // error even though the comment is inert TOML.
+        let toml_content = r#"
+# example: dst = "{{ vars.not_defined_anywhere }}"
+# to disable a plugin: {% if false %}
+
+[vars]
+name = "app" # trailing comment with {{ vars.also_not_defined }}
+
+[options]
+
+[[plugins]]
+name = "test"
+url = "repo"
+dst = "{{ vars.name }}"
+"#;
+
+        let config = parse_config(toml_content).unwrap();
+        assert_eq!(config.plugins[0].dst.as_deref(), Some("app"));
     }
 
     #[test]
