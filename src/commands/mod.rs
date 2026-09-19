@@ -11,6 +11,7 @@ use crate::git::Repo;
 use crate::merge::*;
 use crate::paths::*;
 use crate::plugin_build::*;
+use crate::tera_raw::sanitize_tera_raw;
 use crate::tui::{PluginStatus, TuiState};
 use crate::url::*;
 use crate::*;

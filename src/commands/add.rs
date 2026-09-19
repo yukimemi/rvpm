@@ -17,7 +17,8 @@ pub(crate) async fn run_add(
     let config_path = rvpm_config_path();
     ensure_config_exists(&config_path)?;
     let toml_content = std::fs::read_to_string(&config_path)?;
-    let mut doc = toml_content.parse::<DocumentMut>()?;
+    let (sanitized, tera_guard) = sanitize_tera_raw(&toml_content);
+    let mut doc = sanitized.parse::<DocumentMut>()?;
     // url_style は DocumentMut から直接読む (parse_config 経由だと Tera 展開と
     // 全フィールドのデシリアライズが走って無駄。ここでは add に必要な
     // option だけ拾えればよい)。値が無効 / 読めないなら default (Short)。
@@ -125,7 +126,7 @@ pub(crate) async fn run_add(
         set_plugin_list_field(&mut doc, &stored_url, "on_event", items)?;
     }
 
-    let toml_content = doc.to_string();
+    let toml_content = tera_guard.restore(&doc.to_string());
     let chezmoi_enabled = read_chezmoi_flag(&config_path);
     chezmoi::write_routed(chezmoi_enabled, &config_path, &toml_content).await?;
     println!("Added plugin to config: {}", stored_url);
@@ -230,7 +231,9 @@ pub(crate) async fn run_add(
                                 // `plugin_entry_toml` は None — stub entry をそのまま残す。
                                 if let Some(entry_toml) = outcome.plugin_entry_toml {
                                     let latest = std::fs::read_to_string(&config_path)?;
-                                    let mut doc_patch = latest.parse::<DocumentMut>()?;
+                                    let (latest_sanitized, latest_guard) =
+                                        sanitize_tera_raw(&latest);
+                                    let mut doc_patch = latest_sanitized.parse::<DocumentMut>()?;
                                     if let Err(e) = replace_plugin_entry_with_ai_toml(
                                         &mut doc_patch,
                                         &stored_url,
@@ -242,7 +245,7 @@ pub(crate) async fn run_add(
                                             "\u{26a0} failed to apply AI proposal: {e}. Stub entry remains."
                                         );
                                     } else {
-                                        let patched = doc_patch.to_string();
+                                        let patched = latest_guard.restore(&doc_patch.to_string());
                                         chezmoi::write_routed(
                                             config_data.options.chezmoi,
                                             &config_path,
@@ -323,9 +326,10 @@ pub(crate) async fn run_add(
                                 decide_add_lazy_apply(suggestion, policy, &plugin.display_name())
                         {
                             let latest = std::fs::read_to_string(&config_path)?;
-                            let mut doc_patch = latest.parse::<DocumentMut>()?;
+                            let (latest_sanitized, latest_guard) = sanitize_tera_raw(&latest);
+                            let mut doc_patch = latest_sanitized.parse::<DocumentMut>()?;
                             patch_plugin_entry_suggestion(&mut doc_patch, &stored_url, &applied);
-                            let patched = doc_patch.to_string();
+                            let patched = latest_guard.restore(&doc_patch.to_string());
                             let wp = chezmoi::write_path(config_data.options.chezmoi, &config_path)
                                 .await;
                             std::fs::write(&wp, &patched)?;
@@ -413,7 +417,7 @@ fn read_persisted_plugin_name(config_path: &Path, stored_url: &str, fallback_url
     };
     std::fs::read_to_string(config_path)
         .ok()
-        .and_then(|s| s.parse::<DocumentMut>().ok())
+        .and_then(|s| sanitize_tera_raw(&s).0.parse::<DocumentMut>().ok())
         .and_then(|doc| {
             let plugins = doc.get("plugins")?.as_array_of_tables()?;
             let entry = plugins

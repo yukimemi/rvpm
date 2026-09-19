@@ -24,7 +24,8 @@ pub(crate) async fn run_set(
     };
 
     println!("\n>> Setting options for: {}", selected_repo_url);
-    let mut doc = toml_content.parse::<DocumentMut>()?;
+    let (sanitized, tera_guard) = sanitize_tera_raw(&toml_content);
+    let mut doc = sanitized.parse::<DocumentMut>()?;
     let mut modified = false;
 
     let any_flag_set = lazy.is_some()
@@ -271,7 +272,12 @@ pub(crate) async fn run_set(
 
     if modified {
         let chezmoi_enabled = read_chezmoi_flag(&config_path);
-        chezmoi::write_routed(chezmoi_enabled, &config_path, doc.to_string()).await?;
+        chezmoi::write_routed(
+            chezmoi_enabled,
+            &config_path,
+            tera_guard.restore(&doc.to_string()),
+        )
+        .await?;
         println!("Updated config for: {}", selected_repo_url);
         return Ok(true);
     }
