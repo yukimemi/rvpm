@@ -411,6 +411,8 @@ redraw — its spinner and elapsed-time display are time-driven.
 
 `parse_config()` parses in two passes: first extract the vars section only → register `vars`, `env`, `is_windows` into a Tera context → render the entire TOML string → final parse. This makes `{{ vars.base }}` and `{{ env.HOME }}` usable inside the config file.
 
+`add` / `set` / `remove` / `tune` instead parse the raw file with `toml_edit::DocumentMut` (to preserve user formatting/comments across structural edits) rather than going through `parse_config()`'s Tera pass — so a bare, unquoted `{{ ... }}` value elsewhere in the file (not wrapped in quotes) used to be a raw TOML parse error there even though `sync`/`update`/`generate` rendered it fine. `src/tera_raw.rs::sanitize_tera_raw` swaps every such span for a quoted placeholder before the `toml_edit` parse, and `TeraRawGuard::restore` swaps it back in the serialized output before writing to disk, so untouched templated lines round-trip byte-for-byte.
+
 ## Flexible schemas (`string | string[]` / `MapSpec` / etc)
 
 `deserialize_string_or_vec` and `deserialize_map_specs` in `config.rs` use `serde(untagged)` enums to accept multiple TOML shapes.

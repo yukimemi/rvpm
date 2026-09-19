@@ -7,6 +7,7 @@
 //! `resolve_*` family lives in one navigable place (#217).
 
 use crate::config;
+use crate::tera_raw::sanitize_tera_raw;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use toml_edit::DocumentMut;
@@ -79,7 +80,8 @@ pub(crate) fn read_chezmoi_flag(config_path: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(config_path) else {
         return false;
     };
-    let Ok(doc) = content.parse::<DocumentMut>() else {
+    let (sanitized, _guard) = sanitize_tera_raw(&content);
+    let Ok(doc) = sanitized.parse::<DocumentMut>() else {
         return false;
     };
     doc.get("options")

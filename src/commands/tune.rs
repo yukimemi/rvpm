@@ -48,10 +48,13 @@ pub(crate) async fn run_tune(
     }
 
     // 現在の `[[plugins]]` entry を TOML テキストとして抜き出す。
-    let doc = toml_content.parse::<DocumentMut>()?;
-    let current_entry_toml = extract_plugin_entry_toml(&doc, &selected_url).ok_or_else(|| {
-        anyhow::anyhow!("could not extract current entry for `{selected_url}` from config.toml")
-    })?;
+    let (sanitized, tera_guard) = sanitize_tera_raw(&toml_content);
+    let doc = sanitized.parse::<DocumentMut>()?;
+    let current_entry_toml = extract_plugin_entry_toml(&doc, &selected_url)
+        .map(|entry| tera_guard.restore(&entry))
+        .ok_or_else(|| {
+            anyhow::anyhow!("could not extract current entry for `{selected_url}` from config.toml")
+        })?;
 
     let config_root = resolve_config_root(config.options.config_root.as_deref());
     let plugin_cfg_dir = resolve_plugin_config_dir(&config_root, &plugin);
@@ -81,7 +84,8 @@ pub(crate) async fn run_tune(
                 // `plugin_entry_toml` は None — config.toml は触らず、hook ファイル更新のみ。
                 if let Some(entry_toml) = outcome.plugin_entry_toml {
                     let latest = std::fs::read_to_string(&config_path)?;
-                    let mut doc_patch = latest.parse::<DocumentMut>()?;
+                    let (latest_sanitized, latest_guard) = sanitize_tera_raw(&latest);
+                    let mut doc_patch = latest_sanitized.parse::<DocumentMut>()?;
                     // user は preview で fresh / merged を per-section に選択済み。
                     // `Replace` mode で AI が omit した stale field (e.g. 古い `on_cmd`) を消す。
                     if let Err(e) = replace_plugin_entry_with_ai_toml(
@@ -95,7 +99,7 @@ pub(crate) async fn run_tune(
                             "\u{26a0} failed to apply AI proposal: {e}. Existing entry kept."
                         );
                     } else {
-                        let patched = doc_patch.to_string();
+                        let patched = latest_guard.restore(&doc_patch.to_string());
                         chezmoi::write_routed(config.options.chezmoi, &config_path, &patched)
                             .await?;
                         println!(

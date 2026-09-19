@@ -21,10 +21,16 @@ pub(crate) async fn run_remove(query: Option<String>) -> Result<()> {
         return Ok(());
     }
 
-    let mut doc = toml_content.parse::<DocumentMut>()?;
+    let (sanitized, tera_guard) = sanitize_tera_raw(&toml_content);
+    let mut doc = sanitized.parse::<DocumentMut>()?;
     remove_plugin_from_toml(&mut doc, &selected_url)?;
     let chezmoi_enabled = read_chezmoi_flag(&config_path);
-    chezmoi::write_routed(chezmoi_enabled, &config_path, doc.to_string()).await?;
+    chezmoi::write_routed(
+        chezmoi_enabled,
+        &config_path,
+        tera_guard.restore(&doc.to_string()),
+    )
+    .await?;
     println!("Removed '{}' from config.", selected_url);
 
     let cache_root = resolve_cache_root(config.options.cache_root.as_deref());
