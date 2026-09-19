@@ -1171,6 +1171,14 @@ impl TuiState {
                 popup_h,
             );
 
+            // ポップアップの外側も含め全画面を暗くしてから、その上にポップアップを
+            // 描く。一覧がそのまま透けて見えると「本当にモーダルが開いているのか」
+            // 読み取りづらいという指摘 (#dim-overlay) に対応。
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Block::default().style(Style::default().bg(theme.header_background)),
+                area,
+            );
             f.render_widget(Clear, popup);
             f.render_widget(Block::default().style(theme.base_style()), popup);
             f.render_widget(
@@ -1220,6 +1228,12 @@ impl TuiState {
                 popup_h,
             );
 
+            // 全画面を暗くしてからポップアップを描く (help ポップアップと同じ理由)。
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Block::default().style(Style::default().bg(theme.header_background)),
+                area,
+            );
             f.render_widget(Clear, popup);
             f.render_widget(Block::default().style(theme.base_style()), popup);
             let (title, border) = if picker.confirming {
@@ -1531,6 +1545,56 @@ mod tests {
         assert!(
             out.contains("Overwrite [options.theme] with 'nord'?"),
             "the pending overwrite must name the target and the preset; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn theme_picker_dims_the_full_screen_behind_the_popup() {
+        // Regression: the popup used to only `Clear` its own rect, leaving
+        // the plugin list fully legible (and, on terminals that don't fully
+        // repaint the alternate screen, stale glyphs from the pane behind
+        // it) all around the popup. The list is now dimmed with a full-area
+        let config = crate::config::parse_config(
+            "[options]\n\n[[plugins]]\nurl = \"owner/some-very-long-plugin-name\"\n",
+        )
+        .unwrap();
+        let theme = config.options.theme;
+        let icons = Icons::from_style(crate::config::IconStyle::Ascii);
+        let hooks = HookCache {
+            global: None,
+            plugins: Vec::new(),
+        };
+        let mut state = TuiState::new(vec![config.plugins[0].url.clone()]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+
+        // Corner cell, far outside where the centered popup will land.
+        terminal
+            .draw(|f| state.draw_list(f, &config, &icons, &hooks, &theme))
+            .unwrap();
+        assert_ne!(
+            terminal.backend().buffer().cell((0, 0)).unwrap().bg,
+            theme.header_background,
+            "sanity: corner isn't already header_background before the picker opens"
+        );
+
+        state.theme_picker = Some(ThemePickerState {
+            presets: vec![(
+                "nord".to_string(),
+                crate::theme::builtin_preset("nord").unwrap(),
+                false,
+            )],
+            selected: 0,
+            confirming: false,
+        });
+        terminal
+            .draw(|f| state.draw_list(f, &config, &icons, &hooks, &theme))
+            .unwrap();
+        let corner = terminal.backend().buffer().cell((0, 0)).unwrap();
+        let nord = crate::theme::builtin_preset("nord").unwrap();
+        assert_eq!(
+            corner.bg, nord.header_background,
+            "area outside the popup must be dimmed (using the live-previewed preset's color) while the theme picker is open"
         );
     }
 

@@ -525,10 +525,12 @@ async fn apply_theme_preset(
     theme: &crate::theme::Theme,
 ) -> Result<()> {
     let toml_content = std::fs::read_to_string(config_path)?;
-    let mut doc = toml_content.parse::<DocumentMut>()?;
+    let (sanitized, tera_guard) = sanitize_tera_raw(&toml_content);
+    let mut doc = sanitized.parse::<DocumentMut>()?;
     write_theme_preset_into_doc(&mut doc, name, theme);
+    let restored = tera_guard.restore(&doc.to_string());
     let chezmoi_enabled = read_chezmoi_flag(config_path);
-    chezmoi::write_routed(chezmoi_enabled, config_path, doc.to_string()).await?;
+    chezmoi::write_routed(chezmoi_enabled, config_path, restored).await?;
     Ok(())
 }
 
@@ -743,5 +745,33 @@ mod tests {
         let config = crate::config::parse_config(&doc.to_string()).unwrap();
         assert_eq!(config.options.theme, applied);
         assert_eq!(config.options.theme_preset.as_deref(), Some("gruvbox-dark"));
+    }
+
+    #[tokio::test]
+    async fn apply_theme_preset_survives_bare_tera_mustache_fields() {
+        // Regression: a config using rvpm's own lazy-trigger Tera templating
+        // (`on_event = {{ vars.on_ev_buf_open }}`, undocumented but valid per
+        // parse_config's Tera pre-render) is not valid bare TOML on its own.
+        // apply_theme_preset used to `parse::<DocumentMut>()` the raw file
+        // directly, so pressing `T`/Enter/y on any such config always failed
+        // with "missing key for inline table element, expected key" instead
+        // of writing the theme.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[[plugins]]\nurl = \"owner/repo\"\non_event = {{ vars.on_ev_buf_open }}\n",
+        )
+        .unwrap();
+        let theme = crate::theme::builtin_preset("dracula").unwrap();
+        apply_theme_preset(&config_path, "dracula", &theme)
+            .await
+            .expect("apply_theme_preset must tolerate bare Tera mustaches");
+        let out = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            out.contains("on_event = {{ vars.on_ev_buf_open }}"),
+            "got:\n{out}"
+        );
+        assert!(out.contains("theme_preset = \"dracula\""), "got:\n{out}");
     }
 }
