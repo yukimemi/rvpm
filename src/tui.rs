@@ -1171,14 +1171,9 @@ impl TuiState {
                 popup_h,
             );
 
-            // ポップアップの外側も含め全画面を暗くしてから、その上にポップアップを
-            // 描く。一覧がそのまま透けて見えると「本当にモーダルが開いているのか」
-            // 読み取りづらいという指摘 (#dim-overlay) に対応。
-            f.render_widget(Clear, area);
-            f.render_widget(
-                Block::default().style(Style::default().bg(theme.header_background)),
-                area,
-            );
+            // ポップアップの背景だけ Clear してから描く。一覧全体を暗くすると
+            // (以前の実装) 背景に敷いている theme の色が見えなくなり、
+            // 「T で選んだ theme がどう見えるか」を確認できなくなる。
             f.render_widget(Clear, popup);
             f.render_widget(Block::default().style(theme.base_style()), popup);
             f.render_widget(
@@ -1228,12 +1223,8 @@ impl TuiState {
                 popup_h,
             );
 
-            // 全画面を暗くしてからポップアップを描く (help ポップアップと同じ理由)。
-            f.render_widget(Clear, area);
-            f.render_widget(
-                Block::default().style(Style::default().bg(theme.header_background)),
-                area,
-            );
+            // ポップアップの背景だけ Clear する (help ポップアップと同じ理由 —
+            // 一覧を暗くすると選んだ theme の見た目が確認できない)。
             f.render_widget(Clear, popup);
             f.render_widget(Block::default().style(theme.base_style()), popup);
             let (title, border) = if picker.confirming {
@@ -1254,25 +1245,47 @@ impl TuiState {
             );
             let hint_y = (popup.y + popup.height).min(area.height.saturating_sub(1));
             if picker.confirming {
-                // 確認プロンプトは popup 幅 (40) に収まらないので frame 全幅を
-                // 使う。書き込む対象 (`[options.theme]`) と preset 名を明示して、
+                // 確認プロンプトも一覧の下に独立したポップアップとして表示する。
+                // 書き込む対象 (`[options.theme]`) と preset 名を明示して、
                 // 「今の色が丸ごと消える」ことが読めるようにする。
+                use unicode_width::UnicodeWidthStr;
                 let name = picker.current().map(|(n, _, _)| n.as_str()).unwrap_or("");
-                let hint_area = Rect::new(0, hint_y, area.width, 1);
-                f.render_widget(Clear, hint_area);
+                let line1 = format!("Overwrite [options.theme] with '{name}'?");
+                let line2 = "Enter/y:apply  Esc/n:cancel";
+                let confirm_w = (UnicodeWidthStr::width(line1.as_str())
+                    .max(UnicodeWidthStr::width(line2)) as u16
+                    + 4)
+                .min(area.width);
+                let confirm_h = 4u16.min(area.height);
+                // 一覧ポップアップの下に置けるならそこに、収まらない場合は上に
+                // 出す。どちらも無理な小さすぎる端末では画面下端に寄せる
+                // (一覧との重なりは最後の妥協)。
+                let confirm_y = if hint_y + confirm_h <= area.height {
+                    hint_y
+                } else if popup.y >= confirm_h {
+                    popup.y - confirm_h
+                } else {
+                    area.height.saturating_sub(confirm_h)
+                };
+                let confirm_area = Rect::new(
+                    (area.width.saturating_sub(confirm_w)) / 2,
+                    confirm_y,
+                    confirm_w,
+                    confirm_h,
+                );
+                f.render_widget(Clear, confirm_area);
                 f.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(
-                            format!(" Overwrite [options.theme] with '{name}'? "),
-                            Style::default().fg(theme.warning),
-                        ),
-                        Span::styled(
-                            "Enter/y:apply  Esc/n:cancel",
-                            Style::default().fg(theme.muted),
-                        ),
-                    ]))
-                    .style(theme.base_style()),
-                    hint_area,
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(line1, Style::default().fg(theme.warning))),
+                        Line::from(Span::styled(line2, Style::default().fg(theme.muted))),
+                    ])
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(theme.warning))
+                            .style(theme.base_style()),
+                    ),
+                    confirm_area,
                 );
             } else {
                 let hint_area = Rect::new(popup.x, hint_y, popup.width, 1);
@@ -1549,11 +1562,14 @@ mod tests {
     }
 
     #[test]
-    fn theme_picker_dims_the_full_screen_behind_the_popup() {
-        // Regression: the popup used to only `Clear` its own rect, leaving
-        // the plugin list fully legible (and, on terminals that don't fully
-        // repaint the alternate screen, stale glyphs from the pane behind
-        // it) all around the popup. The list is now dimmed with a full-area
+    fn theme_picker_keeps_the_background_list_visible_behind_the_popup() {
+        // Regression (reverting #412): dimming the whole frame behind the
+        // popup overwrote the plugin list's own glyphs with blank
+        // header_background cells, which defeats the point of a *live
+        // preview* picker — you can no longer see what the previewed theme
+        // actually looks like against real content. The corner cell holds
+        // part of the title block's border, which the old dim step blanked
+        // out to ' '; it must now survive untouched outside the popup.
         let config = crate::config::parse_config(
             "[options]\n\n[[plugins]]\nurl = \"owner/some-very-long-plugin-name\"\n",
         )
@@ -1572,10 +1588,11 @@ mod tests {
         terminal
             .draw(|f| state.draw_list(f, &config, &icons, &hooks, &theme))
             .unwrap();
+        let before = terminal.backend().buffer().cell((0, 0)).unwrap().clone();
         assert_ne!(
-            terminal.backend().buffer().cell((0, 0)).unwrap().bg,
-            theme.header_background,
-            "sanity: corner isn't already header_background before the picker opens"
+            before.symbol(),
+            " ",
+            "sanity: corner holds a border glyph before the picker opens"
         );
 
         state.theme_picker = Some(ThemePickerState {
@@ -1591,10 +1608,10 @@ mod tests {
             .draw(|f| state.draw_list(f, &config, &icons, &hooks, &theme))
             .unwrap();
         let corner = terminal.backend().buffer().cell((0, 0)).unwrap();
-        let nord = crate::theme::builtin_preset("nord").unwrap();
         assert_eq!(
-            corner.bg, nord.header_background,
-            "area outside the popup must be dimmed (using the live-previewed preset's color) while the theme picker is open"
+            corner.symbol(),
+            before.symbol(),
+            "the border glyph outside the popup must survive untouched (not blanked by a full-screen dim) while the theme picker is open"
         );
     }
 
