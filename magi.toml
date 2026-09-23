@@ -13,8 +13,7 @@
 # - `[verify]` runs `cargo`. The machine layer doesn't know this checkout is
 #   a Rust crate, let alone which commands verify it.
 # - `[merge] base` names this repository's branch, and is required at all
-#   because of how this checkout is set up (see below). `mode` overrides the
-#   machine layer's default for this repository specifically.
+#   because of how this checkout is set up (see below).
 # - `[prompts]` are this project's conventions.
 #
 # Note that an array may be declared in exactly one layer
@@ -78,10 +77,6 @@ gate = ["CARGO_TARGET_DIR={{ vars.cache }}/rvpm-target cargo make check"]
 # HEAD` fallback magi would otherwise use to infer the base branch fails
 # here.
 base = "main"
-# Overrides the machine layer's default (`mode = "pr"`): this repository
-# stays on manual landing, so `magi review` only verifies and reports — it
-# never pushes a branch or opens a PR by itself.
-mode = "none"
 
 # Project conventions appended to the node prompts, never merged into them.
 # Repository-wide context lives in AGENTS.md, which every agent already
