@@ -22,7 +22,11 @@ if is_empty ${ec_path}
     echo "editorconfig-checker not on PATH; skipping editorconfig-check locally (still enforced in CI). Install: https://github.com/editorconfig-checker/editorconfig-checker#installation"
     exit 0
 end
-exec --fail-on-error editorconfig-checker
+# Without FILE args editorconfig-checker checks `git ls-files`, but only when
+# it finds a git repo. A renri jj workspace has no `.git`, so it walks the whole
+# tree, gitignored files included, and trips over the `apm_modules/` source
+# cache that renri's on-add hook installs. None of it is ours to lint.
+exec --fail-on-error editorconfig-checker -exclude apm_modules/
 '''
 
 [tasks.fmt]
