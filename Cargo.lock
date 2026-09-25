@@ -802,6 +802,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
 name = "dirs-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2613,7 +2622,7 @@ checksum = "6f70f9fcb2f5f448ea0fcd48bfc64e86e1c9b93e7591df30c7a6334caa68a02a"
 dependencies = [
  "anyhow",
  "console",
- "dirs",
+ "dirs 6.0.0",
  "fs2",
  "humantime",
  "reqwest",
@@ -3771,7 +3780,7 @@ dependencies = [
  "console",
  "crossterm",
  "dialoguer",
- "dirs",
+ "dirs 7.0.0",
  "gix",
  "indicatif",
  "junction",
@@ -4290,7 +4299,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d1721aca263e9a1d8d82519ff0206eec8915bf0eb08af00a79e560275381d09"
 dependencies = [
- "dirs",
+ "dirs 6.0.0",
  "serde",
  "tera",
  "thiserror 2.0.20",
