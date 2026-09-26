@@ -803,6 +803,7 @@ readme_command = ["mdcat"]
 | `u` | Update selected plugin |
 | `U` | Update all plugins |
 | `d` | Remove selected plugin |
+| `o` | Open selected plugin's repository in the default browser |
 | `?` | Toggle help popup |
 | `q` / `Esc` | Quit |
 

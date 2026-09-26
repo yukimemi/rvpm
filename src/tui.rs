@@ -258,6 +258,8 @@ pub struct TuiState {
     /// プリセットをライブプレビューしながら選び、Enter で確定・config.toml へ
     /// 永続化、Esc でキャンセル (config は無変更)。
     pub theme_picker: Option<ThemePickerState>,
+    /// 次のキー入力まで footer に出す一時メッセージ (`o` で URL が無い時など)。
+    pub status_message: Option<String>,
 }
 
 impl TuiState {
@@ -282,6 +284,7 @@ impl TuiState {
             show_help: false,
             started_at: Instant::now(),
             theme_picker: None,
+            status_message: None,
         }
     }
 
@@ -1035,7 +1038,14 @@ impl TuiState {
                     .border_style(Style::default().fg(theme.info)),
             )
         } else {
-            Paragraph::new(Line::from(vec![
+            let mut spans = Vec::new();
+            if let Some(msg) = &self.status_message {
+                spans.push(Span::styled(
+                    format!(" {msg} "),
+                    Style::default().fg(theme.warning),
+                ));
+            }
+            spans.extend([
                 Span::styled(" b", Style::default().fg(theme.info)),
                 Span::styled(":browse ", Style::default().fg(theme.muted)),
                 Span::styled("c", Style::default().fg(theme.info)),
@@ -1054,14 +1064,16 @@ impl TuiState {
                 Span::styled(":update ", Style::default().fg(theme.muted)),
                 Span::styled("d", Style::default().fg(theme.info)),
                 Span::styled(":delete ", Style::default().fg(theme.muted)),
+                Span::styled("o", Style::default().fg(theme.info)),
+                Span::styled(":open ", Style::default().fg(theme.muted)),
                 Span::styled("/", Style::default().fg(theme.info)),
                 Span::styled(":search ", Style::default().fg(theme.muted)),
                 Span::styled("?", Style::default().fg(theme.info)),
                 Span::styled(":help ", Style::default().fg(theme.muted)),
                 Span::styled("q", Style::default().fg(theme.info)),
                 Span::styled(":quit", Style::default().fg(theme.muted)),
-            ]))
-            .block(Block::default().borders(Borders::ALL))
+            ]);
+            Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::ALL))
         };
         f.render_widget(footer, chunks[2]);
 
@@ -1153,6 +1165,10 @@ impl TuiState {
                 Line::from(vec![
                     Span::styled("  d           ", Style::default().fg(theme.info)),
                     Span::styled("Delete selected", Style::default().fg(theme.foreground)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  o           ", Style::default().fg(theme.info)),
+                    Span::styled("Open in browser", Style::default().fg(theme.foreground)),
                 ]),
                 Line::from(vec![
                     Span::styled("  q / Esc     ", Style::default().fg(theme.info)),

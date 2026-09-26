@@ -123,9 +123,52 @@ pub(crate) fn format_plugin_url(input: &str, style: crate::config::UrlStyle) -> 
     }
 }
 
+/// プラグインの設定 URL からブラウザで開く Web URL を導く。
+///
+/// - GitHub 形式 (`owner/repo` / `https://github.com/...` / `git@github.com:...`)
+///   → `https://github.com/owner/repo`
+/// - GitHub 以外の `http(s)://` URL → そのまま
+/// - 空文字 (`[ Global hooks ]` sentinel) / ローカルパス / その他のスキーム → `None`
+pub(crate) fn plugin_web_url(url: &str) -> Option<String> {
+    if let Some(owner_repo) = github_owner_repo(url) {
+        return Some(format!("https://github.com/{owner_repo}"));
+    }
+    let trimmed = url.trim();
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_plugin_web_url() {
+        let gh = |s: &str| Some(s.to_string());
+        assert_eq!(
+            plugin_web_url("folke/snacks.nvim"),
+            gh("https://github.com/folke/snacks.nvim")
+        );
+        assert_eq!(
+            plugin_web_url("https://github.com/Foo/Bar.git/"),
+            gh("https://github.com/Foo/Bar")
+        );
+        assert_eq!(
+            plugin_web_url("git@github.com:foo/bar.git"),
+            gh("https://github.com/foo/bar")
+        );
+        assert_eq!(
+            plugin_web_url("https://gitlab.com/foo/bar"),
+            gh("https://gitlab.com/foo/bar")
+        );
+        assert_eq!(plugin_web_url(""), None);
+        assert_eq!(plugin_web_url("~/dev/plug"), None);
+        assert_eq!(plugin_web_url("./plug"), None);
+        assert_eq!(plugin_web_url("C:/dev/plug"), None);
+        assert_eq!(plugin_web_url("git@gitlab.com:foo/bar.git"), None);
+    }
 
     #[test]
     fn test_installed_full_name_owner_repo() {
