@@ -24,7 +24,7 @@ sources everything without any runtime glob cost.
 
 ### Startup profile
 
-**`rvpm profile`** — per-plugin phase breakdown in a TUI: banner + phase timeline + plugin table + selected-plugin file detail. Keys: `j/k` navigate · `g/G` top/bottom · `s` cycle sort · `h` hide groups · `f` require-tree threshold · `c` require-tree sort · `?` help · `q` quit.
+**`rvpm profile`** — per-plugin phase breakdown in a TUI: banner + phase timeline + plugin table + selected-plugin file detail. Keys: `j/k` navigate · `g/G` top/bottom · `s` cycle sort · `h` hide groups · `f` require-tree threshold · `c` require-tree sort · `o` open repo in browser · `?` help · `q` quit.
 
 Selecting the `[user config]` pseudo-plugin swaps the detail pane for a **require tree** of your `init.lua`: a stack-based tracer wraps `_G.require` for the run, captures `vim.uv.hrtime()` deltas per module, and renders the result depth-indented in the pane. Useful when `[user config]` is one of the heaviest rows and you want to find the offending `require(...)`.
 
