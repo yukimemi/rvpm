@@ -277,10 +277,14 @@ struct ProfileTuiState {
     /// 折りたたまれた require モジュール名。module 名でのみ識別するので、同名モジュールが
     /// 複数カ所で require されているとまとめて折りたたむ扱い (シンプルさ優先)。
     tree_collapsed: std::collections::HashSet<String>,
+    /// プラグイン表示名 → 設定 URL。`o` で開く対象の解決に使う (擬似グループは無い)。
+    urls: std::collections::HashMap<String, String>,
+    /// 次のキー入力まで footer に出す一時メッセージ。
+    status_message: Option<String>,
 }
 
 impl ProfileTuiState {
-    fn new(report: ProfileReport) -> Self {
+    fn new(report: ProfileReport, urls: std::collections::HashMap<String, String>) -> Self {
         let mut ts = TableState::default();
         ts.select(Some(0));
         // instrumented の時は load、素計測時は total が自然
@@ -295,6 +299,8 @@ impl ProfileTuiState {
             hide_groups: false,
             table_state: ts,
             show_help: false,
+            urls,
+            status_message: None,
             // 1.0 ms 未満の require は細かすぎてノイズ。まずは bold な top-level だけ
             // 見える状態で start し、f キーで 0.5 / 0.0 ms に広げていく運用。
             require_tree_threshold_ms: 1.0,
@@ -447,7 +453,7 @@ impl Drop for TerminalGuard {
 }
 
 /// エントリポイント: TUI を起動してユーザが q で終了するまでブロック。
-pub fn run(report: ProfileReport) -> Result<()> {
+pub fn run(report: ProfileReport, urls: std::collections::HashMap<String, String>) -> Result<()> {
     enable_raw_mode()?;
     // raw mode を掴んだ直後に guard を作る — 以降の `?` や panic は Drop 経由で cleanup される。
     let _guard = TerminalGuard;
@@ -457,7 +463,7 @@ pub fn run(report: ProfileReport) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut state = ProfileTuiState::new(report);
+    let mut state = ProfileTuiState::new(report, urls);
     let result = run_loop(&mut terminal, &mut state);
 
     // 正常終了ルート (Drop も追加で走るが冪等)
@@ -477,6 +483,7 @@ fn run_loop(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            state.status_message = None;
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 // Tab で pane focus を切り替え。Detail focus は [user config] を選んで
@@ -520,6 +527,21 @@ fn run_loop(
                 }
                 KeyCode::Char('c') => {
                     state.require_tree_sort = state.require_tree_sort.toggle();
+                }
+                KeyCode::Char('o') => {
+                    let web = state
+                        .selected_plugin_index()
+                        .and_then(|i| state.urls.get(&state.report.plugins[i].name))
+                        .and_then(|u| crate::url::plugin_web_url(u));
+                    match web {
+                        Some(web) => {
+                            let _ = open::that(&web);
+                        }
+                        None => {
+                            state.status_message =
+                                Some("No repository URL for this row".to_string());
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1196,14 +1218,21 @@ fn draw_detail(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
     f.render_widget(widget, area);
 }
 
-fn draw_footer(f: &mut Frame, area: Rect, _state: &ProfileTuiState) {
+fn draw_footer(f: &mut Frame, area: Rect, state: &ProfileTuiState) {
     let mut spans: Vec<Span> = Vec::new();
+    if let Some(msg) = &state.status_message {
+        spans.push(Span::styled(
+            format!(" {msg} "),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     for (k, d) in [
         ("j/k", "move"),
         ("g/G", "top/bot"),
         ("Tab", "focus"),
         ("h/l", "collapse"),
         ("s/c/f", "sort/thresh"),
+        ("o", "open"),
         ("?", "help"),
         ("q", "quit"),
     ] {
@@ -1236,7 +1265,7 @@ fn key_hint(key: &'static str, desc: &'static str) -> Vec<Span<'static>> {
 fn draw_help_overlay(f: &mut Frame, area: Rect) {
     // 元は 60x18 だったが require tree 用のキー説明が右端に溢れるので 76x24 に拡張。
     let w = 76.min(area.width.saturating_sub(4));
-    let h = 24.min(area.height.saturating_sub(4));
+    let h = 25.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -1260,6 +1289,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from("  h               toggle [merged]/[runtime] group rows"),
+        Line::from("  o               Open in browser"),
         Line::from(""),
         Line::from(Span::styled(
             "  require tree ([user config], focus = Detail)",

@@ -236,6 +236,7 @@ pub(crate) async fn run_list(no_tui: bool) -> Result<bool> {
             // キー入力は選択位置・検索状態のいずれかを動かしうるので、
             // 個別ハンドラで判定せずまとめて再描画対象にする。
             dirty = true;
+            tui_state.status_message = None;
 
             // ── 検索モード: インライン入力 ──
             if tui_state.search_mode {
@@ -481,6 +482,19 @@ pub(crate) async fn run_list(no_tui: bool) -> Result<bool> {
                         leave_tui(&mut terminal)?;
                         let _ = run_remove(Some(url)).await;
                         reload!();
+                    }
+                }
+                crossterm::event::KeyCode::Char('o') => {
+                    if let Some(url) = tui_state.selected_url() {
+                        match crate::url::plugin_web_url(&url) {
+                            Some(web) => {
+                                let _ = open::that(&web);
+                            }
+                            None => {
+                                tui_state.status_message =
+                                    Some("No repository URL for this row".to_string());
+                            }
+                        }
                     }
                 }
                 _ => {}

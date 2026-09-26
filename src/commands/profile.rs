@@ -200,7 +200,12 @@ pub(crate) async fn run_profile(
         return Ok(());
     }
 
-    crate::profile_tui::run(report)?;
+    let urls = config
+        .plugins
+        .iter()
+        .map(|p| (p.display_name(), p.url.clone()))
+        .collect();
+    crate::profile_tui::run(report, urls)?;
     Ok(())
 }
 
