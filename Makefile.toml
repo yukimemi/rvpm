@@ -5,8 +5,12 @@ alias = "check"
 # Aggregate only: do not inherit cargo-make's built-in cargo check command.
 clear = true
 category = "Test"
-description = "Run editorconfig-check + fmt + clippy + test + lock-check (same as CI)"
-dependencies = ["editorconfig-check", "fmt-check", "clippy", "test", "lock-check"]
+description = "Run editorconfig-check + fmt + clippy + test (same as CI; the lockfile is enforced by --locked on clippy and test)"
+# No `lock-check` here: `clippy` and `test` already run with `--locked`, so a
+# Cargo.lock out of sync fails them with the same error, and a separate
+# `cargo check --all-targets` only type-checks every target once more. CI
+# still runs `lock-check` as its own job.
+dependencies = ["editorconfig-check", "fmt-check", "clippy", "test"]
 
 [tasks.fmt-check]
 description = "Check formatting"
@@ -56,9 +60,44 @@ command = "cargo"
 args = ["install", "--path", ".", "--locked"]
 
 [tasks.test-targets]
-description = "cargo test --all-targets (lib / bins / tests / benches / examples — no doc)"
-command = "cargo"
-args = ["test", "--locked", "--all-targets"]
+description = "All test targets except doc (lib / bins / tests / benches / examples). Plain `cargo test --all-targets` by default; with PJ_RUST_TEST_RUNNER=nextest, integration tests run under cargo-nextest instead (see below)."
+# Opt in per repository with an `[env]` entry in its own Makefile.toml
+# (kata does not own `[env]`, so it survives `kata apply`):
+#
+#     [env]
+#     PJ_RUST_TEST_RUNNER = "nextest"
+#
+# `cargo test` runs the integration binaries one after another; nextest runs
+# them side by side, one process per test, honouring the repository's
+# `.config/nextest.toml`. Lib / bin unit tests stay on `cargo test` because
+# they may share process-wide state on purpose and fail when split one test per
+# process. Opt in only where CI runs the integration tests the same way, so a
+# local pass still means a green CI. Without cargo-nextest installed the task
+# warns and falls back to the default, so a pre-push hook never breaks on a
+# machine that lacks it.
+script_runner = "@duckscript"
+script = '''
+runner = get_env PJ_RUST_TEST_RUNNER
+if eq ${runner} "nextest"
+    nextest_path = which cargo-nextest
+    if is_empty ${nextest_path}
+        echo "PJ_RUST_TEST_RUNNER=nextest but cargo-nextest is not on PATH; running cargo test --all-targets instead. Install: https://nexte.st/docs/installation/pre-built-binaries/"
+        exec --fail-on-error cargo test --locked --all-targets
+    else
+        has_lib = is_path_exists src/lib.rs
+        if ${has_lib}
+            exec --fail-on-error cargo test --locked --lib --bins --examples --benches
+        else
+            exec --fail-on-error cargo test --locked --bins --examples --benches
+        end
+        # Integration test targets only (`kind(test)`), wherever they are
+        # declared; a crate without any is not an error.
+        exec --fail-on-error cargo nextest run --locked --no-tests=pass -E kind(test)
+    end
+else
+    exec --fail-on-error cargo test --locked --all-targets
+end
+'''
 
 [tasks.test-doc]
 description = "cargo test --doc (doc tests only — excluded from --all-targets). Skipped on bin-only packages, since `cargo test --doc` errors with `no library targets found` when there is no library to extract doc tests from. Drop the `condition` line once yukimemi/todoke#50 and yukimemi/rvpm#176 (lib + bin refactor) both land."
