@@ -545,7 +545,7 @@ covers git workflow, PR review cycle, and worktree usage.
 ### Build / lint / test
 
 ```sh
-cargo make check                    # editorconfig-check + fmt --check + clippy + test + lock-check (the pre-push gate)
+cargo make check                    # editorconfig-check + fmt --check + clippy + test (the pre-push gate; --locked enforces Cargo.lock)
 cargo make setup                    # one-time hook install + apm install
 cargo build                         # debug build
 cargo build --release               # release build
@@ -557,6 +557,17 @@ the local pre-push hook calls — anything that passes locally
 should pass on CI and vice versa. Don't paper over a failing
 clippy by sprinkling `#[allow(clippy::...)]`; fix the underlying
 issue or push back on the lint with reasoning.
+
+`cargo make check` runs the integration test binaries one after
+another through `cargo test`. A repository whose CI already runs
+them under cargo-nextest can opt in locally with
+`PJ_RUST_TEST_RUNNER = "nextest"` in its own Makefile.toml `[env]`
+(kata leaves `[env]` alone): lib / bin unit tests stay on
+`cargo test`, integration tests run in parallel under the
+repository's `.config/nextest.toml`, and a machine without
+cargo-nextest falls back to `cargo test` with a warning. Don't opt
+in where CI runs plain `cargo test`: the local gate has to run the
+tests the way CI does.
 
 ### Toolchain pin
 
