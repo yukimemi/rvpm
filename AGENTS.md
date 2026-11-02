@@ -707,16 +707,42 @@ a **CLI** crate:
 
 Set the `CARGO_REGISTRY_TOKEN` secret once per repo (`gh secret
 set CARGO_REGISTRY_TOKEN`) before the first release. If the
-crate is internal-only and shouldn't go to crates.io, either drop
-the `publish` job locally (release.yml is `when = "once"` so the
-edit survives subsequent applies) or set `package.publish = false`
-in `Cargo.toml`.
+crate is internal-only and shouldn't go to crates.io, set
+`package.publish = false` in `Cargo.toml`. The workflow is
+`when = "always"`: `kata apply` overwrites local workflow edits.
 
 The binary name is derived from the GitHub repo name at runtime
 (`${{ github.event.repository.name }}`), so the workflow is
 identical across CLIs using these templates unless your `[[bin]] name` in
 `Cargo.toml` deliberately differs from the repo name — in that
 case override `BIN_NAME` in the workflow's `env:` block.
+
+### Optional release signing hook
+
+Consumers can provide `scripts/ci/release-post-build.sh`. The workflow
+invokes it with Bash and a subcommand on every matrix target:
+
+1. `sign` runs after smoke and before either OS packaging step.
+2. `verify-dist` runs after packaging and before artifact upload.
+
+Both calls receive `TARGET` (the full target triple) and the workflow's
+`BIN_NAME`. Only `sign` receives the `MACOS_SIGN_CERT_P12_BASE64` and
+`MACOS_SIGN_CERT_PASSWORD` repository secrets. `verify-dist` must verify
+the archives in `dist/` without signing credentials. A failing hook
+blocks subsequent packaging or upload through normal step failure.
+
+The presence of `deploy/macos/signing-cert.sha1` opts into required
+signing integration: a missing hook fails immediately after smoke.
+Keep this certificate pin under version control. Without a pin, a
+present hook still runs; projects with neither file keep the ordinary
+unsigned release flow. The consumer hook owns target-specific policy,
+certificate pin validation, and failure on missing signing credentials
+for targets that require signing. It must implement both subcommands
+and safely handle targets where signing does not apply.
+
+The workflow and this guidance regenerate on `kata apply` because
+their manifest entries use `when = "always"`. Put signing policy in
+the consumer hook and pin rather than editing the generated workflow.
 
 ### Release smoke target (`examples/smoke.rs`)
 
