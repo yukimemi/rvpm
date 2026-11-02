@@ -52,6 +52,20 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: cargo run --release --target ${{ matrix.target }} --example smoke
+      - name: Require post-build hook when a signing pin exists
+        if: ${{ hashFiles('deploy/macos/signing-cert.sha1') != '' && hashFiles('scripts/ci/release-post-build.sh') == '' }}
+        shell: bash
+        run: |
+          echo "::error::Signing pin exists but scripts/ci/release-post-build.sh is missing"
+          exit 1
+      - name: Sign binaries (post-build hook)
+        if: ${{ hashFiles('scripts/ci/release-post-build.sh') != '' }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          MACOS_SIGN_CERT_P12_BASE64: ${{ secrets.MACOS_SIGN_CERT_P12_BASE64 }}
+          MACOS_SIGN_CERT_PASSWORD: ${{ secrets.MACOS_SIGN_CERT_PASSWORD }}
+        run: bash scripts/ci/release-post-build.sh sign
       - name: package (unix)
         if: runner.os != 'Windows'
         run: |
@@ -66,6 +80,12 @@ jobs:
           $pkg = "target/${{ matrix.target }}/release"
           Compress-Archive -Path "$pkg/$env:BIN_NAME.exe" `
             -DestinationPath "dist/$env:BIN_NAME-${{ matrix.target }}.zip"
+      - name: Verify packaged signatures (post-build hook)
+        if: ${{ hashFiles('scripts/ci/release-post-build.sh') != '' }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash scripts/ci/release-post-build.sh verify-dist
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ env.BIN_NAME }}-${{ matrix.target }}
