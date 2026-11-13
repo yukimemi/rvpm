@@ -1,9 +1,9 @@
 preset = "github.com/yukimemi/pj-presets:rust-cli"
-applied_at = "2026-11-09T03:23:52.659178364Z"
+applied_at = "2026-11-13T03:22:39.0116195Z"
 
 [[templates]]
 source = "github.com/yukimemi/pj-base"
-rev = "319784779fae0b010db4973f99fe2a967e0122c7"
+rev = "776ddef39479343d2a78843e3a3634de25f42b3a"
 version = "0.18.0"
 
 [[templates]]
@@ -33,7 +33,7 @@ content_hash = "486c974de88903113ed99b4e643432b7050e88f1031276f5263e8da7b43fe11e
 content_hash = "6d380d1ecc2f882c2011429d548a6f3c774b74f0c757d884453e4667172acc2a"
 
 [files.".github/workflows/apm-bump.yml"]
-content_hash = "0ac5ed2847ab6e1041e34209dcc2396a582722ea9537d03bd950e1db1851a4b7"
+content_hash = "febe6ad732b1fcd0240eb8f1ad837eeed8c5d0f898849e9d9baa2f89ac1b315d"
 
 [files.".github/workflows/auto-tag.yml"]
 content_hash = "4e2735f40c2ae61014810159a2458da2edc1646589f5f65d9f2f3d099366c9a8"
@@ -48,7 +48,7 @@ content_hash = "4a8e47aabb3cdf2a59030d5194467022f0efb53bb1819d4495752020d10be773
 content_hash = "7bb6c538ec5c2688e01b54e983232fa99f65e24ee16172c4270341345cbdac34"
 
 [files.".github/workflows/kata-apply.yml"]
-content_hash = "7000353151b01b5d14cb8f56e314b1a25b020e22bdf5842dcaf5686efb59facb"
+content_hash = "9759afe06a5acdb4d7646b6d624cb2300e17d926edc4ee324ce09fc7a1f643ab"
 
 [files.".github/workflows/release.yml"]
 content_hash = "7f8a50a0cafc20fa6835908881666b0f0bb9b4148ee5f697b87e33b848c9d29f"
