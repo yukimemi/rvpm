@@ -75,10 +75,29 @@ description = "All test targets except doc (lib / bins / tests / benches / examp
 # local pass still means a green CI. Without cargo-nextest installed the task
 # warns and falls back to the default, so a pre-push hook never breaks on a
 # machine that lacks it.
+#
+# PJ_RUST_TEST_RUNNER = "nextest-unit" additionally moves lib / bin unit tests
+# under nextest (`kind(lib) | kind(bin) | kind(test)`, one invocation, empty
+# sets pass) and runs examples / benches once with `cargo test`. Opt in only if
+# every unit test tolerates one-process-per-test, and set the same value in
+# `.kata/vars.toml` so the rendered CI matches (see AGENTS.md). Without
+# cargo-nextest it warns and runs `cargo test --locked --all-targets`.
 script_runner = "@duckscript"
 script = '''
 runner = get_env PJ_RUST_TEST_RUNNER
-if eq ${runner} "nextest"
+if eq ${runner} "nextest-unit"
+    nextest_path = which cargo-nextest
+    if is_empty ${nextest_path}
+        echo "PJ_RUST_TEST_RUNNER=nextest-unit but cargo-nextest is not on PATH; running cargo test --all-targets instead. Install: https://nexte.st/docs/installation/pre-built-binaries/"
+        exec --fail-on-error cargo test --locked --all-targets
+    else
+        # lib + bin + integration under nextest in one invocation (the filter
+        # is ONE quoted argument); examples / benches are not nextest targets,
+        # so Cargo runs them once.
+        exec --fail-on-error cargo nextest run --locked --no-tests=pass -E "kind(lib) | kind(bin) | kind(test)"
+        exec --fail-on-error cargo test --locked --examples --benches
+    end
+elseif eq ${runner} "nextest"
     nextest_path = which cargo-nextest
     if is_empty ${nextest_path}
         echo "PJ_RUST_TEST_RUNNER=nextest but cargo-nextest is not on PATH; running cargo test --all-targets instead. Install: https://nexte.st/docs/installation/pre-built-binaries/"

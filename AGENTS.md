@@ -569,6 +569,36 @@ cargo-nextest falls back to `cargo test` with a warning. Don't opt
 in where CI runs plain `cargo test`: the local gate has to run the
 tests the way CI does.
 
+`PJ_RUST_TEST_RUNNER = "nextest-unit"` goes further: lib / bin /
+integration tests all run under nextest
+(`kind(lib) | kind(bin) | kind(test)`, empty sets pass, so bin-only
+crates work) and examples / benches run once through
+`cargo test --examples --benches`. Cargo's `--benches` target selection
+can include the lib / bin benchmark harnesses, so unit tests may run
+again under Cargo even after nextest has run them. Without cargo-nextest
+the task warns and runs `cargo test --locked --all-targets`. Adopt it in
+two places that must carry the same value:
+
+1. the repo's Makefile.toml `[env]` (`PJ_RUST_TEST_RUNNER = "nextest-unit"`);
+2. `.kata/vars.toml`, top level (`PJ_RUST_TEST_RUNNER = "nextest-unit"`),
+   which switches the rendered `ci.yml` test jobs. Unset or any other
+   value renders the unchanged plain `cargo test` workflow.
+
+The repo also needs a `ci` profile in `.config/nextest.toml` that writes
+JUnit (`[profile.ci.junit]` with `path = "junit.xml"`, giving
+`target/nextest/ci/junit.xml`; uploaded as a non-fatal artifact). The
+rendered CI runs lib/bin/integration in one nextest run on Linux and
+macOS; on Windows it splits into `test-windows-unit` (lib/bin,
+examples/benches, doc tests) and three integration-only
+`test-windows-shard` jobs, with the required check `test (windows-latest)`
+aggregating them (failed, cancelled or skipped parts fail it). Only opt in
+when every unit test tolerates one process per test (no shared
+process-wide state). A repo with its own hand-maintained CI (not rendered
+from this template) must mirror the split manually. Magi ignores the
+rendered CI path and maintains its own workflow; do not overwrite it
+with the rendered template. Adopt the local runner and the matching
+manual CI split together as a separate, synchronized change.
+
 ### Toolchain pin
 
 The Rust toolchain is pinned via `rust-toolchain.toml` and the
