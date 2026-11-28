@@ -36,7 +36,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 regex = "1.13.2"
 toml = "1.2.3"
-toml_edit = "0.25.20"
+toml_edit = "0.25.21"
 
 # CLI subprocess discovery (`claude` / `agy` / `codex` on PATH for AI add #93).
 which = "8.0.6"
